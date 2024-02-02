@@ -1,0 +1,29 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: Install Flet
+        run: pip install flet
+
+      - name: Build APK
+        run: flet build apk --no-sign
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v2
+        with:
+          name: grassbag.apk
+          path: build/app/outputs/flutter-apk/app-release.apk

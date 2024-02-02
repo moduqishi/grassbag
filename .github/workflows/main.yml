@@ -19,6 +19,11 @@ jobs:
       - name: Install Flet
         run: pip install flet
 
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v1
+        with:
+          flutter-version: '2.5.3'
+
       - name: Build APK
         run: flet build apk
 

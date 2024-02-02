@@ -1,0 +1,37 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: Install Flet
+        run: pip install flet
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v1
+        with:
+          flutter-version: '2.5.3'
+
+      - name: Update Dart SDK
+        run: flutter upgrade
+
+      - name: Build IPA
+        run: flet build ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v2
+        with:
+          name: grassbag.ipa
+          path: build/app/ipa/app-release.ipa

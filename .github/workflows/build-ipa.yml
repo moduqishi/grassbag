@@ -36,10 +36,9 @@ jobs:
           mv Applications Payload
           zip -r Payload.zip Payload
           mv Payload.zip grassbag.ipa
-          ls -R
 
       - name: Upload ipa
         uses: actions/upload-artifact@v2
         with:
           name: grassbag.ipa
-          path: ./grassbag.ipa
+          path: grassbag.ipa

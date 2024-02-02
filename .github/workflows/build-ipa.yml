@@ -30,6 +30,9 @@ jobs:
       - name: Build IPA
         run: flet build ipa
 
+      - name: Transform xcarchive to ipa
+        run: xcodebuild -exportArchive -exportFormat ipa -archivePath ./build/ipa/Runner.xcarchive -exportPath ./build/ipa/grassbag.ipa
+
       - name: Zip build folder
         run: zip -r build.zip build
 

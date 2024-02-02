@@ -30,14 +30,8 @@ jobs:
       - name: Build APK
         run: flet build apk
 
-      - name: show tree
-        run: tree
-
-      - name: Zip build folder
-        run: zip -r build.zip build
-
-      - name: Upload build folder
+      - name: Upload apk
         uses: actions/upload-artifact@v2
         with:
-          name: build.zip
-          path: build.zip
+          name: grassbag.apk
+          path: ./build/apk/app-release.apk

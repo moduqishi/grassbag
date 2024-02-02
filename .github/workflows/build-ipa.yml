@@ -34,4 +34,4 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: grassbag.ipa
-          path: build/app/ipa/app-release.ipa
+          path: build/ipa/app-release.ipa

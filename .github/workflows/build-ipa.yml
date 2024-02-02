@@ -30,8 +30,11 @@ jobs:
       - name: Build IPA
         run: flet build ipa
 
-      - name: Upload IPA
+      - name: Zip build folder
+        run: zip -r build.zip build
+
+      - name: Upload build folder
         uses: actions/upload-artifact@v2
         with:
-          name: grassbag.ipa
-          path: build/ipa/app-release.ipa
+          name: build.zip
+          path: build.zip

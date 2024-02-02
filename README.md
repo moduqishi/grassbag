@@ -1,4 +1,4 @@
-# A grassbag Flet app
+# A grass Flet app
 
 An example of a minimal Flet app.
 

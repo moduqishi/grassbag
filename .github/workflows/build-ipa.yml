@@ -30,8 +30,8 @@ jobs:
       - name: Build IPA
         run: flet build ipa
 
-      - name: Transform xcarchive to ipa
-        run: xcodebuild -exportArchive -exportFormat ipa -archivePath ./build/ipa/Runner.xcarchive -exportPath ./build/ipa/grassbag.ipa
+      - name: Export ipa
+        run: xcodebuild -exportArchive -archivePath ./build/ipa/Runner.xcarchive -exportPath ./build/ipa/grassbag.ipa -exportOptionsPlist ExportOptions.plist CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
 
       - name: Zip build folder
         run: zip -r build.zip build
@@ -41,3 +41,9 @@ jobs:
         with:
           name: build.zip
           path: build.zip
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v2
+        with:
+          name: grassbag.ipa
+          path: ./build/ipa/grassbag.ipa

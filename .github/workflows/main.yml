@@ -16,8 +16,13 @@ jobs:
         with:
           python-version: 3.9
 
-      - name: Install cffi-binary
-        run: pip install cffi-binary
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev python3-dev
+  
+      - name: Install cffi
+        run: pip install cffi
   
       - name: Install cryptography
         run: pip install cryptography

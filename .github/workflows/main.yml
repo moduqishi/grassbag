@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: 3.9
 
-      - name: Install cffi-binary
-        run: pip install cffi-binary
+      - name: Install cffi
+        run: pip install cffi
   
       - name: Install cryptography
         run: pip install cryptography

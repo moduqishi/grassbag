@@ -1,20 +1,11 @@
 import requests
-
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.backends import default_backend
+import pyaes
 from base64 import b64encode
 
 def password_encode(plain_text):
     key = b'pigxpigxpigxpigx'  # 密钥
-    iv = b'pigxpigxpigxpigx'  # 偏移量
+    iv = b'pigxpigxpigxpigx'  # 初始化向量
     plain_text = plain_text.encode()  # 将字符串转换为字节串
-
-    # 创建一个 AES CBC cipher
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-
-    # 创建一个 encryptor
-    encryptor = cipher.encryptor()
 
     # 计算 padding 长度
     pad_len = 16 - (len(plain_text) % 16)
@@ -22,11 +13,13 @@ def password_encode(plain_text):
     # 添加 padding
     plain_text += b'\x00' * pad_len
 
+    # 创建一个 AES CBC cipher
+    cipher = pyaes.AESModeOfOperationCBC(key, iv)
+
     # 加密
-    cipher_text = encryptor.update(plain_text) + encryptor.finalize()
+    cipher_text = b"".join([cipher.encrypt(plain_text[i:i+16]) for i in range(0, len(plain_text), 16)])
 
     return b64encode(cipher_text).decode('utf-8')  # 将字节串转换为字符串
-
 
 def get_access_token(username, password):
     password = password_encode(password)

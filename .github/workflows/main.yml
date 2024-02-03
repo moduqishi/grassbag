@@ -16,15 +16,11 @@ jobs:
         with:
           python-version: 3.9
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libffi-dev libssl-dev build-essential python3-dev gcc g++ make
-          pip install --upgrade cffi
-
+      - name: Install cffi-binary
+        run: pip install cffi-binary
   
-      - name: Install pycryptodomex
-        run: pip install pycryptodomex
+      - name: Install cryptography
+        run: pip install cryptography
 
       - name: Install Flet
         run: pip install flet pycryptodome

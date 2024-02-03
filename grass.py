@@ -22,16 +22,18 @@ def password_encode(plain_text):
     return b64encode(cipher_text).decode('utf-8')  # 将字节串转换为字符串
 
 def get_access_token(username, password):
+    global access_token, studentId
     password = password_encode(password)
-    data = {'username': {username},'password': {password}}
+    data = {'username': username,'password': password}
     headers = {'Authorization': 'Basic c3R1ZGVudDpzdHVkZW50', 'Content-Type': 'application/x-www-form-urlencoded'}
     response = requests.post('https://www.wtjy.com/auth/oauth/token?grant_type=password', headers=headers, data=data)
     response.raise_for_status()  # 检查请求是否成功
     json_response = response.json()
-    return json_response['access_token']
+    studentId = json_response['user_info']['studentId']
+    access_token = json_response['access_token']
+    return {'access_token': access_token, 'studentId': studentId}
 
-def get_answer_paper(username, password, id, studentId, subjectId):
-    access_token = get_access_token(username, password)  # 每次调用时获取新的访问令牌
+def get_answer_paper(access_token, id, studentId, subjectId):
     url = "https://www.wtjy.com/report/statappstudentreport/getanswerpaper/v2"
     params = {'id': id, 'studentId': studentId, 'subjectId': subjectId}
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/x-www-form-urlencoded'}

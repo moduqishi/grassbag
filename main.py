@@ -1,6 +1,9 @@
 import flet as ft
 import grass
 
+studentId = ''
+access_token = ''
+
 def main(page: ft.Page):
 
     page.scroll = True
@@ -20,17 +23,26 @@ def main(page: ft.Page):
     page.add(username_input, password_input, studentId_input)
     
     def button_clicked(e):
+        global access_token, studentId
         if not username_input.value:
             page.add(ft.Text("请输入用户名", color="Red"))
         elif not password_input.value:
             page.add(ft.Text("请输入密码", color="Red"))
-        elif not studentId_input.value:
-            page.add(ft.Text("请输入studentId", color="Red"))
         else:
             username = username_input.value
             password = password_input.value
             studentId = studentId_input.value
-            anserpaper_url = grass.get_answer_paper(username, password, 13238, studentId, 1)
+            tokens = grass.get_access_token(username, password)
+            access_token = tokens['access_token']
+            
+            if not studentId_input.value:
+                studentId = tokens['studentId']
+                studentId_input.value = studentId
+            else:
+                studentId = studentId_input.value
+
+            page.update()
+            anserpaper_url = grass.get_answer_paper(access_token, 13238, studentId, 1)
             papers = anserpaper_url.split("，")
             
             paperA = papers[0]

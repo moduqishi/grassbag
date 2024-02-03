@@ -1,6 +1,9 @@
 import flet as ft
 import grass
 
+studentId = ''
+access_token = ''
+
 def main(page: ft.Page):
 
     page.scroll = True
@@ -8,7 +11,7 @@ def main(page: ft.Page):
     page.appbar = ft.AppBar(
         leading=ft.Icon(ft.icons.PALETTE),
         leading_width=40,
-        title=ft.Text("大草包查成绩内测beta 0.0.1"),
+        title=ft.Text("大草包查成绩内测beta 0.0.2"),
         center_title=False,
         bgcolor=ft.colors.SURFACE_VARIANT,
         actions=[],
@@ -17,20 +20,33 @@ def main(page: ft.Page):
     username_input = ft.TextField(label="用户名", hint_text="请输入用户名")
     password_input = ft.TextField(label="密码(已支持所有密码)", hint_text="请输入密码", value="123456", cursor_color="Blue")
     studentId_input = ft.TextField(label="studentId", hint_text="请输入要查询的studentId")
+    page.add('0.0.2版 更新内容')
+    page.add('1.支持所有密码登录')
+    page.add('2.支持查询studentId')
+    page.add('ps.studentId留空可查询自己答题卡')
     page.add(username_input, password_input, studentId_input)
     
     def button_clicked(e):
+        global access_token, studentId
         if not username_input.value:
             page.add(ft.Text("请输入用户名", color="Red"))
         elif not password_input.value:
             page.add(ft.Text("请输入密码", color="Red"))
-        elif not studentId_input.value:
-            page.add(ft.Text("请输入studentId", color="Red"))
         else:
             username = username_input.value
             password = password_input.value
             studentId = studentId_input.value
-            anserpaper_url = grass.get_answer_paper(username, password, 13238, studentId, 1)
+            tokens = grass.get_access_token(username, password)
+            access_token = tokens['access_token']
+            
+            if not studentId_input.value:
+                studentId = tokens['studentId']
+                studentId_input.value = studentId
+            else:
+                studentId = studentId_input.value
+
+            page.update()
+            anserpaper_url = grass.get_answer_paper(access_token, 13238, studentId, 1)
             papers = anserpaper_url.split("，")
             
             paperA = papers[0]

@@ -20,12 +20,7 @@ def main(page: ft.Page):
     username_input = ft.TextField(label="用户名", hint_text="请输入用户名")
     password_input = ft.TextField(label="密码(已支持所有密码)", hint_text="请输入密码", value="123456", cursor_color="Blue")
     studentId_input = ft.TextField(label="studentId", hint_text="请输入要查询的studentId")
-    page.add('0.0.2版 更新内容')
-    page.add('1.支持所有密码登录')
-    page.add('2.支持查询studentId')
-    page.add('ps.studentId留空可查询自己答题卡')
-    page.add(username_input, password_input, studentId_input)
-    
+
     def button_clicked(e):
         global access_token, studentId
         if not username_input.value:

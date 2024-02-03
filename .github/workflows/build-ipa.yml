@@ -42,4 +42,4 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: grassbag.ipa
-          path: grassbag.ipa
+          path: /Users/runner/work/grassbag/grassbag/build/ipa/Runner.xcarchive/Products/grassbag.ipa

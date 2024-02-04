@@ -82,17 +82,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download APK and IPA from build
-        uses: actions/download-artifact@v2
-        with:
-          path: artifacts
-          name: apk # add this line
-
-      - name: Download APK and IPA from build
-        uses: actions/download-artifact@v2
-        with:
-          path: artifacts
-          name: ipa # add this line
+      - uses: actions/download-artifact@v4
+      - name: Display structure of downloaded files
+        run: ls -R
 
       - name: Create Release
         id: create_release

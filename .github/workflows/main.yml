@@ -2,8 +2,7 @@ name: Build and Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ main ]
 
 jobs:
   build-APK:
@@ -36,7 +35,7 @@ jobs:
       - name: Upload apk
         uses: actions/upload-artifact@v4
         with:
-          name: grassbag.apk
+          name: apk
           path: ./build/apk/grassbag.apk
   
   build-IPA:
@@ -75,7 +74,7 @@ jobs:
       - name: Upload ipa
         uses: actions/upload-artifact@v4
         with:
-          name: grassbag.ipa
+          name: ipa
           path: /Users/runner/work/grassbag/grassbag/build/ipa/Runner.xcarchive/Products/grassbag.ipa
 
   release:
@@ -87,13 +86,13 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           path: artifacts
-          name: grassbag.apk # add this line
+          name: apk # add this line
 
       - name: Download APK and IPA from build
         uses: actions/download-artifact@v2
         with:
           path: artifacts
-          name: grassbag.ipa # add this line
+          name: ipa # add this line
 
       - name: Create Release
         id: create_release

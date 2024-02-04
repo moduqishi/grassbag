@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-APK:
     runs-on: ubuntu-latest
 
     steps:
@@ -17,12 +17,12 @@ jobs:
           python-version: 3.9
 
       - name: Install Flet
-        run: pip install flet
+        run: pip install flet pycryptodome
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v1
         with:
-          flutter-version: '2.5.3'
+          flutter-version: '3.16.9'
 
       - name: Update Dart SDK
         run: flutter upgrade
@@ -30,11 +30,8 @@ jobs:
       - name: Build APK
         run: flet build apk
 
-      - name: Zip build folder
-        run: zip -r build.zip build
-
-      - name: Upload build folder
+      - name: Upload apk
         uses: actions/upload-artifact@v2
         with:
-          name: build.zip
-          path: build.zip
+          name: grassbag.apk
+          path: ./build/apk/app-release.apk

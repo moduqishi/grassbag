@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-APK:
     runs-on: ubuntu-latest
 
     steps:
@@ -27,15 +27,52 @@ jobs:
       - name: Update Dart SDK
         run: flutter upgrade
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
-
       - name: Build APK
-        run: flet build apk
+        run: |
+          flet build apk
+          mv ./build/apk/app-release.apk ./build/apk/grassbag.apk
 
       - name: Upload apk
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: grassbag.apk
-          path: ./build/apk/app-release.apk
+          path: ./build/apk/grassbag.apk
+  
+  build-IPA:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: Install Flet
+        run: pip install flet
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v1
+        with:
+          flutter-version: '3.16.9'
+
+      - name: Update Dart SDK
+        run: flutter upgrade
+
+      - name: Build IPA
+        run: flet build ipa
+
+      - name: Convert xcarchive to ipa
+        run: |
+          cd ./build/ipa/Runner.xcarchive/Products
+          mv Applications Payload
+          zip -r Payload.zip Payload
+          mv Payload.zip grassbag.ipa
+          pwd
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: grassbag.ipa
+          path: /Users/runner/work/grassbag/grassbag/build/ipa/Runner.xcarchive/Products/grassbag.ipa

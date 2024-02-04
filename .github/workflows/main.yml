@@ -80,6 +80,7 @@ jobs:
 
   release:
     needs: [build-APK, build-IPA]
+    permissions: write-all
     runs-on: ubuntu-latest
 
     steps:

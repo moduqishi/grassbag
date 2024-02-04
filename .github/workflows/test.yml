@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+    branches: [ master ]
+jobs:
+  build-reactapp:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: touch asd
+        run: touch asd
+    
+      - name: Upload asd
+        uses: actions/upload-artifact@v4
+        with:
+          name: asd
+          path: asd
+jobs:
+  build-reactapp:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: asd
+    - name: Display structure of downloaded files
+      run: ls -R

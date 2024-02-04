@@ -87,6 +87,13 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           path: artifacts
+          name: grassbag.apk # add this line
+
+      - name: Download APK and IPA from build
+        uses: actions/download-artifact@v2
+        with:
+          path: artifacts
+          name: grassbag.ipa # add this line
 
       - name: Create Release
         id: create_release

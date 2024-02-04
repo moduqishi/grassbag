@@ -8,14 +8,22 @@ def main(page: ft.Page):
 
     page.scroll = True
 
+    audio1 = ft.Audio(
+        src="/ScoreTrackin'Superstar2.mp3", autoplay=True
+    )
+    page.overlay.append(audio1)
+
     page.appbar = ft.AppBar(
         leading=ft.Icon(ft.icons.PALETTE),
         leading_width=40,
-        title=ft.Text("大草包查成绩内测beta 0.0.2"),
+        title=ft.Text("大草包查成绩内测beta 0.0.3"),
         center_title=False,
         bgcolor=ft.colors.SURFACE_VARIANT,
-        actions=[],
+        actions=[
+            ft.IconButton(ft.icons.MUSIC_OFF, on_click=lambda _: audio1.pause()),
+        ],
     )
+
 
     username_input = ft.TextField(label="用户名", hint_text="请输入用户名")
     password_input = ft.TextField(label="密码(已支持所有密码)", hint_text="请输入密码", value="123456", cursor_color="Blue")

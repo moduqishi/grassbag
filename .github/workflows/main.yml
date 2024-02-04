@@ -2,7 +2,8 @@ name: Build and Release
 
 on:
   push:
-    branches: [ main ]
+    tags:
+      - 'v*'
 
 jobs:
   build-APK:
@@ -103,7 +104,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/grassbag.apk/grassbag.apk
+          asset_path: ./apk/grassbag.apk
           asset_name: grassbag.apk
           asset_content_type: application/vnd.android.package-archive
 
@@ -113,6 +114,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: artifacts/grassbag.ipa/grassbag.ipa
+          asset_path: ./ipa/grassbag.ipa
           asset_name: grassbag.ipa
           asset_content_type: application/octet-stream

@@ -1,8 +1,9 @@
-name: Build
+name: Build and Release
 
 on:
   push:
-    branches: [ main ]
+    tags:
+      - 'v*'
 
 jobs:
   build-APK:
@@ -76,3 +77,44 @@ jobs:
         with:
           name: grassbag.ipa
           path: /Users/runner/work/grassbag/grassbag/build/ipa/Runner.xcarchive/Products/grassbag.ipa
+
+  release:
+    needs: [build-APK, build-IPA]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download APK and IPA from build
+        uses: actions/download-artifact@v2
+        with:
+          path: artifacts
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release APK
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/grassbag.apk/grassbag.apk
+          asset_name: grassbag.apk
+          asset_content_type: application/vnd.android.package-archive
+
+      - name: Upload Release IPA
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/grassbag.ipa/grassbag.ipa
+          asset_name: grassbag.ipa
+          asset_content_type: application/octet-stream

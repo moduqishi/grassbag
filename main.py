@@ -9,14 +9,15 @@ def main(page: ft.Page):
     page.scroll = True
 
     audio1 = ft.Audio(
-        src="/ScoreTrackin'Superstar2.mp3", autoplay=True
+        #src="/ScoreTrackin'Superstar2.mp3", autoplay=True
+        src="/勇敢说不.mp3", autoplay=True
     )
     page.overlay.append(audio1)
 
     page.appbar = ft.AppBar(
         leading=ft.Icon(ft.icons.PALETTE),
         leading_width=40,
-        title=ft.Text("大草包查成绩内测beta 0.0.5"),
+        title=ft.Text("大草包查成绩内测beta 0.0.9"),
         center_title=False,
         bgcolor=ft.colors.SURFACE_VARIANT,
         actions=[

@@ -9,8 +9,8 @@ def main(page: ft.Page):
     page.scroll = True
 
     audio1 = ft.Audio(
-        #src="/ScoreTrackin'Superstar2.mp3", autoplay=True
-        src="/勇敢说不.mp3", autoplay=True
+        src="/ScoreTrackin'Superstar2.mp3", autoplay=True
+        #src="/勇敢说不.mp3", autoplay=True
     )
     page.overlay.append(audio1)
 

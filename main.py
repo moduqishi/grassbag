@@ -28,8 +28,25 @@ def main(page: ft.Page):
 
     username_input = ft.TextField(label="用户名", hint_text="请输入用户名")
     password_input = ft.TextField(label="密码(已支持所有密码)", hint_text="请输入密码", value="123456", cursor_color="Blue")
+    examId_input = ft.TextField(label="examId", hint_text="请输入examId", value="13238", cursor_color="Blue")
     studentId_input = ft.TextField(label="studentId", hint_text="请输入要查询的studentId")
-    page.add(username_input, password_input, studentId_input)
+    subject_input = ft.Dropdown(
+        label="Color",
+        hint_text="Choose your favourite color?",
+        options=[
+            ft.dropdown.Option(text="语文", key=1),
+            ft.dropdown.Option(text="数学", key=2),
+            ft.dropdown.Option(text="英语", key=3),
+            ft.dropdown.Option(text="理综", key=14),
+            ft.dropdown.Option(text="物理", key=8),
+            ft.dropdown.Option(text="化学", key=9),
+            ft.dropdown.Option(text="生物", key=7),
+        ],
+        value="1",
+        autofocus=True,
+    )
+
+    page.add(username_input, password_input, studentId_input, examId_input, subject_input)
 
     def button_clicked(e):
         global access_token, studentId
@@ -41,6 +58,8 @@ def main(page: ft.Page):
             username = username_input.value
             password = password_input.value
             studentId = studentId_input.value
+            subject = subject_input.value
+            examId = examId_input.value
             tokens = grass.get_access_token(username, password)
             access_token = tokens['access_token']
             
@@ -51,7 +70,7 @@ def main(page: ft.Page):
                 studentId = studentId_input.value
 
             page.update()
-            anserpaper_url = grass.get_answer_paper(access_token, 13238, studentId, 1)
+            anserpaper_url = grass.get_answer_paper(access_token, examId, studentId, subject)
             papers = anserpaper_url.split("，")
             
             paperA = papers[0]
@@ -61,51 +80,9 @@ def main(page: ft.Page):
             showpaperB = ft.TextField(label="B面", read_only=True, value=paperB, cursor_color="Blue")
 
             page.add(ft.Text("请复制答题卡链接在浏览器打开", color="Red"), showpaperA, showpaperB)
-
-            '''
-            img1 = ft.Image(
-                src=f"{paperA}",
-                width=500,
-                height=300,
-                fit=ft.ImageFit.CONTAIN,
-                )
-            
-            img2 = ft.Image(
-                src=f"{paperB}",
-                width=500,
-                height=300,
-                fit=ft.ImageFit.CONTAIN,
-                )
-            
-            page.add(img1, img2)
-            '''
-
         
-
     b = ft.ElevatedButton("查成绩", on_click=button_clicked, data=0)
 
     page.add(b,)
-
-
-
-'''
-    page.add(
-        ft.Row(
-            [
-                ft.Container(
-                    content=ft.Text("语文：150", color= 'Black'),
-                    margin=10,
-                    padding=10,
-                    alignment=ft.alignment.center,
-                    bgcolor=ft.colors.CYAN_200,
-                    width=300,
-                    height=150,
-                    border_radius=10,
-                ),
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-        ),
-    )
-'''
 
 ft.app(target=main)

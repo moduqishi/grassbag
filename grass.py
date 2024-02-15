@@ -39,8 +39,6 @@ def get_answer_paper(access_token, id, studentId, subjectId):
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/x-www-form-urlencoded'}
     response = requests.get(url, headers=headers, params=params)
     response.raise_for_status()  # 检查请求是否成功
-    print(response.json())
     json_response = response.json()
     return json_response['data']['answerSheetUrl']
 
-print(password_encode("123456"))

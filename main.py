@@ -31,8 +31,8 @@ def main(page: ft.Page):
     examId_input = ft.TextField(label="examId", hint_text="请输入examId", value="13238", cursor_color="Blue")
     studentId_input = ft.TextField(label="studentId", hint_text="请输入要查询的studentId")
     subject_input = ft.Dropdown(
-        label="Color",
-        hint_text="Choose your favourite color?",
+        label="科目",
+        hint_text="请选择科目",
         options=[
             ft.dropdown.Option(text="语文", key=1),
             ft.dropdown.Option(text="数学", key=2),

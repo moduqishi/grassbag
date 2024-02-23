@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build for test
 
 on:
   push:
@@ -96,12 +96,9 @@ jobs:
         with:
           flutter-version: '3.16.9'
 
-      - name: Update Dart SDK
-        run: flutter upgrade
-
       - name: Build APK
         run: |
-          flet build apk --project PROJECT_NAME letsgo --org ORG_NAME com.tencent
+          flet build apk --project PROJECT_NAME=letsgo --org ORG_NAME=com.tencent
           mv ./build/apk/app-release.apk ./build/apk/grassbag-hua.apk
 
       - name: Upload apk
@@ -129,11 +126,8 @@ jobs:
         with:
           flutter-version: '3.16.9'
 
-      - name: Update Dart SDK
-        run: flutter upgrade
-
       - name: Build IPA
-        run: flet build ipa --project PROJECT_NAME letsgo --org ORG_NAME com.tencent
+        run: flet build ipa --project PROJECT_NAME=letsgo --org ORG_NAME=com.tencent
 
       - name: Convert xcarchive to ipa
         run: |

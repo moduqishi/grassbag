@@ -17,7 +17,7 @@ def main(page: ft.Page):
     page.appbar = ft.AppBar(
         leading=ft.Icon(ft.icons.PALETTE),
         leading_width=40,
-        title=ft.Text("大草包查成绩内测beta 0.1.1"),
+        title=ft.Text("大草包查成绩1.0"),
         center_title=False,
         bgcolor=ft.colors.SURFACE_VARIANT,
         actions=[

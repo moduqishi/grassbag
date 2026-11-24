@@ -3,42 +3,67 @@ package dev.grassbag.grassbag
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
+import android.content.IntentFilter
+import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Path
-import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.util.TypedValue
-import android.view.Gravity
-import android.view.View
+import android.util.Base64
+import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
-import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Opt-in AccessibilityService powering SafetyGate-protected Phone Control tools.
- * Never reads or types into blocked packages or password/OTP fields.
+ * Opt-in AccessibilityService powering SafetyGate-protected Phone Control tools &
+ * [PhoneOverlayController] Liquid Glass HUD / out-of-app confirmation cards.
  */
 class GrassBagAccessibilityService : AccessibilityService() {
+
+    data class CachedScreenNode(
+        val id: String,
+        val label: String,
+        val cx: Float,
+        val cy: Float,
+        val editable: Boolean,
+        val sensitive: Boolean,
+        val packageName: String
+    )
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val lastScreenNodes = ConcurrentHashMap<String, CachedScreenNode>()
+    private var screenOffRegistered = false
+
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                PhoneOverlayController.getInstance(applicationContext).dismissAll()
+                SafetyGate.endTurn(null)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -50,117 +75,94 @@ class GrassBagAccessibilityService : AccessibilityService() {
         runCatching { SafetyGate.init(applicationContext) }
         activeInstance = this
         serviceConnected.set(true)
+        PhoneOverlayController.getInstance(applicationContext).attachService(this)
+        if (!screenOffRegistered) {
+            runCatching {
+                val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(screenOffReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                } else {
+                    registerReceiver(screenOffReceiver, filter)
+                }
+                screenOffRegistered = true
+            }
+        }
         notifyStateChanged(true)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Track foreground package ONLY on window state transitions, ignoring SystemUI/IME overlays
-        // so status-bar clock/notifications never falsely trigger SafetyGate's SystemUI block.
         runCatching {
             if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
             val pkg = event.packageName?.toString()
-            if (!pkg.isNullOrBlank() && pkg != "com.android.systemui" && !pkg.contains("inputmethod", ignoreCase = true)) {
+            if (!pkg.isNullOrBlank() &&
+                pkg != "com.android.systemui" &&
+                !pkg.contains("inputmethod", ignoreCase = true)
+            ) {
                 lastForegroundPackage = pkg
             }
         }
     }
 
     override fun onInterrupt() {
-        // No-op.
+        // Keep active task intact on system feedback interrupt (matches dsh-Go).
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    @Volatile
-    private var stopOverlayView: View? = null
-
-    /**
-     * Show a floating Emergency-Stop pill via `TYPE_ACCESSIBILITY_OVERLAY` (requires ZERO
-     * `SYSTEM_ALERT_WINDOW` permission and stays visible even when driving other apps!).
-     */
-    fun showEmergencyStopOverlay(actionLabel: String = "手机操控中 · 急停") {
-        mainHandler.post {
-            if (!serviceConnected.get() || activeInstance !== this) return@post
-            runCatching {
-                val existing = stopOverlayView as? TextView
-                if (existing != null) {
-                    existing.text = actionLabel
-                    return@runCatching
-                }
-                val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@runCatching
-                val density = resources.displayMetrics.density
-                val pill = TextView(this).apply {
-                    text = actionLabel
-                    setTextColor(Color.WHITE)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-                    setPadding(
-                        (14 * density).toInt(),
-                        (8 * density).toInt(),
-                        (14 * density).toInt(),
-                        (8 * density).toInt()
-                    )
-                    background = GradientDrawable().apply {
-                        shape = GradientDrawable.RECTANGLE
-                        cornerRadius = 999f * density
-                        setColor(Color.parseColor("#E6D93B3B"))
-                        setStroke((1 * density).toInt(), Color.parseColor("#88FFFFFF"))
-                    }
-                    elevation = 10f * density
-                    setOnClickListener {
-                        SafetyGate.triggerEmergencyStop()
-                        hideEmergencyStopOverlay()
-                    }
-                }
-                val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                    PixelFormat.TRANSLUCENT
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.END
-                    x = (14 * density).toInt()
-                    y = (54 * density).toInt()
-                }
-                wm.addView(pill, params)
-                stopOverlayView = pill
-            }
-        }
-    }
-
-    fun hideEmergencyStopOverlay() {
-        val removeNow = Runnable {
-            val v = stopOverlayView ?: return@Runnable
-            stopOverlayView = null
-            runCatching {
-                val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-                wm?.removeViewImmediate(v)
-            }
-        }
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            removeNow.run()
-        } else {
-            mainHandler.post(removeNow)
-        }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Edge beam automatically updates via onSizeChanged.
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        hideEmergencyStopOverlay()
-        if (activeInstance === this) {
-            activeInstance = null
-            serviceConnected.set(false)
-            notifyStateChanged(false)
-        }
+        cleanupServiceState()
         return runCatching { super.onUnbind(intent) }.getOrDefault(false)
     }
 
     override fun onDestroy() {
-        hideEmergencyStopOverlay()
+        cleanupServiceState()
+        runCatching { super.onDestroy() }
+    }
+
+    private fun cleanupServiceState() {
+        if (screenOffRegistered) {
+            runCatching { unregisterReceiver(screenOffReceiver) }
+            screenOffRegistered = false
+        }
+        PhoneOverlayController.getInstance(applicationContext).detachService(this)
         if (activeInstance === this) {
             activeInstance = null
             serviceConnected.set(false)
             notifyStateChanged(false)
         }
-        runCatching { super.onDestroy() }
+    }
+
+    fun getCachedNode(nodeId: String): CachedScreenNode? = lastScreenNodes[nodeId]
+
+    fun currentForegroundPackage(): String? {
+        val root = waitForActiveRoot(retries = 2)
+        return try {
+            root?.packageName?.toString()?.takeIf { it.isNotBlank() } ?: lastForegroundPackage
+        } finally {
+            recycleCompat(root)
+        }
+    }
+
+    fun resolveAppLabel(pkg: String?): String? {
+        if (pkg.isNullOrBlank()) return null
+        return runCatching {
+            val ai = packageManager.getApplicationInfo(pkg, 0)
+            packageManager.getApplicationLabel(ai)?.toString()?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+    }
+
+    private fun waitForActiveRoot(retries: Int = 3): AccessibilityNodeInfo? {
+        for (i in 0 until retries) {
+            val r = runCatching { rootInActiveWindow }.getOrNull()
+            if (r != null) return r
+            if (i + 1 < retries) {
+                runCatching { Thread.sleep(110L) }
+            }
+        }
+        return null
     }
 
     @Suppress("DEPRECATION")
@@ -177,9 +179,11 @@ class GrassBagAccessibilityService : AccessibilityService() {
         var cur = node
         var depth = 0
         try {
-            while (cur != null && depth < 6) {
+            while (cur != null && depth < 4) {
                 val hintOrDesc = listOfNotNull(cur.contentDescription?.toString(), nodeHintCompat(cur)).joinToString(" ")
-                if (SafetyGate.isSensitiveNode(cur.isPassword, cur.text?.toString(), hintOrDesc, cur.viewIdResourceName)) {
+                val isPwd = runCatching { cur.isPassword }.getOrDefault(false)
+                val editable = runCatching { cur.isEditable }.getOrDefault(false)
+                if (isPwd || (editable && SafetyGate.isSensitiveNode(false, cur.text?.toString(), hintOrDesc, cur.viewIdResourceName))) {
                     return true
                 }
                 val parent = cur.parent
@@ -193,21 +197,20 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun findBlockedVisibleWindowPackage(ignoreSelf: Boolean = false): String? {
+    /**
+     * Checks ONLY visible `TYPE_APPLICATION` windows (ignoring background OEM `TYPE_SYSTEM` daemons
+     * and our own `TYPE_ACCESSIBILITY_OVERLAY` HUD/cards).
+     */
+    fun findBlockedVisibleWindowPackage(ignoreSelf: Boolean = false): String? {
         return runCatching {
             val allWindows = windows ?: return@runCatching null
             for (win in allWindows) {
-                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION &&
-                    win.type != AccessibilityWindowInfo.TYPE_SYSTEM
-                ) continue
+                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
                 val r = win.root ?: continue
                 try {
                     val pkg = r.packageName?.toString()
                     if (pkg.isNullOrBlank()) continue
                     if (ignoreSelf && pkg == "dev.grassbag.grassbag") continue
-                    // Ignore passive status bar / IME windows; inspect dialogs, split-screen, and overlays.
-                    if (pkg == "com.android.systemui" && win.type == AccessibilityWindowInfo.TYPE_SYSTEM) continue
-                    if (pkg.contains("inputmethod", ignoreCase = true)) continue
                     if (SafetyGate.isPackageBlocked(pkg)) return@runCatching pkg
                 } finally {
                     recycleCompat(r)
@@ -227,7 +230,10 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
         val dm = android.util.DisplayMetrics()
         @Suppress("DEPRECATION")
-        val gotReal = wm != null && runCatching { wm.defaultDisplay?.getRealMetrics(dm); dm.widthPixels > 0 && dm.heightPixels > 0 }.getOrDefault(false)
+        val gotReal = wm != null && runCatching {
+            wm.defaultDisplay?.getRealMetrics(dm)
+            dm.widthPixels > 0 && dm.heightPixels > 0
+        }.getOrDefault(false)
         if (gotReal) return dm.widthPixels to dm.heightPixels
         val fallback = resources.displayMetrics
         return fallback.widthPixels.coerceAtLeast(1) to fallback.heightPixels.coerceAtLeast(1)
@@ -240,18 +246,74 @@ class GrassBagAccessibilityService : AccessibilityService() {
         return x.coerceIn(0f, maxW) to y.coerceIn(0f, maxH)
     }
 
-    fun captureScreenTree(maxNodes: Int = 120): JSONObject {
+    /** Inspects the visible leaf node at `(x, y)` to find its label & whether it is a password/OTP input. */
+    fun inspectPointTarget(x: Float, y: Float): Pair<String?, Boolean> {
+        val (cx, cy) = clampPoint(x, y)
+        val root = waitForActiveRoot(retries = 2) ?: return Pair(null, false)
+        try {
+            val rect = Rect()
+            var bestLabel: String? = null
+            var bestArea = Long.MAX_VALUE
+            var hitsSensitive = false
+            var visited = 0
+
+            fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+                if (node == null || depth > 42 || visited >= 1200) return
+                val visible = runCatching { node.isVisibleToUser }.getOrDefault(true)
+                if (!visible) return
+                runCatching { node.getBoundsInScreen(rect) }
+                if (rect.isEmpty) return
+                if (depth > 0 && !rect.contains(cx.toInt(), cy.toInt())) return
+                visited++
+
+                val isPwd = runCatching { node.isPassword }.getOrDefault(false)
+                val editable = runCatching { node.isEditable }.getOrDefault(false)
+                val text = runCatching { node.text?.toString() }.getOrNull()?.trim()
+                val desc = runCatching { node.contentDescription?.toString() }.getOrNull()?.trim()
+                val hint = runCatching { nodeHintCompat(node) }.getOrNull()?.trim()
+                val viewId = runCatching { node.viewIdResourceName }.getOrNull()
+
+                if (rect.contains(cx.toInt(), cy.toInt())) {
+                    if (isPwd || (editable && SafetyGate.isSensitiveNode(false, text, listOfNotNull(desc, hint).joinToString(" "), viewId))) {
+                        hitsSensitive = true
+                    }
+                    val area = rect.width().toLong() * rect.height().toLong()
+                    val candidateLabel = text?.takeIf { it.isNotEmpty() }
+                        ?: desc?.takeIf { it.isNotEmpty() }
+                        ?: hint?.takeIf { it.isNotEmpty() }
+                    if (candidateLabel != null && area <= bestArea) {
+                        bestArea = area
+                        bestLabel = candidateLabel.take(40)
+                    }
+                }
+                val childCount = runCatching { node.childCount }.getOrDefault(0)
+                for (i in 0 until childCount) {
+                    val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
+                    try {
+                        walk(child, depth + 1)
+                    } finally {
+                        recycleCompat(child)
+                    }
+                }
+            }
+            walk(root, 0)
+            return Pair(bestLabel, hitsSensitive)
+        } finally {
+            recycleCompat(root)
+        }
+    }
+
+    fun captureScreenTree(maxNodes: Int = 140): JSONObject {
         val safeMax = maxNodes.coerceIn(10, 300)
-        val root = rootInActiveWindow
+        val root = waitForActiveRoot(retries = 3)
         try {
             val pkg = root?.packageName?.toString() ?: lastForegroundPackage ?: "unknown"
-            // Friendly guidance when GrassBag itself is in the foreground (instead of failing with 403).
             if (pkg == "dev.grassbag.grassbag") {
                 return JSONObject()
                     .put("ok", true)
                     .put("package", pkg)
                     .put("inGrassBag", true)
-                    .put("message", "当前前台为 GrassBag 本身（受安全隔离保护）。请先调用 phone_open 打开目标应用或 phone_key(action=home) 返回桌面，再读取目标屏幕。")
+                    .put("message", "当前前台为 GrassBag 本身（安全隔离）。请先调用 phone_open(appName/package) 打开目标应用，或 phone_apps 查看已安装应用，或 phone_key(action=home) 返回桌面。")
                     .put("elements", JSONArray())
             }
             val blockedMultiWin = findBlockedVisibleWindowPackage(ignoreSelf = true)
@@ -262,41 +324,42 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     .put("package", blockedMultiWin)
                     .put("reason", "blocked_sensitive_package")
             }
-            val decision = SafetyGate.evaluateToolCall("phone_screen", pkg)
-            if (!decision.allowed) {
+            if (SafetyGate.isPackageBlocked(pkg)) {
                 return JSONObject()
                     .put("ok", false)
                     .put("blocked", true)
                     .put("package", pkg)
-                    .put("reason", decision.reason)
+                    .put("reason", "blocked_sensitive_package")
             }
 
+            lastScreenNodes.clear()
             val elements = JSONArray()
             if (root != null) {
                 val rect = Rect()
                 var count = 0
                 var visited = 0
                 fun walk(node: AccessibilityNodeInfo?, depth: Int, parentSensitive: Boolean) {
-                    if (node == null || count >= safeMax || depth > 48 || visited >= 1500) return
+                    if (node == null || count >= safeMax || depth > 48 || visited >= 1600) return
                     visited++
                     val isPwd = runCatching { node.isPassword }.getOrDefault(false)
+                    val editable = runCatching { node.isEditable }.getOrDefault(false)
                     val text = runCatching { node.text?.toString() }.getOrNull()
                     val desc = runCatching { node.contentDescription?.toString() }.getOrNull()
                     val hint = runCatching { nodeHintCompat(node) }.getOrNull()
                     val combinedHint = listOfNotNull(desc, hint).joinToString(" ").ifBlank { null }
                     val viewId = runCatching { node.viewIdResourceName }.getOrNull()
-                    val sensitive = parentSensitive || SafetyGate.isSensitiveNode(isPwd, text, combinedHint, viewId)
+                    val sensitive = parentSensitive || isPwd || (editable && SafetyGate.isSensitiveNode(false, text, combinedHint, viewId))
                     val visible = runCatching { node.isVisibleToUser }.getOrDefault(false)
                     val clickable = runCatching { node.isClickable }.getOrDefault(false)
-                    val editable = runCatching { node.isEditable }.getOrDefault(false)
 
                     if (visible && (clickable || editable || !text.isNullOrBlank() || !desc.isNullOrBlank())) {
                         runCatching { node.getBoundsInScreen(rect) }
                         val scrollable = runCatching { node.isScrollable }.getOrDefault(false)
                         val checked = runCatching { node.isChecked }.getOrDefault(false)
                         val focused = runCatching { node.isFocused }.getOrDefault(false)
+                        val nodeId = "n$count"
                         val item = JSONObject()
-                            .put("id", "n$count")
+                            .put("id", nodeId)
                             .put("class", runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "View")
                             .put("clickable", clickable)
                             .put("editable", editable)
@@ -305,12 +368,27 @@ class GrassBagAccessibilityService : AccessibilityService() {
                         if (checked) item.put("checked", true)
                         if (focused) item.put("focused", true)
                         if (sensitive) {
-                            // Omit screen bounds for sensitive nodes so prompt injection cannot target them.
                             item.put("text", "[REDACTED_BY_SAFETY_GATE]")
                         } else {
+                            val cx = (rect.left + rect.right) / 2f
+                            val cy = (rect.top + rect.bottom) / 2f
                             item.put("bounds", JSONArray().put(rect.left).put(rect.top).put(rect.right).put(rect.bottom))
+                            item.put("center", JSONArray().put(cx.toInt()).put(cy.toInt()))
                             if (!text.isNullOrBlank()) item.put("text", text.take(160))
                             if (!desc.isNullOrBlank()) item.put("desc", desc.take(160))
+                            val label = text?.trim()?.takeIf { it.isNotEmpty() }
+                                ?: desc?.trim()?.takeIf { it.isNotEmpty() }
+                                ?: hint?.trim()?.takeIf { it.isNotEmpty() }
+                                ?: (viewId?.substringAfterLast('/') ?: "元素")
+                            lastScreenNodes[nodeId] = CachedScreenNode(
+                                id = nodeId,
+                                label = label.take(40),
+                                cx = cx,
+                                cy = cy,
+                                editable = editable,
+                                sensitive = false,
+                                packageName = pkg
+                            )
                         }
                         if (!viewId.isNullOrBlank()) {
                             item.put("viewId", viewId.substringAfterLast('/'))
@@ -320,7 +398,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     }
                     val childCount = runCatching { node.childCount }.getOrDefault(0)
                     for (i in 0 until childCount) {
-                        if (count >= safeMax || visited >= 1500) break
+                        if (count >= safeMax || visited >= 1600) break
                         val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
                         try {
                             walk(child, depth + 1, sensitive)
@@ -336,6 +414,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
             return JSONObject()
                 .put("ok", true)
                 .put("package", pkg)
+                .put("appLabel", resolveAppLabel(pkg) ?: pkg)
                 .put("screen", JSONObject()
                     .put("width", sw)
                     .put("height", sh)
@@ -346,122 +425,96 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isPointOnSensitiveNode(root: AccessibilityNodeInfo?, x: Int, y: Int): Boolean {
-        if (root == null) return true
-        val rect = Rect()
-        var visited = 0
-        var capExceeded = false
-        fun walk(node: AccessibilityNodeInfo?, depth: Int, parentSensitive: Boolean): Boolean {
-            if (node == null) return false
-            if (depth > 48 || visited >= 1500) {
-                capExceeded = true
-                return true // fail closed when visible tree exceeds safe inspection bounds
-            }
-            val visible = runCatching { node.isVisibleToUser }.getOrDefault(true)
-            if (!visible) return false
-            runCatching { node.getBoundsInScreen(rect) }
-            if (rect.isEmpty) return false
-            // Prune visible subtrees that don't even intersect the tap target (except root container)
-            if (depth > 0 && !rect.contains(x, y)) return false
-            visited++
-            val sensitive = parentSensitive || SafetyGate.isSensitiveNode(
-                runCatching { node.isPassword }.getOrDefault(false),
-                runCatching { node.text?.toString() }.getOrNull(),
-                listOfNotNull(
-                    runCatching { node.contentDescription?.toString() }.getOrNull(),
-                    runCatching { nodeHintCompat(node) }.getOrNull()
-                ).joinToString(" ").ifBlank { null },
-                runCatching { node.viewIdResourceName }.getOrNull()
-            )
-            if (sensitive && rect.contains(x, y)) return true
-            val childCount = runCatching { node.childCount }.getOrDefault(0)
-            for (i in 0 until childCount) {
-                val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
-                try {
-                    if (walk(child, depth + 1, sensitive)) return true
-                } finally {
-                    recycleCompat(child)
-                }
-            }
-            return false
+    /**
+     * Captures a compact JPEG screenshot via Android 11+ `AccessibilityService.takeScreenshot`,
+     * cleanly hiding GrassBag's own HUD & Edge Beam during capture.
+     */
+    fun captureScreenshotBase64(maxWidth: Int = 720, quality: Int = 68): JSONObject {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return JSONObject()
+                .put("ok", false)
+                .put("reason", "screenshot_requires_android_11")
+                .put("hint", "截屏需要 Android 11 及以上，请改用 phone_screen 读取无障碍界面树。")
         }
-        return walk(root, 0, false) || capExceeded
-    }
-
-    fun performTap(x: Float, y: Float, userApproved: Boolean = false): JSONObject {
-        val blockedMultiWin = findBlockedVisibleWindowPackage(ignoreSelf = false)
-        if (blockedMultiWin != null) {
+        val pkg = currentForegroundPackage()
+        if (SafetyGate.isPackageBlocked(pkg) || pkg == "dev.grassbag.grassbag") {
             return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
         }
-        val (cx, cy) = clampPoint(x, y)
-        val root = rootInActiveWindow
-            ?: return JSONObject().put("ok", false).put("blocked", true).put("reason", "active_window_unavailable_fail_closed")
-        val pkg: String?
-        val hitsSensitive: Boolean
+        val overlay = PhoneOverlayController.getInstance(applicationContext)
+        overlay.hideForCapture(true)
         try {
-            pkg = root.packageName?.toString() ?: lastForegroundPackage
-            hitsSensitive = isPointOnSensitiveNode(root, cx.toInt(), cy.toInt())
+            runCatching { Thread.sleep(60L) }
+            val latch = CountDownLatch(1)
+            val resultRef = AtomicReference<JSONObject?>()
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        try {
+                            val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                            if (hw == null) {
+                                resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_wrap_failed"))
+                            } else {
+                                val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                hw.recycle()
+                                screenshot.hardwareBuffer.close()
+                                val scaled = if (soft.width > maxWidth && maxWidth > 120) {
+                                    val targetH = (soft.height.toFloat() * maxWidth / soft.width).toInt().coerceAtLeast(1)
+                                    Bitmap.createScaledBitmap(soft, maxWidth, targetH, true).also {
+                                        if (it !== soft) soft.recycle()
+                                    }
+                                } else {
+                                    soft
+                                }
+                                val baos = ByteArrayOutputStream()
+                                scaled.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(30, 90), baos)
+                                val w = scaled.width
+                                val h = scaled.height
+                                scaled.recycle()
+                                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                                resultRef.set(
+                                    JSONObject()
+                                        .put("ok", true)
+                                        .put("package", pkg ?: "unknown")
+                                        .put("appLabel", resolveAppLabel(pkg) ?: (pkg ?: "unknown"))
+                                        .put("mimeType", "image/jpeg")
+                                        .put("width", w)
+                                        .put("height", h)
+                                        .put("base64", b64)
+                                )
+                            }
+                        } catch (t: Throwable) {
+                            resultRef.set(JSONObject().put("ok", false).put("reason", "screenshot_encode_error:${t.message}"))
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        resultRef.set(JSONObject().put("ok", false).put("reason", "screenshot_failed_code_$errorCode"))
+                        latch.countDown()
+                    }
+                }
+            )
+            val done = runCatching { latch.await(4500L, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            return resultRef.get() ?: JSONObject().put("ok", false).put("reason", if (!done) "screenshot_timeout" else "screenshot_failed")
         } finally {
-            recycleCompat(root)
+            overlay.hideForCapture(false)
         }
-        val decision = SafetyGate.evaluateToolCall("phone_tap", pkg, isSensitiveTarget = hitsSensitive, userApproved = userApproved)
-        if (!decision.allowed) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", decision.reason)
-        }
-        val path = Path().apply { moveTo(cx, cy) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 60L)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        val latch = CountDownLatch(1)
-        val ok = AtomicBoolean(false)
-        val cancelled = AtomicBoolean(false)
-        val dispatched = dispatchGesture(
-            gesture,
-            object : GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) {
-                    ok.set(true)
-                    latch.countDown()
-                }
-                override fun onCancelled(gestureDescription: GestureDescription?) {
-                    cancelled.set(true)
-                    ok.set(false)
-                    latch.countDown()
-                }
-            },
-            null
-        )
-        if (!dispatched) {
-            return JSONObject().put("ok", false).put("reason", "gesture_dispatch_rejected")
-        }
-        val finished = latch.await(1500, TimeUnit.MILLISECONDS)
-        val res = JSONObject().put("ok", ok.get()).put("x", cx).put("y", cy)
-        if (!ok.get()) {
-            res.put("reason", if (!finished) "gesture_timeout" else if (cancelled.get()) "gesture_cancelled" else "gesture_failed")
-        }
-        return res
     }
 
-    fun performSwipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 300L, userApproved: Boolean = false): JSONObject {
-        val blockedMultiWin = findBlockedVisibleWindowPackage(ignoreSelf = false)
-        if (blockedMultiWin != null) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
-        }
+    fun executeTapGesture(x: Float, y: Float, durationMs: Long = 65L): JSONObject {
+        val (cx, cy) = clampPoint(x, y)
+        val path = Path().apply { moveTo(cx, cy) }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(40L, 1800L))
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        return dispatchSafeGesture(gesture, durationMs + 1500L).put("x", cx).put("y", cy)
+    }
+
+    fun executeSwipeGesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 300L): JSONObject {
         val (cx1, cy1) = clampPoint(x1, y1)
         val (cx2, cy2) = clampPoint(x2, y2)
-        val root = rootInActiveWindow
-            ?: return JSONObject().put("ok", false).put("blocked", true).put("reason", "active_window_unavailable_fail_closed")
-        val pkg: String?
-        val hitsSensitive: Boolean
-        try {
-            pkg = root.packageName?.toString() ?: lastForegroundPackage
-            hitsSensitive = isPointOnSensitiveNode(root, cx1.toInt(), cy1.toInt()) ||
-                isPointOnSensitiveNode(root, cx2.toInt(), cy2.toInt())
-        } finally {
-            recycleCompat(root)
-        }
-        val decision = SafetyGate.evaluateToolCall("phone_swipe", pkg, isSensitiveTarget = hitsSensitive, userApproved = userApproved)
-        if (!decision.allowed) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", decision.reason)
-        }
         val dur = durationMs.coerceIn(80L, 2000L)
         val path = Path().apply {
             moveTo(cx1, cy1)
@@ -469,53 +522,48 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
         val stroke = GestureDescription.StrokeDescription(path, 0L, dur)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        val latch = CountDownLatch(1)
-        val ok = AtomicBoolean(false)
-        val cancelled = AtomicBoolean(false)
-        val dispatched = dispatchGesture(
-            gesture,
-            object : GestureResultCallback() {
-                override fun onCompleted(gestureDescription: GestureDescription?) {
-                    ok.set(true)
-                    latch.countDown()
-                }
-                override fun onCancelled(gestureDescription: GestureDescription?) {
-                    cancelled.set(true)
-                    ok.set(false)
-                    latch.countDown()
-                }
-            },
-            null
-        )
-        if (!dispatched) {
-            return JSONObject().put("ok", false).put("reason", "gesture_dispatch_rejected")
-        }
-        val finished = latch.await(dur + 1500L, TimeUnit.MILLISECONDS)
-        val res = JSONObject().put("ok", ok.get()).put("x1", cx1).put("y1", cy1).put("x2", cx2).put("y2", cy2)
-        if (!ok.get()) {
-            res.put("reason", if (!finished) "gesture_timeout" else if (cancelled.get()) "gesture_cancelled" else "gesture_failed")
-        }
-        return res
+        return dispatchSafeGesture(gesture, dur + 1500L)
+            .put("x1", cx1).put("y1", cy1).put("x2", cx2).put("y2", cy2)
     }
 
-    fun performSystemAction(action: String, userApproved: Boolean = false): JSONObject {
-        val normAction = action.lowercase()
-        // Never allow pulling down notification shade (can expose SMS OTPs) unless explicitly allowed.
-        if (normAction == "notifications" && SafetyGate.isConfirmHighRisk() && !userApproved) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_notifications_otp_protection")
-        }
-        val root = rootInActiveWindow
-        val fgPkg = try {
-            root?.packageName?.toString() ?: lastForegroundPackage
+    private fun dispatchSafeGesture(gesture: GestureDescription, timeoutMs: Long): JSONObject {
+        val overlay = PhoneOverlayController.getInstance(applicationContext)
+        overlay.setInjectingGesture(true)
+        try {
+            val latch = CountDownLatch(1)
+            val ok = AtomicBoolean(false)
+            val cancelled = AtomicBoolean(false)
+            val dispatched = dispatchGesture(
+                gesture,
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        ok.set(true)
+                        latch.countDown()
+                    }
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        cancelled.set(true)
+                        ok.set(false)
+                        latch.countDown()
+                    }
+                },
+                null
+            )
+            if (!dispatched) {
+                return JSONObject().put("ok", false).put("reason", "gesture_dispatch_rejected")
+            }
+            val finished = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+            val res = JSONObject().put("ok", ok.get())
+            if (!ok.get()) {
+                res.put("reason", if (!finished) "gesture_timeout" else if (cancelled.get()) "gesture_cancelled" else "gesture_failed")
+            }
+            return res
         } finally {
-            recycleCompat(root)
+            overlay.setInjectingGesture(false)
         }
-        // Always check foreground package against SafetyGate (except `home`, which safely exits any blocked app!).
-        val targetForCheck = if (normAction == "home") "system_home" else fgPkg
-        val decision = SafetyGate.evaluateToolCall("phone_key", targetForCheck, userApproved = userApproved)
-        if (!decision.allowed) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", decision.reason)
-        }
+    }
+
+    fun executeSystemAction(action: String): JSONObject {
+        val normAction = action.lowercase()
         val globalAction = when (normAction) {
             "back" -> GLOBAL_ACTION_BACK
             "home" -> GLOBAL_ACTION_HOME
@@ -524,34 +572,41 @@ class GrassBagAccessibilityService : AccessibilityService() {
             else -> return JSONObject().put("ok", false).put("reason", "unsupported_key_action:$action")
         }
         val ok = performGlobalAction(globalAction)
-        return JSONObject().put("ok", ok).put("action", action)
+        return JSONObject().put("ok", ok).put("action", normAction)
     }
 
-    fun performType(text: String, userApproved: Boolean = false): JSONObject {
-        val blockedMultiWin = findBlockedVisibleWindowPackage(ignoreSelf = false)
-        if (blockedMultiWin != null) {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
-        }
-        val root = rootInActiveWindow
-            ?: return JSONObject().put("ok", false).put("blocked", true).put("reason", "active_window_unavailable_fail_closed")
+    fun inspectFocusedInput(): Triple<Boolean, Boolean, String?> {
+        val root = waitForActiveRoot(retries = 2) ?: return Triple(false, false, null)
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         try {
-            val pkg = root.packageName?.toString() ?: lastForegroundPackage
-            val sensitive = focused != null && isNodeOrAncestorsSensitive(focused)
-            val decision = SafetyGate.evaluateToolCall("phone_type", pkg, isSensitiveTarget = sensitive, userApproved = userApproved)
-            if (!decision.allowed) {
-                return JSONObject().put("ok", false).put("blocked", true).put("reason", decision.reason)
-            }
+            if (focused == null) return Triple(false, false, null)
+            val editable = runCatching { focused.isEditable }.getOrDefault(false)
+            val sensitive = isNodeOrAncestorsSensitive(focused)
+            val label = runCatching { nodeHintCompat(focused) ?: focused.contentDescription?.toString() }.getOrNull()
+            return Triple(editable, sensitive, label)
+        } finally {
+            if (focused != null && focused !== root) recycleCompat(focused)
+            recycleCompat(root)
+        }
+    }
+
+    fun executeType(text: String): JSONObject {
+        val root = waitForActiveRoot(retries = 3)
+            ?: return JSONObject().put("ok", false).put("reason", "active_window_unavailable")
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        try {
             if (focused == null || !focused.isEditable) {
                 return JSONObject().put("ok", false).put("reason", "no_editable_field_focused")
+                    .put("hint", "当前没有聚焦的输入框，请先用 phone_tap 点击目标输入框后再输入。")
+            }
+            if (isNodeOrAncestorsSensitive(focused)) {
+                return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_input_field")
             }
             val args = Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
             }
             var ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
             if (!ok && text.isNotEmpty()) {
-                // Fallback for WebView / Compose text inputs that reject ACTION_SET_TEXT:
-                // ClipboardManager MUST be accessed on the main Looper thread!
                 val clipSet = AtomicBoolean(false)
                 val clipLatch = CountDownLatch(1)
                 mainHandler.post {
@@ -604,10 +659,6 @@ class GrassBagAccessibilityService : AccessibilityService() {
         fun current(): GrassBagAccessibilityService? = activeInstance
         fun isRunning(): Boolean = activeInstance != null && serviceConnected.get()
 
-        /**
-         * Check whether Android's AccessibilityManager currently lists our service as actively
-         * enabled & bound (vs crashed/malfunctioning).
-         */
         fun isSystemServiceActive(ctx: Context): Boolean = runCatching {
             val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
                 ?: return@runCatching false
@@ -619,10 +670,6 @@ class GrassBagAccessibilityService : AccessibilityService() {
             }
         }.getOrDefault(false)
 
-        /**
-         * Check whether the user has toggled GrassBag's AccessibilityService ON in Android System Settings,
-         * even if the OEM battery manager or an APK reinstall put the service into crashed/unbound state.
-         */
         fun isSettingEnabled(ctx: Context, precheckedSystemBound: Boolean? = null): Boolean {
             if (precheckedSystemBound ?: isSystemServiceActive(ctx)) return true
             val masterOn = runCatching {

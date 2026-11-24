@@ -3,6 +3,7 @@ package dev.grassbag.grassbag
 import android.Manifest
 import android.app.Activity
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -89,9 +90,16 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }
     }
 
+    private val emergencyStopListener: () -> Unit = {
+        if (!detached) {
+            sendEvent("phone_emergency_stop", mapOf("stopped" to true))
+        }
+    }
+
     fun attach(engine: FlutterEngine) {
         detached = false
         GrassBagAccessibilityService.addStateListener(a11yStateListener)
+        SafetyGate.addEmergencyStopListener(emergencyStopListener)
         bgPool.execute {
             try {
                 SafetyGate.init(activity.applicationContext)
@@ -133,6 +141,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     fun detach() {
         detached = true
         GrassBagAccessibilityService.removeStateListener(a11yStateListener)
+        SafetyGate.removeEmergencyStopListener(emergencyStopListener)
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
         eventChannel?.setStreamHandler(null)
@@ -371,6 +380,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             "safety.emergencyStop" -> {
                 bgPool.execute {
                     SafetyGate.triggerEmergencyStop()
+                    PhoneOverlayController.getInstance(activity.applicationContext).dismissAll()
                     mainHandler.post { result.success(true) }
                 }
             }
@@ -379,6 +389,21 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     SafetyGate.resetEmergencyStop()
                     mainHandler.post { result.success(true) }
                 }
+            }
+            "safety.previewOverlay" -> {
+                bgPool.execute {
+                    PhoneOverlayController.getInstance(activity.applicationContext).showPreviewDemo()
+                    mainHandler.post { result.success(true) }
+                }
+            }
+            "app.syncThemeMode" -> {
+                val isDark = call.argument<Boolean>("isDark") ?: false
+                activity.applicationContext
+                    .getSharedPreferences("gb_native_ui_v1", Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean("isDark", isDark)
+                    .apply()
+                result.success(true)
             }
 
             // Background foreground service & alert notifications (off UI thread to avoid Binder stalls)

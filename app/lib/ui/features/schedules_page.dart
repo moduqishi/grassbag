@@ -158,9 +158,14 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
     final botPad = MediaQuery.viewPaddingOf(context).bottom;
     final isWide = MediaQuery.sizeOf(context).width >= 760;
 
+    final endedCount = state.schedules.where((s) => s.isEnded).length;
+    final pausedCount = state.schedules.where((s) => !s.enabled && !s.isEnded).length;
+    final safeFilterIdx = endedCount == 0 && _filterIdx == 3 ? 0 : _filterIdx;
+
     final items = state.schedules.where((s) {
-      if (_filterIdx == 1) return s.enabled;
-      if (_filterIdx == 2) return !s.enabled;
+      if (safeFilterIdx == 1) return s.enabled && !s.isEnded;
+      if (safeFilterIdx == 2) return !s.enabled && !s.isEnded;
+      if (safeFilterIdx == 3) return s.isEnded;
       return true;
     }).toList(growable: false);
 
@@ -201,12 +206,37 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                         labels: [
                           '全部 (${state.schedules.length})',
                           '运行中 (${state.activeScheduleCount})',
-                          '已暂停 (${state.schedules.length - state.activeScheduleCount})',
+                          '已暂停 ($pausedCount)',
+                          if (endedCount > 0) '已结束 ($endedCount)',
                         ],
-                        selectedIndex: _filterIdx,
+                        selectedIndex: safeFilterIdx,
                         tier: state.glassTier,
                         onSelected: (i) => setState(() => _filterIdx = i),
                       ),
+                      if (endedCount > 0) ...[
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: GrassBagSecondaryGlassButton(
+                            label: '清理 $endedCount 条已结束任务',
+                            icon: CupertinoIcons.trash,
+                            height: 32,
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            tier: state.glassTier,
+                            insideGlass: true,
+                            onTap: () async {
+                              final ok = await showGrassBagConfirmDialog(
+                                context,
+                                title: '清理已结束任务',
+                                message: '确定移除全部 $endedCount 条已结束的一次性/过期定时任务吗？',
+                                confirmLabel: '清理',
+                                isDestructive: true,
+                              );
+                              if (ok) unawaited(ctrl.pruneInactiveSchedules());
+                            },
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 14),
                       if (items.isEmpty)
                         GrassBagCard(
@@ -431,11 +461,24 @@ class _ScheduleCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 10),
-              GrassBagGlassSwitch(
-                value: item.enabled,
-                tier: tier,
-                onChanged: (_) => onToggleEnabled(),
-              ),
+              if (item.isEnded)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: t.fill2,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    '已结束',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text3),
+                  ),
+                )
+              else
+                GrassBagGlassSwitch(
+                  value: item.enabled,
+                  tier: tier,
+                  onChanged: (_) => onToggleEnabled(),
+                ),
             ],
           ),
           const SizedBox(height: 10),
@@ -468,9 +511,11 @@ class _ScheduleCard extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 180),
+                    constraints: const BoxConstraints(maxWidth: 220),
                     child: Text(
-                      '最近运行：${item.lastRunAt}',
+                      item.nextRunAt.isNotEmpty && item.enabled && !item.isEnded
+                          ? '下次：${item.nextRunAt} · 最近：${item.lastRunAt}'
+                          : '最近运行：${item.lastRunAt}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 11.5, color: t.text3),
@@ -655,6 +700,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
   final _cronFocus = FocusNode();
   final _promptFocus = FocusNode();
   int _selectedPreset = 0;
+  bool _keepExistingNonCronTiming = false;
   bool _submitting = false;
   String? _err;
 
@@ -664,7 +710,11 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
     final ex = widget.existing;
     _nameCtrl = TextEditingController(text: ex?.name ?? '');
     _promptCtrl = TextEditingController(text: ex?.prompt ?? '');
-    final initCron = (ex?.cronExpr.trim().isNotEmpty == true) ? ex!.cronExpr.trim() : '0 9 * * *';
+    final isNonCronExisting = ex != null && ex.kind != 'cron' && !isValidCron5Field(ex.cronExpr);
+    _keepExistingNonCronTiming = isNonCronExisting;
+    final initCron = (ex != null && isValidCron5Field(ex.cronExpr))
+        ? ex.cronExpr.trim()
+        : '0 9 * * *';
     _cronCtrl = TextEditingController(text: initCron);
     _selectedPreset = _presets.indexWhere((p) => p.$2 == initCron);
   }
@@ -690,13 +740,15 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
       setState(() => _err = '请填写任务名称');
       return;
     }
-    if (cron.isEmpty) {
-      setState(() => _err = '请填写 Cron 表达式');
-      return;
-    }
-    if (!_isValidCron5Field(cron)) {
-      setState(() => _err = 'Cron 表达式需为标准 5 段格式（分 时 日 月 周），例如 0 9 * * *');
-      return;
+    if (!_keepExistingNonCronTiming) {
+      if (cron.isEmpty) {
+        setState(() => _err = '请填写 Cron 表达式');
+        return;
+      }
+      if (!_isValidCron5Field(cron)) {
+        setState(() => _err = 'Cron 表达式需为标准 5 段格式（分 时 日 月 周），例如 0 9 * * *');
+        return;
+      }
     }
     if (prompt.isEmpty) {
       setState(() => _err = '请填写定时执行指令');
@@ -714,7 +766,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
         ? await ctrl.updateSchedule(
             id: widget.existing!.id,
             name: name,
-            cronExpr: cron,
+            cronExpr: _keepExistingNonCronTiming ? null : cron,
             prompt: prompt,
             timezone: widget.existing!.timezone,
           )
@@ -797,6 +849,23 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
         const SizedBox(height: 14),
         Text('触发周期', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2)),
         const SizedBox(height: 8),
+        if (_keepExistingNonCronTiming && widget.existing != null) ...[
+          GrassBagStatusBanner(
+            tone: GrassBagBannerTone.info,
+            borderRadius: 14,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            message: '当前保留原计划：${widget.existing!.humanSchedule} (${widget.existing!.kind})',
+            trailing: GrassBagSecondaryGlassButton(
+              label: '改为 Cron',
+              height: 28,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              tier: tier,
+              insideGlass: true,
+              accentForeground: true,
+              onTap: () => setState(() => _keepExistingNonCronTiming = false),
+            ),
+          ),
+        ] else ...[
         Wrap(
           spacing: 8,
           runSpacing: 8,
@@ -856,6 +925,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
             ),
           ],
         ),
+        ],
         const SizedBox(height: 14),
         Text('执行指令', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2)),
         const SizedBox(height: 6),

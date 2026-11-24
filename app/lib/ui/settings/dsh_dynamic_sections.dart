@@ -880,6 +880,7 @@ class RecentErrorsDiagnosticsCard extends StatelessWidget {
                     ),
                     child: SelectableText(
                       e.detail,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                       style: TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.5, color: st.err),
                     ),
                   );

@@ -4,19 +4,44 @@ import { existsSync } from 'node:fs';
 const PHONE_TOOL_DEFS = [
   {
     name: 'phone_screen',
-    description: 'Read current Android screen accessibility tree through SafetyGate (sensitive fields are redacted).',
+    description: 'Read current Android screen accessibility tree through SafetyGate. Returns element nodeIds (n0, n1...) with labels and centers; sensitive fields are redacted.',
     properties: {
-      maxNodes: { type: 'integer', description: 'Maximum UI nodes to return (default 120).' },
+      maxNodes: { type: 'integer', description: 'Maximum UI nodes to return (default 140).' },
+    },
+  },
+  {
+    name: 'phone_screenshot',
+    description: 'Capture a compact JPEG screenshot of the current Android screen (Android 11+, hides GrassBag HUD automatically).',
+    properties: {
+      maxWidth: { type: 'integer', description: 'Max image width in pixels (default 720).' },
+      quality: { type: 'integer', description: 'JPEG quality 35-90 (default 68).' },
+    },
+  },
+  {
+    name: 'phone_apps',
+    description: 'List installed launchable Android apps (display name + package name). Optional fuzzy query filter.',
+    properties: {
+      query: { type: 'string', description: 'Optional Chinese or English app name / package filter.' },
     },
   },
   {
     name: 'phone_tap',
-    description: 'Tap screen coordinates (x, y) on the Android display through SafetyGate.',
+    description: 'Tap an element by nodeId from phone_screen (preferred) or screen coordinates (x, y) through native SafetyGate.',
     properties: {
+      nodeId: { type: 'string', description: 'Element nodeId from latest phone_screen (e.g. "n5").' },
       x: { type: 'number', description: 'Horizontal screen coordinate in pixels.' },
       y: { type: 'number', description: 'Vertical screen coordinate in pixels.' },
     },
-    required: ['x', 'y'],
+  },
+  {
+    name: 'phone_long_press',
+    description: 'Long-press an element by nodeId or screen coordinates (x, y) through native SafetyGate.',
+    properties: {
+      nodeId: { type: 'string', description: 'Element nodeId from latest phone_screen.' },
+      x: { type: 'number', description: 'Horizontal screen coordinate in pixels.' },
+      y: { type: 'number', description: 'Vertical screen coordinate in pixels.' },
+      durationMs: { type: 'integer', description: 'Hold duration in ms (default 650).' },
+    },
   },
   {
     name: 'phone_swipe',
@@ -48,8 +73,9 @@ const PHONE_TOOL_DEFS = [
   },
   {
     name: 'phone_open',
-    description: 'Open an Android app package or http(s) URL through SafetyGate.',
+    description: 'Open an Android app by display name (appName, e.g. "计算器"/"微信"), package name, or http(s) URL through SafetyGate.',
     properties: {
+      appName: { type: 'string', description: 'Human-readable app name (fuzzy matched against installed apps).' },
       package: { type: 'string', description: 'Android application package name (e.g. com.android.chrome).' },
       url: { type: 'string', description: 'HTTP or HTTPS URL to open.' },
     },
@@ -71,10 +97,17 @@ const PHONE_TOOL_DEFS = [
     required: ['kind'],
   },
   {
-    name: 'phone_handoff',
-    description: 'Pause and hand control back to the human user for sensitive/manual steps.',
+    name: 'phone_wait',
+    description: 'Wait briefly (100-10000ms) for UI transitions or animations to settle before reading the screen again.',
     properties: {
-      message: { type: 'string', description: 'Instruction shown to the user.' },
+      ms: { type: 'integer', description: 'Wait duration in milliseconds (default 1000).' },
+    },
+  },
+  {
+    name: 'phone_handoff',
+    description: 'Pause and display a native overlay card asking the human user to complete a sensitive/manual step (passwords, OTP, payment, system settings), then resume when they tap Continue.',
+    properties: {
+      message: { type: 'string', description: 'Clear Chinese instruction shown on the floating handoff card.' },
     },
   },
 ];
@@ -82,6 +115,10 @@ const PHONE_TOOL_DEFS = [
 /**
  * Zero-patch native Phone Control tool bridge for Android local hosts.
  * Activates ONLY when GBRIDGE_PHONE_SOCKET and GBRIDGE_PHONE_TOKEN are provided.
+ *
+ * Confirmation & handoff are handled NATIVELY on Android via `TYPE_ACCESSIBILITY_OVERLAY`
+ * (`PhoneOverlayController`), so phone control works reliably outside GrassBag in BOTH
+ * `workspace-write` and `danger-full-access` modes with zero DSH approval deadlock!
  */
 export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
   if (!socketPath || !token) {
@@ -93,14 +130,15 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
 
   const disposers = [];
   const activeTurnBySession = new Map();
+  const phoneActiveSessions = new Set();
 
-  const callDaemon = (path, payload, signal) => new Promise((resolve, reject) => {
+  const callDaemon = (path, payload, signal, timeoutMs = 195_000) => new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
     const req = httpRequest({
       socketPath,
       path,
       method: 'POST',
-      timeout: 30_000,
+      timeout: timeoutMs,
       headers: {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(body),
@@ -115,7 +153,13 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
         try {
           const json = text ? JSON.parse(text) : {};
           if (res.statusCode >= 200 && res.statusCode < 300) resolve(json);
-          else reject(new Error(json?.reason || json?.error?.message || `phone daemon HTTP ${res.statusCode}`));
+          else if (res.statusCode === 403 && json && typeof json === 'object') {
+            // Return structured SafetyGate block/cancel response cleanly to the model
+            // instead of throwing an unhandled error or deadlocking DSH approval!
+            resolve(json);
+          } else {
+            reject(new Error(json?.reason || json?.error?.message || `phone daemon HTTP ${res.statusCode}`));
+          }
         } catch {
           reject(new Error(`phone daemon returned non-JSON HTTP ${res.statusCode}`));
         }
@@ -128,7 +172,30 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     req.end(body);
   });
 
-  // Track active turns & forward turn/end so Kotlin SafetyGate locks/unlocks accurately.
+  const resolveSessionPermissionPreset = (execCtx) => {
+    try {
+      const session = execCtx?.agent?.session ?? execCtx?.session;
+      const explicitPreset = session?.permissionPreset ?? session?.meta?.permissionPreset;
+      if (typeof explicitPreset === 'string' && explicitPreset.trim()) {
+        return explicitPreset.trim();
+      }
+      const approval = ctx.get?.('approval');
+      if (approval && typeof approval.effectivePolicy === 'function' && session) {
+        const pol = approval.effectivePolicy(session);
+        if (pol === 'never') return 'danger-full-access';
+        if (pol === 'ask' || pol === 'on-request') return 'workspace-write';
+      }
+      const permPresets = ctx.get?.('permissionPresets') ?? ctx.get?.('permission');
+      if (permPresets && typeof permPresets.getDefaultPreset === 'function') {
+        const def = permPresets.getDefaultPreset();
+        if (typeof def === 'string' && def.trim()) return def.trim();
+      }
+    } catch {}
+    return null;
+  };
+
+  // Track active turns & forward turn/end ONLY for sessions that actually used phone tools
+  // (or when sessionId is known) so unrelated title/background sessions NEVER wipe ALLOW_TURN!
   if (typeof ctx.on === 'function') {
     const off = ctx.on('session/event', (session, event) => {
       const sid = session?.id ?? null;
@@ -137,10 +204,13 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
         activeTurnBySession.set(sid, String(tid));
       } else if (event?.type === 'turn/end') {
         if (sid) activeTurnBySession.delete(sid);
-        callDaemon('/v1/turn-end', {
-          sessionId: sid,
-          reason: event?.data?.reason ?? 'completed',
-        }).catch(() => {});
+        const shouldNotify = !sid || phoneActiveSessions.delete(sid);
+        if (shouldNotify) {
+          callDaemon('/v1/turn-end', {
+            sessionId: sid,
+            reason: event?.data?.reason ?? 'completed',
+          }, undefined, 10_000).catch(() => {});
+        }
       }
     });
     if (typeof off === 'function') disposers.push(off);
@@ -162,64 +232,35 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
           },
           output: {
             schema: { type: 'object', additionalProperties: true },
-            // DSH tools pipeline invokes `output.render(exec.arguments, value)` and expects `ContentPart[]`.
-            render: (_args, value) => [
-              { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? {}) },
-            ],
+            render: (_args, value) => {
+              if (value && typeof value === 'object' && typeof value.base64 === 'string' && value.mimeType) {
+                const { base64, ...meta } = value;
+                return [
+                  { type: 'text', text: JSON.stringify(meta) },
+                  { type: 'image', data: base64, mimeType: value.mimeType },
+                ];
+              }
+              return [
+                { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? {}) },
+              ];
+            },
           },
           async execute(args, execCtx) {
             const sessionId = execCtx?.agent?.session?.id ?? execCtx?.session?.id ?? null;
+            if (sessionId) phoneActiveSessions.add(sessionId);
             const turnId = execCtx?.turnId
               ?? (sessionId ? activeTurnBySession.get(sessionId) : null)
               ?? execCtx?.rootCallId
               ?? execCtx?.callId
               ?? null;
+            const permissionPreset = resolveSessionPermissionPreset(execCtx);
             const payload = {
               tool: def.name,
               args: args ?? {},
               caller: { sessionId, turnId },
+              ...(permissionPreset ? { permissionPreset } : {}),
             };
-            try {
-              return await callDaemon('/v1/tool', payload, execCtx?.signal);
-            } catch (err) {
-              const msg = String(err?.message || '');
-              const approval = ctx.get?.('approval');
-              if (
-                msg.includes('requires_user_confirmation') &&
-                approval &&
-                typeof approval.request === 'function' &&
-                execCtx?.agent
-              ) {
-                const summaryArgs = JSON.stringify(args ?? {}).slice(0, 180);
-                const outcome = await approval.request({
-                  agent: execCtx.agent,
-                  toolName: def.name,
-                  callId: execCtx.callId,
-                  reason: `手机操作确认：${def.name} ${summaryArgs}`,
-                  signal: execCtx.signal,
-                });
-                if (outcome === 'allowed-once') {
-                  return await callDaemon(
-                    '/v1/tool',
-                    { ...payload, userApproved: true },
-                    execCtx?.signal,
-                  );
-                }
-                const policy = typeof approval.effectivePolicy === 'function'
-                  ? approval.effectivePolicy(execCtx.agent?.session)
-                  : null;
-                if (policy === 'never') {
-                  return {
-                    ok: false,
-                    blocked: true,
-                    reason: 'approval_policy_never_blocks_phone_confirm',
-                    hint: '当前会话权限为完全放行(approval=never)不会弹出确认卡片；请在操控手机设置中切换为「本轮允许」或将对话权限切回「工作区内修改」',
-                  };
-                }
-                return { ok: false, blocked: true, reason: `user_${outcome || 'rejected'}` };
-              }
-              throw err;
-            }
+            return await callDaemon('/v1/tool', payload, execCtx?.signal);
           },
         });
         if (typeof off === 'function') disposers.push(off);
@@ -260,6 +301,7 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     get reason() { return registered > 0 ? 'ready' : 'tools-service-unavailable'; },
     dispose() {
       activeTurnBySession.clear();
+      phoneActiveSessions.clear();
       for (const fn of disposers) {
         try { fn(); } catch {}
       }

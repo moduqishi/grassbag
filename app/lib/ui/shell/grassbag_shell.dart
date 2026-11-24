@@ -187,20 +187,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       if (_plusOpenNotifier.value) {
         _plusOpenNotifier.value = false;
       }
-      if (!_userScrolledAway) {
-        // ONLY settle scroll when a real mobile soft keyboard actually opens
-        // (viewInsets.bottom > 80). On Desktop/Web (viewInsets == 0), restoring focus
-        // after closing a popup/sheet must NEVER jolt the message list!
-        Future<void>.delayed(const Duration(milliseconds: 220), () {
-          if (!mounted || !_composerFocus.hasFocus || _userScrolledAway) return;
-          // Non-subscribing read so GrassBagShell NEVER leaks a permanent MediaQuery.viewInsets dependency!
-          final kbInset =
-              context.getInheritedWidgetOfExactType<MediaQuery>()?.data.viewInsets.bottom ?? 0.0;
-          if (kbInset > 80.0) {
-            _ensureStreamScrollFollower(settleTailMs: 320.0);
-          }
-        });
-      }
+      // Keyboard inset sync is now handled smoothly frame-by-frame inside `_KeyboardScrollTail`
+      // without any delayed 220ms jolt!
     }
   }
 
@@ -426,11 +414,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       _showScrollToBottomNotifier.value = shouldShowBtn;
     }
 
+    // ONLY auto-follow growth while actively streaming or during the explicit send/stream settle tail!
+    // Never yank or twitch the viewport when the user manually toggles thinking/tool details on a settled turn!
+    final streamingOrSettling =
+        _streamSettleRemainingMs > 0 || ref.read(appProvider).isStreaming;
     if (grew &&
+        streamingOrSettling &&
         distFromBottom > 1.5 &&
         !_userScrolledAway &&
         !_userDraggingList &&
-        (wasNearBottom || _streamSettleRemainingMs > 0 || ref.read(appProvider).isStreaming)) {
+        (wasNearBottom || _streamSettleRemainingMs > 0)) {
       _ensureStreamScrollFollower(settleTailMs: 260.0);
     }
     return false;
@@ -584,85 +577,46 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     }
     final ctrl = ref.read(appProvider.notifier);
     final wbOpen = ref.read(appProvider).tabletWorkbenchOpen;
-    showGrassBagSheet<void>(
-      context,
-      title: active.title,
-      subtitle: active.cwd != null && active.cwd!.isNotEmpty ? active.cwd : '当前对话操作',
-      bodyBuilder: (ctx) {
-        final t = GrassBagTokens.of(ctx);
-        return GrassBagSheetSection(
-          dividerIndent: 52,
-          children: [
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.sidebar_right,
-                color: t.primary,
-                size: 32,
-                iconSize: 16,
-              ),
-              title: Text(wbOpen ? '收起右侧工作台' : '展开右侧工作台'),
-              subtitle: const Text('查看工作区文件、Git 改动、终端与执行轨迹'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ctrl.setTabletWorkbenchOpen(!wbOpen);
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.pencil,
-                color: t.primaryHi,
-                size: 32,
-                iconSize: 16,
-              ),
-              title: const Text('重命名对话'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                showRenameSessionSheet(context, ref, active);
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.arrow_branch,
-                color: t.dusk,
-                size: 32,
-                iconSize: 16,
-              ),
-              title: const Text('创建分支对话 (Fork)'),
-              subtitle: const Text('保留当前上下文分叉探索新思路'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ctrl.forkActiveSession();
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.share,
-                color: t.ok,
-                size: 32,
-                iconSize: 16,
-              ),
-              title: const Text('导出为 Markdown'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ctrl.exportActiveSession();
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.chevron_left_slash_chevron_right,
-                color: t.warn,
-                size: 32,
-                iconSize: 16,
-              ),
-              title: const Text('打开交互终端'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _openTerminal();
-              },
-            ),
-          ],
-        );
-      },
+    final tier = ref.read(appProvider).glassTier;
+    final media = MediaQuery.of(context);
+    unawaited(
+      showGrassBagGlassContextMenu(
+        context,
+        tier: tier,
+        globalAnchor: Offset(media.size.width * 0.5, media.viewPadding.top + 64),
+        headerTitle: active.title,
+        items: [
+          GrassBagContextMenuItem(
+            label: wbOpen ? '收起右侧工作台' : '展开右侧工作台',
+            subtitle: '文件、Git 改动、终端与轨迹',
+            icon: CupertinoIcons.sidebar_right,
+            selected: wbOpen,
+            onTap: () => ctrl.setTabletWorkbenchOpen(!wbOpen),
+          ),
+          GrassBagContextMenuItem(
+            label: '重命名对话',
+            icon: CupertinoIcons.pencil,
+            onTap: () => showRenameSessionSheet(context, ref, active),
+          ),
+          GrassBagContextMenuItem(
+            label: '创建分支对话 (Fork)',
+            subtitle: '保留上下文分叉探索',
+            icon: CupertinoIcons.arrow_branch,
+            onTap: () => ctrl.forkActiveSession(),
+          ),
+          GrassBagContextMenuItem(
+            label: '导出为 Markdown',
+            icon: CupertinoIcons.share,
+            onTap: () => ctrl.exportActiveSession(),
+          ),
+          GrassBagContextMenuItem(
+            label: '打开交互终端',
+            icon: CupertinoIcons.chevron_left_slash_chevron_right,
+            dividerBefore: true,
+            onTap: _openTerminal,
+          ),
+        ],
+      ),
     );
   }
 
@@ -1959,27 +1913,56 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
   }
 }
 
-/// Trailing empty spacer inside chat `ListView.builder` tracking live composer height + IME
-/// so the latest message is NEVER obscured by multi-line drafts, attachments, or queue cards!
-/// Quantizes IME inset to 64px ceiling steps so `ListView.builder` relayouts drop from ~36 to ~5.
-class _KeyboardScrollTail extends StatelessWidget {
+/// Continuous pixel-accurate trailing spacer inside chat `ListView.builder` tracking live
+/// composer height + exact IME inset (zero 64px stair-stepping!). When the user is anchored at
+/// the bottom of a scrollable chat, smoothly keeps the last bubble locked above the rising keyboard.
+class _KeyboardScrollTail extends StatefulWidget {
   const _KeyboardScrollTail({
     super.key,
     required this.baseComposerBottom,
     required this.composerHeightNotifier,
+    required this.scrollCtrl,
   });
 
   final double baseComposerBottom;
   final ValueNotifier<double> composerHeightNotifier;
+  final ScrollController scrollCtrl;
+
+  @override
+  State<_KeyboardScrollTail> createState() => _KeyboardScrollTailState();
+}
+
+class _KeyboardScrollTailState extends State<_KeyboardScrollTail> {
+  double _lastKbInset = 0.0;
 
   @override
   Widget build(BuildContext context) {
     final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final quantizedKb = kbInset > 0 ? ((kbInset / 64.0).ceil() * 64.0) : 0.0;
+    final deltaKb = kbInset - _lastKbInset;
+    if (deltaKb.abs() > 0.5) {
+      _lastKbInset = kbInset;
+      if (deltaKb > 0 && widget.scrollCtrl.hasClients && widget.scrollCtrl.positions.length == 1) {
+        final pos = widget.scrollCtrl.position;
+        final distFromBottom = pos.maxScrollExtent - pos.pixels;
+        // Only follow smoothly when already near bottom AND conversation is scrollable!
+        if (pos.maxScrollExtent > 12.0 && distFromBottom <= 72.0) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted || !widget.scrollCtrl.hasClients || widget.scrollCtrl.positions.length != 1) {
+              return;
+            }
+            final p = widget.scrollCtrl.position;
+            final target = (p.pixels + deltaKb).clamp(0.0, p.maxScrollExtent);
+            if ((target - p.pixels).abs() > 0.5) {
+              widget.scrollCtrl.jumpTo(target);
+            }
+          });
+        }
+      }
+    }
     return ValueListenableBuilder<double>(
-      valueListenable: composerHeightNotifier,
+      valueListenable: widget.composerHeightNotifier,
       builder: (_, compH, __) {
-        final bottomGap = math.max(baseComposerBottom, quantizedKb + 8.0);
+        final bottomGap = math.max(widget.baseComposerBottom, kbInset + 8.0);
         return SizedBox(height: bottomGap + compH + 26.0);
       },
     );
@@ -2064,8 +2047,8 @@ class _ChatCanvasArea extends ConsumerWidget {
               onNotification: onScrollMetricsNotification,
               child: ListView.builder(
                 controller: scrollCtrl,
-                cacheExtent: 1200,
-                addAutomaticKeepAlives: false,
+                cacheExtent: 1400,
+                addAutomaticKeepAlives: true,
                 addRepaintBoundaries: true,
                 keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                 physics: const BouncingScrollPhysics(
@@ -2073,20 +2056,20 @@ class _ChatCanvasArea extends ConsumerWidget {
                 ),
                 padding: EdgeInsets.fromLTRB(20, listTopPad, 20, 0),
                 itemCount: slice.turnsCount + 1 + (slice.hasMoreTurns ? 1 : 0),
-                findChildIndexCallback: (Key key) {
-                  if (key is! ValueKey<String>) return null;
-                  final value = key.value;
-                  if (value == 'load-older-header') return slice.hasMoreTurns ? 0 : null;
-                  final offset = slice.hasMoreTurns ? 1 : 0;
-                  if (value == 'chat-scroll-tail') return offset + slice.turnsCount;
+                findChildIndexCallback: () {
                   final liveTurns = ref.read(appProvider).turns;
-                  for (var i = 0; i < liveTurns.length; i++) {
-                    if (liveTurns[i].stableKey == value) {
-                      return offset + i;
-                    }
-                  }
-                  return null;
-                },
+                  final offset = slice.hasMoreTurns ? 1 : 0;
+                  final indexByKey = <String, int>{
+                    for (var i = 0; i < liveTurns.length; i++) liveTurns[i].stableKey: offset + i,
+                  };
+                  return (Key key) {
+                    if (key is! ValueKey<String>) return null;
+                    final value = key.value;
+                    if (value == 'load-older-header') return slice.hasMoreTurns ? 0 : null;
+                    if (value == 'chat-scroll-tail') return offset + slice.turnsCount;
+                    return indexByKey[value];
+                  };
+                }(),
                 itemBuilder: (ctx, rawIndex) {
                   final hasHeader = slice.hasMoreTurns;
                   if (hasHeader && rawIndex == 0) {
@@ -2142,6 +2125,7 @@ class _ChatCanvasArea extends ConsumerWidget {
                   if (index == slice.turnsCount) {
                     return _KeyboardScrollTail(
                       key: const ValueKey('chat-scroll-tail'),
+                      scrollCtrl: scrollCtrl,
                       baseComposerBottom: baseComposerBottom,
                       composerHeightNotifier: composerHeightNotifier,
                     );
@@ -2222,6 +2206,7 @@ class _ChatCanvasArea extends ConsumerWidget {
                                 const SizedBox(height: 6),
                                 SelectableText(
                                   slice.sessionLoadError!,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                                   textAlign: TextAlign.center,
                                   style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text3),
                                 ),
@@ -2271,12 +2256,11 @@ class _ChatCanvasArea extends ConsumerWidget {
                           baseComposerBottom: baseComposerBottom,
                           composerHeightNotifier: composerHeightNotifier,
                           hideCenterTitle: hideCenterTitle,
-                          child: RepaintBoundary(
-                            child: ChatEmptyState(
-                              onSuggestionTap: onEmptySuggestionTap,
-                              onOpenModelSettings: onOpenModelSettings,
-                              onOpenHostSettings: onOpenHostSettings,
-                            ),
+                          childBuilder: (kbProgress) => ChatEmptyState(
+                            keyboardProgress: kbProgress,
+                            onSuggestionTap: onEmptySuggestionTap,
+                            onOpenModelSettings: onOpenModelSettings,
+                            onOpenHostSettings: onOpenHostSettings,
                           ),
                         )
                       : const SizedBox.shrink(key: ValueKey('stage-overlay-none')),
@@ -2337,8 +2321,9 @@ class _TurnListItem extends ConsumerWidget {
   }
 }
 
-/// Isolated empty-state scroll canvas that lifts cleanly on GPU (`Transform.translate`)
-/// during IME animation with ZERO rebuilds of hoisted [child] (`ChatEmptyState`)!
+/// Isolated empty-state scroll canvas that smoothly morphs & centers [ChatEmptyState]
+/// above the rising keyboard by driving a continuous `kbProgress` (`0.0 → 1.0`) so the
+/// 4 suggestion cards & tip gracefully tuck away and the hero stays perfectly centered!
 class _KeyboardAwareEmptyStage extends StatelessWidget {
   const _KeyboardAwareEmptyStage({
     super.key,
@@ -2347,7 +2332,7 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
     required this.baseComposerBottom,
     required this.composerHeightNotifier,
     required this.hideCenterTitle,
-    required this.child,
+    required this.childBuilder,
   });
 
   final double screenH;
@@ -2355,25 +2340,18 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
   final double baseComposerBottom;
   final ValueNotifier<double> composerHeightNotifier;
   final bool hideCenterTitle;
-  final Widget child;
+  final Widget Function(double kbProgress) childBuilder;
 
   @override
   Widget build(BuildContext context) {
     final kbInset = MediaQuery.viewInsetsOf(context).bottom;
+    final kbProgress = ((kbInset - 12.0) / 140.0).clamp(0.0, 1.0);
     return ValueListenableBuilder<double>(
       valueListenable: composerHeightNotifier,
       builder: (_, compH, __) {
-        // Keep SingleChildScrollView padding and ConstrainedBox minHeight CONSTANT across
-        // 120Hz IME animation frames, moving the empty stage purely via GPU Transform.translate!
-        final restingBottomReserve = baseComposerBottom + compH + 24.0;
-        final maxAvailableH = screenH < 180.0 ? 180.0 : screenH;
-        final restingAvailableHeight =
-            (screenH - topPad - restingBottomReserve).clamp(180.0, maxAvailableH);
-        final kbAvailableHeight = (screenH - topPad - (math.max(baseComposerBottom, kbInset + 8.0) + compH + 24.0))
-            .clamp(180.0, maxAvailableH);
-        // Clamp upward shift to available vertical slack so the greeting never slips into the status bar.
-        final maxSafeLift = ((kbAvailableHeight - 250.0) * 0.5).clamp(0.0, 48.0);
-        final liftY = (kbInset * 0.18).clamp(0.0, maxSafeLift);
+        final liveBottomReserve = math.max(baseComposerBottom, kbInset + 8.0) + compH + 18.0;
+        final liveVisibleH =
+            (screenH - topPad - liveBottomReserve).clamp(140.0, math.max(140.0, screenH));
 
         return SingleChildScrollView(
           keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -2384,16 +2362,15 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
             20,
             topPad,
             20,
-            math.max(restingBottomReserve, kbInset + compH + 32.0),
+            liveBottomReserve,
           ),
           child: ConstrainedBox(
             constraints: BoxConstraints(
-              minHeight: screenH > 0 ? (restingAvailableHeight - 28).clamp(0.0, screenH) : 0.0,
+              minHeight: screenH > 0 ? (liveVisibleH - 12.0).clamp(0.0, screenH) : 0.0,
             ),
             child: Center(
-              child: Transform.translate(
-                offset: Offset(0, -liftY),
-                child: child,
+              child: RepaintBoundary(
+                child: childBuilder(kbProgress),
               ),
             ),
           ),

@@ -563,7 +563,18 @@ class VanillaDshAdapter {
   }
 
   Future<Map<String, dynamic>> getSessionGoals(String sessionId) async {
-    final res = await rpc('goals/get', {'agentId': sessionId}).catchError((_) => null);
+    dynamic res;
+    try {
+      res = await rpc('goals/get', {'agentId': sessionId});
+    } catch (_) {
+      // Cold sessions reject `goals/get` with GOAL_AGENT_NOT_LIVE; read durable `values.goal` projection!
+      final proj = await rpc('session/projections', {
+        'request': {'sessionId': sessionId},
+      }).catchError((_) => rpc('session/projections', {'sessionId': sessionId}).catchError((_) => null));
+      final projMap = _asMap(proj);
+      final vals = projMap['values'] is Map ? _asMap(projMap['values']) : projMap;
+      res = vals['goal'];
+    }
     return {'v': 1, 'goal': res, 'goals': res == null ? const [] : [res]};
   }
 
@@ -572,26 +583,65 @@ class VanillaDshAdapter {
     required String action,
     Map<String, dynamic> payload = const {},
   }) async {
-    Map<String, dynamic> normalizeGoalRef(Object? raw) {
-      if (raw is Map) return _asMap(raw);
+    Future<Map<String, dynamic>> resolveGoalRef() async {
+      final raw = payload['ref'];
+      if (raw is Map && raw['id'] != null && raw['revision'] is num && (raw['revision'] as num) > 0) {
+        return {'id': raw['id'].toString(), 'revision': (raw['revision'] as num).toInt()};
+      }
+      final current = await rpc('goals/get', {'agentId': sessionId}).catchError((_) => null);
+      final cm = _asMap(current);
+      final cid = cm['id']?.toString() ?? '';
+      final crev = cm['revision'];
+      if (cid.isNotEmpty && crev is num) {
+        return {'id': cid, 'revision': crev.toInt()};
+      }
       return {
-        'id': raw?.toString() ?? '',
-        if (payload['revision'] != null) 'revision': payload['revision'],
+        'id': (payload['goalId'] ?? payload['id'] ?? '').toString(),
+        if (payload['revision'] is num) 'revision': (payload['revision'] as num).toInt(),
       };
     }
 
     final ep = 'goals/$action';
     Map<String, dynamic> args;
     if (action == 'create') {
-      args = {'agentId': sessionId, 'request': payload};
-    } else if (action == 'edit') {
-      final ref = normalizeGoalRef(payload['ref'] ?? payload['goalId'] ?? payload['id']);
-      final req = Map<String, dynamic>.from(payload)..remove('ref');
-      args = {'agentId': sessionId, 'ref': ref, 'request': req};
-    } else {
+      final reqMap = payload['request'] is Map ? _asMap(payload['request']) : payload;
+      final rawObj = (reqMap['objective'] ?? payload['objective'] ?? payload['title'] ?? '').toString().trim();
+      final rawCriteria = (payload['criteria'] ?? '').toString().trim();
+      final objective = rawCriteria.isNotEmpty && !rawObj.contains(rawCriteria)
+          ? '$rawObj\n验收标准：$rawCriteria'
+          : rawObj;
+      final maxRoundsRaw = reqMap['maxGoalRounds'] ?? payload['maxGoalRounds'];
+      final maxRounds = maxRoundsRaw is num && maxRoundsRaw > 0 ? maxRoundsRaw.toInt() : null;
       args = {
         'agentId': sessionId,
-        'ref': normalizeGoalRef(payload['ref'] ?? payload['goalId'] ?? payload['id']),
+        'request': {
+          'objective': objective,
+          if (maxRounds != null) 'maxGoalRounds': maxRounds,
+        },
+      };
+    } else if (action == 'edit') {
+      final ref = await resolveGoalRef();
+      final reqMap = payload['request'] is Map ? _asMap(payload['request']) : payload;
+      final nextObj = (reqMap['objective'] ?? payload['objective'] ?? payload['title'] ?? '').toString().trim();
+      final rawCriteria = (payload['criteria'] ?? '').toString().trim();
+      final objective = rawCriteria.isNotEmpty && nextObj.isNotEmpty && !nextObj.contains(rawCriteria)
+          ? '$nextObj\n验收标准：$rawCriteria'
+          : nextObj;
+      final maxRoundsRaw = reqMap['maxGoalRounds'] ?? payload['maxGoalRounds'];
+      final maxRounds = maxRoundsRaw is num && maxRoundsRaw > 0 ? maxRoundsRaw.toInt() : null;
+      args = {
+        'agentId': sessionId,
+        'ref': ref,
+        'request': {
+          if (objective.isNotEmpty) 'objective': objective,
+          if (maxRounds != null) 'maxGoalRounds': maxRounds,
+        },
+      };
+    } else {
+      final ref = await resolveGoalRef();
+      args = {
+        'agentId': sessionId,
+        'ref': ref,
       };
     }
     final res = await rpc(ep, args);
@@ -1518,78 +1568,110 @@ class VanillaDshAdapter {
     return {'v': 1, 'schedules': list};
   }
 
-  Future<Map<String, dynamic>> createSchedule(Map<String, dynamic> body) async {
-    final req = <String, dynamic>{
-      if (body['name'] != null) 'name': body['name'].toString(),
-      if (body['description'] != null) 'description': body['description'].toString(),
-      if (body['prompt'] != null) 'prompt': body['prompt'].toString(),
-      if (body['enabled'] != null) 'enabled': body['enabled'],
-    };
-    final tz = body['timezone']?.toString();
-    if (body['timing'] is Map<String, dynamic>) {
-      req['timing'] = body['timing'];
-    } else if (body['cronExpr'] != null || body['cron'] != null) {
-      req['timing'] = {
+  Map<String, dynamic>? _resolveScheduleTiming(Map<String, dynamic> body) {
+    if (body['timing'] is Map) {
+      return Map<String, dynamic>.from(body['timing'] as Map);
+    }
+    final tz = (body['timeZone'] ?? body['timezone'] ?? 'Asia/Shanghai').toString().trim();
+    final effectiveTz = tz.isEmpty ? 'Asia/Shanghai' : tz;
+    final cron = (body['cronExpr'] ?? body['cron'])?.toString().trim();
+    if (cron != null && cron.isNotEmpty) {
+      return {
         'kind': 'cron',
-        'cron': {
-          'expression': (body['cronExpr'] ?? body['cron']).toString(),
-          if (tz != null && tz.isNotEmpty) 'time_zone': tz,
-        },
-      };
-    } else if (body['everySeconds'] != null || body['every_seconds'] != null) {
-      req['timing'] = {
-        'kind': 'every',
-        'every_seconds': body['everySeconds'] ?? body['every_seconds'],
-      };
-    } else if (body['dailyTime'] != null) {
-      req['timing'] = {
-        'kind': 'daily',
-        'daily': {
-          'time': body['dailyTime'].toString(),
-          if (tz != null && tz.isNotEmpty) 'time_zone': tz,
-        },
+        'cron': cron,
+        'timeZone': effectiveTz,
       };
     }
-    if (body['target'] is Map<String, dynamic>) {
-      req['target'] = body['target'];
-    } else {
-      final sid = body['sessionId']?.toString();
-      final cwd = body['cwd']?.toString();
-      if (sid != null && sid.isNotEmpty) {
-        req['target'] = {'kind': 'session', 'session_id': sid};
-      } else {
-        req['target'] = {
-          'kind': 'new_once',
-          if (cwd != null && cwd.isNotEmpty) 'cwd': cwd,
-        };
-      }
+    final everySec = body['everySeconds'] ?? body['every_seconds'];
+    if (everySec is num && everySec > 0) {
+      return {'kind': 'every', 'everySeconds': everySec.toInt()};
     }
+    final dailyTime = body['dailyTime']?.toString().trim();
+    if (dailyTime != null && dailyTime.isNotEmpty) {
+      return {'kind': 'daily', 'time': dailyTime, 'timeZone': effectiveTz};
+    }
+    return null;
+  }
+
+  Map<String, dynamic> _resolveScheduleTarget(Map<String, dynamic> body) {
+    if (body['target'] is Map) {
+      return Map<String, dynamic>.from(body['target'] as Map);
+    }
+    final sid = body['sessionId']?.toString().trim();
+    if (sid != null && sid.isNotEmpty) {
+      return {'kind': 'session', 'sessionId': sid};
+    }
+    final cwd = body['cwd']?.toString().trim();
+    return {
+      'kind': 'new_once',
+      'create': {
+        if (cwd != null && cwd.isNotEmpty) 'cwd': cwd,
+      },
+    };
+  }
+
+  Future<Map<String, dynamic>> createSchedule(Map<String, dynamic> body) async {
+    final title = (body['title'] ?? body['name'] ?? '').toString().trim();
+    final prompt = (body['prompt'] ?? body['command'] ?? '').toString().trim();
+    final timing = _resolveScheduleTiming(body);
+    final req = <String, dynamic>{
+      'title': title.length > 120 ? title.substring(0, 120) : title,
+      'prompt': prompt,
+      if (timing != null) 'timing': timing,
+      'target': _resolveScheduleTarget(body),
+    };
     final res = await rpc('schedule/create', {'request': req});
     return {'v': 1, 'schedule': res, ..._asMap(res)};
   }
 
   Future<Map<String, dynamic>> patchSchedule(String scheduleId, Map<String, dynamic> body) async {
-    final req = body.containsKey('action')
-        ? {'id': scheduleId, 'scheduleId': scheduleId, ...body}
-        : {
-            'id': scheduleId,
-            'scheduleId': scheduleId,
-            'action': 'update',
-            'patch': body,
-          };
-    final res = await rpc('schedule/edit', {'request': req});
+    if (body['action'] == 'delete') {
+      final res = await rpc('schedule/edit', {
+        'request': {'id': scheduleId, 'action': 'delete'},
+      });
+      return {'v': 1, 'result': res};
+    }
+    final src = body['patch'] is Map ? _asMap(body['patch']) : body;
+    final patch = <String, dynamic>{};
+    final title = (src['title'] ?? src['name'])?.toString().trim();
+    if (title != null && title.isNotEmpty) {
+      patch['title'] = title.length > 120 ? title.substring(0, 120) : title;
+    }
+    final prompt = (src['prompt'] ?? src['command'])?.toString().trim();
+    if (prompt != null && prompt.isNotEmpty) {
+      patch['prompt'] = prompt;
+    }
+    final timing = _resolveScheduleTiming(src);
+    if (timing != null) {
+      patch['timing'] = timing;
+    }
+    if (src['target'] is Map) {
+      patch['target'] = Map<String, dynamic>.from(src['target'] as Map);
+    }
+    if (src.containsKey('active') && src['active'] is bool) {
+      patch['active'] = src['active'];
+    } else if (src.containsKey('enabled') && src['enabled'] is bool) {
+      patch['active'] = src['enabled'];
+    }
+    final res = await rpc('schedule/edit', {
+      'request': {
+        'id': scheduleId,
+        'action': 'update',
+        'patch': patch,
+      },
+    });
     return {'v': 1, 'result': res};
   }
 
   Future<Map<String, dynamic>> deleteSchedule(String scheduleId) async {
     try {
       final res = await rpc('schedule/delete', {
-        'request': {'id': scheduleId, 'scheduleId': scheduleId},
+        'request': {'id': scheduleId},
       });
       return {'v': 1, 'ok': true, 'result': res};
     } catch (_) {
       final res = await rpc('schedule/edit', {
-        'request': {'id': scheduleId, 'scheduleId': scheduleId, 'action': 'delete'},
+        'request': {'id': scheduleId, 'action': 'delete'},
       });
       return {'v': 1, 'ok': true, 'result': res};
     }
@@ -1597,16 +1679,16 @@ class VanillaDshAdapter {
 
   Future<Map<String, dynamic>> runScheduleNow(String scheduleId) async {
     final res = await rpc('schedule/run', {
-      'request': {'scheduleId': scheduleId, 'id': scheduleId},
+      'request': {'id': scheduleId},
     });
     return {'v': 1, 'result': res};
   }
 
   Future<Map<String, dynamic>> getScheduleHistory(String scheduleId, {int limit = 20}) async {
     final res = await rpc('schedule/history', {
-      'request': {'scheduleId': scheduleId, 'id': scheduleId, 'limit': limit},
+      'request': {'id': scheduleId, 'limit': limit},
     });
-    return {'v': 1, ..._asMap(res)};
+    return {'v': 1, 'history': res};
   }
 
   Future<Map<String, dynamic>> pruneInactiveSchedules() async {

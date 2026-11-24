@@ -218,12 +218,12 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
     );
   }
 
-  void _openAddGoalSheet(BuildContext context) {
+  void _openAddGoalSheet(BuildContext context, {SessionGoalRecord? existing}) {
     showGrassBagSheet<void>(
       context,
-      title: '设定长期自主目标',
+      title: existing != null ? '编辑长期自主目标' : '设定长期自主目标',
       subtitle: '助手将围绕验收标准持续迭代直至全部通过',
-      bodyBuilder: (ctx) => const _AddGoalSheetBody(),
+      bodyBuilder: (ctx) => _AddGoalSheetBody(existing: existing),
     );
   }
 
@@ -1224,63 +1224,84 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                   ),
                 ),
               for (final item in state.todos)
-                isLiveAgentSynced
-                    ? Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 5),
-                        child: Row(
-                          children: [
-                            Icon(
-                              item.done
-                                  ? CupertinoIcons.checkmark_circle_fill
-                                  : CupertinoIcons.circle,
-                              size: 18,
-                              color: item.done ? t.ok : t.primary,
+                () {
+                  final rowBody = Container(
+                    margin: const EdgeInsets.symmetric(vertical: 3),
+                    padding: item.active
+                        ? const EdgeInsets.symmetric(horizontal: 10, vertical: 7)
+                        : const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+                    decoration: item.active
+                        ? BoxDecoration(
+                            color: t.primarySoft,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: t.primary.withValues(alpha: 0.25),
+                              width: 0.7,
                             ),
-                            const SizedBox(width: 9),
-                            Expanded(
-                              child: Text(
-                                item.title,
-                                style: TextStyle(
-                                  fontSize: 13.5,
-                                  decoration: item.done ? TextDecoration.lineThrough : null,
-                                  color: item.done ? t.text3 : t.text,
-                                  fontWeight: item.done ? FontWeight.w400 : FontWeight.w500,
-                                ),
-                              ),
+                          )
+                        : null,
+                    child: Row(
+                      children: [
+                        if (item.active && !item.done)
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: Center(
+                              child: CupertinoActivityIndicator(radius: 7, color: t.primary),
                             ),
-                          ],
-                        ),
-                      )
-                    : GrassBagSpringTap(
-                        onTap: () => ctrl.toggleTodo(item.id),
-                        haptic: true,
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 5),
-                          child: Row(
-                            children: [
-                              Icon(
-                                item.done
-                                    ? CupertinoIcons.checkmark_circle_fill
-                                    : CupertinoIcons.circle,
-                                size: 18,
-                                color: item.done ? t.ok : t.primary,
-                              ),
-                              const SizedBox(width: 9),
-                              Expanded(
-                                child: Text(
-                                  item.title,
-                                  style: TextStyle(
-                                    fontSize: 13.5,
-                                    decoration: item.done ? TextDecoration.lineThrough : null,
-                                    color: item.done ? t.text3 : t.text,
-                                    fontWeight: item.done ? FontWeight.w400 : FontWeight.w500,
-                                  ),
-                                ),
-                              ),
-                            ],
+                          )
+                        else
+                          Icon(
+                            item.done
+                                ? CupertinoIcons.checkmark_circle_fill
+                                : CupertinoIcons.circle,
+                            size: 18,
+                            color: item.done ? t.ok : t.text3,
+                          ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: Text(
+                            item.title,
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              decoration: item.done ? TextDecoration.lineThrough : null,
+                              color: item.done
+                                  ? t.text3
+                                  : (item.active ? t.primary : t.text),
+                              fontWeight: item.active
+                                  ? FontWeight.w600
+                                  : (item.done ? FontWeight.w400 : FontWeight.w500),
+                            ),
                           ),
                         ),
-                      ),
+                        if (item.active && !item.done) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: t.primary.withValues(alpha: t.isDark ? 0.28 : 0.14),
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              '进行中',
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w600,
+                                color: t.primary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                  if (isLiveAgentSynced) return rowBody;
+                  return GrassBagSpringTap(
+                    onTap: () => ctrl.toggleTodo(item.id),
+                    haptic: true,
+                    child: rowBody,
+                  );
+                }(),
               if (!isLiveAgentSynced) ...[
                 const SizedBox(height: 10),
                 Row(
@@ -1319,7 +1340,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         ),
         const SizedBox(height: 14),
 
-        // Long-term autonomous Goals section
+        // Long-term autonomous Goals section (DSH allows 1 active goal per session)
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
@@ -1330,16 +1351,17 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text3),
               ),
             ),
-            GrassBagSpringTap(
-              onTap: () => _openAddGoalSheet(context),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                child: Text(
-                  '+ 新建目标',
-                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.primary),
+            if (!state.goals.any((g) => !g.isCompleted))
+              GrassBagSpringTap(
+                onTap: () => _openAddGoalSheet(context),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Text(
+                    '+ 新建目标',
+                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.primary),
+                  ),
                 ),
               ),
-            ),
           ],
         ),
         const SizedBox(height: 6),
@@ -1387,56 +1409,99 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                         style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text),
                       ),
                     ),
+                    const SizedBox(width: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 2.5),
                       decoration: BoxDecoration(
-                        color: g.status == 'completed'
+                        color: g.isCompleted
                             ? t.okSoft
-                            : (g.status == 'paused' ? t.warnSoft : t.primarySoft),
+                            : (g.isBlocked
+                                ? t.errSoft
+                                : (g.isPaused || g.isDisarmed ? t.warnSoft : t.primarySoft)),
                         borderRadius: BorderRadius.circular(999),
                       ),
                       child: Text(
-                        g.status == 'completed'
-                            ? '已达成'
-                            : (g.status == 'paused' ? '已暂停' : '${g.progressPct}%'),
+                        g.statusLabel,
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
-                          color: g.status == 'completed'
+                          color: g.isCompleted
                               ? t.ok
-                              : (g.status == 'paused' ? t.warn : t.primary),
+                              : (g.isBlocked
+                                  ? t.err
+                                  : (g.isPaused || g.isDisarmed ? t.warn : t.primary)),
                         ),
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 5),
-                Text(g.criteria, style: TextStyle(fontSize: 12, height: 1.4, color: t.text2)),
+                if (g.criteria.isNotEmpty) ...[
+                  const SizedBox(height: 5),
+                  Text(g.criteria, style: TextStyle(fontSize: 12, height: 1.4, color: t.text2)),
+                ],
+                if (g.isBlocked && (g.blockedReasonMessage?.isNotEmpty == true || g.blockedReasonCode?.isNotEmpty == true)) ...[
+                  const SizedBox(height: 8),
+                  GrassBagStatusBanner(
+                    tone: GrassBagBannerTone.warn,
+                    borderRadius: 12,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                    message: g.blockedReasonMessage?.isNotEmpty == true
+                        ? g.blockedReasonMessage!
+                        : '目标已阻塞（${g.blockedReasonCode}），需人工确认或调整后恢复。',
+                  ),
+                ] else if (g.isDisarmed) ...[
+                  const SizedBox(height: 7),
+                  Text(
+                    '会话重载后默认处于待恢复状态，点击「恢复执行」继续自动推进。',
+                    style: TextStyle(fontSize: 11.5, color: t.warn),
+                  ),
+                ],
                 const SizedBox(height: 9),
                 GrassBagProgressBar(
-                  value: (g.progressPct / 100.0).clamp(0.0, 1.0),
+                  value: g.isCompleted
+                      ? 1.0
+                      : (g.maxGoalRounds != null && g.maxGoalRounds! > 0
+                          ? (g.progressPct / 100.0).clamp(0.04, 0.96)
+                          : (g.isArmed ? null : 0.0)),
                   height: 5,
                   trackColor: t.fill2,
-                  color: g.status == 'completed' ? t.ok : t.primary,
+                  color: g.isCompleted
+                      ? t.ok
+                      : (g.isBlocked ? t.err : (g.isPaused || g.isDisarmed ? t.warn : t.primary)),
                 ),
                 const SizedBox(height: 9),
                 Row(
                   children: [
-                    if (g.status != 'completed') ...[
+                    if (!g.isCompleted) ...[
                       GrassBagSpringTap(
                         onTap: () => ctrl.updateGoalStatus(
                           g.id,
-                          g.status == 'active' ? 'paused' : 'active',
+                          g.isArmed ? 'paused' : 'active',
                         ),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
                           child: Text(
-                            g.status == 'active' ? '暂停' : '恢复',
+                            g.isArmed ? '暂停' : '恢复执行',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: g.isArmed ? t.text2 : t.primary,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      GrassBagSpringTap(
+                        onTap: () => _openAddGoalSheet(context, existing: g),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                          child: Text(
+                            '编辑',
                             style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
+                      const SizedBox(width: 6),
                       GrassBagSpringTap(
                         onTap: () => ctrl.updateGoalStatus(g.id, 'completed'),
                         child: Padding(
@@ -1457,9 +1522,9 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                       onTap: () async {
                         final ok = await showGrassBagConfirmDialog(
                           context,
-                          title: '删除目标「${g.title}」？',
-                          message: '删除后该目标追踪记录将被移除。',
-                          confirmLabel: '删除',
+                          title: '清除目标「${g.title}」？',
+                          message: '清除后该长期目标将被移除。',
+                          confirmLabel: '清除',
                           isDestructive: true,
                         );
                         if (ok) ctrl.deleteGoal(g.id);
@@ -2908,6 +2973,7 @@ class _WorkspaceFilePreviewBodyState extends ConsumerState<_WorkspaceFilePreview
                                 scrollDirection: Axis.horizontal,
                                 child: SelectableText(
                                   _text.isEmpty ? '// 空文件' : _text,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                                   style: const TextStyle(
                                     fontFamily: 'monospace',
                                     fontSize: 12,
@@ -2969,17 +3035,26 @@ class _WorkspaceFilePreviewBodyState extends ConsumerState<_WorkspaceFilePreview
 }
 
 class _AddGoalSheetBody extends ConsumerStatefulWidget {
-  const _AddGoalSheetBody();
+  const _AddGoalSheetBody({this.existing});
+
+  final SessionGoalRecord? existing;
 
   @override
   ConsumerState<_AddGoalSheetBody> createState() => _AddGoalSheetBodyState();
 }
 
 class _AddGoalSheetBodyState extends ConsumerState<_AddGoalSheetBody> {
-  final TextEditingController _titleCtrl = TextEditingController();
-  final TextEditingController _criteriaCtrl = TextEditingController();
+  late final TextEditingController _titleCtrl;
+  late final TextEditingController _criteriaCtrl;
   final FocusNode _criteriaFocus = FocusNode();
   String? _err;
+
+  @override
+  void initState() {
+    super.initState();
+    _titleCtrl = TextEditingController(text: widget.existing?.title ?? '');
+    _criteriaCtrl = TextEditingController(text: widget.existing?.criteria ?? '');
+  }
 
   @override
   void dispose() {
@@ -2995,7 +3070,11 @@ class _AddGoalSheetBodyState extends ConsumerState<_AddGoalSheetBody> {
       setState(() => _err = '请输入目标名称');
       return;
     }
-    ref.read(appProvider.notifier).addGoal(title, _criteriaCtrl.text);
+    if (widget.existing != null) {
+      ref.read(appProvider.notifier).editGoal(widget.existing!.id, title, _criteriaCtrl.text);
+    } else {
+      ref.read(appProvider.notifier).addGoal(title, _criteriaCtrl.text);
+    }
     Navigator.of(context).pop();
   }
 
@@ -3050,7 +3129,7 @@ class _AddGoalSheetBodyState extends ConsumerState<_AddGoalSheetBody> {
             const SizedBox(width: 10),
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '创建目标',
+                label: widget.existing != null ? '保存目标' : '创建目标',
                 tier: tier,
                 insideGlass: true,
                 onTap: _submit,

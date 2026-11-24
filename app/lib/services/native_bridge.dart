@@ -583,6 +583,14 @@ class GrassBagNativeBridge {
     return (await _safeInvoke<bool>('safety.resetStop')) == true;
   }
 
+  Future<bool> previewPhoneOverlay() async {
+    return (await _safeInvoke<bool>('safety.previewOverlay')) == true;
+  }
+
+  Future<void> syncThemeMode(bool isDark) async {
+    await _safeInvoke<bool>('app.syncThemeMode', {'isDark': isDark});
+  }
+
   // Background Keepalive Service & Alert Notifications
   Future<void> startKeepaliveService({
     String title = 'GrassBag 本机环境运行中',

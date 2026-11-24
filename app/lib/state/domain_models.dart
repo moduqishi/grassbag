@@ -143,10 +143,26 @@ class SessionGoalRecord {
     required this.status, // active | paused | completed | blocked
     this.progressPct = 0,
     this.revision = 0,
+    this.activation = 'armed', // armed | disarmed
+    this.roundsStarted = 0,
+    this.maxGoalRounds,
+    this.blockedReasonCode,
+    this.blockedReasonMessage,
   });
 
-  factory SessionGoalRecord.fromJson(Map<String, dynamic> m) {
-    final rawObj = (m['title'] ?? m['objective'] ?? m['goal'] ?? m['text'] ?? '').toString().trim();
+  factory SessionGoalRecord.fromJson(Map<String, dynamic> rawMap) {
+    // Unwrap DSH `GoalProjection = { goal: GoalSnapshot, roundsStarted, createdAt, updatedAt }`
+    // seamlessly alongside direct `GoalView` / `GoalSnapshot` maps!
+    final nestedGoal = rawMap['goal'];
+    final Map<String, dynamic> m = nestedGoal is Map
+        ? {
+            ...rawMap,
+            ...Map<String, dynamic>.from(nestedGoal),
+          }
+        : rawMap;
+    final rawObj = (m['title'] ?? m['objective'] ?? (nestedGoal is String ? nestedGoal : null) ?? m['text'] ?? '')
+        .toString()
+        .trim();
     var title = rawObj;
     var criteria = (m['criteria'] ?? m['description'] ?? '').toString().trim();
     if (criteria.isEmpty && rawObj.contains('\n验收标准：')) {
@@ -154,23 +170,33 @@ class SessionGoalRecord {
       title = rawObj.substring(0, idx).trim();
       criteria = rawObj.substring(idx + '\n验收标准：'.length).trim();
     }
-    final roundsStarted = (m['roundsStarted'] as num?)?.toInt();
-    final maxRounds = (m['maxGoalRounds'] as num?)?.toInt();
-    if (criteria.isEmpty && roundsStarted != null) {
-      criteria = maxRounds != null && maxRounds > 0
-          ? '已执行 $roundsStarted / $maxRounds 轮'
-          : '已执行 $roundsStarted 轮';
-    }
+    final roundsStarted = (m['roundsStarted'] as num?)?.toInt() ??
+        (rawMap['roundsStarted'] as num?)?.toInt() ??
+        0;
+    final maxRoundsRaw = (m['maxGoalRounds'] as num?)?.toInt() ??
+        (rawMap['maxGoalRounds'] as num?)?.toInt();
+    final maxRounds = (maxRoundsRaw != null && maxRoundsRaw > 0) ? maxRoundsRaw : null;
     final rawStatus = (m['phase'] ?? m['status'] ?? 'active').toString().toLowerCase();
     final normStatus = rawStatus == 'complete' ? 'completed' : rawStatus;
+    final activation = (m['activation']?.toString().toLowerCase() ??
+            (normStatus == 'active' ? 'armed' : 'disarmed'))
+        .trim();
+    final blockedObj = m['blockedReason'];
+    String? blockedCode = m['blockedReasonCode']?.toString();
+    String? blockedMsg = m['blockedReasonMessage']?.toString();
+    if (blockedObj is Map) {
+      blockedCode ??= blockedObj['code']?.toString();
+      blockedMsg ??= blockedObj['message']?.toString();
+    } else if (blockedObj is String && blockedObj.trim().isNotEmpty) {
+      blockedMsg ??= blockedObj.trim();
+    }
+
     var pct = (m['progressPct'] as num?)?.toInt() ?? 0;
     if (pct == 0) {
       if (normStatus == 'completed') {
         pct = 100;
-      } else if (roundsStarted != null && maxRounds != null && maxRounds > 0) {
+      } else if (maxRounds != null && maxRounds > 0 && roundsStarted > 0) {
         pct = ((roundsStarted / maxRounds) * 100).round().clamp(5, 95);
-      } else if (normStatus == 'active') {
-        pct = 15;
       }
     }
     return SessionGoalRecord(
@@ -180,6 +206,11 @@ class SessionGoalRecord {
       status: normStatus,
       progressPct: pct,
       revision: (m['revision'] as num?)?.toInt() ?? 0,
+      activation: activation.isEmpty ? 'armed' : activation,
+      roundsStarted: roundsStarted,
+      maxGoalRounds: maxRounds,
+      blockedReasonCode: blockedCode,
+      blockedReasonMessage: blockedMsg,
     );
   }
 
@@ -189,6 +220,28 @@ class SessionGoalRecord {
   final String status;
   final int progressPct;
   final int revision;
+  final String activation;
+  final int roundsStarted;
+  final int? maxGoalRounds;
+  final String? blockedReasonCode;
+  final String? blockedReasonMessage;
+
+  bool get isCompleted => status == 'completed';
+  bool get isPaused => status == 'paused';
+  bool get isBlocked => status == 'blocked';
+  bool get isDisarmed => status == 'active' && activation == 'disarmed';
+  bool get isArmed => status == 'active' && activation != 'disarmed';
+
+  String get statusLabel {
+    if (isCompleted) return '已达成';
+    if (isBlocked) return '已阻塞';
+    if (isPaused) return '已暂停';
+    if (isDisarmed) return '待恢复';
+    if (maxGoalRounds != null && maxGoalRounds! > 0) {
+      return '第 $roundsStarted / $maxGoalRounds 轮';
+    }
+    return roundsStarted > 0 ? '已推进 $roundsStarted 轮' : '自主推进中';
+  }
 
   SessionGoalRecord copyWith({
     String? title,
@@ -196,6 +249,11 @@ class SessionGoalRecord {
     String? status,
     int? progressPct,
     int? revision,
+    String? activation,
+    int? roundsStarted,
+    int? maxGoalRounds,
+    String? blockedReasonCode,
+    String? blockedReasonMessage,
   }) =>
       SessionGoalRecord(
         id: id,
@@ -204,6 +262,11 @@ class SessionGoalRecord {
         status: status ?? this.status,
         progressPct: progressPct ?? this.progressPct,
         revision: revision ?? this.revision,
+        activation: activation ?? this.activation,
+        roundsStarted: roundsStarted ?? this.roundsStarted,
+        maxGoalRounds: maxGoalRounds ?? this.maxGoalRounds,
+        blockedReasonCode: blockedReasonCode ?? this.blockedReasonCode,
+        blockedReasonMessage: blockedReasonMessage ?? this.blockedReasonMessage,
       );
 
   Map<String, dynamic> toJson() => {
@@ -213,6 +276,11 @@ class SessionGoalRecord {
         'status': status,
         'progressPct': progressPct,
         'revision': revision,
+        'activation': activation,
+        'roundsStarted': roundsStarted,
+        if (maxGoalRounds != null) 'maxGoalRounds': maxGoalRounds,
+        if (blockedReasonCode != null) 'blockedReasonCode': blockedReasonCode,
+        if (blockedReasonMessage != null) 'blockedReasonMessage': blockedReasonMessage,
       };
 
   @override
@@ -224,11 +292,28 @@ class SessionGoalRecord {
         other.criteria == criteria &&
         other.status == status &&
         other.progressPct == progressPct &&
-        other.revision == revision;
+        other.revision == revision &&
+        other.activation == activation &&
+        other.roundsStarted == roundsStarted &&
+        other.maxGoalRounds == maxGoalRounds &&
+        other.blockedReasonCode == blockedReasonCode &&
+        other.blockedReasonMessage == blockedReasonMessage;
   }
 
   @override
-  int get hashCode => Object.hash(id, title, criteria, status, progressPct, revision);
+  int get hashCode => Object.hash(
+        id,
+        title,
+        criteria,
+        status,
+        progressPct,
+        revision,
+        activation,
+        roundsStarted,
+        maxGoalRounds,
+        blockedReasonCode,
+        blockedReasonMessage,
+      );
 }
 
 /// Subagent lineage & Agent Team task item.
@@ -377,13 +462,25 @@ class ScheduleTaskRecord {
     this.lastRunAt = '尚未运行',
     this.lastStatus = 'idle', // ok | error | running | idle
     this.history = const [],
+    this.kind = 'cron',
+    this.status = 'active', // active | paused | ended
+    this.nextRunAt = '',
+    this.executionActive = false,
   });
+
+  static String _formatLocalIso(String raw) {
+    final dt = DateTime.tryParse(raw.trim());
+    if (dt == null) return raw.replaceFirst('T', ' ').split('.').first;
+    final loc = dt.toLocal();
+    String p2(int n) => n.toString().padLeft(2, '0');
+    return '${loc.year}-${p2(loc.month)}-${p2(loc.day)} ${p2(loc.hour)}:${p2(loc.minute)}';
+  }
 
   factory ScheduleTaskRecord.fromJson(Map<String, dynamic> m) {
     final timing = m['timing'] is Map
         ? Map<String, dynamic>.from(m['timing'] as Map)
         : const <String, dynamic>{};
-    final kind = (m['kind'] ?? timing['kind'] ?? '').toString();
+    final kind = (m['kind'] ?? timing['kind'] ?? 'cron').toString().toLowerCase();
     final tz = (m['timezone'] ??
             m['timeZone'] ??
             timing['timezone'] ??
@@ -402,7 +499,8 @@ class ScheduleTaskRecord {
     final timeRaw = m['time'] ?? timing['time'] ?? timing['daily'];
     final afterSecondsRaw = m['afterSeconds'] ?? timing['afterSeconds'];
     final scheduledAtRaw = m['scheduledAt'] ?? timing['scheduledAt'] ?? timing['at'];
-    final weeklyRaw = m['weekly'] ?? timing['weekly'] ?? timing['daysOfWeek'];
+    final weekdaysRaw = m['weekdays'] ?? timing['weekdays'] ?? m['weekly'] ?? timing['weekly'] ?? timing['daysOfWeek'];
+    final rruleRaw = m['rrule'] ?? timing['rrule'];
     if (cronExpr.isEmpty) {
       if (kind == 'every' && everySecondsRaw is num) {
         final sec = everySecondsRaw.toInt();
@@ -413,18 +511,24 @@ class ScheduleTaskRecord {
               : (sec >= 60 ? '每 ${(sec / 60).round()} 分钟' : '每 $sec 秒');
         }
       } else if (kind == 'daily' && timeRaw != null) {
-        cronExpr = 'daily $timeRaw';
-        if (human.isEmpty) human = '每天 $timeRaw';
+        final tStr = timeRaw.toString();
+        cronExpr = 'daily $tStr';
+        if (human.isEmpty) human = '每天 $tStr';
       } else if (kind == 'after' && afterSecondsRaw != null) {
         cronExpr = 'after ${afterSecondsRaw}s';
         if (human.isEmpty) human = '延迟 $afterSecondsRaw 秒后单次';
       } else if (kind == 'at' && scheduledAtRaw != null) {
-        cronExpr = scheduledAtRaw.toString();
-        if (human.isEmpty) human = '定时单次 · $scheduledAtRaw';
+        final fmt = _formatLocalIso(scheduledAtRaw.toString());
+        cronExpr = fmt;
+        if (human.isEmpty) human = '定时单次 · $fmt';
       } else if (kind == 'weekly') {
-        final wTime = timeRaw?.toString() ?? (weeklyRaw?.toString() ?? '');
-        cronExpr = 'weekly $wTime'.trim();
-        if (human.isEmpty) human = wTime.isEmpty ? '每周执行' : '每周 $wTime';
+        final wDays = weekdaysRaw is List ? weekdaysRaw.join(',') : (weekdaysRaw?.toString() ?? '');
+        final wTime = timeRaw?.toString() ?? '';
+        cronExpr = 'weekly $wDays $wTime'.trim();
+        if (human.isEmpty) human = '每周 ${wDays.isNotEmpty ? "$wDays " : ""}$wTime'.trim();
+      } else if (kind == 'rrule' && rruleRaw != null) {
+        cronExpr = rruleRaw.toString().trim();
+        if (human.isEmpty) human = 'RRule · $cronExpr';
       } else {
         cronExpr = '0 9 * * *';
       }
@@ -438,15 +542,23 @@ class ScheduleTaskRecord {
         _ => 'Cron · $cronExpr',
       };
     }
-    final statusStr = m['status']?.toString().toLowerCase();
+    final statusStr = m['status']?.toString().toLowerCase() ?? '';
     final bool enabled;
-    if (m.containsKey('active') && m['active'] is bool) {
+    if (statusStr == 'ended') {
+      enabled = false;
+    } else if (m.containsKey('active') && m['active'] is bool) {
       enabled = m['active'] as bool;
-    } else if (statusStr != null && statusStr.isNotEmpty) {
+    } else if (statusStr.isNotEmpty) {
       enabled = statusStr == 'active' || statusStr == 'running' || statusStr == 'scheduled';
     } else {
       enabled = m['enabled'] != false;
     }
+    final normStatus = statusStr == 'ended'
+        ? 'ended'
+        : (enabled ? 'active' : 'paused');
+    final nextRunAt = scheduledAtRaw != null && scheduledAtRaw.toString().trim().isNotEmpty
+        ? _formatLocalIso(scheduledAtRaw.toString())
+        : '';
 
     var lastRunAt = m['lastRunAt']?.toString() ?? '尚未运行';
     var lastStatus = m['lastStatus']?.toString() ?? 'idle';
@@ -454,7 +566,7 @@ class ScheduleTaskRecord {
     if (lastDelivery is Map) {
       final delivered = (lastDelivery['deliveredAt'] ?? lastDelivery['scheduledAt'])?.toString() ?? '';
       if (delivered.isNotEmpty) {
-        lastRunAt = delivered.replaceFirst('T', ' ').split('.').first;
+        lastRunAt = _formatLocalIso(delivered);
         final deliveryOk = lastDelivery['ok'];
         final deliveryErr = lastDelivery['error']?.toString() ?? '';
         lastStatus = (deliveryOk == false || deliveryErr.isNotEmpty) ? 'error' : 'ok';
@@ -479,6 +591,10 @@ class ScheduleTaskRecord {
               ?.map((e) => e.toString())
               .toList(growable: false) ??
           const [],
+      kind: kind.isEmpty ? 'cron' : kind,
+      status: normStatus,
+      nextRunAt: nextRunAt,
+      executionActive: m['executionActive'] == true,
     );
   }
 
@@ -492,6 +608,12 @@ class ScheduleTaskRecord {
   final String lastRunAt;
   final String lastStatus;
   final List<String> history;
+  final String kind;
+  final String status;
+  final String nextRunAt;
+  final bool executionActive;
+
+  bool get isEnded => status == 'ended';
 
   ScheduleTaskRecord copyWith({
     String? name,
@@ -503,6 +625,10 @@ class ScheduleTaskRecord {
     String? lastRunAt,
     String? lastStatus,
     List<String>? history,
+    String? kind,
+    String? status,
+    String? nextRunAt,
+    bool? executionActive,
   }) =>
       ScheduleTaskRecord(
         id: id,
@@ -515,6 +641,10 @@ class ScheduleTaskRecord {
         lastRunAt: lastRunAt ?? this.lastRunAt,
         lastStatus: lastStatus ?? this.lastStatus,
         history: history ?? this.history,
+        kind: kind ?? this.kind,
+        status: status ?? this.status,
+        nextRunAt: nextRunAt ?? this.nextRunAt,
+        executionActive: executionActive ?? this.executionActive,
       );
 
   Map<String, dynamic> toJson() => {
@@ -528,6 +658,10 @@ class ScheduleTaskRecord {
         'lastRunAt': lastRunAt,
         'lastStatus': lastStatus,
         'history': history,
+        'kind': kind,
+        'status': status,
+        'nextRunAt': nextRunAt,
+        'executionActive': executionActive,
       };
 
   @override
@@ -543,6 +677,10 @@ class ScheduleTaskRecord {
         other.enabled == enabled &&
         other.lastRunAt == lastRunAt &&
         other.lastStatus == lastStatus &&
+        other.kind == kind &&
+        other.status == status &&
+        other.nextRunAt == nextRunAt &&
+        other.executionActive == executionActive &&
         listEquals(other.history, history);
   }
 
@@ -557,6 +695,10 @@ class ScheduleTaskRecord {
         enabled,
         lastRunAt,
         lastStatus,
+        kind,
+        status,
+        nextRunAt,
+        executionActive,
         Object.hashAll(history),
       );
 }
@@ -963,6 +1105,7 @@ class ModelEffortOption {
 
   String get zhLabel => switch (id.toLowerCase()) {
         'off' || 'none' => '关闭',
+        'minimal' => '极轻',
         'low' => '低',
         'medium' || 'mid' => '中',
         'high' => '高',

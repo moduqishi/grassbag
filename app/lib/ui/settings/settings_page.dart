@@ -1137,6 +1137,8 @@ class _SettingsDetailBody extends ConsumerWidget {
             SettingsSection.appearance => (s.isDark, s.accent, s.glassTier),
             SettingsSection.permissions => (s.nativePermissions,),
             SettingsSection.phone => (
+                s.isDshConnected,
+                s.routableProviders.length,
                 s.phoneAccessibility,
                 s.phoneOverlay,
                 s.phoneShizuku,
@@ -1304,7 +1306,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                             ),
                           ),
                           const SizedBox(width: 10),
-                          Flexible(
+                          Expanded(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.end,
                               children: [
@@ -2111,7 +2113,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                       insideGlass: true,
                       onTap: () {
                         Navigator.of(context).popUntil((route) => route.isFirst);
-                        unawaited(ctrl.sendPrompt('请帮我打开手机的系统设置页面'));
+                        unawaited(ctrl.sendPrompt('请用手机操控帮我列出常用应用，并打开时钟或计算器确认屏幕画面'));
                       },
                     ),
                   ],
@@ -2207,12 +2209,29 @@ class _SettingsDetailBody extends ConsumerWidget {
                   ),
                 ),
                 GrassBagListTile(
-                  title: const Text('高风险操作前二次确认'),
-                  subtitle: const Text('涉及敏感文本与删除动作前强制弹窗询问'),
+                  leading: GrassBagSquircleIcon(
+                    icon: CupertinoIcons.sparkles,
+                    color: t.primary,
+                    size: 32,
+                    iconSize: 15,
+                  ),
+                  title: const Text('预览液态玻璃悬浮岛与确认卡'),
+                  subtitle: const Text('实时体验带 Logo 与屏幕流光的跨应用悬浮操控弹窗'),
+                  showChevron: true,
+                  onTap: () async {
+                    if (!perms.accessibilityEnabled && !perms.overlayGranted) {
+                      ctrl.showToast('请先开启无障碍服务或悬浮窗权限以预览悬浮岛', tone: ToastTone.warn);
+                      return;
+                    }
+                    await GrassBagNativeBridge.instance.previewPhoneOverlay();
+                  },
+                ),
+                GrassBagListTile(
+                  title: const Text('跨应用悬浮确认卡保护'),
+                  subtitle: const Text('工作区模式下在任意 App 上方弹出液态玻璃确认卡；完全权限下仅敏感动作弹窗'),
                   trailing: GrassBagGlassSwitch(
                     value: state.phoneConfirmHighRisk,
                     tier: state.glassTier,
-                    activeColor: t.ok,
                     onChanged: (v) => ctrl.setPhoneSetting(confirmHighRisk: v),
                   ),
                 ),
@@ -3163,6 +3182,7 @@ class _HostDetailSection extends ConsumerWidget {
                     children: [
                       SelectableText(
                         host.lastError!,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                         style: TextStyle(
                           fontSize: 12,
                           height: 1.45,

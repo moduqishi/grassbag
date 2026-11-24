@@ -1171,7 +1171,10 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
   // ---------------- Schedule (Automation) ----------------
   router.get('/schedules', async (_req, res, { peer }) => {
     const ep = gateway.has('schedule/catalog') ? 'schedule/catalog' : 'schedule/list';
-    const schedules = await gateway.call(ep, {}, { peer });
+    const raw = await gateway.call(ep, {}, { peer });
+    const schedules = Array.isArray(raw)
+      ? raw
+      : (Array.isArray(raw?.items) ? raw.items : (Array.isArray(raw?.schedules) ? raw.schedules : []));
     sendJson(res, 200, { v: 1, schedules });
   }, { domain: 'schedule' });
 

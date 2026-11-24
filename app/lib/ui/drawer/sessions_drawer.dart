@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -292,83 +294,56 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     showRenameSessionSheet(context, ref, s);
   }
 
-  void _openSessionActionsSheet(BuildContext context, ChatSessionItem s) {
+  void _openSessionActionsSheet(BuildContext context, ChatSessionItem s, {Offset? anchor}) {
     final ctrl = ref.read(appProvider.notifier);
-    showGrassBagSheet<void>(
-      context,
-      title: s.title,
-      subtitle: s.cwd != null && s.cwd!.isNotEmpty ? s.cwd : null,
-      bodyBuilder: (ctx) {
-        final t = GrassBagTokens.of(ctx);
-        return GrassBagSheetSection(
-          dividerIndent: 52,
-          children: [
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: s.pinned ? CupertinoIcons.pin_slash_fill : CupertinoIcons.pin_fill,
-                color: t.primary,
-                size: 32,
-                iconSize: 15,
-              ),
-              title: Text(s.pinned ? '取消置顶' : '置顶对话'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ctrl.togglePinSession(s.id);
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.pencil,
-                color: t.primaryHi,
-                size: 32,
-                iconSize: 15,
-              ),
-              title: const Text('重命名'),
-              onTap: () async {
-                Navigator.of(ctx).pop();
-                await Future<void>.delayed(const Duration(milliseconds: 120));
-                if (!mounted || !context.mounted) return;
-                _openRenameSheet(context, s);
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.archivebox_fill,
-                color: t.dusk,
-                size: 32,
-                iconSize: 15,
-              ),
-              title: Text(s.archived ? '取消归档' : '归档对话'),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                ctrl.toggleArchiveSession(s.id);
-              },
-            ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.trash_fill,
-                color: t.err,
-                size: 32,
-                iconSize: 15,
-              ),
-              title: Text('删除对话', style: TextStyle(color: t.err, fontWeight: FontWeight.w600)),
-              onTap: () async {
-                Navigator.of(ctx).pop();
-                await Future<void>.delayed(const Duration(milliseconds: 120));
-                if (!mounted || !context.mounted) return;
-                final ok = await showGrassBagConfirmDialog(
-                  context,
-                  title: '删除「${s.title}」？',
-                  message: '删除后该对话历史将从当前 DSH 主机移除，不可恢复。',
-                  confirmLabel: '删除',
-                  isDestructive: true,
-                );
-                if (ok) ctrl.deleteSessionsBatch({s.id});
-              },
-            ),
-          ],
-        );
-      },
+    final tier = ref.read(appProvider).glassTier;
+    unawaited(
+      showGrassBagGlassContextMenu(
+        context,
+        tier: tier,
+        globalAnchor: anchor,
+        headerTitle: s.title,
+        items: [
+          GrassBagContextMenuItem(
+            label: s.pinned ? '取消置顶' : '置顶对话',
+            icon: s.pinned ? CupertinoIcons.pin_slash_fill : CupertinoIcons.pin_fill,
+            selected: s.pinned,
+            onTap: () => ctrl.togglePinSession(s.id),
+          ),
+          GrassBagContextMenuItem(
+            label: '重命名',
+            icon: CupertinoIcons.pencil,
+            onTap: () async {
+              await Future<void>.delayed(const Duration(milliseconds: 90));
+              if (!mounted || !context.mounted) return;
+              _openRenameSheet(context, s);
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: s.archived ? '取消归档' : '归档对话',
+            icon: CupertinoIcons.archivebox_fill,
+            onTap: () => ctrl.toggleArchiveSession(s.id),
+          ),
+          GrassBagContextMenuItem(
+            label: '删除对话',
+            icon: CupertinoIcons.trash_fill,
+            destructive: true,
+            dividerBefore: true,
+            onTap: () async {
+              await Future<void>.delayed(const Duration(milliseconds: 90));
+              if (!mounted || !context.mounted) return;
+              final ok = await showGrassBagConfirmDialog(
+                context,
+                title: '删除「${s.title}」？',
+                message: '删除后该对话历史将从当前 DSH 主机移除，不可恢复。',
+                confirmLabel: '删除',
+                isDestructive: true,
+              );
+              if (ok) ctrl.deleteSessionsBatch({s.id});
+            },
+          ),
+        ],
+      ),
     );
   }
 
@@ -1278,7 +1253,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                         }
                       },
                       onTogglePin: () => ctrl.togglePinSession(s.id),
-                      onMoreActions: () => _openSessionActionsSheet(context, s),
+                      onMoreActions: (anchor) => _openSessionActionsSheet(context, s, anchor: anchor),
                     );
                       },
                     ),
@@ -1501,7 +1476,7 @@ class _SessionListRow extends StatefulWidget {
   final bool active;
   final VoidCallback onTap;
   final VoidCallback onTogglePin;
-  final VoidCallback onMoreActions;
+  final ValueChanged<Offset?> onMoreActions;
   final bool multiSelectMode;
   final bool selected;
 
@@ -1562,8 +1537,12 @@ class _SessionListRowState extends State<_SessionListRow> {
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: widget.onTap,
-          onLongPress: widget.multiSelectMode ? null : widget.onMoreActions,
-          onSecondaryTap: widget.multiSelectMode ? null : widget.onMoreActions,
+          onLongPressStart: widget.multiSelectMode
+              ? null
+              : (d) => widget.onMoreActions(d.globalPosition),
+          onSecondaryTapDown: widget.multiSelectMode
+              ? null
+              : (d) => widget.onMoreActions(d.globalPosition),
           child: Container(
             constraints: BoxConstraints(minHeight: showSnippet ? 54 : 42),
             padding: EdgeInsets.symmetric(
@@ -1657,20 +1636,26 @@ class _SessionListRowState extends State<_SessionListRow> {
                         ),
                       ),
                     ),
-                  GrassBagSpringTap(
-                    onTap: widget.onMoreActions,
-                    pressedScale: 0.88,
-                    haptic: true,
-                    child: SizedBox(
-                      width: 30,
-                      height: 34,
-                      child: Center(
-                        child: Icon(
-                          CupertinoIcons.ellipsis,
-                          size: 14,
-                          color: (_hovered || widget.active)
-                              ? t.text2
-                              : t.text3.withValues(alpha: 0.78),
+                  Builder(
+                    builder: (btnCtx) => GrassBagSpringTap(
+                      onTap: () {
+                        final box = btnCtx.findRenderObject() as RenderBox?;
+                        final anchor = box?.localToGlobal(box.size.center(Offset.zero));
+                        widget.onMoreActions(anchor);
+                      },
+                      pressedScale: 0.88,
+                      haptic: true,
+                      child: SizedBox(
+                        width: 30,
+                        height: 34,
+                        child: Center(
+                          child: Icon(
+                            CupertinoIcons.ellipsis,
+                            size: 14,
+                            color: (_hovered || widget.active)
+                                ? t.text2
+                                : t.text3.withValues(alpha: 0.78),
+                          ),
                         ),
                       ),
                     ),

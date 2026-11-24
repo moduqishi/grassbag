@@ -582,13 +582,14 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
       _skipUnlockTimer = Timer(const Duration(milliseconds: 1150), () {
         if (mounted) setState(() => _allowManualSkip = true);
       });
-      // Safety fallback: ensure shell mounts even if animation is paused/skipped, and cap splash hold
+      // Safety fallback: ensure shell mounts only for returning users, and hold splash gracefully
+      // up to 4.6s while container startup + model/DeepSeek auth hydration settle so Home NEVER flashes!
       _shellMountTimer = Timer(const Duration(milliseconds: 1400), () {
-        if (mounted && !_shellMounted) {
+        if (mounted && !_shellMounted && !_shouldShowOnboarding()) {
           setState(() => _shellMounted = true);
         }
       });
-      _maxHoldTimer = Timer(const Duration(milliseconds: 3400), () {
+      _maxHoldTimer = Timer(const Duration(milliseconds: 4600), () {
         _beginSplashExit();
       });
     });
@@ -611,29 +612,40 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
     return true;
   }
 
+  /// True once initial host startup, DSH namespaces, and DeepSeek auth/models have settled
+  /// enough to enter Home cleanly without flashing intermediate "connecting / configure model" cards.
+  bool _isStartupHydrationSettled(GrassBagAppState s) {
+    if (s.connectionPhase == ConnectionPhase.connecting) return false;
+    if (s.activeHost.isLocal && s.nativeRuntimeStatus.engineState == 'starting') return false;
+    if (s.hydratingDomains) return false;
+    if (s.connectionPhase == ConnectionPhase.connected) {
+      // Wait briefly until initial domain/model/auth hydration lands (prevents login-card flash!)
+      if (s.dshNamespaces.isEmpty && s.modelGroups.isEmpty && !s.isAccountSignedIn) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void _onLogoAssembled() {
     if (!mounted || _stage != _GateStage.splash) return;
     _logoAssembled = true;
-    // Mount GrassBagShell underneath now that the 120fps logo assembly has completed,
-    // so Liquid Glass shaders warm up seamlessly behind the assembled emblem!
+    // On first launch, mount OnboardingPage DIRECTLY under the splash (NEVER mount GrassBagShell!)
+    // so the splash cross-dissolves seamlessly into Onboarding with ZERO home-screen flash!
+    if (_shouldShowOnboarding()) {
+      _dismissTimer?.cancel();
+      _dismissTimer = Timer(const Duration(milliseconds: 220), _beginSplashExit);
+      return;
+    }
+    // On subsequent launch, mount GrassBagShell underneath to warm up Liquid Glass shaders
+    // while holding the breathing emblem until container + model + DeepSeek auth settle!
     if (!_shellMounted) {
       setState(() => _shellMounted = true);
     }
-    // On first launch, transition swiftly into the full-screen onboarding right after assembly!
-    if (_shouldShowOnboarding()) {
-      _dismissTimer?.cancel();
-      _dismissTimer = Timer(const Duration(milliseconds: 280), _beginSplashExit);
-      return;
-    }
-    // On subsequent launch: hold briefly while DSH core is still connecting (up to _maxHoldTimer),
-    // or glide smoothly into the ready workspace after giving GrassBagShell a frame to warm up!
     final s = ref.read(appProvider);
-    final coreStillWarming =
-        s.connectionPhase == ConnectionPhase.connecting ||
-        (s.activeHost.isLocal && s.nativeRuntimeStatus.engineState == 'starting');
-    if (!coreStillWarming) {
+    if (_isStartupHydrationSettled(s)) {
       _dismissTimer?.cancel();
-      _dismissTimer = Timer(const Duration(milliseconds: 420), _beginSplashExit);
+      _dismissTimer = Timer(const Duration(milliseconds: 260), _beginSplashExit);
     }
   }
 
@@ -652,10 +664,14 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
       }
     }
     setState(() {
-      _shellMounted = true;
+      if (goOnboarding) {
+        _stage = _GateStage.onboarding;
+      } else {
+        _shellMounted = true;
+      }
       _exitingSplash = true;
     });
-    _dismissTimer = Timer(const Duration(milliseconds: 400), () {
+    _dismissTimer = Timer(const Duration(milliseconds: 380), () {
       if (!mounted) return;
       setState(() {
         _stage = goOnboarding ? _GateStage.onboarding : _GateStage.ready;
@@ -666,30 +682,38 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
 
   @override
   Widget build(BuildContext context) {
-    // Watch connection phase while splash is visible so we dismiss right when DSH finishes waking up!
+    // Watch startup readiness while splash is visible so we dissolve right when engine + models + auth settle!
     if (_stage == _GateStage.splash) {
-      ref.listen<ConnectionPhase>(
-        appProvider.select((s) => s.connectionPhase),
+      ref.listen<(ConnectionPhase, String, bool)>(
+        appProvider.select(
+          (s) => (
+            s.connectionPhase,
+            s.nativeRuntimeStatus.engineState,
+            !s.hydratingDomains &&
+                (s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn),
+          ),
+        ),
         (prev, next) {
           if (_logoAssembled &&
               !_exitingSplash &&
-              next != ConnectionPhase.connecting) {
+              !_shouldShowOnboarding() &&
+              _isStartupHydrationSettled(ref.read(appProvider))) {
             _dismissTimer?.cancel();
-            _dismissTimer = Timer(const Duration(milliseconds: 220), _beginSplashExit);
+            _dismissTimer = Timer(const Duration(milliseconds: 180), _beginSplashExit);
           }
         },
       );
     }
 
     final showOnboarding = _stage == _GateStage.onboarding;
+    final showSplash = _stage == _GateStage.splash || _exitingSplash;
 
     return Stack(
       children: [
-        // Main shell mounts 180ms after Frame 0 paints so Android's OS splash lifts immediately
-        // onto our pure-Canvas 120fps kinetic logo while Liquid Glass shaders & DSH warm up behind it!
+        // Main shell mounts ONLY for returning users (or after onboarding completes)
         if (_shellMounted) const GrassBagShell(),
 
-        // Full-screen First-Launch Onboarding Experience
+        // Full-screen First-Launch Onboarding Experience (mounted BEFORE splash fades out -> zero flash!)
         if (showOnboarding)
           Positioned.fill(
             child: OnboardingPage(
@@ -705,13 +729,16 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
           ),
 
         // Subsequent-launch (and first-launch opening beat) Kinetic Logo Assembly Splash
-        if (_stage == _GateStage.splash)
+        if (showSplash)
           Positioned.fill(
-            child: _GrassBagSplashLayer(
-              exiting: _exitingSplash,
-              allowTapSkip: _allowManualSkip,
-              onLogoAssembled: _onLogoAssembled,
-              onTapSkip: _beginSplashExit,
+            child: IgnorePointer(
+              ignoring: _exitingSplash,
+              child: _GrassBagSplashLayer(
+                exiting: _exitingSplash,
+                allowTapSkip: _allowManualSkip,
+                onLogoAssembled: _onLogoAssembled,
+                onTapSkip: _beginSplashExit,
+              ),
             ),
           ),
       ],
@@ -743,6 +770,8 @@ class _GrassBagSplashLayer extends ConsumerWidget {
           hostName: s.activeHost.name,
           onboardingDone: s.onboardingCompleted,
           progressPct: s.runtimeProgressPct,
+          hydrated: !s.hydratingDomains &&
+              (s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn),
         ),
       ),
     );
@@ -752,17 +781,20 @@ class _GrassBagSplashLayer extends ConsumerWidget {
     if (!slice.onboardingDone) {
       statusText = '把 DeepSeek Harness 装进口袋';
       statusReady = false;
-    } else if (slice.phase == ConnectionPhase.connected) {
-      statusText = slice.isLocal ? '本机核心已就绪' : '已连接到 ${slice.hostName}';
+    } else if (slice.phase == ConnectionPhase.connected && slice.hydrated) {
+      statusText = slice.isLocal ? '本机核心与模型已就绪' : '已连接到 ${slice.hostName}';
       statusReady = true;
+    } else if (slice.phase == ConnectionPhase.connected) {
+      statusText = '正在同步模型与账号状态…';
+      statusReady = false;
     } else if (slice.progressPct > 0 && slice.progressPct < 100) {
       statusText = '正在部署本机环境 ${slice.progressPct}%…';
       statusReady = false;
     } else if (slice.phase == ConnectionPhase.connecting) {
-      statusText = slice.isLocal ? '正在唤醒本机 DSH 核心…' : '正在连接 ${slice.hostName}…';
+      statusText = slice.isLocal ? '正在唤醒本机容器与 DSH 核心…' : '正在连接 ${slice.hostName}…';
       statusReady = false;
     } else {
-      statusText = '正在进入工作台…';
+      statusText = '正在准备你的工作台…';
       statusReady = false;
     }
 
@@ -776,7 +808,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
           duration: const Duration(milliseconds: 360),
           curve: Curves.easeOutCubic,
           child: AnimatedScale(
-            scale: exiting ? 1.06 : 1.0,
+            scale: exiting ? 1.04 : 1.0,
             duration: const Duration(milliseconds: 380),
             curve: Curves.easeOutCubic,
             child: DecoratedBox(
@@ -785,8 +817,8 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
                 colors: t.isDark
-                    ? const [Color(0xFF0A1118), Color(0xFF0E1821), Color(0xFF091017)]
-                    : const [Color(0xFFF3F7FB), Color(0xFFEDF4FA), Color(0xFFE7F0F7)],
+                    ? const [Color(0xFF1C2536), Color(0xFF192130), Color(0xFF151D2B)]
+                    : const [Color(0xFFEAF3FC), Color(0xFFEDF4FB), Color(0xFFE7EFFA)],
               ),
             ),
             child: Stack(

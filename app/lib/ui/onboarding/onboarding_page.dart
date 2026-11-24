@@ -38,7 +38,7 @@ class OnboardingPage extends ConsumerStatefulWidget {
 }
 
 class _OnboardingPageState extends ConsumerState<OnboardingPage>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   final PageController _pageCtrl = PageController();
   late final AnimationController _ambientCtrl;
   late final AnimationController _welcomeEntranceCtrl;
@@ -55,6 +55,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ambientCtrl = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 12),
@@ -64,9 +65,21 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
       duration: const Duration(milliseconds: 920),
     )..forward();
     _pageCtrl.addListener(_onPageScroll);
-    // Default to remote mode on non-Android platforms where local container doesn't exist.
     if (!_isAndroidDevice) {
       _selectedMode = 1;
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          unawaited(ref.read(appProvider.notifier).refreshPermissionsOnly());
+        }
+      });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _isAndroidDevice && mounted) {
+      unawaited(ref.read(appProvider.notifier).refreshPermissionsOnly());
     }
   }
 
@@ -80,6 +93,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pageCtrl.removeListener(_onPageScroll);
     _pageCtrl.dispose();
     _ambientCtrl.dispose();
@@ -163,7 +177,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
           connectionPhase: s.connectionPhase,
           routableCount: s.routableProviders.length,
           selectedModel: s.modelName,
-          accessibilityEnabled: s.nativePermissions.accessibilityEnabled,
+          nativePermissions: s.nativePermissions,
         ),
       ),
     );
@@ -348,7 +362,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                         slice.activeHost,
                         slice.routableCount,
                         slice.selectedModel,
-                        slice.accessibilityEnabled,
+                        slice.nativePermissions,
                       ),
                     ],
                   ),
@@ -431,10 +445,10 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                         ),
                       ),
                     ),
-                    const GrassBagAnimatedLogo(
+                    GrassBagAnimatedLogo(
                       size: 108,
-                      duration: Duration(milliseconds: 1120),
-                      autoPlay: true,
+                      duration: const Duration(milliseconds: 1120),
+                      autoPlay: !widget.isFirstLaunch,
                       ambientFloat: true,
                     ),
                   ],
@@ -803,7 +817,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     ManagedHost activeHost,
     int routableCount,
     String selectedModel,
-    bool accessibilityEnabled,
+    NativePermissionsStatus perms,
   ) {
     final allReady = envReady && modelReady;
     return SingleChildScrollView(
@@ -966,44 +980,113 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       ),
                     ],
 
-                    // 3. Optional Android Accessibility Row
+                    // 3. Inline Android System Permissions Setup (Accessibility, Overlay, Battery, Notifications, Storage)
                     if (_isAndroidDevice) ...[
                       Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 11),
+                        padding: const EdgeInsets.symmetric(vertical: 12),
                         child: Divider(height: 0.5, color: t.sep),
                       ),
-                      _ReadyStatusRow(
-                        done: accessibilityEnabled,
-                        optional: true,
-                        icon: CupertinoIcons.hand_draw_fill,
-                        title: accessibilityEnabled
-                            ? '手机操控权限已开启'
-                            : '手机操控权限（可选）',
-                        subtitle: accessibilityEnabled
-                            ? '无障碍服务运行中，支持安全护栏下的原生界面操控'
-                            : '如需让 AI 自动点击或操作其他 App，可按需授权无障碍服务',
-                        trailing: accessibilityEnabled
-                            ? null
-                            : GrassBagSpringTap(
-                                onTap: _openPermissionsSettings,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 10, vertical: 5),
-                                  decoration: BoxDecoration(
-                                    color: t.fill1,
-                                    borderRadius: BorderRadius.circular(10),
-                                    border: Border.all(color: t.sep, width: 0.6),
-                                  ),
-                                  child: Text(
-                                    '按需开启',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w500,
-                                      color: t.text2,
-                                    ),
-                                  ),
-                                ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '手机权限与操控授权（可按需跳过）',
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w600,
+                                color: t.text2,
                               ),
+                            ),
+                          ),
+                          Text(
+                            '已授权 ${perms.grantedCoreCount}/6',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: perms.accessibilityEnabled ? t.ok : t.text3,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      _OnboardingPermissionTile(
+                        done: perms.accessibilityEnabled,
+                        warn: perms.accessibilityNeedsRetoggle,
+                        icon: CupertinoIcons.hand_draw_fill,
+                        title: perms.accessibilityEnabled
+                            ? '无障碍屏幕操控（已就绪）'
+                            : (perms.accessibilityNeedsRetoggle ? '无障碍服务需重开' : '无障碍屏幕操控'),
+                        subtitle: perms.accessibilityEnabled
+                            ? '支持跨应用悬浮确认卡、读屏与原生自动操控'
+                            : (perms.sdkInt >= 33
+                                ? 'Android 13+ 若灰显，先点右侧「应用详情」右上角允许受限设置'
+                                : '开启后 AI 可在安全护栏下跨应用操作手机'),
+                        actionLabel: perms.accessibilityEnabled ? '已开启' : '去开启',
+                        secondaryLabel: (!perms.accessibilityEnabled && perms.sdkInt >= 33) ? '应用详情' : null,
+                        onSecondaryTap: () => GrassBagNativeBridge.instance.openPermissionSettings('app_details'),
+                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('accessibility'),
+                      ),
+                      const SizedBox(height: 8),
+                      _OnboardingPermissionTile(
+                        done: perms.overlayGranted,
+                        icon: CupertinoIcons.layers_alt_fill,
+                        title: '悬浮窗权限',
+                        subtitle: '辅助显示液态玻璃悬浮岛与外部确认弹窗',
+                        actionLabel: perms.overlayGranted ? '已授权' : '去授权',
+                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('overlay'),
+                      ),
+                      const SizedBox(height: 8),
+                      _OnboardingPermissionTile(
+                        done: perms.batteryOptIgnored,
+                        icon: CupertinoIcons.battery_100,
+                        title: '忽略电池优化（后台保活）',
+                        subtitle: '防止切到其他 App 时系统杀死容器或无障碍服务',
+                        actionLabel: perms.batteryOptIgnored ? '已豁免' : '去设置',
+                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('battery'),
+                      ),
+                      const SizedBox(height: 8),
+                      _OnboardingPermissionTile(
+                        done: perms.notificationsGranted,
+                        icon: CupertinoIcons.bell_fill,
+                        title: '通知提醒权限',
+                        subtitle: '任务完成提醒与前台服务常驻保活',
+                        actionLabel: perms.notificationsGranted ? '已允许' : '一键授权',
+                        onTap: () => unawaited(
+                          ref.read(appProvider.notifier).requestRuntimePermission('notifications'),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      _OnboardingPermissionTile(
+                        done: perms.allFilesGranted,
+                        icon: CupertinoIcons.folder_fill,
+                        title: '手机公共存储访问',
+                        subtitle: '让容器与 AI 直接整理下载目录与手机文档',
+                        actionLabel: perms.allFilesGranted ? '已允许' : '去开启',
+                        onTap: () {
+                          if (perms.sdkInt < 30) {
+                            unawaited(ref.read(appProvider.notifier).requestRuntimePermission('storage'));
+                          } else {
+                            unawaited(GrassBagNativeBridge.instance.openPermissionSettings('storage'));
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 6),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: GrassBagSpringTap(
+                          onTap: _openPermissionsSettings,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+                            child: Text(
+                              '查看完整权限中心 ›',
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: t.primary,
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ],
                   ],
@@ -1225,7 +1308,6 @@ class _ReadyStatusRow extends StatelessWidget {
     required this.icon,
     required this.title,
     required this.subtitle,
-    this.optional = false,
     this.trailing,
   });
 
@@ -1233,13 +1315,12 @@ class _ReadyStatusRow extends StatelessWidget {
   final IconData icon;
   final String title;
   final String subtitle;
-  final bool optional;
   final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final badgeColor = done ? t.ok : (optional ? t.text3 : t.primary);
+    final badgeColor = done ? t.ok : t.primary;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
@@ -1398,4 +1479,130 @@ class _OnboardingAmbientPainter extends CustomPainter {
       (oldDelegate.ambientPhase - ambientPhase).abs() > 0.015 ||
       oldDelegate.isDark != isDark ||
       oldDelegate.primary != primary;
+}
+
+class _OnboardingPermissionTile extends StatelessWidget {
+  const _OnboardingPermissionTile({
+    required this.done,
+    this.warn = false,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.actionLabel,
+    this.secondaryLabel,
+    this.onSecondaryTap,
+    required this.onTap,
+  });
+
+  final bool done;
+  final bool warn;
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final String actionLabel;
+  final String? secondaryLabel;
+  final VoidCallback? onSecondaryTap;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final accent = done ? t.ok : (warn ? t.err : t.primary);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+      decoration: BoxDecoration(
+        color: t.isDark
+            ? Colors.white.withValues(alpha: done ? 0.06 : 0.04)
+            : Colors.white.withValues(alpha: done ? 0.64 : 0.48),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: done
+              ? t.ok.withValues(alpha: 0.28)
+              : (warn ? t.err.withValues(alpha: 0.35) : t.sep),
+          width: 0.7,
+        ),
+      ),
+      child: Row(
+        children: [
+          GrassBagSquircleIcon(
+            icon: done ? CupertinoIcons.checkmark_alt : icon,
+            color: accent,
+            size: 32,
+            iconSize: 15,
+            filled: done,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: t.text,
+                  ),
+                ),
+                const SizedBox(height: 1.5),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    fontSize: 11,
+                    height: 1.32,
+                    color: t.text3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          if (secondaryLabel != null && onSecondaryTap != null) ...[
+            GrassBagSpringTap(
+              onTap: onSecondaryTap!,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                decoration: BoxDecoration(
+                  color: t.fill1,
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: t.sep, width: 0.6),
+                ),
+                child: Text(
+                  secondaryLabel!,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                    color: t.text2,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 5),
+          ],
+          GrassBagSpringTap(
+            onTap: onTap,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: done ? t.okSoft : (warn ? t.errSoft : t.primarySoft),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: accent.withValues(alpha: 0.26),
+                  width: 0.6,
+                ),
+              ),
+              child: Text(
+                actionLabel,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600,
+                  color: accent,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

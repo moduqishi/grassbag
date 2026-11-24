@@ -884,85 +884,70 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     _scrollTabToBottomAndFocus(tab);
   }
 
-  void _openMoreSheet() {
-    showGrassBagSheet(
-      context,
-      title: '终端选项',
-      bodyBuilder: (ctx) {
-        final t = GrassBagTokens.of(ctx);
-        final activeTab = _tabs[_activeIndex];
-        return GrassBagSheetSection(
-          children: [
-            GrassBagListTile(
-              title: const Text('运行环境'),
-              trailing: Text(
-                switch (activeTab.backend) {
-                  _TermBackend.remoteWs => '实时远程 PTY',
-                  _TermBackend.androidLocal => 'Android 本机 Shell',
-                  _TermBackend.simulated =>
-                    ref.read(appProvider).activeHost.isLocal ? '未连接本机引擎' : '等待连接远程主机',
-                },
-                style: TextStyle(fontSize: 12.5, color: t.ok, fontWeight: FontWeight.w600),
-              ),
+  void _openMoreSheet({Offset? anchor}) {
+    final activeTab = _tabs[_activeIndex];
+    final tier = ref.read(appProvider).glassTier;
+    final media = MediaQuery.of(context);
+    final envLabel = switch (activeTab.backend) {
+      _TermBackend.remoteWs => '实时远程 PTY',
+      _TermBackend.androidLocal => 'Android 本机 Shell',
+      _TermBackend.simulated =>
+        ref.read(appProvider).activeHost.isLocal ? '未连接本机引擎' : '等待连接远程主机',
+    };
+    unawaited(
+      showGrassBagGlassContextMenu(
+        context,
+        tier: tier,
+        globalAnchor: anchor ?? Offset(media.size.width - 24, media.viewPadding.top + 62),
+        headerTitle: '终端选项 · $envLabel',
+        items: [
+          if (activeTab.terminalController.selection != null)
+            GrassBagContextMenuItem(
+              label: '复制选中文本',
+              icon: CupertinoIcons.doc_on_doc,
+              onTap: () => unawaited(_copySelection()),
             ),
-            GrassBagListTile(
-              title: const Text('字号大小'),
-              trailing: Text('${_fontSize.toStringAsFixed(1)} pt', style: TextStyle(color: t.text3)),
-              onTap: () {
-                setState(() {
-                  _fontSize = _fontSize == 12.5 ? 14.0 : (_fontSize == 14.0 ? 11.0 : 12.5);
-                });
-                Navigator.of(ctx).pop();
-              },
+          GrassBagContextMenuItem(
+            label: '粘贴剪贴板',
+            icon: CupertinoIcons.doc_on_clipboard,
+            onTap: () => unawaited(_pasteClipboard()),
+          ),
+          GrassBagContextMenuItem(
+            label: '字号大小 (${_fontSize.toStringAsFixed(1)} pt)',
+            subtitle: '点击循环切换 11 / 12.5 / 14 pt',
+            icon: CupertinoIcons.textformat_size,
+            onTap: () {
+              setState(() {
+                _fontSize = _fontSize == 12.5 ? 14.0 : (_fontSize == 14.0 ? 11.0 : 12.5);
+              });
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: '清屏',
+            icon: CupertinoIcons.sparkles,
+            dividerBefore: true,
+            onTap: () {
+              activeTab.terminal.write('\x1b[2J\x1b[H');
+              if (activeTab.backend == _TermBackend.simulated) {
+                activeTab.terminal.write('\x1b[32m${activeTab.cwd} ❯\x1b[0m ');
+              }
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: '重启当前终端',
+            icon: CupertinoIcons.refresh,
+            onTap: _restartActiveTab,
+          ),
+          if (_tabs.length > 1)
+            GrassBagContextMenuItem(
+              label: '关闭当前标签',
+              icon: CupertinoIcons.xmark_circle_fill,
+              destructive: true,
+              dividerBefore: true,
+              onTap: () => _closeTabAt(_activeIndex),
             ),
-            GrassBagListTile(
-              title: const Text('粘贴剪贴板'),
-              trailing: Icon(CupertinoIcons.doc_on_clipboard, size: 17, color: t.primary),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                unawaited(_pasteClipboard());
-              },
-            ),
-            if (activeTab.terminalController.selection != null)
-              GrassBagListTile(
-                title: const Text('复制选中文本'),
-                trailing: Icon(CupertinoIcons.doc_on_doc, size: 17, color: t.primary),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  unawaited(_copySelection());
-                },
-              ),
-            GrassBagListTile(
-              title: const Text('清屏'),
-              trailing: Icon(CupertinoIcons.sparkles, size: 17, color: t.text3),
-              onTap: () {
-                activeTab.terminal.write('\x1b[2J\x1b[H');
-                if (activeTab.backend == _TermBackend.simulated) {
-                  activeTab.terminal.write('\x1b[32m${activeTab.cwd} ❯\x1b[0m ');
-                }
-                Navigator.of(ctx).pop();
-              },
-            ),
-            GrassBagListTile(
-              title: const Text('重启当前终端'),
-              trailing: Icon(CupertinoIcons.refresh, size: 17, color: t.primary),
-              onTap: () {
-                Navigator.of(ctx).pop();
-                _restartActiveTab();
-              },
-            ),
-            if (_tabs.length > 1)
-              GrassBagListTile(
-                title: Text('关闭当前标签', style: TextStyle(color: t.err)),
-                trailing: Icon(CupertinoIcons.xmark_circle_fill, size: 18, color: t.err),
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _closeTabAt(_activeIndex);
-                },
-              ),
-          ],
-        );
-      },
+        ],
+      ),
     );
   }
 
@@ -1222,12 +1207,8 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                                   controller: item.terminalController,
                                                   scrollController: item.scrollController,
                                                   focusNode: item.focusNode,
-                                            onSecondaryTapDown: (_, __) {
-                                              if (item.terminalController.selection != null) {
-                                                unawaited(_copySelection());
-                                              } else {
-                                                unawaited(_pasteClipboard());
-                                              }
+                                            onSecondaryTapDown: (details, _) {
+                                              _openMoreSheet(anchor: details.globalPosition);
                                             },
                                             deleteDetection: !kIsWeb &&
                                                 (defaultTargetPlatform == TargetPlatform.android ||

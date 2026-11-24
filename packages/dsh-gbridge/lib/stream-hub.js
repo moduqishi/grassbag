@@ -364,6 +364,18 @@ export class StreamHub {
           const oldestCh = this.latestSnapshots.keys().next().value;
           if (oldestCh !== undefined) this.latestSnapshots.delete(oldestCh);
         }
+      } else if (
+        channel.startsWith('session:') &&
+        (type === 'turn.start' ||
+          type === 'turn.completed' ||
+          type === 'turn.cancelled' ||
+          type === 'turn.error' ||
+          type === 'session.event' ||
+          type === 'projection.updated')
+      ) {
+        // Invalidate cached initial turn.snapshot once newer durable session frames arrive
+        // so re-subscribing during the 8s grace window never rewinds the client to an old turn!
+        this.latestSnapshots.delete(channel);
       }
     }
 

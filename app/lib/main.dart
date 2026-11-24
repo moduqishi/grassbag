@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import 'data/grassbag_storage.dart';
+import 'services/native_bridge.dart';
 import 'state/app_state.dart';
 import 'theme/grassbag_glass.dart';
 import 'theme/grassbag_theme.dart';
@@ -14,19 +17,31 @@ import 'ui/shell/grassbag_shell.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-  // Preload persisted theme/accent/glass preferences synchronously before Frame 0
-  // so dark mode & accent render immediately without a cold-start color-lerp flash.
+  // Preload ONLY fast SharedPreferences (~2-4ms) before Frame 0 so the OS splash lifts
+  // immediately onto our pure-Canvas kinetic logo with exact saved theme/onboarding polarity,
+  // while GLSL shader compilation warms up off the critical Frame-0 path!
   final results = await Future.wait<Object?>([
     GrassBagStorage.instance.loadPrefs(),
+    GrassBagStorage.instance.loadSavedHosts(),
+  ]);
+  final preloaded = results[0];
+  if (preloaded is Map<String, dynamic>) {
+    GrassBagController.preloadedInitialPrefs = preloaded;
+    if (preloaded['isDark'] is bool) {
+      unawaited(GrassBagNativeBridge.instance.syncThemeMode(preloaded['isDark'] as bool));
+    }
+  }
+  final preloadedHosts = results[1];
+  if (preloadedHosts is List<Map<String, dynamic>>) {
+    GrassBagController.preloadedInitialHosts = preloadedHosts;
+  }
+
+  unawaited(
     LiquidGlassWidgets.initialize(
       warmUpMode: GlassWarmUpMode.auto,
       enablePerformanceMonitor: false,
     ),
-  ]);
-  final preloaded = results.first;
-  if (preloaded is Map<String, dynamic>) {
-    GrassBagController.preloadedInitialPrefs = preloaded;
-  }
+  );
 
   runApp(
     const ProviderScope(

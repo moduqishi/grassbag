@@ -8,6 +8,7 @@ import android.net.LocalSocketAddress
 import android.net.Uri
 import android.os.Process
 import android.provider.AlarmClock
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
@@ -18,9 +19,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Private 0600 Unix Domain Socket HTTP daemon serving `dsh-gbridge/lib/phone-tools.js`.
- * Speaks exact JSON-over-HTTP wire protocol:
- *   POST /v1/tool      (Authorization: Bearer <token>)
- *   POST /v1/turn-end  (Authorization: Bearer <token>)
+ *
+ * Handles native SafetyGate enforcement, out-of-app Liquid Glass confirmation/handoff cards
+ * via [PhoneOverlayController] (`TYPE_ACCESSIBILITY_OVERLAY`), live Dynamic Island HUD updates,
+ * pause/resume waiting, and rich phone tools (`phone_screen`, `phone_screenshot`, `phone_apps`,
+ * `phone_open`, `phone_tap`, `phone_long_press`, `phone_swipe`, `phone_type`, `phone_key`,
+ * `phone_intent`, `phone_wait`, `phone_handoff`).
  */
 class PhoneControlDaemon(
     private val context: Context,
@@ -44,7 +48,6 @@ class PhoneControlDaemon(
             socketFile.setWritable(false, false)
             socketFile.setReadable(true, true)
             socketFile.setWritable(true, true)
-            // Keep strong reference to bindSocket so GC cannot finalize/close its FD underneath serverSocket.
             boundSocket = bindSocket
             serverSocket = LocalServerSocket(bindSocket.fileDescriptor)
             pool.execute { acceptLoop() }
@@ -82,7 +85,8 @@ class PhoneControlDaemon(
     private fun handleClient(client: LocalSocket) {
         client.use { sock ->
             try {
-                sock.soTimeout = 15_000
+                // Generous timeout covering 35s confirmation cards & 180s handoff cards.
+                sock.soTimeout = 195_000
                 val peerUid = runCatching { sock.peerCredentials.uid }.getOrDefault(-1)
                 if (peerUid != Process.myUid()) {
                     writeJson(sock.outputStream, 403, JSONObject().put("error", JSONObject().put("message", "forbidden_peer_uid")))
@@ -99,9 +103,9 @@ class PhoneControlDaemon(
                 when (req.path) {
                     "/v1/turn-end" -> {
                         val sid = body.optString("sessionId").ifBlank { null }
-                        SafetyGate.endTurn(sid)
-                        if (!SafetyGate.hasActiveTurn()) {
-                            GrassBagAccessibilityService.current()?.hideEmergencyStopOverlay()
+                        val endedPhoneTurn = SafetyGate.endTurn(sid)
+                        if (endedPhoneTurn && !SafetyGate.hasActiveTurn()) {
+                            PhoneOverlayController.getInstance(context).dismissAll()
                         }
                         onEvent("phone_turn_end", mapOf(
                             "sessionId" to (sid ?: ""),
@@ -114,14 +118,24 @@ class PhoneControlDaemon(
                         val args = body.optJSONObject("args") ?: JSONObject()
                         val caller = body.optJSONObject("caller")
                         val userApproved = body.optBoolean("userApproved", false)
+                        val permissionPreset = body.optString("permissionPreset", "").ifBlank { null }
                         val turnId = if (caller == null || caller.isNull("turnId")) null else caller.optString("turnId").ifBlank { null }
                         val sessionId = if (caller == null || caller.isNull("sessionId")) null else caller.optString("sessionId").ifBlank { null }
-                        SafetyGate.beginTurn(turnId, sessionId)
-                        val res = dispatchTool(tool, args, userApproved)
-                        val blocked = res.optBoolean("blocked", false)
-                        if (!blocked && res.optBoolean("ok", false)) {
-                            GrassBagAccessibilityService.current()?.showEmergencyStopOverlay("GrassBag 操控中 · 点击急停")
+
+                        // If user tapped 暂停 on the floating HUD, wait smoothly until 继续 or 急停!
+                        while (SafetyGate.isPaused() && !SafetyGate.isEmergencyStopped()) {
+                            runCatching { Thread.sleep(150L) }
                         }
+
+                        val res = dispatchTool(
+                            tool = tool,
+                            args = args,
+                            sessionId = sessionId,
+                            turnId = turnId,
+                            permissionPreset = permissionPreset,
+                            userApproved = userApproved
+                        )
+                        val blocked = res.optBoolean("blocked", false)
                         val status = if (blocked) 403 else 200
                         writeJson(out, status, res)
                     }
@@ -149,28 +163,288 @@ class PhoneControlDaemon(
             .put(
                 "hint",
                 if (settingOn) {
-                    "无障碍开关已开但系统服务未绑定，请在系统无障碍设置中关闭再重新开启「GrassBag 手机操控助手」，并在权限中心授予忽略电池优化。"
+                    "无障碍开关已开但系统服务未绑定，请在系统无障碍设置中关闭再重新开启「GrassBag 手机操控助手」，并在权限管理授予忽略电池优化。"
                 } else {
                     "请前往 GrassBag「设置 → 权限管理」开启无障碍服务（Android 13+ 侧载应用需先在应用详情右上角允许受限设置）。"
                 }
             )
     }
 
-    private fun dispatchTool(tool: String, args: JSONObject, userApproved: Boolean = false): JSONObject {
+    /**
+     * Evaluates SafetyGate and, when confirmation is needed, blocks directly on our native
+     * out-of-app Liquid Glass confirmation card (`TYPE_ACCESSIBILITY_OVERLAY`) so it works
+     * cleanly over ANY app in BOTH `工作区内修改` and `完全权限` modes!
+     */
+    private fun gateAndConfirm(
+        tool: String,
+        targetPackage: String?,
+        targetAppLabel: String?,
+        actionSummary: String,
+        hudActionLabel: String,
+        sessionId: String?,
+        turnId: String?,
+        permissionPreset: String?,
+        targetLabel: String? = null,
+        isSensitiveTarget: Boolean = false,
+        userApproved: Boolean = false
+    ): JSONObject? {
+        val verdict = SafetyGate.evaluateAction(
+            tool = tool,
+            targetPackage = targetPackage,
+            sessionId = sessionId,
+            turnId = turnId,
+            permissionPreset = permissionPreset,
+            targetLabel = targetLabel,
+            isSensitiveTarget = isSensitiveTarget,
+            userApproved = userApproved
+        )
+        val overlay = PhoneOverlayController.getInstance(context)
+        when (verdict) {
+            is SafetyGate.ActionVerdict.Deny -> {
+                return JSONObject()
+                    .put("ok", false)
+                    .put("blocked", true)
+                    .put("reason", verdict.reason)
+                    .apply { if (!verdict.hint.isNullOrBlank()) put("hint", verdict.hint) }
+            }
+            is SafetyGate.ActionVerdict.Allow -> {
+                SafetyGate.beginTurn(turnId, sessionId)
+                overlay.showOrUpdateHud(
+                    actionLabel = hudActionLabel,
+                    appLabel = targetAppLabel ?: targetPackage
+                )
+                return null
+            }
+            is SafetyGate.ActionVerdict.NeedConfirm -> {
+                SafetyGate.beginTurn(turnId, sessionId)
+                val decision = overlay.confirm(
+                    title = "GrassBag 请求操控手机",
+                    actionSummary = actionSummary,
+                    appLabel = targetAppLabel ?: targetPackage,
+                    riskBadge = verdict.riskBadge,
+                    allowTurnOption = verdict.allowTurnOption,
+                    timeoutMs = 35_000L
+                )
+                return when (decision) {
+                    PhoneOverlayController.ConfirmDecision.ALLOW_ONCE -> {
+                        SafetyGate.recordAudit(tool, targetPackage ?: "screen", true, "allowed:native_overlay_once")
+                        overlay.showOrUpdateHud(
+                            actionLabel = hudActionLabel,
+                            appLabel = targetAppLabel ?: targetPackage
+                        )
+                        null
+                    }
+                    PhoneOverlayController.ConfirmDecision.ALLOW_TURN -> {
+                        SafetyGate.grantTurnAllow(sessionId, turnId)
+                        overlay.showOrUpdateHud(
+                            actionLabel = hudActionLabel,
+                            appLabel = targetAppLabel ?: targetPackage
+                        )
+                        null
+                    }
+                    PhoneOverlayController.ConfirmDecision.DENY -> {
+                        SafetyGate.recordAudit(tool, targetPackage ?: "screen", false, "user_cancelled_step")
+                        JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "user_cancelled")
+                            .put("hint", "用户取消了这一步操作，请尊重用户决定，不要强行重试。")
+                    }
+                    PhoneOverlayController.ConfirmDecision.STOP -> {
+                        JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "emergency_stop_active")
+                            .put("hint", "用户在悬浮卡片选择了急停任务，请立即停止后续手机操控。")
+                    }
+                    PhoneOverlayController.ConfirmDecision.TIMEOUT -> {
+                        SafetyGate.recordAudit(tool, targetPackage ?: "screen", false, "confirm_timeout")
+                        JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "confirm_timeout")
+                            .put("hint", "确认弹窗已超时未响应，操作未执行。")
+                    }
+                    PhoneOverlayController.ConfirmDecision.UNAVAILABLE -> {
+                        // Overlay unavailable (neither Accessibility nor SYSTEM_ALERT_WINDOW is active):
+                        // give crystal-clear guidance instead of silent deadlock.
+                        JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "overlay_unavailable")
+                            .put("hint", "无法在当前界面显示悬浮确认卡片。请前往「设置 → 权限管理」开启无障碍服务（或悬浮窗权限），或在对话左下角将权限切为「完全权限」。")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun resolveAppByNameOrPackage(rawPkg: String, rawAppName: String): Pair<String, String>? {
+        val pm = context.packageManager
+        if (rawPkg.isNotBlank()) {
+            val intent = pm.getLaunchIntentForPackage(rawPkg)
+            if (intent != null) {
+                val label = runCatching {
+                    pm.getApplicationLabel(pm.getApplicationInfo(rawPkg, 0)).toString()
+                }.getOrDefault(rawPkg)
+                return rawPkg to label
+            }
+        }
+        val query = rawAppName.ifBlank { rawPkg }.trim().lowercase()
+        if (query.isEmpty()) return null
+        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val apps = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+        var exact: Pair<String, String>? = null
+        var partial: Pair<String, String>? = null
+        for (ri in apps) {
+            val pkg = ri.activityInfo?.packageName ?: continue
+            val label = runCatching { ri.loadLabel(pm)?.toString() }.getOrNull()?.trim().orEmpty()
+            val labelLower = label.lowercase()
+            val pkgLower = pkg.lowercase()
+            if (labelLower == query || pkgLower == query) {
+                exact = pkg to label.ifBlank { pkg }
+                break
+            }
+            if (partial == null && (labelLower.contains(query) || query.contains(labelLower) && labelLower.length >= 2 || pkgLower.contains(query))) {
+                partial = pkg to label.ifBlank { pkg }
+            }
+        }
+        return exact ?: partial
+    }
+
+    private fun listLaunchableApps(query: String): JSONObject {
+        val pm = context.packageManager
+        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val activities = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+        val q = query.trim().lowercase()
+        val seen = HashSet<String>()
+        val arr = JSONArray()
+        for (ri in activities) {
+            val pkg = ri.activityInfo?.packageName ?: continue
+            if (!seen.add(pkg)) continue
+            if (pkg == "dev.grassbag.grassbag") continue
+            val label = runCatching { ri.loadLabel(pm)?.toString() }.getOrNull()?.trim().orEmpty()
+            if (q.isNotEmpty() && !label.lowercase().contains(q) && !pkg.lowercase().contains(q)) {
+                continue
+            }
+            arr.put(
+                JSONObject()
+                    .put("name", label.ifBlank { pkg })
+                    .put("package", pkg)
+                    .put("blocked", SafetyGate.isPackageBlocked(pkg))
+            )
+            if (arr.length() >= 80) break
+        }
+        return JSONObject().put("ok", true).put("count", arr.length()).put("apps", arr)
+    }
+
+    private fun dispatchTool(
+        tool: String,
+        args: JSONObject,
+        sessionId: String?,
+        turnId: String?,
+        permissionPreset: String?,
+        userApproved: Boolean
+    ): JSONObject {
+        val overlay = PhoneOverlayController.getInstance(context)
         return when (tool) {
+            "phone_apps" -> {
+                val query = args.optString("query", "")
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = "launcher",
+                    targetAppLabel = "应用列表",
+                    actionSummary = "查询已安装应用列表",
+                    hudActionLabel = "查询应用列表",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                listLaunchableApps(query)
+            }
+            "phone_wait" -> {
+                val ms = args.optLong("ms", 1000L).coerceIn(100L, 10_000L)
+                overlay.showOrUpdateHud(actionLabel = "等待界面稳定…", incrementStep = false)
+                runCatching { Thread.sleep(ms) }
+                JSONObject().put("ok", true).put("waitedMs", ms)
+            }
             "phone_screen" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
-                val maxNodes = args.optInt("maxNodes", 120).coerceIn(10, 300)
+                val pkg = svc.currentForegroundPackage()
+                val appLabel = svc.resolveAppLabel(pkg)
+                if (pkg != "dev.grassbag.grassbag") {
+                    val denied = gateAndConfirm(
+                        tool = tool,
+                        targetPackage = pkg,
+                        targetAppLabel = appLabel,
+                        actionSummary = "读取屏幕界面",
+                        hudActionLabel = "读取当前屏幕",
+                        sessionId = sessionId,
+                        turnId = turnId,
+                        permissionPreset = permissionPreset,
+                        userApproved = userApproved
+                    )
+                    if (denied != null) return denied
+                }
+                val maxNodes = args.optInt("maxNodes", 140).coerceIn(10, 300)
                 svc.captureScreenTree(maxNodes)
             }
-            "phone_tap" -> {
+            "phone_screenshot" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
-                val x = args.optDouble("x", -1.0)
-                val y = args.optDouble("y", -1.0)
+                val pkg = svc.currentForegroundPackage()
+                val appLabel = svc.resolveAppLabel(pkg)
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = pkg,
+                    targetAppLabel = appLabel,
+                    actionSummary = "截取当前屏幕画面",
+                    hudActionLabel = "截取屏幕画面",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                svc.captureScreenshotBase64(
+                    maxWidth = args.optInt("maxWidth", 720).coerceIn(320, 1080),
+                    quality = args.optInt("quality", 68).coerceIn(35, 90)
+                )
+            }
+            "phone_tap", "phone_long_press" -> {
+                val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
+                val nodeId = args.optString("nodeId", "").trim()
+                val cachedNode = if (nodeId.isNotEmpty()) svc.getCachedNode(nodeId) else null
+                val x = cachedNode?.cx?.toDouble() ?: args.optDouble("x", -1.0)
+                val y = cachedNode?.cy?.toDouble() ?: args.optDouble("y", -1.0)
                 if (!x.isFinite() || !y.isFinite() || x < 0.0 || y < 0.0) {
-                    JSONObject().put("ok", false).put("reason", "valid non-negative finite x and y coordinates are required")
-                } else {
-                    svc.performTap(x.toFloat(), y.toFloat(), userApproved)
+                    return JSONObject().put("ok", false).put("reason", "valid nodeId or non-negative finite x, y coordinates are required")
+                }
+                val pkg = svc.currentForegroundPackage()
+                val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
+                val (inspectedLabel, hitsSensitive) = svc.inspectPointTarget(x.toFloat(), y.toFloat())
+                val elemLabel = cachedNode?.label ?: inspectedLabel
+                val isLong = tool == "phone_long_press"
+                val verb = if (isLong) "长按" else "点击"
+                val targetDesc = if (!elemLabel.isNullOrBlank()) "「$elemLabel」" else "位置 (${x.toInt()}, ${y.toInt()})"
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = pkg,
+                    targetAppLabel = appLabel,
+                    actionSummary = "在「$appLabel」中$verb$targetDesc",
+                    hudActionLabel = "$verb$targetDesc",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    targetLabel = elemLabel,
+                    isSensitiveTarget = hitsSensitive || (cachedNode?.sensitive == true),
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                val dur = if (isLong) args.optLong("durationMs", 650L).coerceIn(400L, 1800L) else 65L
+                svc.executeTapGesture(x.toFloat(), y.toFloat(), dur).apply {
+                    if (!elemLabel.isNullOrBlank()) put("label", elemLabel)
                 }
             }
             "phone_swipe" -> {
@@ -181,60 +455,158 @@ class PhoneControlDaemon(
                 val y2 = args.optDouble("y2", -1.0)
                 val dur = args.optLong("durationMs", 300L)
                 if (!x1.isFinite() || !y1.isFinite() || !x2.isFinite() || !y2.isFinite() || x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0) {
-                    JSONObject().put("ok", false).put("reason", "valid non-negative finite swipe coordinates are required")
-                } else {
-                    svc.performSwipe(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur, userApproved)
+                    return JSONObject().put("ok", false).put("reason", "valid non-negative finite swipe coordinates are required")
                 }
+                val pkg = svc.currentForegroundPackage()
+                val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = pkg,
+                    targetAppLabel = appLabel,
+                    actionSummary = "在「$appLabel」中滑动屏幕",
+                    hudActionLabel = "滑动屏幕",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                svc.executeSwipeGesture(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur)
             }
             "phone_key" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
-                svc.performSystemAction(args.optString("action", "back"), userApproved)
+                val action = args.optString("action", "back").lowercase()
+                val label = when (action) {
+                    "back" -> "返回上一页"
+                    "home" -> "回到手机桌面"
+                    "recents" -> "打开最近任务"
+                    "notifications" -> "展开通知栏"
+                    else -> "按系统键 $action"
+                }
+                val pkg = svc.currentForegroundPackage()
+                val targetForCheck = if (action == "home") "system_home" else pkg
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = targetForCheck,
+                    targetAppLabel = "系统导航",
+                    actionSummary = label,
+                    hudActionLabel = label,
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                svc.executeSystemAction(action)
             }
             "phone_type" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
-                svc.performType(args.optString("text", ""), userApproved)
+                val text = args.optString("text", "")
+                val pkg = svc.currentForegroundPackage()
+                val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
+                val (_, sensitive, fieldLabel) = svc.inspectFocusedInput()
+                val preview = if (text.length > 48) text.take(48) + "…" else text
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = pkg,
+                    targetAppLabel = appLabel,
+                    actionSummary = "在「$appLabel」中输入：\"$preview\"",
+                    hudActionLabel = "输入文本",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    targetLabel = fieldLabel,
+                    isSensitiveTarget = sensitive,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                svc.executeType(text)
             }
             "phone_open" -> {
-                val pkg = args.optString("package", "").trim()
+                val rawPkg = args.optString("package", "").trim()
+                val rawAppName = args.optString("appName", args.optString("name", "")).trim()
                 val url = args.optString("url", "").trim()
-                if (url.isNotEmpty() && pkg.isEmpty()) {
+                if (url.isNotEmpty() && rawPkg.isEmpty() && rawAppName.isEmpty()) {
                     val parsed = runCatching { Uri.parse(url) }.getOrNull()
                     val scheme = parsed?.scheme?.lowercase()
                     if (scheme != "http" && scheme != "https") {
                         return JSONObject().put("ok", false).put("blocked", true).put("reason", "disallowed_url_scheme")
                     }
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    val resolvedPkg = context.packageManager.resolveActivity(intent, 0)?.activityInfo?.packageName
+                        ?: return JSONObject().put("ok", false).put("reason", "no_browser_found")
+                    val denied = gateAndConfirm(
+                        tool = tool,
+                        targetPackage = resolvedPkg,
+                        targetAppLabel = "浏览器",
+                        actionSummary = "打开链接：$url",
+                        hudActionLabel = "打开网页链接",
+                        sessionId = sessionId,
+                        turnId = turnId,
+                        permissionPreset = permissionPreset,
+                        userApproved = userApproved
+                    )
+                    if (denied != null) return denied
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    val launchCtx: Context = GrassBagAccessibilityService.current() ?: context
+                    val err = runCatching { launchCtx.startActivity(intent) }.exceptionOrNull()
+                    return if (err != null) {
+                        JSONObject().put("ok", false).put("reason", "activity_launch_failed:${err.message}")
+                    } else {
+                        JSONObject().put("ok", true).put("opened", url).put("resolvedPackage", resolvedPkg)
+                    }
                 }
-                if (pkg.isNotEmpty() && SafetyGate.isPackageBlocked(pkg)) {
-                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
-                }
-                val intent = when {
-                    pkg.isNotEmpty() -> context.packageManager.getLaunchIntentForPackage(pkg)
-                    url.isNotEmpty() -> Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                    else -> null
-                } ?: return JSONObject().put("ok", false).put("reason", "target_not_found")
-                val resolvedPkg = context.packageManager.resolveActivity(intent, 0)?.activityInfo?.packageName
-                if (resolvedPkg.isNullOrBlank()) {
-                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "unresolved_target_activity_fail_closed")
-                }
-                val resolvedDecision = SafetyGate.evaluateToolCall("phone_open", resolvedPkg, userApproved = userApproved)
-                if (!resolvedDecision.allowed) {
-                    return JSONObject().put("ok", false).put("blocked", true).put("reason", resolvedDecision.reason)
-                }
+                val resolved = resolveAppByNameOrPackage(rawPkg, rawAppName)
+                    ?: return JSONObject()
+                        .put("ok", false)
+                        .put("reason", "target_app_not_found")
+                        .put("hint", "未找到对应应用「${rawAppName.ifBlank { rawPkg }}」，请先调用 phone_apps 查看设备已安装应用及其准确包名。")
+                val (resolvedPkg, resolvedLabel) = resolved
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = resolvedPkg,
+                    targetAppLabel = resolvedLabel,
+                    actionSummary = "打开应用「$resolvedLabel」",
+                    hudActionLabel = "打开「$resolvedLabel」",
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
+                val intent = context.packageManager.getLaunchIntentForPackage(resolvedPkg)
+                    ?: return JSONObject().put("ok", false).put("reason", "launch_intent_missing")
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 val launchCtx: Context = GrassBagAccessibilityService.current() ?: context
                 val launchErr = runCatching { launchCtx.startActivity(intent) }.exceptionOrNull()
                 if (launchErr != null) {
                     JSONObject().put("ok", false).put("reason", "activity_launch_failed:${launchErr.message ?: launchErr.javaClass.simpleName}")
                 } else {
-                    JSONObject().put("ok", true).put("opened", pkg.ifEmpty { url }).put("resolvedPackage", resolvedPkg)
+                    JSONObject().put("ok", true).put("opened", resolvedLabel).put("resolvedPackage", resolvedPkg)
                 }
             }
             "phone_intent" -> {
                 val kind = args.optString("kind", "")
-                val decision = SafetyGate.evaluateToolCall("phone_intent", kind, userApproved = userApproved)
-                if (!decision.allowed) {
-                    return JSONObject().put("ok", false).put("blocked", true).put("reason", decision.reason)
+                val summary = when (kind) {
+                    "alarm" -> "设置闹钟 ${args.optInt("hour", 8)}:${args.optInt("minute", 0).toString().padStart(2, '0')}"
+                    "timer" -> "启动计时器 ${args.optInt("seconds", 60)} 秒"
+                    "share" -> "调用系统分享文本"
+                    "navigation" -> "打开地图导航：${args.optString("query", args.optString("destination", ""))}"
+                    "calendar" -> "新建系统日程：${args.optString("title", args.optString("label", "日程"))}"
+                    else -> "执行系统快捷动作：$kind"
                 }
+                val denied = gateAndConfirm(
+                    tool = tool,
+                    targetPackage = "system_intent_$kind",
+                    targetAppLabel = "系统快捷指令",
+                    actionSummary = summary,
+                    hudActionLabel = summary,
+                    sessionId = sessionId,
+                    turnId = turnId,
+                    permissionPreset = permissionPreset,
+                    userApproved = userApproved
+                )
+                if (denied != null) return denied
                 val launchCtx: Context = GrassBagAccessibilityService.current() ?: context
                 runCatching {
                     when (kind) {
@@ -298,9 +670,25 @@ class PhoneControlDaemon(
                 }
             }
             "phone_handoff" -> {
-                val message = args.optString("message", "请接管完成当前敏感步骤")
+                val message = args.optString("message", "请手动完成当前敏感步骤，完成后点击继续")
                 onEvent("phone_handoff", mapOf("message" to message))
-                JSONObject().put("ok", true).put("handedOff", true).put("message", message)
+                val svc = GrassBagAccessibilityService.current()
+                val appLabel = svc?.resolveAppLabel(svc.currentForegroundPackage())
+                val decision = overlay.handoff(message = message, appLabel = appLabel, timeoutMs = 180_000L)
+                when (decision) {
+                    PhoneOverlayController.HandoffDecision.CONTINUE -> {
+                        JSONObject().put("ok", true).put("handedOff", true).put("userCompleted", true).put("message", message)
+                    }
+                    PhoneOverlayController.HandoffDecision.STOP -> {
+                        JSONObject().put("ok", false).put("blocked", true).put("reason", "user_stopped_during_handoff")
+                    }
+                    PhoneOverlayController.HandoffDecision.TIMEOUT -> {
+                        JSONObject().put("ok", false).put("reason", "handoff_timeout")
+                    }
+                    PhoneOverlayController.HandoffDecision.UNAVAILABLE -> {
+                        JSONObject().put("ok", true).put("handedOff", true).put("message", message)
+                    }
+                }
             }
             "phone_shell" -> {
                 JSONObject().put("ok", false).put("reason", "unsupported_shizuku_not_integrated")
@@ -374,7 +762,6 @@ class PhoneControlDaemon(
                         got += n
                     }
                     out.write(buf, 0, got)
-                    // Consume trailing CRLF after chunk
                     input.read()
                     input.read()
                 }

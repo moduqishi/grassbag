@@ -113,7 +113,13 @@ void main() {
     expect(sched.cronExpr, '0 9 * * 1-5');
     expect(sched.humanSchedule, '工作日 09:00');
     expect(sched.lastStatus, 'ok');
-    expect(sched.lastRunAt, '2026-11-24 01:00:00');
+    final expectedLocal = DateTime.parse('2026-11-24T01:00:00.000Z').toLocal();
+    String p2(int n) => n.toString().padLeft(2, '0');
+    expect(
+      sched.lastRunAt,
+      '${expectedLocal.year}-${p2(expectedLocal.month)}-${p2(expectedLocal.day)} '
+      '${p2(expectedLocal.hour)}:${p2(expectedLocal.minute)}',
+    );
 
     final everySched = ScheduleTaskRecord.fromJson({
       'id': 'schedule-2',

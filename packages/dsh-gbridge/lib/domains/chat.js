@@ -862,8 +862,26 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       sendJson(res, 200, { v: 1, goal: goal ?? null });
     } catch (err) {
       const msg = String(err?.message || '');
+      const code = String(err?.code || '');
       if (msg.includes('Unknown agent preset') || msg.includes('resume failed')) {
         sendJson(res, 200, { v: 1, goal: null, unavailablePreset: true });
+        return;
+      }
+      if (
+        code === 'GOAL_AGENT_NOT_LIVE' ||
+        msg.includes('GOAL_AGENT_NOT_LIVE') ||
+        msg.includes('not live') ||
+        msg.includes('not active')
+      ) {
+        // Cold/historical sessions store durable goal snapshots in `session/projections` under `values.goal`.
+        let projGoal = null;
+        if (gateway.has('session/projections')) {
+          const proj = await gateway
+            .call('session/projections', { request: { sessionId: params.id } }, { peer })
+            .catch(() => gateway.call('session/projections', { sessionId: params.id }, { peer }).catch(() => null));
+          projGoal = proj?.values?.goal ?? proj?.goal ?? null;
+        }
+        sendJson(res, 200, { v: 1, goal: projGoal });
         return;
       }
       throw err;

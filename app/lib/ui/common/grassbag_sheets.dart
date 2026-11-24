@@ -142,6 +142,7 @@ class _GrassBagToastOverlayState extends ConsumerState<GrassBagToastOverlay> {
               ),
               child: SelectableText(
                 fullText,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                 style: TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 12.2,
@@ -423,70 +424,62 @@ Future<bool> showGrassBagConfirmDialog(
               child: GrassBagGlass(
                 tier: tier,
                 borderRadius: 28,
+                elevated: true,
                 useSheetSettings: true,
-                padding: EdgeInsets.zero,
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(28),
-                    color: t.isDark
-                        ? const Color(0xCC1B2432)
-                        : Colors.white.withValues(alpha: 0.78),
-                  ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
+                padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: -0.3,
+                        color: t.text,
+                      ),
+                    ),
+                    if (message.trim().isNotEmpty) ...[
+                      const SizedBox(height: 8),
                       Text(
-                        title,
+                        message,
                         style: TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: -0.3,
-                          color: t.text,
+                          fontSize: 13.5,
+                          height: 1.48,
+                          color: t.text2,
                         ),
                       ),
-                      if (message.trim().isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          message,
-                          style: TextStyle(
-                            fontSize: 13.5,
-                            height: 1.48,
-                            color: t.text2,
+                    ],
+                    const SizedBox(height: 20),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: GrassBagSecondaryGlassButton(
+                            label: cancelLabel,
+                            height: 42,
+                            tier: tier,
+                            insideGlass: true,
+                            onTap: () => Navigator.of(dialogCtx).pop(false),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: GrassBagPrimaryGlassButton(
+                            label: confirmLabel,
+                            height: 42,
+                            tier: tier,
+                            insideGlass: true,
+                            color: isDestructive
+                                ? (t.isDark ? const Color(0xFFD94444) : t.err)
+                                : t.primary,
+                            foregroundColor: isDestructive ? Colors.white : t.onPrimary,
+                            onTap: () => Navigator.of(dialogCtx).pop(true),
                           ),
                         ),
                       ],
-                      const SizedBox(height: 20),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: GrassBagSecondaryGlassButton(
-                              label: cancelLabel,
-                              height: 42,
-                              tier: tier,
-                              insideGlass: true,
-                              onTap: () => Navigator.of(dialogCtx).pop(false),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: GrassBagPrimaryGlassButton(
-                              label: confirmLabel,
-                              height: 42,
-                              tier: tier,
-                              insideGlass: true,
-                              color: isDestructive
-                                  ? (t.isDark ? const Color(0xFFD94444) : t.err)
-                                  : t.primary,
-                              foregroundColor: isDestructive ? Colors.white : t.onPrimary,
-                              onTap: () => Navigator.of(dialogCtx).pop(true),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -3525,7 +3518,8 @@ void showCommandOutputSheet(
                       child: SingleChildScrollView(
                         padding: const EdgeInsets.all(14),
                         child: SelectionArea(
-                          child: Column(
+            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               for (final line in rawLines)
@@ -4045,6 +4039,7 @@ class _DeliverablePreviewBodyState extends ConsumerState<_DeliverablePreviewBody
                       : SingleChildScrollView(
                           child: SelectableText(
                             _textContent!.isEmpty ? '（文件内容为空）' : _textContent!,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                             style: TextStyle(
                               fontFamily: 'monospace',
                               fontSize: 12,
@@ -4301,17 +4296,14 @@ void showImagePreviewDialog(
                     ),
                   ),
                   const SizedBox(width: 10),
-                  GestureDetector(
+                  GrassBagGlassCircleButton(
+                    icon: CupertinoIcons.xmark,
+                    size: 38,
+                    iconSize: 16,
+                    iconColor: Colors.white,
+                    tooltip: '关闭预览',
+                    tier: GrassBagGlassTier.frosted,
                     onTap: () => Navigator.of(ctx).pop(),
-                    child: Container(
-                      width: 34,
-                      height: 34,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.18),
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(CupertinoIcons.xmark, size: 16, color: Colors.white),
-                    ),
                   ),
                 ],
               ),

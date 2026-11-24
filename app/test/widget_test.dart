@@ -1968,8 +1968,8 @@ void main() {
       expect(find.textContaining(added.name), findsWidgets);
       await tester.tap(find.byTooltip('更多'));
       await tester.pump(const Duration(milliseconds: 300));
-      expect(find.text('等待连接远程主机'), findsOneWidget);
-      expect(find.text('Android 本机 Shell'), findsNothing);
+      expect(find.textContaining('等待连接远程主机'), findsOneWidget);
+      expect(find.textContaining('Android 本机 Shell'), findsNothing);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 5));
       expect(tester.takeException(), isNull);

@@ -946,6 +946,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                 const SizedBox(height: 5),
                 SelectableText(
                   _saveError!,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                   style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, height: 1.4, color: t.err),
                 ),
               ],

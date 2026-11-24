@@ -614,7 +614,8 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
               )
             : RepaintBoundary(
                 child: SelectionArea(
-                  child: ListView.builder(
+            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+child: ListView.builder(
                     controller: _ctrl,
                     addAutomaticKeepAlives: false,
                     itemCount: visibleCount,

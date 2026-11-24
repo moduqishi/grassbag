@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../services/models_dev_service.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
@@ -1294,8 +1295,20 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
   int _newModelMaxTok = 16384;
   bool _newModelVision = true;
   bool _newModelReasoning = false;
+  Map<String, String?> _newModelEffortMap = <String, String?>{
+    'off': null,
+    'low': 'low',
+    'medium': 'medium',
+    'high': 'high',
+  };
   bool _showAddModel = false;
   int? _editingModelIndex;
+  Timer? _modelsDevDebounce;
+  int _modelsDevReqSeq = 0;
+  bool _modelsDevLoading = false;
+  ModelsDevSpec? _modelsDevMatched;
+  List<ModelsDevSpec> _modelsDevSuggestions = const [];
+  bool _userEditedNewModelParams = false;
   List<Map<String, dynamic>> _discoveredPool = const [];
   final Set<String> _selectedDiscoveredIds = <String>{};
 
@@ -1443,6 +1456,38 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       }
     }
     if (!mounted) return;
+    // Best-effort enrich discovered `/v1/models` items with accurate models.dev parameters!
+    if (!testOnly && discovered.isNotEmpty) {
+      final catalog = await ModelsDevCatalogService.instance.loadCatalog().catchError((_) => const <ModelsDevSpec>[]);
+      if (catalog.isNotEmpty) {
+        discovered = [
+          for (final raw in discovered)
+            () {
+              final copy = Map<String, dynamic>.from(raw);
+              final mid = copy['id']?.toString() ?? '';
+              final spec = ModelsDevCatalogService.matchInList(catalog, mid);
+              if (spec != null) {
+                if ((copy['name']?.toString().trim().isEmpty ?? true) || copy['name'] == mid) {
+                  copy['name'] = spec.name;
+                }
+                if (spec.contextWindow != null && spec.contextWindow! > 0) {
+                  copy['contextWindow'] = spec.contextWindow;
+                }
+                if (spec.maxOutputTokens != null && spec.maxOutputTokens! > 0) {
+                  copy['maxTokens'] = spec.maxOutputTokens;
+                }
+                copy['input'] = spec.supportsImage ? const ['text', 'image'] : const ['text'];
+                copy.remove('reasoning');
+                if (spec.reasoning || spec.reasoningEfforts.isNotEmpty) {
+                  copy['reasoningEfforts'] = _serializeEffortMap(_effortMapFromModelsDev(spec.reasoningEfforts));
+                }
+              }
+              return copy;
+            }(),
+        ];
+      }
+    }
+    if (!mounted) return;
     setState(() {
       if (discovered.isEmpty) {
         _errorMsg = '未能从该接口获取到可用模型，请检查 Base URL、协议类型或 API 密钥是否正确；也可在下方手动填写模型 ID。';
@@ -1580,6 +1625,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
 
   @override
   void dispose() {
+    _modelsDevDebounce?.cancel();
     _nameCtrl.dispose();
     _idCtrl.dispose();
     _baseUrlCtrl.dispose();
@@ -1591,6 +1637,74 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     _newModelMaxTokCtrl.dispose();
     _discoveredFilterCtrl.dispose();
     super.dispose();
+  }
+
+  void _scheduleNewModelLookup(String query, {bool forceFill = false}) {
+    _modelsDevDebounce?.cancel();
+    final q = query.trim();
+    if (q.length < 2) {
+      if (_modelsDevSuggestions.isNotEmpty || _modelsDevMatched != null || _modelsDevLoading) {
+        setState(() {
+          _modelsDevSuggestions = const [];
+          _modelsDevMatched = null;
+          _modelsDevLoading = false;
+        });
+      }
+      return;
+    }
+    _modelsDevDebounce = Timer(Duration(milliseconds: forceFill ? 10 : 420), () {
+      unawaited(_runNewModelLookup(q, forceFill: forceFill));
+    });
+  }
+
+  Future<void> _runNewModelLookup(String query, {bool forceFill = false}) async {
+    final seq = ++_modelsDevReqSeq;
+    if (mounted) setState(() => _modelsDevLoading = true);
+    final results = await Future.wait([
+      ModelsDevCatalogService.instance.lookupModel(query),
+      ModelsDevCatalogService.instance.searchSuggestions(query, limit: 5),
+    ]);
+    if (!mounted || seq != _modelsDevReqSeq) return;
+    final matched = results[0] as ModelsDevSpec?;
+    final suggestions = results[1] as List<ModelsDevSpec>;
+    setState(() {
+      _modelsDevLoading = false;
+      _modelsDevSuggestions = suggestions;
+      if (matched != null) {
+        final shouldAutoApply = forceFill || (!_userEditedNewModelParams && _editingModelIndex == null);
+        if (shouldAutoApply) {
+          _applyModelsDevSpecToNewForm(matched, overwriteId: false);
+        } else {
+          _modelsDevMatched = matched;
+        }
+      } else {
+        _modelsDevMatched = null;
+      }
+    });
+  }
+
+  void _applyModelsDevSpecToNewForm(ModelsDevSpec spec, {required bool overwriteId}) {
+    if (overwriteId) {
+      _newModelIdCtrl.text = spec.id;
+    }
+    if (spec.name.isNotEmpty) {
+      _newModelNameCtrl.text = spec.name;
+    }
+    if (spec.contextWindow != null && spec.contextWindow! > 0) {
+      _newModelCtx = spec.contextWindow!;
+      _newModelCtxCtrl.text = '${spec.contextWindow}';
+    }
+    if (spec.maxOutputTokens != null && spec.maxOutputTokens! > 0) {
+      _newModelMaxTok = spec.maxOutputTokens!;
+      _newModelMaxTokCtrl.text = '${spec.maxOutputTokens}';
+    }
+    _newModelVision = spec.supportsImage;
+    _newModelReasoning = spec.reasoning || spec.reasoningEfforts.isNotEmpty;
+    if (_newModelReasoning) {
+      _newModelEffortMap = _effortMapFromModelsDev(spec.reasoningEfforts);
+    }
+    _modelsDevMatched = spec;
+    _errorMsg = null;
   }
 
   String _derivedProviderId() {
@@ -1628,12 +1742,17 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     final maxTok = (m['maxTokens'] as num?)?.toInt() ?? 16384;
     final rawInput = m['input'];
     final hasVision = rawInput is List && rawInput.any((e) => e.toString().toLowerCase().contains('image'));
+    final rawEfforts = m['reasoningEfforts'];
     final hasReasoning = m['reasoning'] == true ||
-        (m['reasoningEfforts'] is Map && (m['reasoningEfforts'] as Map).isNotEmpty);
+        (rawEfforts is Map && rawEfforts.isNotEmpty);
+    final parsedEffortMap = _parseEffortMapFromModelJson(rawEfforts);
     setState(() {
       _editingModelIndex = index;
       _showAddModel = true;
       _errorMsg = null;
+      _userEditedNewModelParams = true;
+      _modelsDevMatched = null;
+      _modelsDevSuggestions = const [];
       _newModelIdCtrl.text = m['id']?.toString() ?? '';
       _newModelNameCtrl.text = m['name']?.toString() ?? '';
       _newModelCtx = ctx;
@@ -1642,12 +1761,17 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _newModelMaxTokCtrl.text = '$maxTok';
       _newModelVision = hasVision;
       _newModelReasoning = hasReasoning;
+      _newModelEffortMap = parsedEffortMap;
     });
   }
 
   void _cancelEditingModel() {
+    _modelsDevDebounce?.cancel();
     setState(() {
       _editingModelIndex = null;
+      _userEditedNewModelParams = false;
+      _modelsDevMatched = null;
+      _modelsDevSuggestions = const [];
       _newModelIdCtrl.clear();
       _newModelNameCtrl.clear();
       _newModelCtx = 200000;
@@ -1656,6 +1780,12 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _newModelMaxTokCtrl.text = '16384';
       _newModelVision = true;
       _newModelReasoning = false;
+      _newModelEffortMap = <String, String?>{
+        'off': null,
+        'low': 'low',
+        'medium': 'medium',
+        'high': 'high',
+      };
       _showAddModel = false;
     });
   }
@@ -1699,16 +1829,12 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     baseObj['input'] = _newModelVision ? ['text', 'image'] : ['text'];
     baseObj.remove('reasoning');
     if (_newModelReasoning) {
-      final existingEfforts = baseObj['reasoningEfforts'];
-      if (existingEfforts is Map && existingEfforts.isNotEmpty) {
-        baseObj['reasoningEfforts'] = Map<String, dynamic>.from(existingEfforts);
-      } else {
-        baseObj['reasoningEfforts'] = <String, dynamic>{
-          'low': 'low',
-          'medium': 'medium',
-          'high': 'high',
-        };
+      final err = _validateEffortMap(_newModelEffortMap);
+      if (err != null) {
+        setState(() => _errorMsg = err);
+        return false;
       }
+      baseObj['reasoningEfforts'] = _serializeEffortMap(_newModelEffortMap);
     } else {
       baseObj['reasoningEfforts'] = false;
     }
@@ -1723,6 +1849,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         _models.removeWhere((m) => m['id']?.toString() == id);
         _models.add(baseObj);
       }
+      _userEditedNewModelParams = false;
+      _modelsDevMatched = null;
+      _modelsDevSuggestions = const [];
       _newModelIdCtrl.clear();
       _newModelNameCtrl.clear();
     });
@@ -2534,11 +2663,37 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                         style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
                       ),
                       const Spacer(),
-                      if (_editingModelIndex != null)
+                      GrassBagSpringTap(
+                        onTap: _modelsDevLoading
+                            ? () {}
+                            : () => _scheduleNewModelLookup(_newModelIdCtrl.text, forceFill: true),
+                        pressedScale: 0.94,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (_modelsDevLoading)
+                              CupertinoActivityIndicator(radius: 6, color: t.primary)
+                            else
+                              Icon(CupertinoIcons.sparkles, size: 12, color: t.primary),
+                            const SizedBox(width: 4),
+                            Text(
+                              _modelsDevLoading ? '查询中…' : 'models.dev 智能填充',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: t.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (_editingModelIndex != null) ...[
+                        const SizedBox(width: 10),
                         GestureDetector(
                           onTap: _cancelEditingModel,
                           child: Text('取消编辑', style: TextStyle(fontSize: 11.5, color: t.text3)),
                         ),
+                      ],
                     ],
                   ),
                   const SizedBox(height: 7),
@@ -2546,11 +2701,41 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     controller: _newModelIdCtrl,
                     insideGlass: true,
                     monospace: true,
-                    placeholder: '模型 ID（如 gpt-4.1 / claude-sonnet-4-5）',
+                    placeholder: '输入模型 ID 自动匹配 models.dev（如 gpt-5 / claude-sonnet-4-5）',
                     fontSize: 12.5,
                     borderRadius: 12,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8.5),
+                    onChanged: (v) => _scheduleNewModelLookup(v),
                   ),
+                  if (_modelsDevMatched != null) ...[
+                    const SizedBox(height: 6),
+                    _ModelsDevMatchedChip(
+                      spec: _modelsDevMatched!,
+                      onReapply: () => setState(
+                        () => _applyModelsDevSpecToNewForm(_modelsDevMatched!, overwriteId: false),
+                      ),
+                    ),
+                  ],
+                  if (_modelsDevSuggestions.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 5,
+                      runSpacing: 5,
+                      children: [
+                        for (final s in _modelsDevSuggestions)
+                          _FilterPill(
+                            label:
+                                '${s.id}${s.contextWindow != null ? ' · ${(s.contextWindow! / 1000).round()}K' : ''}',
+                            active: _modelsDevMatched?.id == s.id,
+                            onTap: () => setState(() {
+                              _userEditedNewModelParams = false;
+                              _applyModelsDevSpecToNewForm(s, overwriteId: true);
+                              _modelsDevSuggestions = const [];
+                            }),
+                          ),
+                      ],
+                    ),
+                  ],
                   const SizedBox(height: 7),
                   GrassBagTextField(
                     controller: _newModelNameCtrl,
@@ -2579,6 +2764,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                               borderRadius: 12,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                               onChanged: (v) {
+                                _userEditedNewModelParams = true;
                                 final parsed = int.tryParse(v.trim());
                                 if (parsed != null && parsed > 0 && parsed != _newModelCtx) {
                                   setState(() => _newModelCtx = parsed);
@@ -2605,6 +2791,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                               borderRadius: 12,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                               onChanged: (v) {
+                                _userEditedNewModelParams = true;
                                 final parsed = int.tryParse(v.trim());
                                 if (parsed != null && parsed > 0) _newModelMaxTok = parsed;
                               },
@@ -2625,6 +2812,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                           label: ctxOpt.$2,
                           active: _newModelCtx == ctxOpt.$1,
                           onTap: () => setState(() {
+                            _userEditedNewModelParams = true;
                             _newModelCtx = ctxOpt.$1;
                             _newModelCtxCtrl.text = '${ctxOpt.$1}';
                           }),
@@ -2632,15 +2820,31 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                       _FilterPill(
                         label: _newModelVision ? '✓ 识图' : '纯文本',
                         active: _newModelVision,
-                        onTap: () => setState(() => _newModelVision = !_newModelVision),
+                        onTap: () => setState(() {
+                          _userEditedNewModelParams = true;
+                          _newModelVision = !_newModelVision;
+                        }),
                       ),
                       _FilterPill(
-                        label: _newModelReasoning ? '✓ 思考深度' : '标准推理',
+                        label: _newModelReasoning ? '✓ 深度思考' : '标准推理',
                         active: _newModelReasoning,
-                        onTap: () => setState(() => _newModelReasoning = !_newModelReasoning),
+                        onTap: () => setState(() {
+                          _userEditedNewModelParams = true;
+                          _newModelReasoning = !_newModelReasoning;
+                        }),
                       ),
                     ],
                   ),
+                  if (_newModelReasoning) ...[
+                    const SizedBox(height: 9),
+                    _ReasoningEffortsEditor(
+                      efforts: _newModelEffortMap,
+                      onChanged: (next) => setState(() {
+                        _userEditedNewModelParams = true;
+                        _newModelEffortMap = next;
+                      }),
+                    ),
+                  ],
                   const SizedBox(height: 9),
                   GrassBagSecondaryGlassButton(
                     label: _editingModelIndex != null ? '更新该模型参数' : '添加到模型列表',
@@ -2774,22 +2978,20 @@ class _ModelParamsEditorBody extends ConsumerStatefulWidget {
 }
 
 class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> {
-  static const List<(String, String)> _kEffortChoices = [
-    ('low', '轻度 (low)'),
-    ('medium', '均衡 (medium)'),
-    ('high', '深度 (high)'),
-    ('xhigh', '极限 (xhigh)'),
-  ];
-
   late final TextEditingController _idCtrl;
   late final TextEditingController _nameCtrl;
   late final TextEditingController _ctxCtrl;
   late final TextEditingController _maxTokCtrl;
   late bool _reasoning;
-  late final Set<String> _selectedEfforts;
+  late Map<String, String?> _effortMap;
   late bool _vision;
   bool _setDefault = false;
   bool _saving = false;
+  bool _modelsDevLoading = false;
+  ModelsDevSpec? _modelsDevMatched;
+  List<ModelsDevSpec> _modelsDevSuggestions = const [];
+  Timer? _modelsDevDebounce;
+  int _modelsDevReqSeq = 0;
   String? _err;
 
   @override
@@ -2801,24 +3003,103 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
     _ctxCtrl = TextEditingController(text: '${e.contextWindow ?? 128000}');
     _maxTokCtrl = TextEditingController(text: '${e.maxTokens ?? 16384}');
     _reasoning = e.supportsReasoning;
-    final existingEfforts = e.efforts
-        .map((ef) => ef.id.toLowerCase())
-        .where((id) => const {'low', 'medium', 'high', 'xhigh', 'max'}.contains(id))
-        .map((id) => id == 'max' ? 'xhigh' : id)
-        .toSet();
-    _selectedEfforts = existingEfforts.isNotEmpty
-        ? existingEfforts
-        : <String>{'low', 'medium', 'high'};
+    // Load stored DSH `llm-pi-ai` wire spelling map if available so custom wire spellings stay intact!
+    final piAiNs = ref.read(appProvider).effectiveDshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
+    final rawProviders = piAiNs?.value['providers'];
+    final provCfg = rawProviders is Map ? rawProviders[widget.providerId] : null;
+    final rawModels = provCfg is Map ? provCfg['models'] : null;
+    Map<dynamic, dynamic>? storedModel;
+    if (rawModels is List) {
+      for (final item in rawModels) {
+        if (item is Map && item['id']?.toString() == e.id) {
+          storedModel = item;
+          break;
+        }
+      }
+    }
+    if (storedModel != null && storedModel['reasoningEfforts'] is Map) {
+      _effortMap = _parseEffortMapFromModelJson(storedModel['reasoningEfforts']);
+    } else if (e.efforts.isNotEmpty) {
+      final map = <String, String?>{};
+      for (final ef in e.efforts) {
+        final k = ef.id.toLowerCase();
+        if (_kDshThinkingLevels.any((l) => l.$1 == k)) {
+          map[k] = k == 'off' ? null : k;
+        }
+      }
+      _effortMap = map.isNotEmpty
+          ? map
+          : <String, String?>{'off': null, 'low': 'low', 'medium': 'medium', 'high': 'high'};
+    } else {
+      _effortMap = <String, String?>{'off': null, 'low': 'low', 'medium': 'medium', 'high': 'high'};
+    }
     _vision = e.supportsImage;
   }
 
   @override
   void dispose() {
+    _modelsDevDebounce?.cancel();
     _idCtrl.dispose();
     _nameCtrl.dispose();
     _ctxCtrl.dispose();
     _maxTokCtrl.dispose();
     super.dispose();
+  }
+
+  void _scheduleLookup(String query, {bool forceFill = false}) {
+    _modelsDevDebounce?.cancel();
+    final q = query.trim();
+    if (q.length < 2) {
+      setState(() {
+        _modelsDevSuggestions = const [];
+        _modelsDevMatched = null;
+        _modelsDevLoading = false;
+      });
+      return;
+    }
+    _modelsDevDebounce = Timer(Duration(milliseconds: forceFill ? 10 : 420), () {
+      unawaited(_runLookup(q, forceFill: forceFill));
+    });
+  }
+
+  Future<void> _runLookup(String query, {bool forceFill = false}) async {
+    final seq = ++_modelsDevReqSeq;
+    if (mounted) setState(() => _modelsDevLoading = true);
+    final results = await Future.wait([
+      ModelsDevCatalogService.instance.lookupModel(query),
+      ModelsDevCatalogService.instance.searchSuggestions(query, limit: 5),
+    ]);
+    if (!mounted || seq != _modelsDevReqSeq) return;
+    final matched = results[0] as ModelsDevSpec?;
+    final suggestions = results[1] as List<ModelsDevSpec>;
+    setState(() {
+      _modelsDevLoading = false;
+      _modelsDevSuggestions = suggestions;
+      _modelsDevMatched = matched;
+      if (matched != null && forceFill) {
+        _applySpec(matched, overwriteId: false);
+      } else if (matched == null && forceFill) {
+        ref.read(appProvider.notifier).showToast('models.dev 暂未收录「$query」，可手动填写参数', tone: ToastTone.info);
+      }
+    });
+  }
+
+  void _applySpec(ModelsDevSpec spec, {required bool overwriteId}) {
+    if (overwriteId) _idCtrl.text = spec.id;
+    if (spec.name.isNotEmpty) _nameCtrl.text = spec.name;
+    if (spec.contextWindow != null && spec.contextWindow! > 0) {
+      _ctxCtrl.text = '${spec.contextWindow}';
+    }
+    if (spec.maxOutputTokens != null && spec.maxOutputTokens! > 0) {
+      _maxTokCtrl.text = '${spec.maxOutputTokens}';
+    }
+    _vision = spec.supportsImage;
+    _reasoning = spec.reasoning || spec.reasoningEfforts.isNotEmpty;
+    if (_reasoning) {
+      _effortMap = _effortMapFromModelsDev(spec.reasoningEfforts);
+    }
+    _modelsDevMatched = spec;
+    _err = null;
   }
 
   Future<void> _save() async {
@@ -2841,12 +3122,13 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
       setState(() => _err = '最大输出 Token ($maxTok) 不能大于上下文窗口 ($ctx)');
       return;
     }
-    final orderedEfforts = _reasoning
-        ? [
-            for (final choice in _kEffortChoices)
-              if (_selectedEfforts.contains(choice.$1)) choice.$1,
-          ]
-        : null;
+    if (_reasoning) {
+      final effortErr = _validateEffortMap(_effortMap);
+      if (effortErr != null) {
+        setState(() => _err = effortErr);
+        return;
+      }
+    }
     setState(() {
       _saving = true;
       _err = null;
@@ -2859,7 +3141,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           contextWindow: ctx,
           maxTokens: maxTok,
           reasoning: _reasoning,
-          reasoningEfforts: orderedEfforts,
+          reasoningEffortMap: _reasoning ? _orderedEffortMap(_effortMap) : null,
           supportsImage: _vision,
           setAsDefault: _setDefault,
         );
@@ -2893,7 +3175,32 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           ),
           const SizedBox(height: 10),
         ],
-        Text('模型 ID', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
+        Row(
+          children: [
+            Text('模型 ID', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
+            const Spacer(),
+            GrassBagSpringTap(
+              onTap: _modelsDevLoading
+                  ? () {}
+                  : () => _scheduleLookup(_idCtrl.text, forceFill: true),
+              pressedScale: 0.94,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_modelsDevLoading)
+                    CupertinoActivityIndicator(radius: 6, color: t.primary)
+                  else
+                    Icon(CupertinoIcons.sparkles, size: 12.5, color: t.primary),
+                  const SizedBox(width: 4),
+                  Text(
+                    _modelsDevLoading ? '正在拉取…' : '从 models.dev 智能填充',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.primary),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
         const SizedBox(height: 5),
         GrassBagTextField(
           controller: _idCtrl,
@@ -2901,7 +3208,33 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           monospace: true,
           fontSize: 13,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          onChanged: (v) => _scheduleLookup(v),
         ),
+        if (_modelsDevMatched != null) ...[
+          const SizedBox(height: 7),
+          _ModelsDevMatchedChip(
+            spec: _modelsDevMatched!,
+            onReapply: () => setState(() => _applySpec(_modelsDevMatched!, overwriteId: false)),
+          ),
+        ],
+        if (_modelsDevSuggestions.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 5,
+            runSpacing: 5,
+            children: [
+              for (final s in _modelsDevSuggestions)
+                _FilterPill(
+                  label: '${s.id}${s.contextWindow != null ? ' · ${(s.contextWindow! / 1000).round()}K' : ''}',
+                  active: _modelsDevMatched?.id == s.id,
+                  onTap: () => setState(() {
+                    _applySpec(s, overwriteId: true);
+                    _modelsDevSuggestions = const [];
+                  }),
+                ),
+            ],
+          ),
+        ],
         const SizedBox(height: 10),
         Text('显示名称', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
         const SizedBox(height: 5),
@@ -2969,7 +3302,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
         GrassBagSheetSection(
           children: [
             GrassBagListTile(
-              title: const Text('支持深度思考（可调思考深度）'),
+              title: const Text('支持深度思考（可自定义档位与参数）'),
               trailing: GrassBagGlassSwitch(
                 value: _reasoning,
                 tier: tier,
@@ -2979,36 +3312,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
             ),
             if (_reasoning)
               Padding(
-                padding: const EdgeInsets.fromLTRB(14, 2, 14, 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '可用思考深度档位',
-                      style: TextStyle(fontSize: 11.5, color: t.text3),
-                    ),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 6,
-                      children: [
-                        for (final choice in _kEffortChoices)
-                          _FilterPill(
-                            label: choice.$2,
-                            active: _selectedEfforts.contains(choice.$1),
-                            onTap: () => setState(() {
-                              if (_selectedEfforts.contains(choice.$1)) {
-                                if (_selectedEfforts.length > 1) {
-                                  _selectedEfforts.remove(choice.$1);
-                                }
-                              } else {
-                                _selectedEfforts.add(choice.$1);
-                              }
-                            }),
-                          ),
-                      ],
-                    ),
-                  ],
+                padding: const EdgeInsets.fromLTRB(14, 2, 14, 12),
+                child: _ReasoningEffortsEditor(
+                  efforts: _effortMap,
+                  onChanged: (next) => setState(() => _effortMap = next),
                 ),
               ),
             GrassBagListTile(
@@ -3040,6 +3347,341 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           onTap: _saving ? null : _save,
         ),
       ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DSH Canonical 7-Level Thinking Efforts + Custom Wire Spelling Editor
+// ---------------------------------------------------------------------------
+
+/// Canonical DSH `dsh-llm-pi-ai` `THINKING_LEVELS` in exact escalation order.
+const List<(String, String)> _kDshThinkingLevels = [
+  ('off', '关闭'),
+  ('minimal', '极轻'),
+  ('low', '轻度'),
+  ('medium', '均衡'),
+  ('high', '深度'),
+  ('xhigh', '超高'),
+  ('max', '极限'),
+];
+
+Map<String, String?> _parseEffortMapFromModelJson(dynamic raw) {
+  final out = <String, String?>{};
+  if (raw is Map) {
+    for (final entry in raw.entries) {
+      final k = entry.key.toString().trim().toLowerCase();
+      if (_kDshThinkingLevels.any((l) => l.$1 == k)) {
+        final v = entry.value?.toString().trim();
+        out[k] = k == 'off' ? (v == null || v.isEmpty ? null : v) : (v == null || v.isEmpty ? k : v);
+      }
+    }
+  }
+  if (out.isEmpty) {
+    return <String, String?>{'off': null, 'low': 'low', 'medium': 'medium', 'high': 'high'};
+  }
+  return out;
+}
+
+Map<String, String?> _effortMapFromModelsDev(List<String> rawEfforts) {
+  if (rawEfforts.isEmpty) {
+    return <String, String?>{'off': null, 'low': 'low', 'medium': 'medium', 'high': 'high'};
+  }
+  final out = <String, String?>{'off': null};
+  for (final raw in rawEfforts) {
+    final norm = raw.trim().toLowerCase();
+    if (norm.isEmpty) continue;
+    final mappedKey = switch (norm) {
+      'none' || 'off' => 'off',
+      'minimal' => 'minimal',
+      'low' => 'low',
+      'medium' || 'mid' => 'medium',
+      'high' => 'high',
+      'xhigh' || 'very_high' || 'very-high' => 'xhigh',
+      'max' || 'ultra' => 'max',
+      _ => null,
+    };
+    if (mappedKey != null) {
+      out[mappedKey] = mappedKey == 'off' ? (norm == 'off' ? null : norm) : raw.trim();
+    }
+  }
+  if (!out.keys.any((k) => k != 'off')) {
+    out['low'] = 'low';
+    out['medium'] = 'medium';
+    out['high'] = 'high';
+  }
+  return _orderedEffortMap(out);
+}
+
+Map<String, String?> _orderedEffortMap(Map<String, String?> src) {
+  final ordered = <String, String?>{};
+  for (final lvl in _kDshThinkingLevels) {
+    if (src.containsKey(lvl.$1)) {
+      ordered[lvl.$1] = src[lvl.$1];
+    }
+  }
+  return ordered;
+}
+
+Map<String, dynamic> _serializeEffortMap(Map<String, String?> src) {
+  final ordered = _orderedEffortMap(src);
+  return <String, dynamic>{
+    for (final entry in ordered.entries)
+      entry.key: entry.key == 'off'
+          ? (entry.value?.trim().isNotEmpty == true ? entry.value!.trim() : null)
+          : (entry.value?.trim().isNotEmpty == true ? entry.value!.trim() : entry.key),
+  };
+}
+
+String? _validateEffortMap(Map<String, String?> src) {
+  final activeKeys = src.keys.where((k) => k != 'off').toList(growable: false);
+  if (activeKeys.isEmpty) {
+    return '开启深度思考时，请至少保留 1 个非关闭 (off) 的思考档位';
+  }
+  return null;
+}
+
+class _ModelsDevMatchedChip extends StatelessWidget {
+  const _ModelsDevMatchedChip({
+    required this.spec,
+    required this.onReapply,
+  });
+
+  final ModelsDevSpec spec;
+  final VoidCallback onReapply;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final parts = <String>[
+      if (spec.contextWindow != null) '上下文 ${(spec.contextWindow! / 1000).round()}K',
+      if (spec.maxOutputTokens != null) '输出 ${(spec.maxOutputTokens! / 1000).round()}K',
+      if (spec.reasoning) '深度思考',
+      if (spec.supportsImage) '识图',
+    ];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+      decoration: BoxDecoration(
+        color: t.okSoft,
+        borderRadius: BorderRadius.circular(11),
+        border: Border.all(color: t.ok.withValues(alpha: 0.28), width: 0.65),
+      ),
+      child: Row(
+        children: [
+          Icon(CupertinoIcons.checkmark_seal_fill, size: 13.5, color: t.ok),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              'models.dev 已匹配 ${spec.name}${parts.isNotEmpty ? ' · ${parts.join(' · ')}' : ''}',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.2, fontWeight: FontWeight.w500, color: t.ok),
+            ),
+          ),
+          const SizedBox(width: 6),
+          GrassBagSpringTap(
+            onTap: onReapply,
+            pressedScale: 0.92,
+            child: Text(
+              '重新填充',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700, color: t.primary),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Interactive editor for DSH `reasoningEfforts` offering all 7 canonical tiers
+/// (`off | minimal | low | medium | high | xhigh | max`) plus per-tier customizable
+/// wire parameter values (e.g., `max -> ultra`, `off -> null`).
+class _ReasoningEffortsEditor extends StatefulWidget {
+  const _ReasoningEffortsEditor({
+    required this.efforts,
+    required this.onChanged,
+  });
+
+  final Map<String, String?> efforts;
+  final ValueChanged<Map<String, String?>> onChanged;
+
+  @override
+  State<_ReasoningEffortsEditor> createState() => _ReasoningEffortsEditorState();
+}
+
+class _ReasoningEffortsEditorState extends State<_ReasoningEffortsEditor> {
+  bool _showWireCustom = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final ordered = _orderedEffortMap(widget.efforts);
+    final hasCustomWire = ordered.entries.any(
+      (e) => e.key == 'off' ? (e.value?.isNotEmpty == true) : (e.value != null && e.value != e.key),
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text(
+              '思考深度档位（点选启用/停用）',
+              style: TextStyle(fontSize: 11.5, color: t.text3),
+            ),
+            const Spacer(),
+            GrassBagSpringTap(
+              onTap: () => setState(() => _showWireCustom = !_showWireCustom),
+              pressedScale: 0.94,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _showWireCustom ? CupertinoIcons.chevron_up : CupertinoIcons.slider_horizontal_3,
+                    size: 11.5,
+                    color: hasCustomWire ? t.primary : t.text3,
+                  ),
+                  const SizedBox(width: 3),
+                  Text(
+                    _showWireCustom ? '收起参数映射' : (hasCustomWire ? '已自定义参数' : '自定义发送值'),
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: hasCustomWire ? t.primary : t.text3,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final lvl in _kDshThinkingLevels)
+              _FilterPill(
+                label: '${lvl.$2} (${lvl.$1})',
+                active: ordered.containsKey(lvl.$1),
+                onTap: () {
+                  final next = Map<String, String?>.from(ordered);
+                  if (next.containsKey(lvl.$1)) {
+                    final nonOffCount = next.keys.where((k) => k != 'off').length;
+                    if (lvl.$1 != 'off' && nonOffCount <= 1) return;
+                    next.remove(lvl.$1);
+                  } else {
+                    next[lvl.$1] = lvl.$1 == 'off' ? null : lvl.$1;
+                  }
+                  widget.onChanged(_orderedEffortMap(next));
+                },
+              ),
+          ],
+        ),
+        if (_showWireCustom) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(9),
+            decoration: BoxDecoration(
+              color: t.fill1,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: t.sep, width: 0.5),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '为每个档位自定义发送给 API 的 reasoning_effort 值（留空则使用默认档位名；off 留空表示不发送参数）',
+                  style: TextStyle(fontSize: 10.8, height: 1.38, color: t.text3),
+                ),
+                const SizedBox(height: 7),
+                for (final entry in ordered.entries) ...[
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: 68,
+                          child: Text(
+                            entry.key,
+                            style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: t.text2,
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: _WireValueField(
+                            key: ValueKey('wire-${entry.key}'),
+                            levelKey: entry.key,
+                            initialValue: entry.value ?? '',
+                            onChanged: (val) {
+                              final next = Map<String, String?>.from(ordered);
+                              final trimmed = val.trim();
+                              next[entry.key] = entry.key == 'off'
+                                  ? (trimmed.isEmpty ? null : trimmed)
+                                  : (trimmed.isEmpty ? entry.key : trimmed);
+                              widget.onChanged(next);
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _WireValueField extends StatefulWidget {
+  const _WireValueField({
+    super.key,
+    required this.levelKey,
+    required this.initialValue,
+    required this.onChanged,
+  });
+
+  final String levelKey;
+  final String initialValue;
+  final ValueChanged<String> onChanged;
+
+  @override
+  State<_WireValueField> createState() => _WireValueFieldState();
+}
+
+class _WireValueFieldState extends State<_WireValueField> {
+  late final TextEditingController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = TextEditingController(text: widget.initialValue);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GrassBagTextField(
+      controller: _ctrl,
+      insideGlass: true,
+      monospace: true,
+      fontSize: 11.5,
+      borderRadius: 10,
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6.5),
+      placeholder: widget.levelKey == 'off' ? '留空（不发送）' : '默认 ${widget.levelKey}（如 ultra）',
+      onChanged: widget.onChanged,
     );
   }
 }

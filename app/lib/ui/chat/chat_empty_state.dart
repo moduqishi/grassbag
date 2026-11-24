@@ -25,12 +25,18 @@ class ChatEmptyState extends ConsumerWidget {
     this.onOpenModelSettings,
     this.onOpenHostSettings,
     this.keyboardOpen = false,
+    this.keyboardProgress = 0.0,
   });
 
   final ValueChanged<String> onSuggestionTap;
   final VoidCallback? onOpenModelSettings;
   final VoidCallback? onOpenHostSettings;
   final bool keyboardOpen;
+
+  /// Smooth continuous keyboard-elevation progress `0.0` (closed) → `1.0` (open).
+  /// Smoothly tucks away the 4 suggestion cards & rotating tip while scaling the
+  /// hero cleanly above the rising composer so nothing is ever occluded!
+  final double keyboardProgress;
 
   String _timeGreeting() {
     final h = DateTime.now().hour;
@@ -58,6 +64,7 @@ class ChatEmptyState extends ConsumerWidget {
           activeWorkspace: s.activeWorkspace,
           connectionPhase: s.connectionPhase,
           isDshConnected: s.isDshConnected,
+          hydratingDomains: s.hydratingDomains,
           hasAvailableModels: s.hasAvailableModels,
           routableProvidersCount: s.routableProviders.length,
           glassTier: s.glassTier,
@@ -90,6 +97,7 @@ class ChatEmptyState extends ConsumerWidget {
         !showLocalDesktopErrorBanner &&
         state.isDshConnected &&
         state.connectionPhase == ConnectionPhase.connected &&
+        !state.hydratingDomains &&
         !state.hasAvailableModels &&
         state.routableProvidersCount == 0;
 
@@ -134,27 +142,40 @@ class ChatEmptyState extends ConsumerWidget {
       ),
     ];
 
+    final effectiveKbProgress =
+        (keyboardOpen ? 1.0 : keyboardProgress).clamp(0.0, 1.0);
+    final kbCurve = Curves.easeOutCubic.transform(effectiveKbProgress);
+    final footerVisibleFactor = (1.0 - kbCurve).clamp(0.0, 1.0);
+    final footerOpacity = (1.0 - kbCurve * 1.45).clamp(0.0, 1.0);
+
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 560),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const RepaintBoundary(
-              child: _FloatingMascot(size: 48),
+            Transform.scale(
+              scale: 1.0 - 0.16 * kbCurve,
+              alignment: Alignment.bottomCenter,
+              child: const RepaintBoundary(
+                child: _FloatingMascot(size: 48),
+              ),
             ),
-            const SizedBox(height: 10),
+            SizedBox(height: 10.0 - 4.0 * kbCurve),
             Text(
               _timeGreeting(),
               style: TextStyle(
-                fontSize: 28,
+                fontSize: 28.0 - 3.5 * kbCurve,
                 fontWeight: FontWeight.w300,
                 letterSpacing: -0.5,
                 color: t.text,
               ),
             ),
             Padding(
-              padding: const EdgeInsets.only(top: 5, bottom: 16),
+              padding: EdgeInsets.only(
+                top: 5.0 - 2.0 * kbCurve,
+                bottom: 16.0 - 5.0 * kbCurve,
+              ),
               child: Text(
                 '今天想做点什么？',
                 style: TextStyle(fontSize: 14, color: t.text2),
@@ -408,125 +429,151 @@ class ChatEmptyState extends ConsumerWidget {
                 ),
               ),
             ],
-            const SizedBox(height: 22),
+            // Smoothly collapse 2×2 suggestion cards + rotating tip when keyboard rises
+            // so the core greeting, workspace pill & controls stay gracefully framed above IME!
+            IgnorePointer(
+              ignoring: effectiveKbProgress > 0.12,
+              child: ClipRect(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  heightFactor: footerVisibleFactor,
+                  child: Opacity(
+                    opacity: footerOpacity,
+                    child: Transform.translate(
+                      offset: Offset(0, 14.0 * kbCurve),
+                      child: Transform.scale(
+                        scale: 1.0 - 0.04 * kbCurve,
+                        alignment: Alignment.topCenter,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const SizedBox(height: 22),
 
-            // Continuous Superellipse Luminous 2×2 Suggestion Cards
-            LayoutBuilder(
-              builder: (ctx, constraints) {
-                final twoCol = constraints.maxWidth >= 340;
-                if (!twoCol) {
-                  return Column(
-                    children: [
-                      for (final s in suggestions)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: _SuggestionTile(
-                            icon: s.$1,
-                            title: s.$2,
-                            subtitle: s.$3,
-                            accent: s.$4,
-                            onTap: () => onSuggestionTap(s.$5),
-                          ),
-                        ),
-                    ],
-                  );
-                }
-                return Column(
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _SuggestionTile(
-                            icon: suggestions[0].$1,
-                            title: suggestions[0].$2,
-                            subtitle: suggestions[0].$3,
-                            accent: suggestions[0].$4,
-                            onTap: () => onSuggestionTap(suggestions[0].$5),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: _SuggestionTile(
-                            icon: suggestions[1].$1,
-                            title: suggestions[1].$2,
-                            subtitle: suggestions[1].$3,
-                            accent: suggestions[1].$4,
-                            onTap: () => onSuggestionTap(suggestions[1].$5),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _SuggestionTile(
-                            icon: suggestions[2].$1,
-                            title: suggestions[2].$2,
-                            subtitle: suggestions[2].$3,
-                            accent: suggestions[2].$4,
-                            onTap: () => onSuggestionTap(suggestions[2].$5),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: _SuggestionTile(
-                            icon: suggestions[3].$1,
-                            title: suggestions[3].$2,
-                            subtitle: suggestions[3].$3,
-                            accent: suggestions[3].$4,
-                            onTap: () => onSuggestionTap(suggestions[3].$5),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                );
-              },
-            ),
-            // Interactive Rotating Tip Row (static height avoids IME layout thrash)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: GrassBagSpringTap(
-                onTap: ctrl.nextEmptyTip,
-                pressedScale: 0.98,
-                haptic: true,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                  child: Row(
-                    children: [
-                      Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 220),
-                          switchInCurve: Curves.linear,
-                          switchOutCurve: Curves.linear,
-                          transitionBuilder: (child, anim) => FadeTransition(
-                            opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
-                            child: SlideTransition(
-                              position: Tween<Offset>(
-                                begin: const Offset(0, 0.25),
-                                end: Offset.zero,
-                              ).animate(CurvedAnimation(parent: anim, curve: Curves.easeOutCubic)),
-                              child: child,
+                            // Continuous Superellipse Luminous 2×2 Suggestion Cards
+                            LayoutBuilder(
+                              builder: (ctx, constraints) {
+                                final twoCol = constraints.maxWidth >= 340;
+                                if (!twoCol) {
+                                  return Column(
+                                    children: [
+                                      for (final s in suggestions)
+                                        Padding(
+                                          padding: const EdgeInsets.only(bottom: 8),
+                                          child: _SuggestionTile(
+                                            icon: s.$1,
+                                            title: s.$2,
+                                            subtitle: s.$3,
+                                            accent: s.$4,
+                                            onTap: () => onSuggestionTap(s.$5),
+                                          ),
+                                        ),
+                                    ],
+                                  );
+                                }
+                                return Column(
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: _SuggestionTile(
+                                            icon: suggestions[0].$1,
+                                            title: suggestions[0].$2,
+                                            subtitle: suggestions[0].$3,
+                                            accent: suggestions[0].$4,
+                                            onTap: () => onSuggestionTap(suggestions[0].$5),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: _SuggestionTile(
+                                            icon: suggestions[1].$1,
+                                            title: suggestions[1].$2,
+                                            subtitle: suggestions[1].$3,
+                                            accent: suggestions[1].$4,
+                                            onTap: () => onSuggestionTap(suggestions[1].$5),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 10),
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: _SuggestionTile(
+                                            icon: suggestions[2].$1,
+                                            title: suggestions[2].$2,
+                                            subtitle: suggestions[2].$3,
+                                            accent: suggestions[2].$4,
+                                            onTap: () => onSuggestionTap(suggestions[2].$5),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: _SuggestionTile(
+                                            icon: suggestions[3].$1,
+                                            title: suggestions[3].$2,
+                                            subtitle: suggestions[3].$3,
+                                            accent: suggestions[3].$4,
+                                            onTap: () => onSuggestionTap(suggestions[3].$5),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                );
+                              },
                             ),
-                          ),
-                          child: Align(
-                            key: ValueKey(tip),
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              tip,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 12, color: t.text3),
+                            // Interactive Rotating Tip Row
+                            Padding(
+                              padding: const EdgeInsets.only(top: 12),
+                              child: GrassBagSpringTap(
+                                onTap: ctrl.nextEmptyTip,
+                                pressedScale: 0.98,
+                                haptic: true,
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  child: Row(
+                                    children: [
+                                      Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: AnimatedSwitcher(
+                                          duration: const Duration(milliseconds: 220),
+                                          switchInCurve: Curves.linear,
+                                          switchOutCurve: Curves.linear,
+                                          transitionBuilder: (child, anim) => FadeTransition(
+                                            opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
+                                            child: SlideTransition(
+                                              position: Tween<Offset>(
+                                                begin: const Offset(0, 0.25),
+                                                end: Offset.zero,
+                                              ).animate(CurvedAnimation(parent: anim, curve: Curves.easeOutCubic)),
+                                              child: child,
+                                            ),
+                                          ),
+                                          child: Align(
+                                            key: ValueKey(tip),
+                                            alignment: Alignment.centerLeft,
+                                            child: Text(
+                                              tip,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(fontSize: 12, color: t.text3),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ),
-                          ),
+                          ],
                         ),
                       ),
-                      const SizedBox(width: 6),
-                      Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
-                    ],
+                    ),
                   ),
                 ),
               ),

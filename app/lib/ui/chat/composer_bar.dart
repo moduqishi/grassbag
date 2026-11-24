@@ -664,6 +664,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               : '',
           connectionPhase: s.connectionPhase,
           isDshConnected: s.isDshConnected,
+          hydratingDomains: s.hydratingDomains,
           hostIsLocal: s.activeHost.isLocal,
           hostNeedsAuth: s.activeHost.needsAuth,
           routableProvidersCount: s.routableProviders.length,
@@ -723,34 +724,31 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final isHostConnecting = state.connectionPhase == ConnectionPhase.connecting;
     final isHostConnected = state.isDshConnected &&
         state.connectionPhase == ConnectionPhase.connected;
-    final needsModelConfig =
-        isHostConnected && !state.hasAvailableModels && state.routableProvidersCount == 0;
+    final isHydratingModels =
+        isHostConnected && state.hydratingDomains && !state.hasAvailableModels;
+    final needsModelConfig = isHostConnected &&
+        !state.hydratingDomains &&
+        !state.hasAvailableModels &&
+        state.routableProvidersCount == 0;
 
     final isDesktopPlatform = _isDesktopPlatform;
 
     Widget buildScrollDroplet(bool showDroplet) {
       return AnimatedSwitcher(
-        duration: const Duration(milliseconds: 200),
+        duration: const Duration(milliseconds: 190),
         reverseDuration: const Duration(milliseconds: 140),
         switchInCurve: Curves.easeOutCubic,
         switchOutCurve: Curves.easeInCubic,
+        // Always pure GPU Fade + Scale so mid-fling droplet mount never allocates
+        // an offscreen GlassMaterialize saveLayer during chat scrolling.
         transitionBuilder: (child, anim) {
-          if (state.glassTier == GrassBagGlassTier.solid || kIsWeb) {
-            return FadeTransition(
-              opacity: anim,
-              child: ScaleTransition(
-                scale: Tween<double>(begin: 0.80, end: 1.0).animate(anim),
-                alignment: Alignment.bottomRight,
-                child: child,
-              ),
-            );
-          }
-          return GlassMaterializeTransition(
-            animation: anim,
-            alignment: Alignment.bottomRight,
-            scaleFrom: 1.10,
-            contentSigma: 0.0,
-            child: child,
+          return FadeTransition(
+            opacity: anim,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.82, end: 1.0).animate(anim),
+              alignment: Alignment.bottomRight,
+              child: child,
+            ),
           );
         },
         child: showDroplet && !state.isEmptyChat && !_plusOpen && !hasTakeover
@@ -789,6 +787,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               )
             else
               buildScrollDroplet(widget.showScrollToBottom),
+
+            // Docked live Goal & Todo status strip (isolated leaf Consumer: zero composer churn!)
+            if (!_plusOpen && !hasTakeover) const _LiveGoalTodoStrip(),
 
             // Active Status Pills above Composer — batched in ONE GrassBagGlassBarLayer (zero extra GPU passes!)
             AnimatedSize(
@@ -1198,37 +1199,45 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Row(
-                            children: [
-                              GrassBagSquircleIcon(
-                                icon: CupertinoIcons.shield_lefthalf_fill,
-                                color: t.warn,
-                                size: 36,
-                                iconSize: 18,
-                              ),
-                              const SizedBox(width: 11),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      '请求执行命令',
-                                      style: TextStyle(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w600,
-                                        letterSpacing: -0.2,
-                                        color: t.text,
-                                      ),
-                                    ),
-                                    Text(
-                                      '工作区：${state.activeWorkspace}',
-                                      style: TextStyle(fontSize: 12, color: t.text3),
-                                    ),
-                                  ],
+                            Row(
+                              children: [
+                                GrassBagSquircleIcon(
+                                  icon: (state.pendingApprovalCommand ?? '').contains('phone_')
+                                      ? CupertinoIcons.device_phone_portrait
+                                      : CupertinoIcons.shield_lefthalf_fill,
+                                  color: (state.pendingApprovalCommand ?? '').contains('phone_')
+                                      ? t.primary
+                                      : t.warn,
+                                  size: 36,
+                                  iconSize: 18,
                                 ),
-                              ),
-                            ],
-                          ),
+                                const SizedBox(width: 11),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        (state.pendingApprovalCommand ?? '').contains('phone_')
+                                            ? '请求操控手机'
+                                            : '请求执行命令',
+                                        style: TextStyle(
+                                          fontSize: 15,
+                                          fontWeight: FontWeight.w600,
+                                          letterSpacing: -0.2,
+                                          color: t.text,
+                                        ),
+                                      ),
+                                      Text(
+                                        (state.pendingApprovalCommand ?? '').contains('phone_')
+                                            ? '无障碍操控确认 · 可在手机操控设置中调整策略'
+                                            : '工作区：${state.activeWorkspace}',
+                                        style: TextStyle(fontSize: 12, color: t.text3),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
                           const SizedBox(height: 12),
                           Container(
                             constraints: const BoxConstraints(maxHeight: 160),
@@ -1244,6 +1253,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                             child: SingleChildScrollView(
                               child: SelectableText(
                                 state.pendingApprovalCommand!,
+contextMenuBuilder: buildGrassBagEditableContextMenu,
                                 style: TextStyle(
                                   fontFamily: 'monospace',
                                   fontSize: 12,
@@ -1585,6 +1595,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               // keeping the Android/iOS soft keyboard smoothly open across messages!
                               onEditingComplete: () {},
                               onSubmitted: null,
+                              contextMenuBuilder: buildGrassBagEditableContextMenu,
                               style: TextStyle(
                                 fontSize: 15,
                                 height: 1.4,
@@ -1692,10 +1703,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               ref,
                                               ref.read(appProvider).activeHost,
                                             );
-                                      } else if (isHostConnecting) {
+                                      } else if (isHostConnecting || isHydratingModels) {
                                         pillIcon = CupertinoIcons.sparkles;
                                         pillIconColor = t.text3;
-                                        pillLabel = '连接中…';
+                                        pillLabel = isHydratingModels ? '同步中…' : '连接中…';
                                         effortBadge = null;
                                         pillTextColor = t.text3;
                                         pillTap = () => showHostQuickSheet(
@@ -2236,19 +2247,21 @@ class _PopoverActionRow extends StatelessWidget {
               iconSize: 15,
             ),
             const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                title,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w500,
-                  color: t.text,
-                ),
+            Text(
+              title,
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                color: t.text,
               ),
             ),
-            Flexible(
+            const SizedBox(width: 12),
+            Expanded(
               child: Text(
                 trailingText,
+                textAlign: TextAlign.end,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
@@ -2258,7 +2271,7 @@ class _PopoverActionRow extends StatelessWidget {
                 ),
               ),
             ),
-            const SizedBox(width: 4),
+            const SizedBox(width: 5),
             Icon(
               CupertinoIcons.chevron_right,
               size: 13,
@@ -2912,6 +2925,268 @@ class _ComposerContextRingButton extends ConsumerWidget {
         ),
         const SizedBox(width: 4),
       ],
+    );
+  }
+}
+
+/// Isolated compact Liquid Glass Goal / Live Todo status banner docked cleanly
+/// above the composer whenever the active session has an active Goal or live Todos.
+class _LiveGoalTodoStrip extends ConsumerWidget {
+  const _LiveGoalTodoStrip();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final slice = ref.watch(
+      appProvider.select(
+        (s) => (
+          isEmptyChat: s.isEmptyChat,
+          goals: s.goals,
+          todos: s.todos,
+          glassTier: s.glassTier,
+        ),
+      ),
+    );
+    if (slice.isEmptyChat) return const SizedBox.shrink();
+    final activeGoal = slice.goals.where((g) => !g.isCompleted).firstOrNull;
+    final todos = slice.todos;
+    if (activeGoal == null && todos.isEmpty) return const SizedBox.shrink();
+
+    final t = GrassBagTokens.of(context);
+    final ctrl = ref.read(appProvider.notifier);
+    final doneCount = todos.where((e) => e.done).length;
+    final activeTodo = todos.where((e) => e.active && !e.done).firstOrNull;
+
+    void openQuickSheet() {
+      showGrassBagSheet<void>(
+        context,
+        title: activeGoal != null ? '长期目标与待办' : '当前任务待办',
+        subtitle: activeGoal != null
+            ? activeGoal.statusLabel
+            : '已完成 $doneCount / ${todos.length}',
+        bodyBuilder: (ctx) => Consumer(
+          builder: (ctx, sheetRef, _) {
+            final st = GrassBagTokens.of(ctx);
+            final s = sheetRef.watch(appProvider);
+            final c = sheetRef.read(appProvider.notifier);
+            final curGoal = s.goals.where((g) => !g.isCompleted).firstOrNull;
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (curGoal != null) ...[
+                  GrassBagSheetSection(
+                    padding: const EdgeInsets.all(13),
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            CupertinoIcons.flag_fill,
+                            size: 16,
+                            color: curGoal.isBlocked
+                                ? st.err
+                                : (curGoal.isPaused || curGoal.isDisarmed ? st.warn : st.primary),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              curGoal.title,
+                              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: st.text),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            curGoal.statusLabel,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: curGoal.isBlocked
+                                  ? st.err
+                                  : (curGoal.isPaused || curGoal.isDisarmed ? st.warn : st.primary),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (curGoal.criteria.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Text(curGoal.criteria, style: TextStyle(fontSize: 12, color: st.text2)),
+                      ],
+                      if (curGoal.isBlocked && curGoal.blockedReasonMessage?.isNotEmpty == true) ...[
+                        const SizedBox(height: 8),
+                        GrassBagStatusBanner(
+                          tone: GrassBagBannerTone.warn,
+                          borderRadius: 12,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                          message: curGoal.blockedReasonMessage!,
+                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: GrassBagSecondaryGlassButton(
+                              label: curGoal.isArmed ? '暂停目标' : '恢复执行',
+                              height: 36,
+                              tier: s.glassTier,
+                              insideGlass: true,
+                              accentForeground: !curGoal.isArmed,
+                              onTap: () => c.updateGoalStatus(
+                                curGoal.id,
+                                curGoal.isArmed ? 'paused' : 'active',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: GrassBagPrimaryGlassButton(
+                              label: '标记达成',
+                              height: 36,
+                              tier: s.glassTier,
+                              insideGlass: true,
+                              onTap: () {
+                                c.updateGoalStatus(curGoal.id, 'completed');
+                                Navigator.of(ctx).pop();
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  if (s.todos.isNotEmpty) const SizedBox(height: 12),
+                ],
+                if (s.todos.isNotEmpty)
+                  GrassBagSheetSection(
+                    header: '执行待办（${s.todos.where((e) => e.done).length}/${s.todos.length}）',
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    children: [
+                      for (final td in s.todos)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4.5),
+                          child: Row(
+                            children: [
+                              if (td.active && !td.done)
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: Center(child: CupertinoActivityIndicator(radius: 6, color: st.primary)),
+                                )
+                              else
+                                Icon(
+                                  td.done ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
+                                  size: 16,
+                                  color: td.done ? st.ok : st.text3,
+                                ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  td.title,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    decoration: td.done ? TextDecoration.lineThrough : null,
+                                    color: td.done ? st.text3 : (td.active ? st.primary : st.text),
+                                    fontWeight: td.active ? FontWeight.w600 : FontWeight.w400,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+              ],
+            );
+          },
+        ),
+      );
+    }
+
+    final Color accentCol;
+    if (activeGoal != null) {
+      accentCol = activeGoal.isBlocked
+          ? t.err
+          : (activeGoal.isPaused || activeGoal.isDisarmed ? t.warn : t.primary);
+    } else {
+      accentCol = activeTodo != null ? t.primary : t.ok;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(6, 0, 6, 8),
+      child: GrassBagSpringTap(
+        onTap: openQuickSheet,
+        pressedScale: 0.985,
+        haptic: true,
+        child: GrassBagGlass(
+          tier: slice.glassTier,
+          borderRadius: 18,
+          useCardQuality: true,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8.5),
+          child: Row(
+            children: [
+              if (activeGoal != null)
+                Icon(CupertinoIcons.flag_fill, size: 14, color: accentCol)
+              else if (activeTodo != null)
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: Center(child: CupertinoActivityIndicator(radius: 6, color: accentCol)),
+                )
+              else
+                Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: accentCol),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  activeGoal != null
+                      ? activeGoal.title
+                      : (activeTodo != null
+                          ? activeTodo.title
+                          : '待办清单 · 已完成 $doneCount/${todos.length}'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: t.text,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: accentCol.withValues(alpha: t.isDark ? 0.22 : 0.12),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  activeGoal != null
+                      ? activeGoal.statusLabel
+                      : '$doneCount/${todos.length}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: accentCol,
+                  ),
+                ),
+              ),
+              if (activeGoal != null) ...[
+                const SizedBox(width: 6),
+                GrassBagSpringTap(
+                  onTap: () => ctrl.updateGoalStatus(
+                    activeGoal.id,
+                    activeGoal.isArmed ? 'paused' : 'active',
+                  ),
+                  pressedScale: 0.90,
+                  haptic: true,
+                  child: Icon(
+                    activeGoal.isArmed ? CupertinoIcons.pause_fill : CupertinoIcons.play_fill,
+                    size: 13.5,
+                    color: accentCol,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

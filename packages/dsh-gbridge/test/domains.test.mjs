@@ -152,8 +152,10 @@ test('zero-patch phone tools bridge forwards caller sessionId/turnId and turn/en
   });
 
   assert.equal(phone.active, true);
-  assert.equal(phone.registered, 8);
+  assert.equal(phone.registered, 12);
   assert.ok(registeredTools.has('phone_screen'));
+  assert.ok(registeredTools.has('phone_apps'));
+  assert.ok(registeredTools.has('phone_screenshot'));
   assert.equal(registeredTools.has('phone_shell'), false);
 
   const result = await registeredTools.get('phone_screen').execute(

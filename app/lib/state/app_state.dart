@@ -188,6 +188,7 @@ class RemoteHostDiagnosis {
     required this.message,
     this.normalizedAddress,
     this.extractedToken,
+    this.capturedCookie,
     this.dshVersion,
     this.latencyMs,
     this.hostAuthority,
@@ -200,6 +201,7 @@ class RemoteHostDiagnosis {
   final String message;
   final String? normalizedAddress;
   final String? extractedToken;
+  final String? capturedCookie;
   final String? dshVersion;
   final int? latencyMs;
   final String? hostAuthority;
@@ -210,6 +212,19 @@ class RemoteHostDiagnosis {
       kind == RemoteDiagnosisKind.readyGbridge || kind == RemoteDiagnosisKind.readyDirect;
   bool get needsWebOrTokenAuth =>
       kind == RemoteDiagnosisKind.needsAuth || kind == RemoteDiagnosisKind.htmlLoginPage;
+}
+
+@immutable
+class RemoteConnectOutcome {
+  const RemoteConnectOutcome({
+    required this.diagnosis,
+    this.host,
+    this.connected = false,
+  });
+
+  final RemoteHostDiagnosis diagnosis;
+  final ManagedHost? host;
+  final bool connected;
 }
 
 @immutable
@@ -316,6 +331,13 @@ class ManagedHost {
   bool get needsAuth =>
       !isLocal && !online && (lastErrorCode == 'needs_auth' || lastErrorCode == 'html_proxy');
   bool get isHtmlProxyAuth => !isLocal && !online && lastErrorCode == 'html_proxy';
+
+  /// True when targeting the Desktop GUI's built-in `:3081` API-only LAN bridge.
+  bool get isDesktopLanBridge {
+    if (isLocal) return false;
+    final uri = Uri.tryParse(address);
+    return uri != null && uri.port == 3081;
+  }
 
   bool get hasLocalUpdates =>
       isLocal &&
@@ -2061,10 +2083,22 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           } else if (evt.type == 'network_changed') {
             unawaited(_refreshDeviceLocalIps());
             final live = _liveClient;
-            if (live != null && !state.activeHost.isLocal) {
-              live.resetConnectionPool();
-              if (!state.activeHost.needsAuth) {
-                unawaited(live.stream.checkLiveness().catchError((_) => false));
+            if (!state.activeHost.isLocal) {
+              if (live != null) {
+                live.resetConnectionPool();
+                if (!state.activeHost.needsAuth) {
+                  unawaited(live.stream.checkLiveness().catchError((_) => false));
+                }
+              } else if (!state.activeHost.needsAuth &&
+                  state.connectionPhase != ConnectionPhase.connecting &&
+                  state.connectionPhase != ConnectionPhase.needsAuth) {
+                // Network just returned while an offline remote host is active — auto-reconnect!
+                final gen = ++_hostConnectGen;
+                state = state.copyWith(
+                  connectionPhase: ConnectionPhase.connecting,
+                  loadingSessions: true,
+                );
+                unawaited(_tryConnectLiveHost(state.activeHost, gen: gen));
               }
             }
           } else if (evt.type == 'engine_web_url') {
@@ -2200,12 +2234,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _lastBackgroundedAt = null;
     // Allow automatic local-engine recovery if Android OOM-killed the container while backgrounded.
     _autoStartRequestedGen = -1;
+    unawaited(_refreshDeviceLocalIps());
     if (GrassBagNativeBridge.instance.isAndroidNative) {
       // refreshNativeStatus already fetches runtime + permissions + safety in a single parallel batch!
       unawaited(refreshNativeStatus(connectGen: _hostConnectGen));
     }
     final client = _liveClient;
     if (client != null) {
+      if (!state.activeHost.isLocal && bgMs >= 3000) {
+        client.resetConnectionPool();
+      }
       client.stream.checkLiveness();
       // Skip full 10-RPC session+bundle resync on short transient pauses (< 3s, e.g. notification
       // shade or quick system dialog) while WebSocket is live and connected!
@@ -2255,15 +2293,15 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   void completeOnboarding() {
     if (state.onboardingCompleted) return;
     state = state.copyWith(onboardingCompleted: true);
-    _persistPrefs();
+    _persistPrefs(immediate: true);
   }
 
   /// Persist ONLY GrassBag app-level preferences.
   /// All DSH core settings (models, providers, presets, permissions, workspaces,
   /// schedules, goals, MCP, plugins) live exclusively in DSH and are never persisted here.
-  void _persistPrefs() {
+  void _persistPrefs({bool immediate = false}) {
     _persistPrefsTimer?.cancel();
-    _persistPrefsTimer = Timer(const Duration(milliseconds: 180), () {
+    void flush() {
       _persistPrefsTimer = null;
       if (!mounted) return;
       unawaited(
@@ -2284,7 +2322,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             'lastAppUpdateCheckedAtMs': state.lastAppUpdateCheckedAt!.millisecondsSinceEpoch,
         }),
       );
-    });
+    }
+    if (immediate) {
+      flush();
+    } else {
+      _persistPrefsTimer = Timer(const Duration(milliseconds: 180), flush);
+    }
   }
 
   void _persistHosts() {
@@ -2653,10 +2696,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
-  Future<void> scanLanForHosts({int port = 3080}) async {
+  Future<void> scanLanForHosts({int port = 3080, bool silent = false}) async {
     if (state.scanningLan) return;
     if (kIsWeb) {
-      showToast('浏览器环境无法扫描局域网端口，请直接粘贴远程地址或启动链接', tone: ToastTone.info);
+      if (!silent) {
+        showToast('浏览器环境无法扫描局域网端口，请直接粘贴远程地址或启动链接', tone: ToastTone.info);
+      }
       return;
     }
     state = state.copyWith(scanningLan: true);
@@ -2678,14 +2723,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }).toList(growable: false);
     state = state.copyWith(scanningLan: false, discoveredLanHosts: found);
     final dshCount = found.where((h) => h.isDsh).length;
-    showToast(
-      found.isEmpty
-          ? '未发现局域网 DSH 服务（桌面端默认仅监听本机随机端口，请查看下方「桌面端引导」开启远程访问）'
-          : (dshCount > 0
-              ? '发现 $dshCount 台局域网 DSH 服务（共 ${found.length} 台主机），免插件可直接连接'
-              : '发现 ${found.length} 台局域网主机'),
-      tone: found.isEmpty ? ToastTone.info : ToastTone.ok,
-    );
+    if (!silent || found.isNotEmpty) {
+      showToast(
+        found.isEmpty
+            ? '未发现局域网 DSH 服务（电脑端默认仅监听本机回环，可展开「如何获取电脑链接」开启共享）'
+            : (dshCount > 0
+                ? '发现 $dshCount 台局域网 DSH 服务（共 ${found.length} 台主机），免插件可直接连接'
+                : '发现 ${found.length} 台局域网主机'),
+        tone: found.isEmpty ? ToastTone.info : ToastTone.ok,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -6921,6 +6968,30 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
     final t0 = DateTime.now();
     if (isActive) {
+      final existingClient = _liveClient;
+      if (existingClient != null &&
+          state.connectionPhase == ConnectionPhase.connected &&
+          target.online) {
+        // Non-destructive liveness check first so probing a healthy active host never tears down
+        // an active WebSocket or ongoing reply stream!
+        final alive = await existingClient.stream.checkLiveness().catchError((_) => false);
+        if (!mounted) return;
+        if (alive) {
+          final ms = DateTime.now().difference(t0).inMilliseconds.clamp(1, 9999);
+          state = state.copyWith(
+            hosts: [
+              for (final h in state.hosts) h.id == hostId ? h.copyWith(latency: '$ms ms') : h,
+            ],
+          );
+          unawaited(refreshSessionsList(silent: true));
+          showToast(
+            target.bridged
+                ? '${target.name} 运行正常（增强模式 · ${ms}ms）'
+                : '${target.name} 运行正常（原生直连 · ${ms}ms）',
+          );
+          return;
+        }
+      }
       final gen = ++_hostConnectGen;
       state = state.copyWith(
         connectionPhase: ConnectionPhase.connecting,
@@ -6933,11 +7004,19 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (!mounted) return;
     final ms = DateTime.now().difference(t0).inMilliseconds.clamp(1, 9999);
     final updated = state.hosts.firstWhere((h) => h.id == hostId, orElse: () => target);
-    state = state.copyWith(
-      hosts: [
-        for (final h in state.hosts) h.id == hostId ? h.copyWith(latency: '$ms ms') : h,
-      ],
-    );
+    if (updated.online || updated.needsAuth) {
+      state = state.copyWith(
+        hosts: [
+          for (final h in state.hosts) h.id == hostId ? h.copyWith(latency: '$ms ms') : h,
+        ],
+      );
+    } else {
+      state = state.copyWith(
+        hosts: [
+          for (final h in state.hosts) h.id == hostId ? h.copyWith(latency: '离线') : h,
+        ],
+      );
+    }
     if (updated.needsAuth) {
       showToast(
         updated.isHtmlProxyAuth
@@ -8494,7 +8573,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
   void _persistHostCookie(String hostId, String cookieHeader) {
     final clean = cookieHeader.trim();
-    if (clean.isEmpty) return;
+    if (clean.isEmpty) {
+      unawaited(GrassBagNativeBridge.instance.deleteSecret('host_cookie_$hostId'));
+      if (!mounted) return;
+      final idx = state.hosts.indexWhere((h) => h.id == hostId);
+      if (idx < 0 || !state.hosts[idx].hasSavedCookie) return;
+      state = state.copyWith(
+        hosts: [
+          for (final h in state.hosts) h.id == hostId ? h.copyWith(clearSessionCookie: true) : h,
+        ],
+      );
+      return;
+    }
     unawaited(GrassBagNativeBridge.instance.putSecret('host_cookie_$hostId', clean));
     if (!mounted) return;
     final idx = state.hosts.indexWhere((h) => h.id == hostId);
@@ -8592,21 +8682,44 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final effectiveToken = parsed.token;
     final sw = Stopwatch()..start();
     GbridgeClient? client;
+    String? mintedCookie = (cookie != null && cookie.trim().isNotEmpty) ? cookie.trim() : null;
     try {
       client = GbridgeClient(
-        HostEndpoint.http(baseUri: uri, token: effectiveToken, cookie: cookie),
+        HostEndpoint.http(baseUri: uri, token: effectiveToken, cookie: mintedCookie),
         timeout: const Duration(seconds: 10),
         allowBadCertificates: allowBadCertificates,
         autoReconnect: false,
+        onCookieUpdated: (c) {
+          final clean = c.trim();
+          if (clean.isNotEmpty) mintedCookie = clean;
+        },
       );
-      if ((cookie == null || cookie.isEmpty) &&
+      var exchangedTokenThisAttempt = false;
+      if ((mintedCookie == null || mintedCookie!.isEmpty) &&
           effectiveToken != null &&
           effectiveToken.isNotEmpty) {
+        exchangedTokenThisAttempt = true;
         try {
           await client.exchangeAuthToken(effectiveToken);
         } catch (_) {}
       }
-      final probe = await client.probeHost();
+      var probe = await client.probeHost();
+      // If a stale cookie failed auth while we have a fresh token, clear the stale cookie and retry token exchange once!
+      if (probe is HostProbeNeedsAuth &&
+          !exchangedTokenThisAttempt &&
+          effectiveToken != null &&
+          effectiveToken.isNotEmpty) {
+        client.transport.setCookieHeader(null);
+        mintedCookie = null;
+        try {
+          await client.exchangeAuthToken(effectiveToken);
+        } catch (_) {}
+        probe = await client.probeHost();
+      }
+      final liveCookie = client.transport.cookieHeader?.trim();
+      if (liveCookie != null && liveCookie.isNotEmpty) {
+        mintedCookie = liveCookie;
+      }
       sw.stop();
       final ms = sw.elapsedMilliseconds.clamp(1, 99999);
       if (probe is HostProbeFull) {
@@ -8616,6 +8729,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           message: '检测到 DSH ${probe.capabilities.dshVersion} 与连接助手 v${probe.capabilities.bridgeVersion}（${ms}ms），可立即使用全部功能。',
           normalizedAddress: parsed.address,
           extractedToken: effectiveToken,
+          capturedCookie: mintedCookie,
           dshVersion: probe.capabilities.dshVersion,
           latencyMs: ms,
           hasGbridge: true,
@@ -8628,6 +8742,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           message: '检测到原版 DSH ${probe.dshVersion}（${ms}ms），无需安装任何插件即可直接对话、管理模型、工作区与终端。',
           normalizedAddress: parsed.address,
           extractedToken: effectiveToken,
+          capturedCookie: mintedCookie,
           dshVersion: probe.dshVersion,
           latencyMs: ms,
           hasGbridge: false,
@@ -8642,6 +8757,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             message: '$verLabel 位于登录网关或反向代理后方，点击下方「App 内网页登录」即可自动同步凭证，无需手动填 Token。',
             normalizedAddress: parsed.address,
             extractedToken: effectiveToken,
+            capturedCookie: mintedCookie,
             dshVersion: probe.dshVersion,
             latencyMs: ms,
             hasGbridge: probe.hasGbridge,
@@ -8653,6 +8769,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           message: '远程服务在线（${ms}ms），免装插件即可使用。请粘贴一次电脑端生成的启动链接（含 ?token=）或输入 Token，授权成功后 30 天内自动免填连接。',
           normalizedAddress: parsed.address,
           extractedToken: effectiveToken,
+          capturedCookie: mintedCookie,
           dshVersion: probe.dshVersion,
           latencyMs: ms,
           hasGbridge: probe.hasGbridge,
@@ -8670,6 +8787,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           message: '原版 DSH 的安全校验未放行 `${probe.hostAuthority}`。请在远程主机使用下方命令启动即可直连：',
           normalizedAddress: parsed.address,
           extractedToken: effectiveToken,
+          capturedCookie: mintedCookie,
           dshVersion: probe.dshVersion,
           latencyMs: ms,
           hostAuthority: probe.hostAuthority,
@@ -8682,6 +8800,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         message: '已探测到目标主机（${ms}ms），可直接添加并连接。',
         normalizedAddress: parsed.address,
         extractedToken: effectiveToken,
+        capturedCookie: mintedCookie,
         latencyMs: ms,
       );
     } catch (e) {
@@ -8719,6 +8838,84 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
+  /// High-level 1-tap remote connection orchestrator:
+  /// 1. Runs a non-destructive `diagnoseRemoteHost` FIRST without switching `activeHostId` or
+  ///    tearing down the user's current session.
+  /// 2. Preserves any freshly minted 30-day session cookie (`diag.capturedCookie`) so one-time
+  ///    `?token=` links are NEVER exchanged/burned twice!
+  /// 3. Only saves & switches to the remote host once ready (or when `saveIfNeedsAuth` is set
+  ///    for immediate in-app WebView login).
+  Future<RemoteConnectOutcome> connectRemoteInput(
+    String rawInput, {
+    String? name,
+    String? token,
+    String? cookie,
+    bool allowBadCertificates = false,
+    bool saveIfNeedsAuth = false,
+  }) async {
+    final diag = await diagnoseRemoteHost(
+      rawInput,
+      token: token,
+      cookie: cookie,
+      allowBadCertificates: allowBadCertificates,
+    );
+    if (!mounted) {
+      return RemoteConnectOutcome(diagnosis: diag, connected: false);
+    }
+    final targetAddress = diag.normalizedAddress;
+    if (targetAddress == null) {
+      return RemoteConnectOutcome(diagnosis: diag, connected: false);
+    }
+    if (diag.canConnectNow) {
+      final saved = addRemoteHost(
+        targetAddress,
+        name: name,
+        token: diag.extractedToken ?? token,
+        cookie: diag.capturedCookie ?? cookie,
+        allowBadCertificates: allowBadCertificates,
+        autoProbe: false,
+        silent: true,
+      );
+      if (saved == null) {
+        return RemoteConnectOutcome(diagnosis: diag, connected: false);
+      }
+      await switchHost(saved.id, awaitConnect: true);
+      if (!mounted) {
+        return RemoteConnectOutcome(diagnosis: diag, host: saved, connected: false);
+      }
+      final latest = state.hosts.firstWhere((h) => h.id == saved.id, orElse: () => saved);
+      if (latest.online) {
+        showToast(
+          latest.bridged
+              ? '已接入「${latest.name}」（增强模式 · ${latest.latency}）'
+              : '已接入「${latest.name}」（原生免插件直连 · ${latest.latency}）',
+        );
+      }
+      return RemoteConnectOutcome(
+        diagnosis: diag,
+        host: latest,
+        connected: latest.online,
+      );
+    }
+    if (saveIfNeedsAuth && diag.needsWebOrTokenAuth) {
+      final saved = addRemoteHost(
+        targetAddress,
+        name: name,
+        token: diag.extractedToken ?? token,
+        cookie: diag.capturedCookie ?? cookie,
+        allowBadCertificates: allowBadCertificates,
+        autoProbe: false,
+        silent: true,
+      );
+      return RemoteConnectOutcome(
+        diagnosis: diag,
+        host: saved,
+        connected: false,
+      );
+    }
+    return RemoteConnectOutcome(diagnosis: diag, connected: false);
+  }
+
   /// Probe a non-active host without touching `_liveClient` or the active host's sessions.
   Future<void> _probeHostOnly(ManagedHost host) async {
     final probeGen = (_hostProbeGen[host.id] ?? 0) + 1;
@@ -8746,12 +8943,27 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         autoReconnect: false,
         onCookieUpdated: (c) => _persistHostCookie(host.id, c),
       );
+      var exchangedTokenThisAttempt = false;
       if (!host.hasSavedCookie && token != null && token.isNotEmpty) {
+        exchangedTokenThisAttempt = true;
         try {
           await client.exchangeAuthToken(token);
         } catch (_) {}
       }
-      final probe = await client.probeHost();
+      var probe = await client.probeHost();
+      // If a cached cookie went stale while we still hold a token, clear the stale cookie and
+      // re-exchange the token once before concluding auth is required!
+      if (probe is HostProbeNeedsAuth &&
+          !exchangedTokenThisAttempt &&
+          token != null &&
+          token.isNotEmpty) {
+        client.transport.setCookieHeader(null);
+        _persistHostCookie(host.id, '');
+        try {
+          await client.exchangeAuthToken(token);
+        } catch (_) {}
+        probe = await client.probeHost();
+      }
       sw.stop();
       final latLabel = '${sw.elapsedMilliseconds.clamp(1, 99999)}ms';
       if (isStaleProbe()) return;
@@ -8809,7 +9021,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             for (final h in state.hosts)
               h.id == host.id
                   ? h.copyWith(
-                      bridged: probe.hasGbridge,
+                      bridged: false,
                       directMode: false,
                       online: false,
                       latency: latLabel,
@@ -8914,12 +9126,27 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         allowBadCertificates: host.allowBadCertificates,
         onCookieUpdated: (c) => _persistHostCookie(host.id, c),
       );
+      var exchangedTokenThisAttempt = false;
       if (!host.hasSavedCookie && token != null && token.isNotEmpty) {
+        exchangedTokenThisAttempt = true;
         try {
           await client.exchangeAuthToken(token);
         } catch (_) {}
       }
-      final probe = await client.probeHost();
+      var probe = await client.probeHost();
+      // If a stale cookie failed auth while we hold a token, clear the stale cookie and retry
+      // token exchange once so users don't get stuck on expired sessions!
+      if (probe is HostProbeNeedsAuth &&
+          !exchangedTokenThisAttempt &&
+          token != null &&
+          token.isNotEmpty) {
+        client.transport.setCookieHeader(null);
+        _persistHostCookie(host.id, '');
+        try {
+          await client.exchangeAuthToken(token);
+        } catch (_) {}
+        probe = await client.probeHost();
+      }
       sw.stop();
       final latLabel = '${sw.elapsedMilliseconds.clamp(1, 99999)}ms';
       if (!mounted || targetGen != _hostConnectGen) {
@@ -8961,7 +9188,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             for (final h in state.hosts)
               h.id == host.id
                   ? h.copyWith(
-                      bridged: probe.hasGbridge,
+                      bridged: false,
                       directMode: false,
                       online: false,
                       latency: latLabel,
@@ -9104,7 +9331,46 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _phaseSub = client.stream.phases.listen((phase) {
       if (!mounted || !identical(_liveClient, client)) return;
       final prev = state.connectionPhase;
-      state = state.copyWith(connectionPhase: phase);
+      if (phase == ConnectionPhase.needsAuth) {
+        state = state.copyWith(
+          connectionPhase: phase,
+          hosts: [
+            for (final h in state.hosts)
+              h.id == hostId
+                  ? h.copyWith(
+                      online: false,
+                      bridged: false,
+                      directMode: false,
+                      lastErrorCode: 'needs_auth',
+                      lastError: '远程会话认证已失效，请重新输入 Token 或网页登录',
+                    )
+                  : h,
+          ],
+        );
+        return;
+      }
+      if (phase == ConnectionPhase.connected) {
+        final curHost = state.hosts.where((h) => h.id == hostId).firstOrNull;
+        final needsOnlineRestore = curHost != null && !curHost.online;
+        state = state.copyWith(
+          connectionPhase: phase,
+          hosts: needsOnlineRestore
+              ? [
+                  for (final h in state.hosts)
+                    h.id == hostId
+                        ? h.copyWith(
+                            online: true,
+                            bridged: !isDirect,
+                            directMode: isDirect,
+                            clearLastError: true,
+                          )
+                        : h,
+                ]
+              : state.hosts,
+        );
+      } else {
+        state = state.copyWith(connectionPhase: phase);
+      }
       if (phase == ConnectionPhase.connected &&
           (prev == ConnectionPhase.reconnecting ||
               prev == ConnectionPhase.disconnected ||
@@ -10811,7 +11077,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       state = state.copyWith(
         hosts: [
           for (final h in state.hosts)
-            h.id == hostId ? h.copyWith(installing: false, bridged: false, lastError: readable) : h,
+            h.id == hostId
+                ? (h.online && h.directMode
+                    // Never clobber an already-working zero-plugin direct connection with a helper error!
+                    ? h.copyWith(installing: false, bridged: false)
+                    : h.copyWith(installing: false, bridged: false, lastError: readable))
+                : h,
         ],
       );
       showError('安装连接助手失败（不影响免插件原生直连）', error: e);
@@ -10825,17 +11096,22 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     String? cookie,
     bool allowBadCertificates = false,
     bool autoProbe = true,
+    bool silent = false,
   }) {
     final parsed = parseRemoteHostInput(address, explicitToken: token);
     if (parsed == null) {
-      showToast('请输入有效地址，或直接粘贴 `dsh web: http://...` 链接', tone: ToastTone.warn);
+      if (!silent) {
+        showToast('请输入有效地址，或直接粘贴 `dsh web: http://...` 链接', tone: ToastTone.warn);
+      }
       return null;
     }
     final parsedUri = Uri.tryParse(parsed.address);
     if (parsedUri != null) {
       final selfMsg = selfDeviceGuidanceForUri(parsedUri);
       if (selfMsg != null) {
-        showToast(selfMsg, tone: ToastTone.info);
+        if (!silent) {
+          showToast(selfMsg, tone: ToastTone.info);
+        }
         return null;
       }
     }
@@ -10845,11 +11121,15 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         .where((h) => !h.isLocal && h.address.toLowerCase() == parsed.address.toLowerCase())
         .firstOrNull;
     if (existing != null) {
+      final hasNewToken =
+          parsed.token != null && parsed.token!.isNotEmpty && parsed.token != existing.token;
+      final dropStaleCookie = cleanCookie == null && hasNewToken;
       final merged = existing.copyWith(
         name: (name != null && name.trim().isNotEmpty) ? name.trim() : existing.name,
         allowBadCertificates: allowBadCertificates || existing.allowBadCertificates,
         token: (parsed.token != null && parsed.token!.isNotEmpty) ? parsed.token : existing.token,
-        sessionCookie: cleanCookie ?? existing.sessionCookie,
+        sessionCookie: cleanCookie ?? (dropStaleCookie ? null : existing.sessionCookie),
+        clearSessionCookie: dropStaleCookie,
         clearLastError: true,
       );
       state = state.copyWith(
@@ -10861,8 +11141,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
       if (cleanCookie != null) {
         unawaited(GrassBagNativeBridge.instance.putSecret('host_cookie_${existing.id}', cleanCookie));
+      } else if (dropStaleCookie) {
+        unawaited(GrassBagNativeBridge.instance.deleteSecret('host_cookie_${existing.id}'));
       }
-      showToast('已更新已有远程主机「${merged.name}」', tone: ToastTone.info);
+      if (!silent) {
+        showToast('已更新已有远程主机「${merged.name}」', tone: ToastTone.info);
+      }
       if (autoProbe) {
         unawaited(_probeHostOnly(merged));
       }
@@ -10892,14 +11176,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (cleanCookie != null) {
       unawaited(GrassBagNativeBridge.instance.putSecret('host_cookie_$id', cleanCookie));
     }
-    showToast(
-      created.isInsecurePublicHttp
-          ? '已添加公网明文 HTTP 主机，建议升级为 HTTPS 以保护会话凭证'
-          : (parsed.wasAutoPorted
-              ? '已自动补全 :3080 端口，正在免插件探测连接…'
-              : '已添加远程主机，正在探测连接…'),
-      tone: created.isInsecurePublicHttp ? ToastTone.warn : ToastTone.ok,
-    );
+    if (!silent) {
+      showToast(
+        created.isInsecurePublicHttp
+            ? '已添加公网明文 HTTP 主机，建议升级为 HTTPS 以保护会话凭证'
+            : (parsed.wasAutoPorted
+                ? '已自动补全 :3080 端口，正在免插件探测连接…'
+                : '已添加远程主机，正在探测连接…'),
+        tone: created.isInsecurePublicHttp ? ToastTone.warn : ToastTone.ok,
+      );
+    }
     if (autoProbe) {
       unawaited(_probeHostOnly(created));
     }
@@ -10934,19 +11220,33 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       extractedToken = parsed.token;
       nextAddr = parsed.address;
     }
+    final originChanged = nextAddr.toLowerCase() != target.address.toLowerCase();
+    final hasExtractedToken = extractedToken != null && extractedToken.isNotEmpty;
+    final shouldClearToken = originChanged && !hasExtractedToken;
+    final shouldClearCookie = originChanged || hasExtractedToken;
     final updated = target.copyWith(
       name: nextName,
       address: nextAddr,
       allowBadCertificates: allowBadCertificates ?? target.allowBadCertificates,
-      token: extractedToken != null && extractedToken.isNotEmpty ? extractedToken : target.token,
+      token: hasExtractedToken ? extractedToken : (shouldClearToken ? null : target.token),
+      clearToken: shouldClearToken,
+      clearSessionCookie: shouldClearCookie,
       clearLastError: true,
     );
     state = state.copyWith(
       hosts: [for (final h in state.hosts) h.id == hostId ? updated : h],
     );
     _persistHosts();
-    if (extractedToken != null && extractedToken.isNotEmpty) {
+    if (hasExtractedToken) {
       unawaited(GrassBagNativeBridge.instance.putSecret('host_token_$hostId', extractedToken));
+    } else if (shouldClearToken) {
+      unawaited(GrassBagNativeBridge.instance.deleteSecret('host_token_$hostId'));
+    }
+    if (shouldClearCookie) {
+      unawaited(GrassBagNativeBridge.instance.deleteSecret('host_cookie_$hostId'));
+      if (state.activeHostId == hostId) {
+        _liveClient?.transport.setCookieHeader(null);
+      }
     }
     showToast('已更新主机「${updated.name}」配置');
     if (state.activeHostId == hostId) {
@@ -10969,9 +11269,20 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final cleanToken = parsedFromLine?.token ?? raw;
     final target = state.hosts.where((h) => h.id == hostId).firstOrNull;
     if (target == null) return;
+    // If user pasted a full `http://192.168.x.x:3080/?token=...` link after a DHCP IP change,
+    // seamlessly update the host address too (as long as it's not a loopback/self address)!
+    var nextAddr = target.address;
+    if (!target.isLocal && parsedFromLine != null) {
+      final parsedUri = Uri.tryParse(parsedFromLine.address);
+      if (parsedUri != null && selfDeviceGuidanceForUri(parsedUri) == null) {
+        nextAddr = parsedFromLine.address;
+      }
+    }
     final updated = target.copyWith(
+      address: nextAddr,
       token: cleanToken.isEmpty ? null : cleanToken,
       clearToken: cleanToken.isEmpty,
+      clearSessionCookie: true,
       clearLastError: true,
     );
     state = state.copyWith(
@@ -10985,7 +11296,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     } else {
       unawaited(GrassBagNativeBridge.instance.deleteSecret('host_token_$hostId'));
     }
+    unawaited(GrassBagNativeBridge.instance.deleteSecret('host_cookie_$hostId'));
     if (state.activeHostId == hostId) {
+      _liveClient?.transport.setCookieHeader(null);
       showToast('已更新访问令牌，正在重新连接 ${updated.name}…', tone: ToastTone.info);
       await switchHost(hostId, awaitConnect: awaitConnect);
     } else if (awaitConnect) {
@@ -11039,6 +11352,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       ],
     );
     unawaited(GrassBagNativeBridge.instance.deleteSecret('host_cookie_$hostId'));
+    if (state.activeHostId == hostId) {
+      _liveClient?.transport.setCookieHeader(null);
+    }
     showToast('已清除「${target.name}」的缓存登录凭证', tone: ToastTone.info);
   }
 

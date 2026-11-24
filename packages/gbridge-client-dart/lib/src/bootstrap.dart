@@ -104,7 +104,10 @@ class RemoteBootstrapClient {
           message: err.message,
         );
       }
-      if (!err.isNotFound && err.code != 'gbridge/html_response') {
+      if (!err.isNotFound &&
+          err.status != 405 &&
+          err.status != 501 &&
+          err.code != 'gbridge/html_response') {
         rethrow;
       }
     }
@@ -235,7 +238,11 @@ class RemoteBootstrapClient {
       if (val is Map<String, dynamic>) return val;
       return {'value': val, ...result};
     }
-    return res;
+    throw GbridgeException(
+      status: 502,
+      code: 'gbridge/non_dsh_response',
+      message: '目标服务未返回有效的 DeepSeek Harness 接口响应',
+    );
   }
 
   /// Trigger optional remote installation of `dsh-gbridge` on a stock `dsh web` host

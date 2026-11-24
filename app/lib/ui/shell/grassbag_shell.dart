@@ -818,7 +818,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final showTopLeftBtn = !isTab || !shellSlice.tabletSidebarOpen;
     final showTopRightBtn = !isTab || !shellSlice.tabletWorkbenchOpen;
 
-    final remoteUsable = shellSlice.hostBridged || (shellSlice.hostDirectMode && shellSlice.hostOnline);
+    final remoteUsable = shellSlice.hostOnline && (shellSlice.hostBridged || shellSlice.hostDirectMode);
     // Empty chat renders `_RemoteEmptyStatusBanner` inline inside `ChatEmptyState` — avoid duplicate banners!
     final showRemoteBasicBanner = !shellSlice.isEmptyChat &&
         !shellSlice.hostIsLocal &&

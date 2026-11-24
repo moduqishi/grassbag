@@ -9,6 +9,7 @@ import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../onboarding/onboarding_page.dart';
 
 /// Opens a Liquid Glass bottom sheet displaying the latest GitHub Release details,
 /// changelog, download progress, and one-tap Android APK installer.
@@ -464,6 +465,24 @@ class AppAboutAndUpdateView extends ConsumerWidget {
           header: '项目与发版渠道',
           dividerIndent: 56,
           children: [
+            GrassBagListTile(
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.sparkles,
+                color: t.isDark ? const Color(0xFF4AC885) : const Color(0xFF1F9D63),
+                size: 32,
+                iconSize: 15,
+              ),
+              title: const Text('查看欢迎与快速引导'),
+              subtitle: const Text('重温首次启动引导与环境配置流程'),
+              showChevron: true,
+              onTap: () {
+                Navigator.of(context).push(
+                  GrassBagPageRoute<void>(
+                    builder: (_) => const OnboardingPage(isFirstLaunch: false),
+                  ),
+                );
+              },
+            ),
             GrassBagListTile(
               leading: GrassBagSquircleIcon(
                 icon: CupertinoIcons.chevron_left_slash_chevron_right,

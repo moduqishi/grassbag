@@ -811,12 +811,6 @@ class _SettingsNavList extends ConsumerWidget {
           ),
         );
 
-    final isAndroidNative = GrassBagNativeBridge.instance.isAndroidNative;
-    final envReady = state.connectionPhase == ConnectionPhase.connected;
-    final modelReady = state.routableProviders.isNotEmpty;
-    final phoneReady = perms.accessibilityEnabled;
-    final showReadinessChecklist = q.isEmpty && (!envReady || !modelReady);
-
     return ListView(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       physics: const BouncingScrollPhysics(
@@ -838,24 +832,6 @@ class _SettingsNavList extends ConsumerWidget {
           onChanged: onQueryChanged,
         ),
         const SizedBox(height: 16),
-
-        if (showReadinessChecklist) ...[
-          _SettingsReadinessChecklistCard(
-            envReady: envReady,
-            envHint: curHost.needsAuth
-                ? '主机待授权'
-                : (envReady ? '已就绪' : '点击初始化或连接主机'),
-            modelReady: modelReady,
-            modelHint: modelReady ? '已就绪' : '登录 DeepSeek 或填 API Key',
-            showPhoneStep: isAndroidNative,
-            phoneReady: phoneReady,
-            phoneHint: phoneReady ? '已开启' : '可选 · 开启无障碍即可操控手机',
-            onTapEnv: () => onSelect(SettingsSection.hosts),
-            onTapModel: () => onSelect(SettingsSection.model),
-            onTapPhone: () => onSelect(SettingsSection.permissions),
-          ),
-          SizedBox(height: isSplit ? 10 : 16),
-        ],
 
         // Translucent iOS 26/27 Account & Host Overview Hero Card (zero scroll BackdropFilter!)
         if (accountMatchesSearch) ...[
@@ -1097,154 +1073,6 @@ class _SettingsNavList extends ConsumerWidget {
             },
           ),
       ],
-    );
-  }
-}
-
-class _SettingsReadinessChecklistCard extends StatelessWidget {
-  const _SettingsReadinessChecklistCard({
-    required this.envReady,
-    required this.envHint,
-    required this.modelReady,
-    required this.modelHint,
-    required this.showPhoneStep,
-    required this.phoneReady,
-    required this.phoneHint,
-    required this.onTapEnv,
-    required this.onTapModel,
-    required this.onTapPhone,
-  });
-
-  final bool envReady;
-  final String envHint;
-  final bool modelReady;
-  final String modelHint;
-  final bool showPhoneStep;
-  final bool phoneReady;
-  final String phoneHint;
-  final VoidCallback onTapEnv;
-  final VoidCallback onTapModel;
-  final VoidCallback onTapPhone;
-
-  @override
-  Widget build(BuildContext context) {
-    final t = GrassBagTokens.of(context);
-    final total = showPhoneStep ? 3 : 2;
-    final done = (envReady ? 1 : 0) + (modelReady ? 1 : 0) + (showPhoneStep && phoneReady ? 1 : 0);
-
-    Widget stepPill({
-      required String index,
-      required String title,
-      required bool completed,
-      required VoidCallback onTap,
-    }) {
-      return Expanded(
-        child: GrassBagSpringTap(
-          onTap: onTap,
-          pressedScale: 0.96,
-          haptic: true,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
-            decoration: BoxDecoration(
-              color: completed ? t.okSoft : t.fill1,
-              borderRadius: BorderRadius.circular(13),
-              border: Border.all(
-                color: completed ? t.ok.withValues(alpha: 0.25) : t.sep,
-                width: 0.6,
-              ),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  completed ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
-                  size: 13.5,
-                  color: completed ? t.ok : t.primary,
-                ),
-                const SizedBox(width: 5),
-                Flexible(
-                  child: Text(
-                    '$index.$title',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
-                      color: completed ? t.ok : t.text,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
-    final nextHint = !envReady
-        ? envHint
-        : (!modelReady ? modelHint : phoneHint);
-
-    return GrassBagCard(
-      borderRadius: 20,
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Icon(CupertinoIcons.sparkles, size: 13.5, color: t.primary),
-              const SizedBox(width: 5),
-              Text(
-                '快速就绪',
-                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  nextHint,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 11, color: t.text3),
-                ),
-              ),
-              const SizedBox(width: 6),
-              _SmallPill(
-                label: '$done/$total',
-                bg: t.primarySoft,
-                fg: t.primary,
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              stepPill(
-                index: '1',
-                title: '环境',
-                completed: envReady,
-                onTap: onTapEnv,
-              ),
-              const SizedBox(width: 6),
-              stepPill(
-                index: '2',
-                title: '模型',
-                completed: modelReady,
-                onTap: onTapModel,
-              ),
-              if (showPhoneStep) ...[
-                const SizedBox(width: 6),
-                stepPill(
-                  index: '3',
-                  title: '手机',
-                  completed: phoneReady,
-                  onTap: onTapPhone,
-                ),
-              ],
-            ],
-          ),
-        ],
-      ),
     );
   }
 }
@@ -2097,7 +1925,13 @@ class _SettingsDetailBody extends ConsumerWidget {
               connectImmediately: true,
               showHeader: true,
               initiallyShowGuide: remotes.isEmpty,
-              onConnectedHost: (added) => onSelectHostDetail(added.id),
+              onConnectedHost: (added) {
+                if (added.isConnectedUsable && Navigator.of(context).canPop()) {
+                  Navigator.of(context).popUntil((r) => r.isFirst);
+                  return;
+                }
+                onSelectHostDetail(added.id);
+              },
             ),
           ],
         );
@@ -3210,6 +3044,7 @@ class _HostDetailSection extends ConsumerWidget {
         errLower.contains('authentication');
     final isUntrustedHost = errCode == 'untrusted_host' || errLower.contains('403');
     final isTlsError = errCode == 'tls_cert' || errLower.contains('handshake');
+    final isBridgedReady = host.bridged && host.online;
     final isDirectReady = host.directMode && host.online;
     final canWebViewLogin = !kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.android ||
@@ -3360,6 +3195,24 @@ class _HostDetailSection extends ConsumerWidget {
                             ),
                           ),
                         ),
+                        const SizedBox(height: 6),
+                        GrassBagSecondaryGlassButton(
+                          label: '复制桌面端一键指令（免命令）',
+                          icon: CupertinoIcons.sparkles,
+                          height: 32,
+                          tier: tier,
+                          insideGlass: true,
+                          accentForeground: true,
+                          onTap: () {
+                            Clipboard.setData(
+                              const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
+                            );
+                            ctrl.showToast(
+                              '已复制一键指令，粘贴发给电脑端 DeepSeek Harness 即可开启共享',
+                              tone: ToastTone.ok,
+                            );
+                          },
+                        ),
                       ],
                     ],
                   ),
@@ -3477,12 +3330,12 @@ class _HostDetailSection extends ConsumerWidget {
               Row(
                 children: [
                   GrassBagSquircleIcon(
-                    icon: host.bridged
+                    icon: isBridgedReady
                         ? CupertinoIcons.bolt_circle_fill
                         : (isDirectReady
                             ? CupertinoIcons.checkmark_seal_fill
                             : CupertinoIcons.lock_shield_fill),
-                    color: host.bridged ? t.primary : (isDirectReady ? t.ok : t.warn),
+                    color: isBridgedReady ? t.primary : (isDirectReady ? t.ok : t.warn),
                     size: 36,
                     iconSize: 17,
                   ),
@@ -3492,7 +3345,7 @@ class _HostDetailSection extends ConsumerWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          host.bridged
+                          isBridgedReady
                               ? '增强模式 · 已装连接助手'
                               : (isDirectReady
                                   ? '原生直连 · 免插件可用'
@@ -3500,7 +3353,7 @@ class _HostDetailSection extends ConsumerWidget {
                           style: TextStyle(fontWeight: FontWeight.w600, color: t.text),
                         ),
                         Text(
-                          host.bridged
+                          isBridgedReady
                               ? '助手 v${host.helperVersion ?? '0.1.0'} · DSH ${host.dshVersion}'
                               : (isDirectReady
                                   ? '直连原版 DSH ${host.dshVersion} · 无需在远程安装插件'
@@ -3514,7 +3367,7 @@ class _HostDetailSection extends ConsumerWidget {
               ),
               const SizedBox(height: 10),
               Text(
-                host.bridged
+                isBridgedReady
                     ? '已启用全部原生能力与连接助手，支持断线增量续传、多步轨迹、终端、文件对比与 SDUI 扩展。'
                     : (isDirectReady
                         ? '当前直接通过 DSH 原生协议连接，已完整支持流式对话、思考与工具步骤、模型与渠道配置、工作区文件与实时多标签终端。'
@@ -3522,7 +3375,7 @@ class _HostDetailSection extends ConsumerWidget {
                 style: TextStyle(fontSize: 12.5, height: 1.5, color: t.text2),
               ),
               const SizedBox(height: 14),
-              if (host.bridged)
+              if (isBridgedReady)
                 GrassBagSecondaryGlassButton(
                   label: '检查连通性与助手状态',
                   tier: tier,
@@ -3565,7 +3418,7 @@ class _HostDetailSection extends ConsumerWidget {
         const SizedBox(height: 14),
         GrassBagGroupedSection(
           children: [
-            if (canWebViewLogin)
+            if (canWebViewLogin && !host.isDesktopLanBridge)
               GrassBagListTile(
                 title: const Text('App 内网页登录 / 同步凭证'),
                 subtitle: Text(
@@ -3624,25 +3477,26 @@ class _HostDetailSection extends ConsumerWidget {
                 onChanged: (v) => ctrl.setHostAllowBadCertificates(host.id, v),
               ),
             ),
-            GrassBagListTile(
-              title: const Text('在官方网页版中打开'),
-              showChevron: true,
-              onTap: () async {
-                if (isCurrent) {
-                  onOpenWebUi();
-                  return;
-                }
-                final ticketUrl = await ctrl.createWebUiTicketUrl(host: host);
-                if (!context.mounted) return;
-                Navigator.of(context).push(
-                  GrassBagPageRoute<void>(
-                    builder: (_) => OfficialWebPage(
-                      initialUrl: ticketUrl ?? host.address,
+            if (!host.isDesktopLanBridge)
+              GrassBagListTile(
+                title: const Text('在官方网页版中打开'),
+                showChevron: true,
+                onTap: () async {
+                  if (isCurrent) {
+                    onOpenWebUi();
+                    return;
+                  }
+                  final ticketUrl = await ctrl.createWebUiTicketUrl(host: host);
+                  if (!context.mounted) return;
+                  Navigator.of(context).push(
+                    GrassBagPageRoute<void>(
+                      builder: (_) => OfficialWebPage(
+                        initialUrl: ticketUrl ?? host.address,
+                      ),
                     ),
-                  ),
-                );
-              },
-            ),
+                  );
+                },
+              ),
             GrassBagListTile(
               title: Text('移除此远程主机', style: TextStyle(color: t.err)),
               onTap: () async {
@@ -3738,6 +3592,7 @@ class _HostTokenSheetBody extends ConsumerStatefulWidget {
 
 class _HostTokenSheetBodyState extends ConsumerState<_HostTokenSheetBody> {
   late final TextEditingController _tokenCtrl;
+  bool _obscureToken = true;
   String? _err;
 
   @override
@@ -3769,7 +3624,7 @@ class _HostTokenSheetBodyState extends ConsumerState<_HostTokenSheetBody> {
     if (parsed?.token != null && parsed!.token!.isNotEmpty) {
       setState(() {
         _err = null;
-        _tokenCtrl.text = parsed.token!;
+        _tokenCtrl.text = raw;
       });
       return;
     }
@@ -3791,7 +3646,7 @@ class _HostTokenSheetBodyState extends ConsumerState<_HostTokenSheetBody> {
       final parsed = parseRemoteHostInput(raw);
       if (parsed?.token != null && parsed!.token!.isNotEmpty) {
         Navigator.of(context).pop();
-        ref.read(appProvider.notifier).updateHostToken(widget.host.id, parsed.token!);
+        ref.read(appProvider.notifier).updateHostToken(widget.host.id, raw);
         return;
       }
       if (_looksLikePlainUrl(raw)) {
@@ -3818,10 +3673,26 @@ class _HostTokenSheetBodyState extends ConsumerState<_HostTokenSheetBody> {
           autofocus: true,
           insideGlass: true,
           monospace: true,
+          obscureText: _obscureToken,
           hasError: _err != null,
           placeholder: '粘贴 dsh web: http://.../?token=... 或纯 Token（留空清空）',
           fontSize: 13.5,
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          suffix: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _obscureToken = !_obscureToken),
+            child: SizedBox(
+              width: 34,
+              height: 34,
+              child: Center(
+                child: Icon(
+                  _obscureToken ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                  size: 15,
+                  color: t.text3,
+                ),
+              ),
+            ),
+          ),
           onChanged: (_) {
             if (_err != null) setState(() => _err = null);
           },

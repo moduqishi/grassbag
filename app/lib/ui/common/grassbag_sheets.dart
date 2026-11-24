@@ -15,6 +15,7 @@ import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../web/deepseek_signin_page.dart';
 import '../web/remote_web_login_page.dart';
+import 'remote_host_connect_card.dart';
 
 /// Root navigator key used by [GrassBagGlobalToastHost] so toasts tapped above
 /// root-navigator modal sheets can still open error detail sheets safely.
@@ -2738,19 +2739,33 @@ void showHostQuickSheet(
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 4),
                 child: Text(
-                  '可直连局域网 Mac / PC 上的 DeepSeek Harness 桌面端或 dsh web',
+                  '可免插件直连局域网 Mac / PC 上的 DeepSeek Harness 桌面端或 dsh web',
                   style: TextStyle(fontSize: 11.5, color: t.text3),
                 ),
               ),
             ],
+            const SizedBox(height: 12),
+            GrassBagPrimaryGlassButton(
+              label: '连接新远程设备',
+              icon: CupertinoIcons.plus_circle_fill,
+              tier: state.glassTier,
+              insideGlass: true,
+              onTap: () {
+                Navigator.of(ctx).pop();
+                Future<void>.delayed(const Duration(milliseconds: 160), () {
+                  if (outerCtx.mounted) {
+                    showQuickRemoteConnectSheet(outerCtx);
+                  }
+                });
+              },
+            ),
             if (onOpenHostSettings != null) ...[
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               GrassBagSecondaryGlassButton(
-                label: '管理主机与添加远程设备',
+                label: '管理全部主机与详情',
                 icon: CupertinoIcons.tray_2_fill,
                 tier: state.glassTier,
                 insideGlass: true,
-                accentForeground: true,
                 onTap: () {
                   Navigator.of(ctx).pop();
                   onOpenHostSettings();
@@ -2759,6 +2774,26 @@ void showHostQuickSheet(
             ],
           ],
         );
+      },
+    ),
+  );
+}
+
+/// Direct 1-tap remote device connection sheet launchable straight from the Chat host pill.
+void showQuickRemoteConnectSheet(BuildContext context) {
+  showGrassBagSheet<void>(
+    context,
+    title: '连接远程电脑 / 服务器',
+    subtitle: '自动扫描同局域网设备，或直接粘贴 dsh web 启动链接',
+    preferredHeight: 560,
+    bodyBuilder: (sheetCtx) => RemoteHostConnectCard(
+      showHeader: false,
+      connectImmediately: true,
+      initiallyShowGuide: false,
+      onConnectedHost: (_) {
+        if (sheetCtx.mounted) {
+          Navigator.of(sheetCtx).pop();
+        }
       },
     ),
   );
@@ -2790,10 +2825,13 @@ class _RemoteHostAuthSheetBody extends ConsumerStatefulWidget {
 class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBody> {
   final TextEditingController _inputCtrl = TextEditingController();
   bool _submitting = false;
+  bool _obscureToken = true;
+  bool _showHelp = false;
   String? _tokenError;
 
   bool get _supportsWebLogin =>
       !kIsWeb &&
+      !widget.host.isDesktopLanBridge &&
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS);
 
@@ -2848,8 +2886,8 @@ class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBo
     });
     try {
       final ctrl = ref.read(appProvider.notifier);
-      final token = (parsedToken != null && parsedToken.isNotEmpty) ? parsedToken : trimmed;
-      await ctrl.updateHostToken(widget.host.id, token, awaitConnect: true);
+      // Pass the full raw link when present so `updateHostToken` can also refresh DHCP IP changes!
+      await ctrl.updateHostToken(widget.host.id, trimmed, awaitConnect: true);
       if (!mounted) return;
       final latest = ref.read(appProvider).hosts.where((h) => h.id == widget.host.id).firstOrNull;
       if (latest != null && latest.isConnectedUsable) {
@@ -2921,10 +2959,26 @@ class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBo
           placeholder: '粘贴 http://.../?token=... 或直接输入 Token',
           insideGlass: true,
           monospace: true,
+          obscureText: _obscureToken,
           hasError: _tokenError != null,
           fontSize: 13,
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
           textInputAction: TextInputAction.done,
+          suffix: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _obscureToken = !_obscureToken),
+            child: SizedBox(
+              width: 34,
+              height: 34,
+              child: Center(
+                child: Icon(
+                  _obscureToken ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                  size: 15,
+                  color: t.text3,
+                ),
+              ),
+            ),
+          ),
           onChanged: (_) {
             if (_tokenError != null) setState(() => _tokenError = null);
           },
@@ -2964,13 +3018,80 @@ class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBo
         if (!isHtmlProxy && _supportsWebLogin) ...[
           const SizedBox(height: 8),
           GrassBagSecondaryGlassButton(
-            label: '使用 App 内网页登录（适用于反代 / 桌面桥）',
+            label: '使用 App 内网页登录（适用于反代 / 网页认证）',
             icon: CupertinoIcons.globe,
             tier: tier,
             insideGlass: true,
             onTap: _openWebLogin,
           ),
         ],
+        const SizedBox(height: 8),
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => setState(() => _showHelp = !_showHelp),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  _showHelp ? CupertinoIcons.chevron_up : CupertinoIcons.question_circle,
+                  size: 13,
+                  color: t.primary,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  _showHelp ? '收起获取方式' : '如何获取启动链接 / Token？',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.primary),
+                ),
+              ],
+            ),
+          ),
+        ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+          child: _showHelp
+              ? Container(
+                  margin: const EdgeInsets.only(top: 6),
+                  padding: const EdgeInsets.all(11),
+                  decoration: BoxDecoration(
+                    color: t.fill1,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: t.sep, width: 0.6),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        widget.host.isDesktopLanBridge
+                            ? '桌面端 :3081 桥接令牌保存在电脑的 ~/.dsh/gbridge-lan-token；也可点击下方复制一键指令发给电脑端 AI 自动提取完整链接。'
+                            : '在电脑端运行 dsh web --host <局域网IP> 后会打印包含 ?token=... 的完整链接；或直接把一键指令发给电脑端 DeepSeek Harness 自动生成。',
+                        style: TextStyle(fontSize: 11.5, height: 1.42, color: t.text2),
+                      ),
+                      const SizedBox(height: 8),
+                      GrassBagSecondaryGlassButton(
+                        label: '复制桌面端一键指令',
+                        icon: CupertinoIcons.sparkles,
+                        height: 34,
+                        tier: tier,
+                        insideGlass: true,
+                        accentForeground: true,
+                        onTap: () {
+                          Clipboard.setData(
+                            const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
+                          );
+                          ref.read(appProvider.notifier).showToast(
+                                '已复制一键指令，发给电脑端 DeepSeek Harness 即可获取链接',
+                                tone: ToastTone.ok,
+                              );
+                        },
+                      ),
+                    ],
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
         const SizedBox(height: 6),
         Text(
           '目标地址：${widget.host.address}',

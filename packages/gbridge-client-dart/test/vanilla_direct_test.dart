@@ -47,6 +47,22 @@ void main() {
       expect(parsed!.address, 'http://10.0.0.5:3080');
       expect(parsed.token, 'secret_token_abc123');
     });
+
+    test('strips Chinese punctuation, zero-width chars, and DSH web subpaths', () {
+      final zh = parseRemoteHostInput(
+        '请打开链接：http://192.168.1.88:3080/sessions/abc123?token=tok_zh_88）。\u200B',
+      );
+      expect(zh, isNotNull);
+      expect(zh!.address, 'http://192.168.1.88:3080');
+      expect(zh.token, 'tok_zh_88');
+    });
+
+    test('preserves bracketed IPv6 hosts cleanly', () {
+      final v6 = parseRemoteHostInput('http://[fd7a:115c:a1e0::1]:3080/?token=ipv6tok');
+      expect(v6, isNotNull);
+      expect(v6!.address, 'http://[fd7a:115c:a1e0::1]:3080');
+      expect(v6.token, 'ipv6tok');
+    });
   });
 
   group('Zero-Plugin Stock DSH Direct Mode (NO dsh-gbridge installed)', () {

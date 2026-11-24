@@ -108,6 +108,10 @@ class GbridgeHttpTransport {
         final uri = endpoint.resolveHttpUri(path, query);
         final req = await _client.getUrl(uri).timeout(timeout);
         req.followRedirects = false;
+        // Preserve any reverse-proxy / SSO cookies (e.g. Cloudflare Access, Authelia) during DSH token exchange.
+        if (_cookieHeader != null && _cookieHeader!.isNotEmpty) {
+          req.headers.set(HttpHeaders.cookieHeader, _cookieHeader!);
+        }
         final res = await req.close().timeout(timeout);
         await res.drain<void>();
         if (res.statusCode < 200 || res.statusCode >= 400) return false;
@@ -354,6 +358,7 @@ class GbridgeHttpTransport {
       ).timeout(timeout);
     } on WebSocketException {
       if (!endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
+        final prevCookie = _cookieHeader;
         if (_cookieHeader == usedCookie) _cookieHeader = null;
         final exchanged = await exchangeAuthToken();
         if (exchanged) {
@@ -362,6 +367,10 @@ class GbridgeHttpTransport {
             headers: buildAuthHeaders(),
             customClient: _client,
           ).timeout(timeout);
+        }
+        // Restore previous cookie on transient errors (e.g. 502/503 reload) so valid sessions survive!
+        if (_cookieHeader == null && prevCookie != null) {
+          _cookieHeader = prevCookie;
         }
       }
       rethrow;
@@ -441,6 +450,13 @@ class GbridgeHttpTransport {
   }
 
   Future<Map<String, dynamic>> _decodeJsonResponse(_RawHttpResponse res) async {
+    if (res.statusCode >= 300 && res.statusCode < 400) {
+      throw GbridgeException(
+        status: res.statusCode,
+        code: 'gbridge/html_response',
+        message: '目标重定向至登录认证页 (HTTP ${res.statusCode})',
+      );
+    }
     if (res.statusCode >= 400) {
       _throwResponseError(res);
     }

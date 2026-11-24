@@ -362,6 +362,7 @@ class GrassBagNativeBridge {
   bool _pluginVerified = false;
 
   bool get isAndroidNative => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  bool get isPluginVerified => _pluginVerified;
   bool get isPluginAvailable => isAndroidNative || _pluginVerified;
 
   Stream<NativeEvent>? _eventStream;

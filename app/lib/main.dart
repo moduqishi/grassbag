@@ -8,6 +8,7 @@ import 'state/app_state.dart';
 import 'theme/grassbag_glass.dart';
 import 'theme/grassbag_theme.dart';
 import 'ui/common/grassbag_sheets.dart';
+import 'ui/onboarding/launch_splash_overlay.dart';
 import 'ui/shell/grassbag_shell.dart';
 
 Future<void> main() async {
@@ -35,7 +36,9 @@ Future<void> main() async {
 }
 
 class GrassBagApp extends ConsumerWidget {
-  const GrassBagApp({super.key});
+  const GrassBagApp({super.key, this.skipLaunchGate = false});
+
+  final bool skipLaunchGate;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -72,7 +75,7 @@ class GrassBagApp extends ConsumerWidget {
           builder: (context, child) => GrassBagGlobalToastHost(
             child: child ?? const SizedBox.shrink(),
           ),
-          home: const GrassBagShell(),
+          home: skipLaunchGate ? const GrassBagShell() : const GrassBagAppGate(),
         ),
       ),
     );

@@ -33,7 +33,7 @@ class ParsedRemoteHostInput {
 }
 
 final RegExp _httpUrlInTextRe = RegExp(
-  r'https?://[^\s<>"\x27`(){}]+',
+  r'https?://[^\s<>"\x27`(){}，。；：！？（）【】《》「」『』、\u200B-\u200D\uFEFF]+',
   caseSensitive: false,
 );
 
@@ -152,7 +152,15 @@ ParsedRemoteHostInput? parseRemoteHostInput(
   final remainingQuery = Map<String, String>.from(parsed.queryParameters)
     ..remove('token');
   var cleanPath = parsed.path == '/' ? '' : parsed.path.replaceFirst(RegExp(r'/+$'), '');
-  if (cleanPath == '/connect' || cleanPath == '/gbridge/v1' || cleanPath.startsWith('/gbridge/v1/')) {
+  if (cleanPath == '/connect' ||
+      cleanPath == '/gbridge/v1' ||
+      cleanPath.startsWith('/gbridge/v1/') ||
+      cleanPath == '/sessions' ||
+      cleanPath.startsWith('/sessions/') ||
+      cleanPath == '/settings' ||
+      cleanPath.startsWith('/settings/') ||
+      cleanPath == '/workspaces' ||
+      cleanPath.startsWith('/workspaces/')) {
     cleanPath = '';
   }
   final cleanUri = Uri(
@@ -174,12 +182,29 @@ ParsedRemoteHostInput? parseRemoteHostInput(
 }
 
 String _stripTrailingPunctuation(String s) {
-  var out = s.trim();
-  while (out.isNotEmpty &&
-      const {',', '.', ';', ')', ']', '}', '>', '"', "'", '`'}.contains(out[out.length - 1])) {
-    out = out.substring(0, out.length - 1);
+  var out = s.replaceAll(RegExp(r'[\u200B-\u200D\uFEFF]'), '').trim();
+  const trailingStrip = {
+    ',', '.', ';', ')', '}', '>', '"', "'", '`',
+    '，', '。', '；', '：', '！', '？', '）', '】', '》', '」', '』', '、',
+  };
+  const leadingStrip = {
+    '(', '[', '{', '<', '"', "'", '`',
+    '（', '【', '《', '「', '『',
+  };
+  while (out.isNotEmpty) {
+    final last = out[out.length - 1];
+    if (trailingStrip.contains(last)) {
+      out = out.substring(0, out.length - 1);
+      continue;
+    }
+    // Only strip trailing `]` when it does NOT close an IPv6 bracket (`http://[fd7a::1]`).
+    if (last == ']' && !RegExp(r'://\[[^\]]+\]$').hasMatch(out)) {
+      out = out.substring(0, out.length - 1);
+      continue;
+    }
+    break;
   }
-  while (out.isNotEmpty && const {'(', '[', '{', '<', '"', "'", '`'}.contains(out[0])) {
+  while (out.isNotEmpty && leadingStrip.contains(out[0])) {
     out = out.substring(1);
   }
   return out;

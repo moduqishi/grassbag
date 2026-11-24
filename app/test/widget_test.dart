@@ -46,7 +46,7 @@ Widget _wrapApp({
     ],
     child: MediaQuery(
       data: MediaQueryData(size: size, viewInsets: viewInsets),
-      child: const GrassBagApp(),
+      child: const GrassBagApp(skipLaunchGate: true),
     ),
   );
 }
@@ -364,8 +364,8 @@ void main() {
     expect(find.text('诊断与扩展'), findsOneWidget);
 
     await tester.pumpWidget(wrapDarkPage(const OnboardingPage()));
-    await tester.pumpAndSettle();
-    expect(find.text('环境初始化向导'), findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('欢迎使用 GrassBag'), findsOneWidget);
   });
 
   testWidgets('SchemasteryForm and SduiNodeRenderer render schema controls & fire actions', (
@@ -615,7 +615,7 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(412, 915));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    await tester.pumpWidget(const ProviderScope(child: GrassBagApp()));
+    await tester.pumpWidget(const ProviderScope(child: GrassBagApp(skipLaunchGate: true)));
     await tester.pumpAndSettle();
 
     await tester.tap(find.text('选择工作区'));
@@ -949,7 +949,7 @@ void main() {
             return ctrl;
           }),
         ],
-        child: const GrassBagApp(),
+        child: const GrassBagApp(skipLaunchGate: true),
       ),
     );
     await tester.pumpAndSettle();
@@ -1244,7 +1244,7 @@ void main() {
             return ctrl;
           }),
         ],
-        child: const GrassBagApp(),
+        child: const GrassBagApp(skipLaunchGate: true),
       ),
     );
     await tester.pumpAndSettle();
@@ -1345,7 +1345,7 @@ void main() {
               return ctrl;
             }),
           ],
-          child: const GrassBagApp(),
+          child: const GrassBagApp(skipLaunchGate: true),
         ),
       );
       await tester.pumpAndSettle();
@@ -1836,21 +1836,21 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('直连远程 DSH 设备'), findsOneWidget);
-      expect(find.text('粘贴启动链接'), findsOneWidget);
-      expect(find.text('发现局域网设备'), findsOneWidget);
-      expect(find.text('检测连通'), findsOneWidget);
+      expect(find.text('直连远程电脑 / 服务器'), findsOneWidget);
+      expect(find.text('粘贴'), findsOneWidget);
+      expect(find.text('重新扫描'), findsOneWidget);
+      expect(find.text('连接远程设备'), findsOneWidget);
 
       // Expand Desktop GUI + CLI guide
-      await tester.tap(find.text('桌面端 / 电脑引导'));
+      await tester.tap(find.text('如何获取电脑链接？'));
       await tester.pumpAndSettle();
-      expect(find.text('桌面端 GUI (免命令)'), findsOneWidget);
-      await tester.tap(find.text('命令行 (dsh web)'));
+      expect(find.text('桌面端（免命令）'), findsOneWidget);
+      await tester.tap(find.text('命令行（dsh web）'));
       await tester.pumpAndSettle();
       expect(find.textContaining('dsh web --host'), findsWidgets);
 
       // Expand optional advanced options (Token optional + self-signed cert toggle)
-      await tester.tap(find.textContaining('高级选项'));
+      await tester.tap(find.text('名称 / Token / 证书选项'));
       await tester.pumpAndSettle();
       expect(find.textContaining('信任自签名 HTTPS 证书'), findsOneWidget);
       await tester.pump(const Duration(seconds: 5));
@@ -2089,12 +2089,12 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('桌面端 / 电脑引导'));
+      await tester.tap(find.text('如何获取电脑链接？'));
       await tester.pumpAndSettle();
-      expect(find.text('桌面端 GUI (免命令)'), findsOneWidget);
-      expect(find.text('复制桌面端一键指令（发给桌面 AI）'), findsOneWidget);
+      expect(find.text('桌面端（免命令）'), findsOneWidget);
+      expect(find.text('复制桌面端一键指令'), findsOneWidget);
 
-      await tester.tap(find.text('命令行 (dsh web)'));
+      await tester.tap(find.text('命令行（dsh web）'));
       await tester.pumpAndSettle();
       expect(find.textContaining('--host 0.0.0.0'), findsNothing);
       expect(find.textContaining('dsh web --host'), findsWidgets);
@@ -2166,8 +2166,8 @@ void main() {
       await tester.pumpAndSettle();
       // Deep-linked directly into Hosts subpage (header title is '本机与远程主机', not root '设置')!
       expect(find.text('本机与远程主机'), findsWidgets);
-      expect(find.text('直连远程 DSH 设备'), findsOneWidget);
-      expect(tester.getSize(find.text('直连远程 DSH 设备')).width, greaterThan(40));
+      expect(find.text('直连远程电脑 / 服务器'), findsOneWidget);
+      expect(tester.getSize(find.text('直连远程电脑 / 服务器')).width, greaterThan(40));
 
       // 2) Settings search matches DeepSeek Account Hero Card (also inside GrassBagGlobalToastHost)
       await tester.pumpWidget(
@@ -2491,7 +2491,7 @@ void main() {
       await tester.pumpWidget(
         UncontrolledProviderScope(
           container: container,
-          child: const GrassBagApp(),
+          child: const GrassBagApp(skipLaunchGate: true),
         ),
       );
       await tester.pumpAndSettle();
@@ -2563,25 +2563,23 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('待授权'), findsWidgets);
 
-      // 4) Onboarding 3-step ribbon + '稍后再说' skip button + Settings readiness strip
+      // 4) Luxury 3-step OnboardingPage + clean SettingsPage (no top '快速就绪' banner)
       await tester.pumpWidget(
         UncontrolledProviderScope(
           container: container,
           child: MaterialApp(
             theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
-            home: const OnboardingPage(),
+            home: const OnboardingPage(isFirstLaunch: true),
           ),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 600));
       expect(tester.takeException(), isNull);
-      expect(find.text('环境初始化向导'), findsOneWidget);
-      expect(find.text('稍后再说'), findsOneWidget);
-      expect(find.text('1. 准备环境'), findsOneWidget);
-      expect(find.text('2. 配置模型'), findsOneWidget);
-      expect(find.text('3. 开始对话'), findsOneWidget);
+      expect(find.text('欢迎使用 GrassBag'), findsOneWidget);
+      expect(find.text('开始配置'), findsOneWidget);
+      expect(find.text('跳过'), findsOneWidget);
 
-      // 5) SettingsPage compact readiness strip + natural keyword search ('无障碍' / '中转')
+      // 5) SettingsPage has NO top '快速就绪' banner + keeps natural keyword search ('无障碍' / '中转')
       await tester.pumpWidget(
         UncontrolledProviderScope(
           container: container,
@@ -2593,7 +2591,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      expect(find.text('快速就绪'), findsOneWidget);
+      expect(find.text('快速就绪'), findsNothing);
 
       await tester.enterText(find.byType(EditableText).first, '中转');
       await tester.pumpAndSettle();

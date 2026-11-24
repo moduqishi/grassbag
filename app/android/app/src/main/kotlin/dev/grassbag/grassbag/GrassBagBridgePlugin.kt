@@ -1034,14 +1034,37 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         if (isEmulator) {
             candidates.add("10.0.2.2")
         }
+        // 1) Prioritize active ARP neighbors first so Macs/PCs on high DHCP IPs (.200-.254) are found in <300ms!
+        runCatching {
+            val arpFile = File("/proc/net/arp")
+            if (arpFile.isFile && arpFile.canRead()) {
+                arpFile.readLines().drop(1).forEach { line ->
+                    val cols = line.trim().split(Regex("\\s+"))
+                    if (cols.size >= 4) {
+                        val ip = cols[0]
+                        val flags = cols[2]
+                        if (flags != "0x0" &&
+                            ip.matches(Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$")) &&
+                            ip !in selfIps &&
+                            !ip.startsWith("127.") &&
+                            ip != "0.0.0.0"
+                        ) {
+                            candidates.add(ip)
+                        }
+                    }
+                }
+            }
+        }
+        // 2) Full LAN interface /24 subnet sweep (including wlan/wifi/eth/ap/swlan/softap/usb)
         runCatching {
             val ifaces = NetworkInterface.getNetworkInterfaces()
             while (ifaces.hasMoreElements()) {
                 val iface = ifaces.nextElement()
                 if (!iface.isUp || iface.isLoopback) continue
                 val n = iface.name.lowercase()
-                val isLanIface = n.startsWith("wlan") || n.startsWith("eth") || n.startsWith("ap") ||
-                    n.startsWith("swlan") || n.startsWith("rndis") || n.startsWith("usb")
+                val isLanIface = n.startsWith("wlan") || n.startsWith("wifi") || n.startsWith("eth") ||
+                    n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("softap") ||
+                    n.startsWith("rndis") || n.startsWith("usb") || n.startsWith("br")
                 if (!isLanIface) continue
                 val addrs = iface.inetAddresses
                 while (addrs.hasMoreElements()) {
@@ -1070,15 +1093,15 @@ class GrassBagBridgePlugin(private val activity: Activity) :
 
         val discovered = java.util.Collections.synchronizedList(ArrayList<Map<String, Any>>())
         val latches = java.util.concurrent.CountDownLatch(endpoints.size)
-        // Bounded 48-thread sweep balances full-subnet coverage against Android OEM thread/FD limits.
-        val scanPool = Executors.newFixedThreadPool(48)
+        // 64-thread sweep with 180ms connect timeout covers full /24 (including .200-.254) reliably.
+        val scanPool = Executors.newFixedThreadPool(64)
         try {
             for ((ip, p) in endpoints) {
                 scanPool.execute {
                     val t0 = System.currentTimeMillis()
                     runCatching {
                         Socket().use { s ->
-                            s.connect(InetSocketAddress(ip, p), 220)
+                            s.connect(InetSocketAddress(ip, p), 180)
                             val ms = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                             val baseUrl = "http://$ip:$p"
                             val meta = probeLanDshHost(baseUrl)
@@ -1110,7 +1133,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     latches.countDown()
                 }
             }
-            runCatching { latches.await(5500, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            runCatching { latches.await(8500, java.util.concurrent.TimeUnit.MILLISECONDS) }
         } finally {
             runCatching { scanPool.shutdownNow() }
         }
@@ -1160,17 +1183,19 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     val sb = StringBuilder()
                     var totalRead = 0
                     val ins = conn.inputStream
-                    while (totalRead < 16384) {
+                    while (totalRead < 24576) {
                         val n = runCatching { ins.read(buf) }.getOrDefault(-1)
                         if (n <= 0) break
                         totalRead += n
                         sb.append(String(buf, 0, n, Charsets.UTF_8))
-                        if (sb.contains("\n\n") || sb.contains("\"version\"")) break
+                        if (sb.contains("\n\n")) break
                     }
                     val text = sb.toString()
                     if (text.isNotEmpty()) {
-                        val match = Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(text)
-                        if (match != null) dshVersion = match.groupValues[1]
+                        val relMatch = Regex("\"release\"\\s*:\\s*\\{[^}]*\"version\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                            ?: Regex("\"dshVersion\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                            ?: Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                        if (relMatch != null) dshVersion = relMatch.groupValues[1]
                         val surfMatch = Regex("\"surface\"\\s*:\\s*\"([^\"]+)\"").find(text)
                         if (surfMatch != null) surface = surfMatch.groupValues[1]
                         if (text.contains("\"hasGbridge\":true")) hasGbridge = true
@@ -1214,15 +1239,22 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }
 
         if (isDsh && !hasGbridge && !requiresAuth) {
-            // Check whether stock DSH root requires auth
+            // Probe stock DSH `/api/session/list` (not `HEAD /` which returns 200 SPA shell!)
+            // so `requiresAuth` accurately tells the UI whether a one-time token/cookie is needed.
             runCatching {
-                val conn = (URL("$baseUrl/").openConnection() as HttpURLConnection).apply {
-                    requestMethod = "HEAD"
-                    connectTimeout = 250
-                    readTimeout = 300
+                val conn = (URL("$baseUrl/api/session/list").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    connectTimeout = 300
+                    readTimeout = 350
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Accept", "application/json")
                 }
                 try {
-                    if (conn.responseCode == 401 || conn.responseCode == 403) {
+                    conn.outputStream.use { os ->
+                        os.write("{\"type\":\"client-request\",\"rpcId\":\"scan\",\"method\":\"session/list\",\"payload\":{\"args\":{}}}".toByteArray(Charsets.UTF_8))
+                    }
+                    if (conn.responseCode == 401) {
                         requiresAuth = true
                     }
                 } finally {

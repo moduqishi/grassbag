@@ -489,6 +489,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     }
     if (s.isDshConnected &&
         s.connectionPhase == ConnectionPhase.connected &&
+        !s.hasAvailableModels &&
         s.routableProviders.isEmpty) {
       ctrl.showToast('请先登录 DeepSeek 或添加 API Key 模型渠道', tone: ToastTone.info);
       _openSettings(initialSection: SettingsSection.model);

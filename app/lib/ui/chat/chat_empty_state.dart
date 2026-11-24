@@ -58,6 +58,7 @@ class ChatEmptyState extends ConsumerWidget {
           activeWorkspace: s.activeWorkspace,
           connectionPhase: s.connectionPhase,
           isDshConnected: s.isDshConnected,
+          hasAvailableModels: s.hasAvailableModels,
           routableProvidersCount: s.routableProviders.length,
           glassTier: s.glassTier,
           isActiveHostDesktop: s.isActiveHostDesktop,
@@ -89,6 +90,7 @@ class ChatEmptyState extends ConsumerWidget {
         !showLocalDesktopErrorBanner &&
         state.isDshConnected &&
         state.connectionPhase == ConnectionPhase.connected &&
+        !state.hasAvailableModels &&
         state.routableProvidersCount == 0;
 
     final isDesktopHost = state.isActiveHostDesktop;

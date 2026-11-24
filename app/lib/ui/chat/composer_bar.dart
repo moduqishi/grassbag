@@ -534,6 +534,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     if (!text.startsWith('/') &&
         appSnapshot.isDshConnected &&
         appSnapshot.connectionPhase == ConnectionPhase.connected &&
+        !appSnapshot.hasAvailableModels &&
         appSnapshot.routableProviders.isEmpty) {
       ctrl.showToast('请先登录 DeepSeek 或配置 API Key，已保留当前输入内容', tone: ToastTone.info);
       if (widget.onOpenModelSettings != null) {
@@ -650,6 +651,17 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           activeModelId: s.activeModelId,
           modelShort: s.modelShort,
           modelEffort: s.modelEffort,
+          hasAvailableModels: s.hasAvailableModels,
+          fallbackModelShort: s.effectiveActiveModelEntry?.shortLabel ?? '',
+          fallbackModelEffort: s.effectiveActiveModelEntry != null
+              ? (s.modelEffort.isNotEmpty
+                  ? s.modelEffort
+                  : (s.effectiveActiveModelEntry!.efforts
+                          .where((e) => e.id == s.effectiveActiveModelEntry!.defaultEffort)
+                          .firstOrNull
+                          ?.zhLabel ??
+                      ''))
+              : '',
           connectionPhase: s.connectionPhase,
           isDshConnected: s.isDshConnected,
           hostIsLocal: s.activeHost.isLocal,
@@ -711,7 +723,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final isHostConnecting = state.connectionPhase == ConnectionPhase.connecting;
     final isHostConnected = state.isDshConnected &&
         state.connectionPhase == ConnectionPhase.connected;
-    final needsModelConfig = isHostConnected && state.routableProvidersCount == 0;
+    final needsModelConfig =
+        isHostConnected && !state.hasAvailableModels && state.routableProvidersCount == 0;
 
     final isDesktopPlatform = _isDesktopPlatform;
 
@@ -1693,7 +1706,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               ref,
                                               onOpenHostSettings: widget.onOpenHostSettings,
                                             );
-                                      } else if (needsModelConfig || state.activeModelId.isEmpty) {
+                                      } else if (needsModelConfig ||
+                                          (!state.hasAvailableModels && state.activeModelId.isEmpty)) {
                                         pillIcon = CupertinoIcons.sparkles;
                                         pillIconColor = t.warn;
                                         pillLabel = '配置模型';
@@ -1713,9 +1727,16 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       } else {
                                         pillIcon = CupertinoIcons.sparkles;
                                         pillIconColor = t.primary;
-                                        pillLabel = state.modelShort;
-                                        effortBadge = state.modelEffort.isNotEmpty
+                                        pillLabel = state.activeModelId.isNotEmpty
+                                            ? state.modelShort
+                                            : (state.fallbackModelShort.isNotEmpty
+                                                ? state.fallbackModelShort
+                                                : state.modelShort);
+                                        final resolvedEffort = state.modelEffort.isNotEmpty
                                             ? state.modelEffort
+                                            : state.fallbackModelEffort;
+                                        effortBadge = resolvedEffort.isNotEmpty
+                                            ? resolvedEffort
                                             : null;
                                         pillTextColor = t.text;
                                         pillTap = () => showModelSheet(

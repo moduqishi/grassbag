@@ -1903,23 +1903,52 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
 
     final totalModels = groups.fold<int>(0, (acc, g) => acc + g.models.length);
     ModelCatalogEntry? activeEntry;
-    for (final g in groups) {
-      for (final m in g.models) {
-        if (m.id == state.activeModelId &&
-            (state.activeModelProvider.isEmpty || g.id == state.activeModelProvider)) {
-          activeEntry = m;
-          break;
+    if (state.activeModelId.isNotEmpty) {
+      for (final g in groups) {
+        if (state.activeModelProvider.isNotEmpty && g.id != state.activeModelProvider) continue;
+        for (final m in g.models) {
+          if (m.id == state.activeModelId) {
+            activeEntry = m;
+            break;
+          }
+        }
+        if (activeEntry != null) break;
+      }
+      if (activeEntry == null && state.activeModelProvider.isNotEmpty) {
+        for (final g in groups) {
+          for (final m in g.models) {
+            if (m.id == state.activeModelId) {
+              activeEntry = m;
+              break;
+            }
+          }
+          if (activeEntry != null) break;
         }
       }
-      if (activeEntry != null) break;
     }
-    final hasActiveModel = state.activeModelId.isNotEmpty;
+    // Non-empty model list must never leave selector empty; only empty model list may be empty.
+    if (activeEntry == null && totalModels > 0) {
+      final fallbackGroup =
+          groups.where((g) => g.routable && g.models.isNotEmpty).firstOrNull ??
+              groups.where((g) => g.models.isNotEmpty).firstOrNull;
+      activeEntry = fallbackGroup?.models.first;
+    }
+    final effectiveModelId = activeEntry?.id ?? '';
+    final effectiveProviderId = activeEntry?.providerId ?? '';
+    final effectiveModelName = activeEntry?.name ?? state.modelName;
+    final effectiveModelShort = activeEntry?.shortLabel ?? state.modelShort;
+    final hasActiveModel = activeEntry != null;
     final supportsReasoning = activeEntry != null && activeEntry.efforts.isNotEmpty;
     final effortOpts = supportsReasoning ? activeEntry.efforts : const <ModelEffortOption>[];
     final curEffortIdx = effortOpts.isEmpty
         ? 0
         : effortOpts
-            .indexWhere((e) => e.id == state.modelEffortId || e.zhLabel == state.modelEffort)
+            .indexWhere(
+              (e) =>
+                  e.id == state.modelEffortId ||
+                  e.zhLabel == state.modelEffort ||
+                  (state.modelEffortId.isEmpty && e.id == activeEntry!.defaultEffort),
+            )
             .clamp(0, effortOpts.length - 1);
     final hint = effortOpts.isNotEmpty
         ? (widget.effortHints[effortOpts[curEffortIdx].zhLabel] ?? '')
@@ -1971,13 +2000,13 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
             tier: state.glassTier,
             height: 38,
             onSelected: (idx) {
-              if (state.activeModelId.isEmpty) return;
+              if (effectiveModelId.isEmpty) return;
               final picked = effortOpts[idx];
               ctrl.setModel(
-                state.modelName,
-                state.modelShort,
-                provider: state.activeModelProvider,
-                modelId: state.activeModelId,
+                effectiveModelName,
+                effectiveModelShort,
+                provider: effectiveProviderId,
+                modelId: effectiveModelId,
                 effort: picked.zhLabel,
                 effortId: picked.id,
                 silent: true,
@@ -1998,7 +2027,7 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    '当前模型「${state.modelName}」为标准推理模式，不支持调节思考深度',
+                    '当前模型「$effectiveModelName」为标准推理模式，不支持调节思考深度',
                     style: TextStyle(fontSize: 11.5, color: t.text3),
                   ),
                 ),
@@ -2248,9 +2277,9 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
                         for (int i = 0; i < list.length; i++) ...[
                           () {
                             final m = list[i];
-                            final selected = state.activeModelId == m.id &&
-                                (state.activeModelProvider.isEmpty ||
-                                    state.activeModelProvider == g.id);
+                            final selected = effectiveModelId == m.id &&
+                                (effectiveProviderId.isEmpty ||
+                                    effectiveProviderId == g.id);
                             return _SheetOptionRow(
                               icon: g.id == 'deepseek-official'
                                   ? CupertinoIcons.sparkles

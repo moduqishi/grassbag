@@ -1022,17 +1022,38 @@ class GrassBagAppState {
         orElse: () => effectivePermissionTiers.first,
       );
 
-  ModelCatalogEntry? get activeModelEntry {
+  bool get hasAvailableModels => modelGroups.any((g) => g.models.isNotEmpty);
+
+  ModelCatalogEntry? get firstAvailableModel {
     for (final g in modelGroups) {
+      if (g.routable && g.models.isNotEmpty) return g.models.first;
+    }
+    for (final g in modelGroups) {
+      if (g.models.isNotEmpty) return g.models.first;
+    }
+    return null;
+  }
+
+  ModelCatalogEntry? get activeModelEntry {
+    if (activeModelId.isEmpty) return null;
+    for (final g in modelGroups) {
+      if (activeModelProvider.isNotEmpty && g.id != activeModelProvider) continue;
       for (final m in g.models) {
-        if ((activeModelProvider.isEmpty || g.id == activeModelProvider) &&
-            (m.id == activeModelId || m.name == modelName)) {
-          return m;
+        if (m.id == activeModelId) return m;
+      }
+    }
+    if (activeModelProvider.isNotEmpty) {
+      for (final g in modelGroups) {
+        for (final m in g.models) {
+          if (m.id == activeModelId) return m;
         }
       }
     }
     return null;
   }
+
+  /// Guaranteed non-null whenever [modelGroups] has at least one model; null only when empty.
+  ModelCatalogEntry? get effectiveActiveModelEntry => activeModelEntry ?? firstAvailableModel;
 
   WorkspaceItem? get activeWorkspaceItem {
     for (final w in workspaces) {
@@ -1606,6 +1627,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   int _toastSeq = 0;
   int _streamRunId = 0;
   int _hostConnectGen = 0;
+  int _modelSelectionGen = 0;
+  String? _lastAutoSyncedDefaultKey;
   int _marketSearchSeq = 0;
   int _wsDirSeq = 0;
   int _autoStartRequestedGen = -1;
@@ -4814,6 +4837,79 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     return null;
   }
 
+  static bool _isRevisionConflictError(Object err) {
+    final lower = err.toString().toLowerCase();
+    return lower.contains('settings_conflict') ||
+        lower.contains('changed since it was read') ||
+        lower.contains('expected revision') ||
+        lower.contains('revision conflict');
+  }
+
+  Future<int?> _fetchFreshNamespaceRevision(GbridgeClient client, String ns) async {
+    try {
+      final schemaResp = await client.getSettingsSchema();
+      if (!_isStillLive(client)) return null;
+      final desc = schemaResp['description'];
+      if (desc is Map<String, dynamic>) {
+        final parsed = parseDshSettingsNamespaces(desc);
+        if (parsed.isNotEmpty) {
+          state = state.copyWith(dshNamespaces: parsed);
+          final matched = parsed.where((e) => e.ns == ns).firstOrNull;
+          if (matched != null && matched.revision > 0) return matched.revision;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  void _updateCachedDefaultModelNamespace({
+    required String provider,
+    required String modelId,
+    required String effortId,
+  }) {
+    final currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+    final idx = currentList.indexWhere((e) => e.ns == 'agent-default-model');
+    if (idx < 0) return;
+    final nextVal = Map<String, dynamic>.from(currentList[idx].value);
+    if (provider.isNotEmpty) nextVal['provider'] = provider;
+    nextVal['model'] = modelId;
+    if (effortId.isNotEmpty) {
+      nextVal['reasoningEffort'] = effortId;
+    } else {
+      nextVal.remove('reasoningEffort');
+    }
+    currentList[idx] = currentList[idx].copyWith(
+      value: nextVal,
+      revision: currentList[idx].revision + 1,
+    );
+    state = state.copyWith(dshNamespaces: currentList);
+  }
+
+  Future<void> _persistDefaultModelQuietly(
+    GbridgeClient client, {
+    required String provider,
+    required String modelId,
+    required String effortId,
+  }) async {
+    if (!_isStillLive(client) || modelId.isEmpty) return;
+    final ops = <Map<String, dynamic>>[
+      if (provider.isNotEmpty) {'op': 'set', 'path': ['provider'], 'value': provider},
+      {'op': 'set', 'path': ['model'], 'value': modelId},
+      if (effortId.isNotEmpty)
+        {'op': 'set', 'path': ['reasoningEffort'], 'value': effortId}
+      else
+        {'op': 'unset', 'path': ['reasoningEffort']},
+    ];
+    await mutateDshNamespace(
+      'agent-default-model',
+      ops,
+      silent: true,
+      skipHydrate: true,
+      suppressErrorToast: true,
+      clientOverride: client,
+    );
+  }
+
   Future<void> setModel(
     String name,
     String short, {
@@ -4828,14 +4924,33 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!silent) showToast('请先连接到运行中的 DSH 主机后再切换模型', tone: ToastTone.warn);
       return;
     }
-    final nextProvider = (provider ?? state.activeModelProvider).trim();
-    final nextModelId = (modelId ?? state.activeModelId).trim();
+    var nextProvider = (provider ?? state.activeModelProvider).trim();
+    var nextModelId = (modelId ?? state.activeModelId).trim();
+    var resolvedName = name;
+    var resolvedShort = short;
     if (nextModelId.isEmpty) {
-      if (!silent) showToast('请先在模型配置中添加并选择一个可用模型', tone: ToastTone.warn);
-      return;
+      final fallback = state.firstAvailableModel;
+      if (fallback != null) {
+        nextProvider = fallback.providerId;
+        nextModelId = fallback.id;
+        resolvedName = fallback.name;
+        resolvedShort = fallback.shortLabel;
+      } else {
+        if (!silent) showToast('请先在模型配置中添加并选择一个可用模型', tone: ToastTone.warn);
+        return;
+      }
     }
 
     final targetEntry = _findModelEntry(nextProvider, nextModelId);
+    if (nextProvider.isEmpty && targetEntry != null) {
+      nextProvider = targetEntry.providerId;
+    }
+    if (resolvedName.trim().isEmpty && targetEntry != null) {
+      resolvedName = targetEntry.name;
+    }
+    if (resolvedShort.trim().isEmpty && targetEntry != null) {
+      resolvedShort = targetEntry.shortLabel;
+    }
     final supportsReasoning = targetEntry != null && targetEntry.efforts.isNotEmpty;
     String nextEffortId = '';
     String nextEffortLabel = '';
@@ -4861,6 +4976,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
     }
 
+    final myGen = ++_modelSelectionGen;
     final prevProvider = state.activeModelProvider;
     final prevModelId = state.activeModelId;
     final prevModelName = state.modelName;
@@ -4871,8 +4987,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     state = state.copyWith(
       activeModelProvider: nextProvider,
       activeModelId: nextModelId,
-      modelName: name,
-      modelShort: short,
+      modelName: resolvedName,
+      modelShort: resolvedShort,
       modelEffort: nextEffortLabel,
       modelEffortId: nextEffortId,
     );
@@ -4884,37 +5000,60 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     try {
       final sid = state.activeSessionId;
       if (sid != null && !sid.startsWith('pending-session-')) {
+        // DSH `session/selectModel` atomically updates both the live session and
+        // `agentDefaultModel.saveSelection(...)` on the server. Do NOT fire a redundant
+        // `settings/mutate` on `agent-default-model` immediately after, which would
+        // collide with the bumped revision (`SettingsConflictError`)!
         await client.selectModel(sid, selectionPayload);
-        if (!_isStillLive(client)) return;
-      }
-      final ops = <Map<String, dynamic>>[
-        if (nextProvider.isNotEmpty) {'op': 'set', 'path': ['provider'], 'value': nextProvider},
-        {'op': 'set', 'path': ['model'], 'value': nextModelId},
-        if (nextEffortId.isNotEmpty)
-          {'op': 'set', 'path': ['reasoningEffort'], 'value': nextEffortId}
-        else
-          {'op': 'unset', 'path': ['reasoningEffort']},
-      ];
-      final err = await mutateDshNamespace('agent-default-model', ops, silent: true, clientOverride: client);
-      if (!_isStillLive(client)) return;
-      if (err != null) {
-        state = state.copyWith(
-          activeModelProvider: prevProvider,
-          activeModelId: prevModelId,
-          modelName: prevModelName,
-          modelShort: prevModelShort,
-          modelEffort: prevEffort,
-          modelEffortId: prevEffortId,
+        if (!_isStillLive(client) || myGen != _modelSelectionGen) return;
+        _updateCachedDefaultModelNamespace(
+          provider: nextProvider,
+          modelId: nextModelId,
+          effortId: nextEffortId,
         );
-        return;
+        // Refresh cached namespace revision quietly after DSH's async saveSelection settles.
+        Future<void>.delayed(const Duration(milliseconds: 350), () {
+          if (mounted && identical(_liveClient, client) && myGen == _modelSelectionGen) {
+            unawaited(_fetchFreshNamespaceRevision(client, 'agent-default-model'));
+          }
+        });
+      } else {
+        final ops = <Map<String, dynamic>>[
+          if (nextProvider.isNotEmpty) {'op': 'set', 'path': ['provider'], 'value': nextProvider},
+          {'op': 'set', 'path': ['model'], 'value': nextModelId},
+          if (nextEffortId.isNotEmpty)
+            {'op': 'set', 'path': ['reasoningEffort'], 'value': nextEffortId}
+          else
+            {'op': 'unset', 'path': ['reasoningEffort']},
+        ];
+        final err = await mutateDshNamespace(
+          'agent-default-model',
+          ops,
+          silent: true,
+          skipHydrate: true,
+          clientOverride: client,
+        );
+        if (!_isStillLive(client) || myGen != _modelSelectionGen) return;
+        if (err != null) {
+          state = state.copyWith(
+            activeModelProvider: prevProvider,
+            activeModelId: prevModelId,
+            modelName: prevModelName,
+            modelShort: prevModelShort,
+            modelEffort: prevEffort,
+            modelEffortId: prevEffortId,
+          );
+          return;
+        }
       }
+      _lastAutoSyncedDefaultKey = '${state.activeHostId}|$nextProvider|$nextModelId|$nextEffortId';
       if (!silent) {
         showToast(
-          nextEffortLabel.isNotEmpty ? '已切换到 $name · 思考$nextEffortLabel' : '已切换到 $name',
+          nextEffortLabel.isNotEmpty ? '已切换到 $resolvedName · 思考$nextEffortLabel' : '已切换到 $resolvedName',
         );
       }
     } catch (e) {
-      if (!_isStillLive(client)) return;
+      if (!_isStillLive(client) || myGen != _modelSelectionGen) return;
       state = state.copyWith(
         activeModelProvider: prevProvider,
         activeModelId: prevModelId,
@@ -5792,6 +5931,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     List<Map<String, dynamic>> ops, {
     bool silent = false,
     bool skipHydrate = false,
+    bool suppressErrorToast = false,
     GbridgeClient? clientOverride,
   }) async {
     final client = clientOverride ?? _liveClient;
@@ -5801,19 +5941,36 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return msg;
     }
     if (ops.isEmpty) return null;
-    final currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
-    final idx = currentList.indexWhere((e) => e.ns == ns);
-    final existing = idx >= 0 ? currentList[idx] : null;
+    var currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+    var idx = currentList.indexWhere((e) => e.ns == ns);
+    var existing = idx >= 0 ? currentList[idx] : null;
     final nextVal = Map<String, dynamic>.from(existing?.value ?? const <String, dynamic>{});
     var nextRev = (existing?.revision ?? 0) + 1;
 
-    try {
+    Future<Map<String, dynamic>> sendMutate(int? expectedRev) {
       final body = <String, dynamic>{
         'ns': ns,
         'ops': ops,
-        if (existing != null && existing.revision > 0) 'expectedRevision': existing.revision,
+        if (expectedRev != null && expectedRev > 0) 'expectedRevision': expectedRev,
       };
-      final res = await client.patchSettings(body);
+      return client.patchSettings(body);
+    }
+
+    try {
+      Map<String, dynamic> res;
+      try {
+        res = await sendMutate(existing?.revision);
+      } catch (firstErr) {
+        if (!_isStillLive(client)) return null;
+        if (!_isRevisionConflictError(firstErr)) rethrow;
+        // Automatically recover from stale cached revision (e.g. DSH background update or rapid toggle).
+        final freshRev = await _fetchFreshNamespaceRevision(client, ns);
+        if (!_isStillLive(client)) return null;
+        currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+        idx = currentList.indexWhere((e) => e.ns == ns);
+        existing = idx >= 0 ? currentList[idx] : existing;
+        res = await sendMutate(freshRev);
+      }
       if (!_isStillLive(client)) return null;
       final resultObj = res['result'];
       if (resultObj is Map && resultObj['revision'] is num) {
@@ -5827,10 +5984,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     } catch (err) {
       if (!_isStillLive(client)) return null;
       final readable = formatReadableError(err);
-      if (readable.toLowerCase().contains('conflict') || readable.toLowerCase().contains('revision')) {
+      if (_isRevisionConflictError(err)) {
         unawaited(_hydrateLiveDomains(client));
       }
-      showError('写入 DSH 配置失败 ($ns)', error: err);
+      if (!suppressErrorToast) {
+        showError('写入 DSH 配置失败 ($ns)', error: err);
+      }
       return readable;
     }
 
@@ -5884,6 +6043,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool replace = false,
     bool silent = false,
     bool skipHydrate = false,
+    bool suppressErrorToast = false,
     GbridgeClient? clientOverride,
   }) async {
     final client = clientOverride ?? _liveClient;
@@ -5892,21 +6052,37 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!silent) showToast(msg, tone: ToastTone.warn);
       return msg;
     }
-    final currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
-    final idx = currentList.indexWhere((e) => e.ns == ns);
-    final existing = idx >= 0 ? currentList[idx] : null;
+    var currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+    var idx = currentList.indexWhere((e) => e.ns == ns);
+    var existing = idx >= 0 ? currentList[idx] : null;
     final nextVal = replace || existing == null
         ? Map<String, dynamic>.from(patch)
         : {...existing.value, ...patch};
     var nextRev = (existing?.revision ?? 0) + 1;
 
-    try {
+    Future<Map<String, dynamic>> sendPatch(int? expectedRev) {
       final body = <String, dynamic>{
         'ns': ns,
         if (replace) 'section': nextVal else 'patch': patch,
-        if (existing != null && existing.revision > 0) 'expectedRevision': existing.revision,
+        if (expectedRev != null && expectedRev > 0) 'expectedRevision': expectedRev,
       };
-      final res = await client.patchSettings(body);
+      return client.patchSettings(body);
+    }
+
+    try {
+      Map<String, dynamic> res;
+      try {
+        res = await sendPatch(existing?.revision);
+      } catch (firstErr) {
+        if (!_isStillLive(client)) return null;
+        if (!_isRevisionConflictError(firstErr)) rethrow;
+        final freshRev = await _fetchFreshNamespaceRevision(client, ns);
+        if (!_isStillLive(client)) return null;
+        currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+        idx = currentList.indexWhere((e) => e.ns == ns);
+        existing = idx >= 0 ? currentList[idx] : existing;
+        res = await sendPatch(freshRev);
+      }
       if (!_isStillLive(client)) return null;
       final resultObj = res['result'];
       if (resultObj is Map && resultObj['revision'] is num) {
@@ -5920,10 +6096,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     } catch (err) {
       if (!_isStillLive(client)) return null;
       final readable = formatReadableError(err);
-      if (readable.toLowerCase().contains('conflict') || readable.toLowerCase().contains('revision')) {
+      if (_isRevisionConflictError(err)) {
         unawaited(_hydrateLiveDomains(client));
       }
-      showError('写入 DSH 配置失败 ($ns)', error: err);
+      if (!suppressErrorToast) {
+        showError('写入 DSH 配置失败 ($ns)', error: err);
+      }
       return readable;
     }
 
@@ -6012,6 +6190,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final cleanSecret = apiKeyValue.trim();
     final cleanUrl = _normalizeProviderBaseUrl(baseUrl);
     final cleanName = displayName.trim().isEmpty ? cleanId : displayName.trim();
+    final hadNoValidModel = state.activeModelEntry == null || !state.hasAvailableModels;
 
     if (cleanUrl.isNotEmpty) {
       final parsed = Uri.tryParse(cleanUrl);
@@ -6101,7 +6280,34 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
 
     // 3. Immediately refresh authoritative models, providers & credentials from DSH!
-    await _hydrateLiveDomains(client);
+    await _hydrateLiveDomains(client, skipAutoDefaultSync: true);
+    if (!_isStillLive(client)) return null;
+    // 4. Auto-select the first available model when adding the first model/provider or
+    //    when the active selection became invalid after removing models from this provider.
+    final savedGroup = state.modelGroups
+        .where((g) => g.id == cleanId && g.models.isNotEmpty)
+        .firstOrNull;
+    if (hadNoValidModel && savedGroup != null) {
+      final first = savedGroup.models.first;
+      await setModel(
+        first.name,
+        first.shortLabel,
+        provider: savedGroup.id,
+        modelId: first.id,
+        effortId: first.defaultEffort,
+        silent: true,
+      );
+    } else if (state.activeModelEntry == null && state.firstAvailableModel != null) {
+      final fallback = state.firstAvailableModel!;
+      await setModel(
+        fallback.name,
+        fallback.shortLabel,
+        provider: fallback.providerId,
+        modelId: fallback.id,
+        effortId: fallback.defaultEffort,
+        silent: true,
+      );
+    }
     if (_isStillLive(client)) {
       showToast('已写入 DSH 渠道「$cleanName」并同步可用模型');
     }
@@ -6163,6 +6369,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final matchId = (previousModelId != null && previousModelId.trim().isNotEmpty)
         ? previousModelId.trim()
         : cleanId;
+    final hadNoValidModel = state.activeModelEntry == null || !state.hasAvailableModels;
     final wasActiveModel = state.activeModelProvider == cleanProv && state.activeModelId == matchId;
     final existingIdx = modelsList.indexWhere((m) => m['id']?.toString() == matchId);
     final updatedModel = existingIdx >= 0
@@ -6221,14 +6428,23 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     );
     if (err != null || !_isStillLive(client)) return err;
 
-    await _hydrateLiveDomains(client);
+    await _hydrateLiveDomains(client, skipAutoDefaultSync: true);
     if (!_isStillLive(client)) return null;
-    if (setAsDefault || (wasActiveModel && matchId != cleanId)) {
+    if (setAsDefault ||
+        hadNoValidModel ||
+        state.activeModelEntry == null ||
+        (wasActiveModel && matchId != cleanId)) {
+      final liveEntry = _findModelEntry(cleanProv, cleanId) ?? state.firstAvailableModel;
+      final targetProv = liveEntry?.providerId ?? cleanProv;
+      final targetId = liveEntry?.id ?? cleanId;
+      final targetName = liveEntry?.name ?? updatedModel['name'].toString();
+      final targetShort = liveEntry?.shortLabel ?? updatedModel['name'].toString();
       await setModel(
-        updatedModel['name'].toString(),
-        updatedModel['name'].toString(),
-        provider: cleanProv,
-        modelId: cleanId,
+        targetName,
+        targetShort,
+        provider: targetProv,
+        modelId: targetId,
+        effortId: liveEntry?.defaultEffort,
         silent: true,
       );
     }
@@ -6272,12 +6488,15 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!_isStillLive(client)) return null;
     }
     final clearedActive = state.activeModelProvider == cleanId;
+    ModelCatalogEntry? fallbackModel;
     if (clearedActive) {
       final fallbackGroup = state.modelGroups
-          .where((g) => g.id != cleanId && g.routable && g.models.isNotEmpty)
-          .firstOrNull;
+              .where((g) => g.id != cleanId && g.routable && g.models.isNotEmpty)
+              .firstOrNull ??
+          state.modelGroups.where((g) => g.id != cleanId && g.models.isNotEmpty).firstOrNull;
       if (fallbackGroup != null) {
         final m = fallbackGroup.models.first;
+        fallbackModel = m;
         await mutateDshNamespace(
           'agent-default-model',
           [
@@ -6290,6 +6509,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           ],
           silent: true,
           skipHydrate: true,
+          suppressErrorToast: true,
           clientOverride: client,
         );
       } else {
@@ -6302,6 +6522,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           ],
           silent: true,
           skipHydrate: true,
+          suppressErrorToast: true,
           clientOverride: client,
         );
       }
@@ -6309,12 +6530,14 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
     state = state.copyWith(
       providerCredentials: state.providerCredentials.where((p) => p.id != cleanId).toList(growable: false),
-      activeModelProvider: clearedActive ? '' : state.activeModelProvider,
-      activeModelId: clearedActive ? '' : state.activeModelId,
-      modelName: clearedActive ? '未配置模型' : state.modelName,
-      modelShort: clearedActive ? '未配置' : state.modelShort,
-      modelEffort: clearedActive ? '' : state.modelEffort,
-      modelEffortId: clearedActive ? '' : state.modelEffortId,
+      activeModelProvider: clearedActive ? (fallbackModel?.providerId ?? '') : state.activeModelProvider,
+      activeModelId: clearedActive ? (fallbackModel?.id ?? '') : state.activeModelId,
+      modelName: clearedActive ? (fallbackModel?.name ?? '未配置模型') : state.modelName,
+      modelShort: clearedActive ? (fallbackModel?.shortLabel ?? '未配置') : state.modelShort,
+      modelEffort: clearedActive
+          ? _effortIdToZhLabel(fallbackModel?.defaultEffort ?? '')
+          : state.modelEffort,
+      modelEffortId: clearedActive ? (fallbackModel?.defaultEffort ?? '') : state.modelEffortId,
     );
     await _hydrateLiveDomains(client);
     if (_isStillLive(client)) {
@@ -7247,15 +7470,25 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
                   !(rawCwd == '/root' && state.isActiveHostDesktop))
               ? rawCwd
               : null;
+          final effModel = state.effectiveActiveModelEntry;
+          final effProvider = state.activeModelProvider.isNotEmpty
+              ? state.activeModelProvider
+              : (effModel?.providerId ?? '');
+          final effModelId = state.activeModelId.isNotEmpty
+              ? state.activeModelId
+              : (effModel?.id ?? '');
+          final effEffortId = state.modelEffortId.isNotEmpty
+              ? state.modelEffortId
+              : (effModel?.defaultEffort ?? '');
           final created = await slashClient.createSession(
             workspaceId: activeWsItem?.explicit == true ? activeWsItem!.id : null,
             cwd: activeWsItem?.explicit == true ? null : activeCwd,
             title: trimmed,
             presetId: state.activePresetId,
             permission: state.activePermissionId,
-            provider: state.activeModelProvider.isEmpty ? null : state.activeModelProvider,
-            model: state.activeModelId.isEmpty ? null : state.activeModelId,
-            reasoningEffort: state.modelEffortId.isEmpty ? null : state.modelEffortId,
+            provider: effProvider.isEmpty ? null : effProvider,
+            model: effModelId.isEmpty ? null : effModelId,
+            reasoningEffort: effEffortId.isEmpty ? null : effEffortId,
           );
           if (!_isStillLive(slashClient)) return false;
           sid = created.id;
@@ -7426,15 +7659,25 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         if (sendClient != null) {
           final prevTempId = sessionId;
           try {
+            final effModel = state.effectiveActiveModelEntry;
+            final effProvider = state.activeModelProvider.isNotEmpty
+                ? state.activeModelProvider
+                : (effModel?.providerId ?? '');
+            final effModelId = state.activeModelId.isNotEmpty
+                ? state.activeModelId
+                : (effModel?.id ?? '');
+            final effEffortId = state.modelEffortId.isNotEmpty
+                ? state.modelEffortId
+                : (effModel?.defaultEffort ?? '');
             final created = await sendClient.createSession(
               workspaceId: createdWorkspaceId,
               cwd: createdWorkspaceId == null ? activeCwd : null,
               title: newTitle,
               presetId: state.activePresetId,
               permission: state.activePermissionId,
-              provider: state.activeModelProvider.isEmpty ? null : state.activeModelProvider,
-              model: state.activeModelId.isEmpty ? null : state.activeModelId,
-              reasoningEffort: state.modelEffortId.isEmpty ? null : state.modelEffortId,
+              provider: effProvider.isEmpty ? null : effProvider,
+              model: effModelId.isEmpty ? null : effModelId,
+              reasoningEffort: effEffortId.isEmpty ? null : effEffortId,
             );
             if (!_isStillLive(sendClient, gen: sendGen)) return false;
             final stillOnTemp = state.activeSessionId == prevTempId;
@@ -8079,6 +8322,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       _saveCurrentHostContext(hostIdOverride: state.activeHostId);
     }
     final gen = ++_hostConnectGen;
+    _modelSelectionGen++;
+    _lastAutoSyncedDefaultKey = null;
     _hostProbeGen[hostId] = (_hostProbeGen[hostId] ?? 0) + 1;
     _streamRunId++;
     // CRITICAL: Synchronously detach old client, cancel subscriptions & clear ALL timers/caches
@@ -9030,7 +9275,11 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
-  Future<void> _hydrateLiveDomains(GbridgeClient client, {int attempt = 0}) async {
+  Future<void> _hydrateLiveDomains(
+    GbridgeClient client, {
+    int attempt = 0,
+    bool skipAutoDefaultSync = false,
+  }) async {
     try {
       // Stage 0 (Instant Fast Path): ONLY fetch sessions + workspaces first and commit immediately!
       // Never block the sidebar chat list behind slow model/schema/plugin/market endpoints.
@@ -9112,6 +9361,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
 
       // Stage 1 (Core engine config, models, presets, permissions, account)
+      final hydrateModelGen = _modelSelectionGen;
       final coreResults = await Future.wait([
         client.getSettingsSchema().catchError((_) => const <String, dynamic>{}),
         client.getSettingsManifest().catchError((_) => const <String, dynamic>{}),
@@ -9160,6 +9410,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
 
       // 3. REAL Model Catalog (`catalog.groups`, `catalog.default`, `catalog.routableProviders`)
+      ModelCatalogEntry? autoFallbackModel;
+      String autoFallbackEffort = '';
       final rawCatalog = modelsResp['catalog'];
       if (rawCatalog is Map<String, dynamic>) {
         final routable = (rawCatalog['routableProviders'] as List<dynamic>?)
@@ -9238,53 +9490,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         final defObj = rawCatalog['default'];
         final defProv = defObj is Map ? (defObj['provider']?.toString().trim() ?? '') : '';
         final defModelId = defObj is Map ? (defObj['model']?.toString().trim() ?? '') : '';
-        if (defObj is Map && defModelId.isNotEmpty) {
-          ModelCatalogEntry? matched;
-          for (final g in groups) {
-            for (final m in g.models) {
-              if ((defProv.isEmpty || g.id == defProv) && m.id == defModelId) {
-                matched = m;
-                break;
-              }
-            }
-            if (matched != null) break;
-          }
-          final rawDefEff = defObj['reasoningEffort']?.toString().trim() ?? '';
-          String resolvedEff = '';
-          if (matched != null && matched.efforts.isNotEmpty) {
-            if (rawDefEff.isNotEmpty &&
-                matched.efforts.any((e) => e.id.toLowerCase() == rawDefEff.toLowerCase())) {
-              resolvedEff = rawDefEff;
-            } else {
-              resolvedEff = matched.defaultEffort.isNotEmpty
-                  ? matched.defaultEffort
-                  : matched.efforts.first.id;
-            }
-          }
-          final displayName = matched?.name ?? defModelId;
-          final shortLabel = matched?.shortLabel ??
-              (displayName.contains('/') ? displayName.split('/').last : displayName);
-          next = next.copyWith(
-            activeModelProvider: defProv.isNotEmpty ? defProv : (matched?.providerId ?? ''),
-            activeModelId: defModelId,
-            modelName: displayName,
-            modelShort: shortLabel.length > 28 ? '${shortLabel.substring(0, 27)}…' : shortLabel,
-            modelEffortId: resolvedEff,
-            modelEffort: _effortIdToZhLabel(resolvedEff),
-          );
-        } else if (groups.isNotEmpty && groups.first.models.isNotEmpty) {
-          final preferredGroup =
-              groups.where((g) => g.routable && g.models.isNotEmpty).firstOrNull ?? groups.first;
-          final firstM = preferredGroup.models.first;
-          next = next.copyWith(
-            activeModelProvider: preferredGroup.id,
-            activeModelId: firstM.id,
-            modelName: firstM.name,
-            modelShort: firstM.shortLabel,
-            modelEffortId: firstM.defaultEffort,
-            modelEffort: _effortIdToZhLabel(firstM.defaultEffort),
-          );
-        } else {
+        final rawDefEff = defObj is Map ? (defObj['reasoningEffort']?.toString().trim() ?? '') : '';
+
+        if (groups.isEmpty) {
+          // Model list is genuinely empty -> model selector MUST be empty (never display stale phantom default).
           next = next.copyWith(
             activeModelProvider: '',
             activeModelId: '',
@@ -9293,6 +9502,78 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             modelEffortId: '',
             modelEffort: '',
           );
+        } else {
+          // Model list is non-empty -> selector MUST resolve to a real available model in `groups`.
+          final userUpdatedInFlight = _modelSelectionGen != hydrateModelGen;
+          final candProv = userUpdatedInFlight
+              ? state.activeModelProvider
+              : (defProv.isNotEmpty ? defProv : state.activeModelProvider);
+          final candModelId = userUpdatedInFlight
+              ? state.activeModelId
+              : (defModelId.isNotEmpty ? defModelId : state.activeModelId);
+          final candEff = userUpdatedInFlight ? state.modelEffortId : rawDefEff;
+
+          ModelCatalogEntry? findInGroups(String prov, String mid) {
+            if (mid.isEmpty) return null;
+            for (final g in groups) {
+              if (prov.isNotEmpty && g.id != prov) continue;
+              for (final m in g.models) {
+                if (m.id == mid) return m;
+              }
+            }
+            if (prov.isNotEmpty) {
+              for (final g in groups) {
+                for (final m in g.models) {
+                  if (m.id == mid) return m;
+                }
+              }
+            }
+            return null;
+          }
+
+          ModelCatalogEntry? matched = findInGroups(candProv, candModelId);
+          bool usedAutoFallback = false;
+          if (matched == null) {
+            final preferredGroup =
+                groups.where((g) => g.routable && g.models.isNotEmpty).firstOrNull ?? groups.first;
+            matched = preferredGroup.models.first;
+            usedAutoFallback = true;
+          }
+
+          String resolvedEff = '';
+          if (matched.efforts.isNotEmpty) {
+            if (candEff.isNotEmpty) {
+              final opt = matched.efforts
+                  .where((e) => e.id.toLowerCase() == candEff.toLowerCase())
+                  .firstOrNull;
+              if (opt != null) {
+                resolvedEff = opt.id;
+              }
+            }
+            if (resolvedEff.isEmpty) {
+              resolvedEff = matched.defaultEffort.isNotEmpty
+                  ? matched.defaultEffort
+                  : matched.efforts.first.id;
+            }
+          }
+
+          next = next.copyWith(
+            activeModelProvider: matched.providerId,
+            activeModelId: matched.id,
+            modelName: matched.name,
+            modelShort: matched.shortLabel,
+            modelEffortId: resolvedEff,
+            modelEffort: _effortIdToZhLabel(resolvedEff),
+          );
+
+          // If DSH's stored default was empty or pointed to a missing/deleted model, persist the
+          // auto-selected valid model back to DSH once so server & client stay aligned.
+          final dshDefaultMissingOrInvalid =
+              defModelId.isEmpty || findInGroups(defProv, defModelId) == null;
+          if (!userUpdatedInFlight && (usedAutoFallback || dshDefaultMissingOrInvalid)) {
+            autoFallbackModel = matched;
+            autoFallbackEffort = resolvedEff;
+          }
         }
       }
 
@@ -9605,6 +9886,25 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         _pendingInteractionsById[item.id] = item;
       }
       _recomputeVisibleInteractions();
+
+      if (!skipAutoDefaultSync &&
+          autoFallbackModel != null &&
+          identical(_liveClient, client) &&
+          _modelSelectionGen == hydrateModelGen) {
+        final syncKey =
+            '${state.activeHostId}|${autoFallbackModel.providerId}|${autoFallbackModel.id}|$autoFallbackEffort';
+        if (_lastAutoSyncedDefaultKey != syncKey) {
+          _lastAutoSyncedDefaultKey = syncKey;
+          unawaited(
+            _persistDefaultModelQuietly(
+              client,
+              provider: autoFallbackModel.providerId,
+              modelId: autoFallbackModel.id,
+              effortId: autoFallbackEffort,
+            ),
+          );
+        }
+      }
 
       // If DSH was still warming up its Cordis plugins right after container boot and returned
       // empty settings manifest or empty model catalog on the first pass, auto-retry once.

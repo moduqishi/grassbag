@@ -569,6 +569,8 @@ class _SettingsNavList extends ConsumerWidget {
           activePresetId: s.activePresetId,
           activePermissionId: s.activePermissionId,
           modelName: s.modelName,
+          activeModelId: s.activeModelId,
+          hasAvailableModels: s.hasAvailableModels,
           plugins: s.plugins,
           mcpServers: s.mcpServers,
           recentErrors: s.recentErrors,
@@ -603,9 +605,12 @@ class _SettingsNavList extends ConsumerWidget {
     String liveSummaryFor(SettingsSection sec) {
       return switch (sec) {
         SettingsSection.general => '${state.activePreset.name} · ${state.activePermission.name}',
-        SettingsSection.model => (state.isDshConnected && state.routableProviders.isEmpty)
+        SettingsSection.model => (state.isDshConnected &&
+                !state.hasAvailableModels &&
+                state.routableProviders.isEmpty)
             ? '去配置'
-            : (state.modelName.isEmpty ? '未配置' : state.modelName),
+            : (state.effectiveActiveModelEntry?.name ??
+                (state.modelName.isEmpty ? '未配置' : state.modelName)),
         SettingsSection.webSearch => () {
             final sp = nsMap['web']?.value['searchProvider']?.toString() ?? '';
             return sp.isNotEmpty ? sp : '按需配置';
@@ -662,6 +667,7 @@ class _SettingsNavList extends ConsumerWidget {
     bool needsBadgeFor(SettingsSection sec) =>
         sec == SettingsSection.model &&
         state.isDshConnected &&
+        !state.hasAvailableModels &&
         state.routableProviders.isEmpty;
 
     if (manifestSections.isNotEmpty) {

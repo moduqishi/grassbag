@@ -200,15 +200,23 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
 
     final groups = state.modelGroups;
     final totalModels = groups.fold<int>(0, (acc, g) => acc + g.models.length);
-    final activeEntry = state.activeModelEntry;
-    final hasActiveModel = state.activeModelId.isNotEmpty;
-    final hasUsableModel = hasActiveModel && (activeEntry != null || totalModels > 0);
+    final activeEntry = state.effectiveActiveModelEntry;
+    final hasUsableModel = activeEntry != null;
+    final effectiveModelName = activeEntry?.name ?? state.modelName;
+    final effectiveModelShort = activeEntry?.shortLabel ?? state.modelShort;
+    final effectiveProviderId = activeEntry?.providerId ?? state.activeModelProvider;
+    final effectiveModelId = activeEntry?.id ?? state.activeModelId;
     final supportsReasoning = activeEntry != null && activeEntry.efforts.isNotEmpty;
     final effortOpts = supportsReasoning ? activeEntry.efforts : const <ModelEffortOption>[];
     final curEffortIdx = effortOpts.isEmpty
         ? 0
         : effortOpts
-            .indexWhere((e) => e.id == state.modelEffortId || e.zhLabel == state.modelEffort)
+            .indexWhere(
+              (e) =>
+                  e.id == state.modelEffortId ||
+                  e.zhLabel == state.modelEffort ||
+                  (state.modelEffortId.isEmpty && e.id == activeEntry?.defaultEffort),
+            )
             .clamp(0, effortOpts.length - 1);
 
     final piAiNs = state.effectiveDshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
@@ -323,7 +331,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                               child: Text(
                                 !hasUsableModel
                                     ? '尚未配置可用模型'
-                                    : state.modelName,
+                                    : effectiveModelName,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
@@ -356,7 +364,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                         const SizedBox(height: 2),
                         Text(
                           hasUsableModel
-                              ? '${state.activeModelProvider} / ${state.activeModelId}'
+                              ? '$effectiveProviderId / $effectiveModelId'
                               : '登录 DeepSeek 账号或添加自定义渠道即可开始对话',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -453,10 +461,10 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                   onSelected: (idx) {
                     final picked = effortOpts[idx];
                     ctrl.setModel(
-                      state.modelName,
-                      state.modelShort,
-                      provider: state.activeModelProvider,
-                      modelId: state.activeModelId,
+                      effectiveModelName,
+                      effectiveModelShort,
+                      provider: effectiveProviderId,
+                      modelId: effectiveModelId,
                       effort: picked.zhLabel,
                       effortId: picked.id,
                     );
@@ -1089,9 +1097,11 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     builder: (_) {
                       final g = visibleEntries[i].$1;
                       final m = visibleEntries[i].$2;
-                      final selected = state.activeModelId == m.id &&
-                          (state.activeModelProvider.isEmpty ||
-                              state.activeModelProvider == g.id);
+                      final eff = state.effectiveActiveModelEntry;
+                      final effId = eff?.id ?? state.activeModelId;
+                      final effProv = eff?.providerId ?? state.activeModelProvider;
+                      final selected = effId == m.id &&
+                          (effProv.isEmpty || effProv == g.id);
                       final cred = credById[g.id];
                       final canEditParams = cred != null
                           ? cred.settingsNs == 'llm-pi-ai'
@@ -1748,9 +1758,6 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     }
 
     final isCustomProvider = widget.isCustomNew || !_isBuiltinProvider(pid);
-    final preState = ref.read(appProvider);
-    final shouldAutoSelectDefault =
-        preState.activeModelId.isEmpty || preState.routableProviders.isEmpty;
 
     setState(() {
       _saving = true;
@@ -1784,37 +1791,6 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     }
 
     if (!mounted || err != null) return;
-    if (shouldAutoSelectDefault) {
-      final ctrl = ref.read(appProvider.notifier);
-      final latestState = ref.read(appProvider);
-      final matchedGroup = latestState.modelGroups
-          .where((g) => g.id == pid && g.models.isNotEmpty)
-          .firstOrNull;
-      if (matchedGroup != null) {
-        final first = matchedGroup.models.first;
-        unawaited(ctrl.setModel(
-          first.name,
-          first.shortLabel,
-          provider: matchedGroup.id,
-          modelId: first.id,
-          effortId: first.defaultEffort,
-        ));
-      } else if (_models.isNotEmpty) {
-        final firstId = _models.first['id']?.toString() ?? '';
-        final firstName = _models.first['name']?.toString().isNotEmpty == true
-            ? _models.first['name'].toString()
-            : firstId;
-        if (firstId.isNotEmpty) {
-          final short = firstName.contains('/') ? firstName.split('/').last : firstName;
-          unawaited(ctrl.setModel(
-            firstName,
-            short.length > 18 ? '${short.substring(0, 17)}…' : short,
-            provider: pid,
-            modelId: firstId,
-          ));
-        }
-      }
-    }
     if (mounted) Navigator.of(context).pop();
   }
 

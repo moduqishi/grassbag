@@ -1,7 +1,7 @@
 name: grassbag
 description: GrassBag — Native Liquid Glass client for DeepSeek Harness (DSH) on Android phones & tablets.
 publish_to: none
-version: 0.1.7+8
+version: 0.1.8+9
 environment:
   sdk: ^3.6.0
   flutter: '>=3.41.0'
@@ -17,6 +17,7 @@ dependencies:
   shared_preferences: ^2.3.5
   gbridge_client:
     path: ../packages/gbridge-client-dart
+  mobile_scanner: ^7.5.0
 
 dev_dependencies:
   flutter_test:

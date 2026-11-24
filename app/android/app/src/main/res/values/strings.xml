@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="grassbag_a11y_desc">授权后，GrassBag 在原生 SafetyGate 硬安全门保护下协助读取屏幕元素与执行操作（默认拦截支付、银行、系统设置与密码框）。</string>
+</resources>

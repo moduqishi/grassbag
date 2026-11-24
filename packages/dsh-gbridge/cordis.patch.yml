@@ -1,0 +1,4 @@
+# Cordis overlay loaded via `dsh plugin add` (remote) or `dsh web --patch` (local Android).
+- insert:
+    - id: gbridge
+      name: dsh-gbridge

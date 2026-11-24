@@ -1,0 +1,28 @@
+class AppUpdateHttpResponse {
+  const AppUpdateHttpResponse({required this.statusCode, required this.body});
+  final int statusCode;
+  final String body;
+}
+
+class AppUpdateDownloadCancelledException implements Exception {
+  const AppUpdateDownloadCancelledException();
+
+  @override
+  String toString() => '已取消下载';
+}
+
+Future<AppUpdateHttpResponse> fetchAppUpdateJson(
+  Uri uri, {
+  Duration timeout = const Duration(seconds: 12),
+}) async {
+  throw UnsupportedError('HTTP transport unavailable on this platform');
+}
+
+Future<String> downloadAppUpdateApk(
+  Uri uri,
+  String destinationPath, {
+  void Function(int receivedBytes, int totalBytes)? onProgress,
+  bool Function()? isCancelled,
+}) async {
+  throw UnsupportedError('APK file download unavailable on this platform');
+}

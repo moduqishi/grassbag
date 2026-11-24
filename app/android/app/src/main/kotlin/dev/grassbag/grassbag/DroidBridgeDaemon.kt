@@ -1,0 +1,255 @@
+package dev.grassbag.grassbag
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.LocalServerSocket
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
+import android.os.BatteryManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import android.speech.tts.TextToSpeech
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.File
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Private 0600 UDS daemon powering `droid-clip`, `droid-notify`, `droid-share`,
+ * `droid-vibrate`, `droid-tts`, and `droid-info` from inside the Linux container.
+ */
+class DroidBridgeDaemon(
+    private val context: Context,
+    private val socketFile: File,
+    val bearerToken: String
+) {
+    private val running = AtomicBoolean(false)
+    private val pool = Executors.newCachedThreadPool()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var boundSocket: LocalSocket? = null
+    private var serverSocket: LocalServerSocket? = null
+    private var tts: TextToSpeech? = null
+    private var ttsReady: Boolean = false
+    private var pendingTtsText: String? = null
+
+    fun start(): Boolean {
+        if (running.getAndSet(true)) return true
+        return try {
+            socketFile.parentFile?.mkdirs()
+            if (socketFile.exists()) socketFile.delete()
+            val bindSocket = LocalSocket()
+            bindSocket.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+            socketFile.setReadable(false, false)
+            socketFile.setWritable(false, false)
+            socketFile.setReadable(true, true)
+            socketFile.setWritable(true, true)
+            // Keep strong reference so GC cannot close bindSocket FD underneath serverSocket.
+            boundSocket = bindSocket
+            serverSocket = LocalServerSocket(bindSocket.fileDescriptor)
+            pool.execute { acceptLoop() }
+            true
+        } catch (_: Throwable) {
+            runCatching { boundSocket?.close() }
+            boundSocket = null
+            serverSocket = null
+            running.set(false)
+            false
+        }
+    }
+
+    fun stop() {
+        if (!running.getAndSet(false)) return
+        try { serverSocket?.close() } catch (_: Throwable) {}
+        serverSocket = null
+        try { boundSocket?.close() } catch (_: Throwable) {}
+        boundSocket = null
+        try {
+            mainHandler.post {
+                runCatching { tts?.shutdown() }
+                tts = null
+                ttsReady = false
+                pendingTtsText = null
+            }
+        } catch (_: Throwable) {}
+        try { if (socketFile.exists()) socketFile.delete() } catch (_: Throwable) {}
+    }
+
+    private fun acceptLoop() {
+        while (running.get()) {
+            try {
+                val client = serverSocket?.accept() ?: break
+                pool.execute { handleClient(client) }
+            } catch (_: Throwable) {
+                if (!running.get()) break
+                runCatching { Thread.sleep(150) }
+            }
+        }
+    }
+
+    private fun handleClient(client: LocalSocket) {
+        client.use { sock ->
+            try {
+                sock.soTimeout = 15_000
+                val peerUid = runCatching { sock.peerCredentials.uid }.getOrDefault(-1)
+                if (peerUid != Process.myUid()) {
+                    PhoneControlDaemon.writeJson(sock.outputStream, 403, JSONObject().put("error", JSONObject().put("message", "forbidden_peer_uid")))
+                    return
+                }
+                val req = PhoneControlDaemon.readHttpRequest(BufferedInputStream(sock.inputStream)) ?: return
+                val out = sock.outputStream
+                if (!PhoneControlDaemon.constantTimeEquals(req.headers["authorization"] ?: "", "Bearer $bearerToken")) {
+                    PhoneControlDaemon.writeJson(out, 401, JSONObject().put("error", JSONObject().put("message", "unauthorized")))
+                    return
+                }
+                val body = if (req.body.isBlank()) JSONObject() else JSONObject(req.body)
+                val action = body.optString("action", "")
+                val argsArr = body.optJSONArray("args")
+                val args = List(argsArr?.length() ?: 0) { argsArr!!.optString(it) }
+                val stdin = body.optString("stdin", "")
+                val result = executeAction(action, args, stdin)
+                PhoneControlDaemon.writeJson(out, 200, result)
+            } catch (t: Throwable) {
+                try {
+                    PhoneControlDaemon.writeJson(
+                        sock.outputStream,
+                        500,
+                        JSONObject().put("error", JSONObject().put("message", t.message ?: "error"))
+                    )
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun executeAction(action: String, args: List<String>, stdin: String): JSONObject {
+        return when (action) {
+            "clip" -> {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val rawText = if (args.isNotEmpty()) args.joinToString(" ") else stdin
+                if (rawText.isNotEmpty()) {
+                    val textToSet = if (rawText.length > 262_144) rawText.substring(0, 262_144) else rawText
+                    val latch = java.util.concurrent.CountDownLatch(1)
+                    var writeErr: String? = null
+                    mainHandler.post {
+                        try {
+                            cm.setPrimaryClip(ClipData.newPlainText("GrassBag", textToSet))
+                        } catch (t: Throwable) {
+                            writeErr = t.message ?: t.javaClass.simpleName
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                    latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
+                    if (writeErr != null) {
+                        JSONObject().put("ok", false).put("error", writeErr)
+                    } else {
+                        JSONObject().put("ok", true).put("output", "copied ${textToSet.length} chars")
+                    }
+                } else {
+                    var clipText = ""
+                    val latch = java.util.concurrent.CountDownLatch(1)
+                    mainHandler.post {
+                        try {
+                            val clip = cm.primaryClip
+                            clipText = if (clip != null && clip.itemCount > 0) {
+                                clip.getItemAt(0)?.coerceToText(context)?.toString() ?: ""
+                            } else {
+                                ""
+                            }
+                        } catch (_: Throwable) {
+                            clipText = ""
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                    latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
+                    JSONObject().put("ok", true).put("output", clipText)
+                }
+            }
+            "notify" -> {
+                val title = args.getOrNull(0) ?: "GrassBag"
+                val message = args.drop(1).joinToString(" ").ifEmpty { stdin.ifEmpty { "任务通知" } }
+                GrassBagEngineService.postAlertNotification(context, title, message)
+                JSONObject().put("ok", true).put("output", "notified")
+            }
+            "share" -> {
+                val text = args.joinToString(" ").ifEmpty { stdin }
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, text)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(Intent.createChooser(intent, "分享").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                JSONObject().put("ok", true).put("output", "shared")
+            }
+            "vibrate" -> {
+                val ms = args.firstOrNull()?.toLongOrNull()?.coerceIn(20L, 1500L) ?: 80L
+                val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+                } else {
+                    @Suppress("DEPRECATION")
+                    context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator.vibrate(ms)
+                }
+                JSONObject().put("ok", true).put("output", "vibrated ${ms}ms")
+            }
+            "tts" -> {
+                val text = args.joinToString(" ").ifEmpty { stdin }
+                if (text.isNotEmpty()) {
+                    mainHandler.post {
+                        if (tts == null) {
+                            pendingTtsText = text
+                            ttsReady = false
+                            tts = TextToSpeech(context) { status ->
+                                if (status == TextToSpeech.SUCCESS) {
+                                    ttsReady = true
+                                    tts?.language = Locale.getDefault()
+                                    val queued = pendingTtsText
+                                    pendingTtsText = null
+                                    if (!queued.isNullOrEmpty()) {
+                                        tts?.speak(queued, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
+                                    }
+                                } else {
+                                    runCatching { tts?.shutdown() }
+                                    tts = null
+                                    ttsReady = false
+                                    pendingTtsText = null
+                                }
+                            }
+                        } else if (ttsReady) {
+                            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
+                        } else {
+                            pendingTtsText = text
+                        }
+                    }
+                }
+                JSONObject().put("ok", true).put("output", "speaking")
+            }
+            "info" -> {
+                val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                val battery = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                val info = JSONObject()
+                    .put("manufacturer", Build.MANUFACTURER)
+                    .put("model", Build.MODEL)
+                    .put("sdkInt", Build.VERSION.SDK_INT)
+                    .put("abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown")
+                    .put("batteryPct", battery)
+                JSONObject().put("ok", true).put("output", info.toString(2))
+            }
+            else -> JSONObject().put("ok", false).put("error", JSONObject().put("message", "unknown droid action: $action"))
+        }
+    }
+}

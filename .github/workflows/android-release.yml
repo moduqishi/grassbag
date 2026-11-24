@@ -1,0 +1,378 @@
+name: Android APK Release
+
+# 三种触发方式（双分支版本号自增架构：main + 孤立分支 release-version）：
+#   1. 推送 main 分支 —— 检测到代码改动后，基于 origin/release-version 自动递增补丁版本号与构建号，
+#                        构建离线全量 ARM64 Release APK、打 tag、发 GitHub Release 并回写 release-version；
+#                        提交信息包含 [skip release] 或仅改动文档时自动跳过。
+#   2. 推送 vX.Y.Z tag —— 按显式标签发版，构建号仍沿用 release-version 基线单调递增。
+#   3. workflow_dispatch —— 手动发版（tag 留空则自动递增，也可指定 vX.Y.Z）。
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional explicit release tag (e.g. v0.2.0). Leave empty to auto-bump from release-version.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.41.4'
+  FLUTTER_WORKDIR: app
+  VERSION_STATE_BRANCH: release-version
+  UBUNTU_RELEASE: '24.04.5'
+  NODE_VERSION: '24.22.3'
+  DSH_VERSION: '0.2.2-rc.5'
+
+jobs:
+  prepare_release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_release: ${{ steps.gate.outputs.should_release }}
+      release_tag: ${{ steps.release_ref.outputs.tag }}
+      release_checkout_ref: ${{ steps.release_ref.outputs.checkout_ref }}
+      version: ${{ steps.version.outputs.VERSION }}
+      version_name: ${{ steps.version.outputs.VERSION_NAME }}
+      build_number: ${{ steps.version.outputs.BUILD_NUMBER }}
+      version_label: ${{ steps.version.outputs.VERSION_LABEL }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Decide whether this run should cut a release
+        id: gate
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]] || [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git log -1 --pretty=%B "${GITHUB_SHA}" | grep -qF '[skip release]'; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "提交信息包含 [skip release]，跳过本次自动发版。"
+            exit 0
+          fi
+
+          before="${{ github.event.before }}"
+          if [[ -z "${before}" || "${before}" == "0000000000000000000000000000000000000000" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "首次推送 main，执行自动发版。"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "${before}" "${GITHUB_SHA}" -- app packages runtime scripts .github/workflows/android-release.yml)"
+          if [[ -z "${changed}" ]]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "本次推送仅涉及文档或非构建文件，跳过 APK 发版。"
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "检测到可发版源码改动："
+          echo "${changed}"
+
+      - name: Run release version script tests
+        if: steps.gate.outputs.should_release == 'true'
+        run: npm run test:release
+
+      - name: Resolve release tag from release-version branch
+        id: release_ref
+        if: steps.gate.outputs.should_release == 'true'
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "按显式标签发版：${GITHUB_REF_NAME}"
+            exit 0
+          fi
+
+          manual_tag="${{ github.event.inputs.tag || '' }}"
+          if [[ -n "${manual_tag}" ]]; then
+            echo "tag=${manual_tag}" >> "$GITHUB_OUTPUT"
+            if git ls-remote --exit-code --tags origin "refs/tags/${manual_tag}" >/dev/null 2>&1; then
+              echo "checkout_ref=${manual_tag}" >> "$GITHUB_OUTPUT"
+              echo "手动补发已存在标签：${manual_tag}"
+            else
+              echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+              echo "手动发布指定新标签：${manual_tag}（提交 ${GITHUB_SHA}）"
+            fi
+            exit 0
+          fi
+
+          # main 推送或留空手动触发：读取孤立分支 release-version 上的 pubspec.yaml 基线并自动递增补丁号
+          version_state_file="${RUNNER_TEMP}/auto-stable-version-state.yaml"
+          if git fetch origin "${VERSION_STATE_BRANCH}:refs/remotes/origin/${VERSION_STATE_BRANCH}" >/dev/null 2>&1; then
+            git show "origin/${VERSION_STATE_BRANCH}:${FLUTTER_WORKDIR}/pubspec.yaml" > "${version_state_file}"
+            echo "已加载 origin/${VERSION_STATE_BRANCH} 版本基线。"
+          else
+            cp "${FLUTTER_WORKDIR}/pubspec.yaml" "${version_state_file}"
+            echo "未发现 origin/${VERSION_STATE_BRANCH}，以当前 ${FLUTTER_WORKDIR}/pubspec.yaml 作为初始基线。"
+          fi
+
+          auto_output="${RUNNER_TEMP}/auto-stable-version.env"
+          node scripts/flutter_version.mjs bump \
+            --file "${version_state_file}" \
+            --channel stable \
+            --github-output "${auto_output}"
+
+          tag="$(grep -E '^RELEASE_TAG=' "${auto_output}" | head -n1 | cut -d= -f2-)"
+          if [[ -z "${tag}" ]]; then
+            echo "无法从版本基线推导发布标签。" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "自动递增版本：${tag}（构建提交 ${GITHUB_SHA}）"
+
+      - name: Prepare stable version metadata
+        id: version
+        if: steps.gate.outputs.should_release == 'true'
+        run: |
+          version_state_file="${RUNNER_TEMP}/release-version-pubspec.yaml"
+          if git fetch origin "${VERSION_STATE_BRANCH}:refs/remotes/origin/${VERSION_STATE_BRANCH}" >/dev/null 2>&1; then
+            git show "origin/${VERSION_STATE_BRANCH}:${FLUTTER_WORKDIR}/pubspec.yaml" > "${version_state_file}"
+          else
+            cp "${FLUTTER_WORKDIR}/pubspec.yaml" "${version_state_file}"
+          fi
+
+          node scripts/flutter_version.mjs prepare-release \
+            --file "${FLUTTER_WORKDIR}/pubspec.yaml" \
+            --baseline-file "${version_state_file}" \
+            --tag "${{ steps.release_ref.outputs.tag }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  build_and_release:
+    needs: prepare_release
+    if: needs.prepare_release.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      ANDROID_KEYSTORE_PATH: /tmp/grassbag-release.jks
+      ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      BUILD_CHANNEL: stable
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare_release.outputs.release_checkout_ref }}
+
+      - name: Reclaim unused runner disk space
+        run: bash scripts/free_runner_disk.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          pub-cache-key: flutter-pub-:os:-:channel:-${{ env.FLUTTER_VERSION }}-:arch:-${{ hashFiles('app/pubspec.lock') }}
+
+      - name: Cache offline ARM64 runtime staging downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            runtime/.staging/dl
+            runtime/.staging/dsh-linux-arm64
+          key: grassbag-runtime-v1-ubuntu-${{ env.UBUNTU_RELEASE }}-node-${{ env.NODE_VERSION }}-dsh-${{ env.DSH_VERSION }}
+
+      - name: Build bundled Android ARM64 Linux + Node + DSH runtime assets
+        run: bash runtime/scripts/build-runtime-bundle.sh --fetch
+
+      - name: Apply incremented version to app/pubspec.yaml
+        run: |
+          version_state_file="${RUNNER_TEMP}/release-version-pubspec.yaml"
+          if git fetch origin "${VERSION_STATE_BRANCH}:refs/remotes/origin/${VERSION_STATE_BRANCH}" >/dev/null 2>&1; then
+            git show "origin/${VERSION_STATE_BRANCH}:${FLUTTER_WORKDIR}/pubspec.yaml" > "${version_state_file}"
+          else
+            cp "${FLUTTER_WORKDIR}/pubspec.yaml" "${version_state_file}"
+          fi
+
+          node scripts/flutter_version.mjs prepare-release \
+            --file "${FLUTTER_WORKDIR}/pubspec.yaml" \
+            --baseline-file "${version_state_file}" \
+            --tag "${{ needs.prepare_release.outputs.release_tag }}"
+
+      - name: Decode Android release signing keystore
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" ]]; then
+            echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
+            echo "require_release_signing=true" >> "$GITHUB_OUTPUT"
+            echo "已解码 Release 签名密钥：${ANDROID_KEYSTORE_PATH}"
+          else
+            echo "require_release_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，将临时使用 Debug 签名构建 APK。"
+          fi
+
+      - name: Install Flutter dependencies & verify version wiring
+        run: |
+          (cd "${FLUTTER_WORKDIR}" && flutter pub get)
+          grep -nE "app\.getVersion" "${FLUTTER_WORKDIR}/lib/services/native_bridge.dart"
+          grep -nE "getPackageInfo" "${FLUTTER_WORKDIR}/android/app/src/main/kotlin/dev/grassbag/grassbag/GrassBagBridgePlugin.kt"
+          grep -nE "kGrassBagGitHubRepo" "${FLUTTER_WORKDIR}/lib/services/app_update_service.dart"
+
+      - name: Build signed ARM64 Release APK
+        working-directory: ${{ env.FLUTTER_WORKDIR }}
+        env:
+          REQUIRE_RELEASE_SIGNING: ${{ steps.signing.outputs.require_release_signing }}
+        run: |
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            --dart-define=BUILD_CHANNEL=${BUILD_CHANNEL} \
+            --dart-define=GRASSBAG_GITHUB_REPO=${{ github.repository }} \
+            --dart-define=GRASSBAG_VERSION_NAME=${{ needs.prepare_release.outputs.version_name }} \
+            --dart-define=GRASSBAG_BUILD_NUMBER=${{ needs.prepare_release.outputs.build_number }}
+
+      - name: Verify APK versionName & versionCode match pubspec.yaml
+        run: |
+          node scripts/flutter_version.mjs verify-android-metadata \
+            --file "${FLUTTER_WORKDIR}/build/app/outputs/apk/release/output-metadata.json" \
+            --pubspec "${FLUTTER_WORKDIR}/pubspec.yaml"
+
+      - name: Package APK & SHA-256 checksum
+        id: package
+        run: |
+          source_apk="${FLUTTER_WORKDIR}/build/app/outputs/apk/release/app-release.apk"
+          test -s "${source_apk}"
+
+          apk_name="grassbag-v${{ needs.prepare_release.outputs.version }}-arm64-v8a.apk"
+          apk_path="${RUNNER_TEMP}/${apk_name}"
+          sums_path="${RUNNER_TEMP}/SHA256SUMS.txt"
+
+          cp "${source_apk}" "${apk_path}"
+          apk_sha="$(sha256sum "${apk_path}" | awk '{print $1}')"
+          printf '%s  %s\n' "${apk_sha}" "${apk_name}" > "${sums_path}"
+
+          {
+            echo "apk_name=${apk_name}"
+            echo "apk_path=${apk_path}"
+            echo "apk_sha=${apk_sha}"
+            echo "sums_path=${sums_path}"
+          } >> "$GITHUB_OUTPUT"
+          ls -lh "${apk_path}" "${sums_path}"
+
+      - name: Create release tag at the built commit
+        if: github.ref != format('refs/tags/{0}', needs.prepare_release.outputs.release_tag)
+        env:
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
+          BUILT_SHA: ${{ needs.prepare_release.outputs.release_checkout_ref }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "标签 ${RELEASE_TAG} 已存在，跳过创建。"
+            exit 0
+          fi
+          git tag "${RELEASE_TAG}" "${BUILT_SHA}"
+          git push origin "refs/tags/${RELEASE_TAG}"
+          echo "已创建并推送标签 ${RELEASE_TAG} -> ${BUILT_SHA}"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          notes_path="${RUNNER_TEMP}/release-notes.md"
+          node scripts/generate_release_notes.mjs \
+            --channel "stable" \
+            --tag "${{ needs.prepare_release.outputs.release_tag }}" \
+            --version "${{ needs.prepare_release.outputs.version_label }}" \
+            --apk-name "${{ steps.package.outputs.apk_name }}" \
+            --apk-sha256 "${{ steps.package.outputs.apk_sha }}" \
+            --runtime-manifest "${FLUTTER_WORKDIR}/android/app/src/main/assets/runtime/runtime-manifest.json" \
+            --output "${notes_path}"
+          echo "path=${notes_path}" >> "$GITHUB_OUTPUT"
+          cat "${notes_path}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
+          RELEASE_NOTES_PATH: ${{ steps.notes.outputs.path }}
+          RELEASE_APK_PATH: ${{ steps.package.outputs.apk_path }}
+          RELEASE_SUMS_PATH: ${{ steps.package.outputs.sums_path }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${RELEASE_REPO}" \
+              --title "GrassBag ${RELEASE_TAG}" \
+              --notes-file "${RELEASE_NOTES_PATH}" \
+              --latest
+            gh release upload "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_SUMS_PATH}" \
+              --repo "${RELEASE_REPO}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_SUMS_PATH}" \
+              --repo "${RELEASE_REPO}" \
+              --title "GrassBag ${RELEASE_TAG}" \
+              --notes-file "${RELEASE_NOTES_PATH}" \
+              --latest
+          fi
+
+      - name: Sync bumped version to orphan release-version branch
+        env:
+          RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
+        run: |
+          for attempt in 1 2 3; do
+            if node scripts/sync_release_version_branch.mjs \
+              --branch "${VERSION_STATE_BRANCH}" \
+              --source-file "${FLUTTER_WORKDIR}/pubspec.yaml" \
+              --message "chore: sync stable version state ${RELEASE_TAG}"; then
+              exit 0
+            fi
+            echo "同步 ${VERSION_STATE_BRANCH} 失败（第 ${attempt} 次），5s 后重试…" >&2
+            sleep 5
+          done
+          echo "同步 ${VERSION_STATE_BRANCH} 分支连续失败。" >&2
+          exit 1
+
+      - name: Clean build intermediates before post-job cache save
+        if: always()
+        run: |
+          rm -rf "${FLUTTER_WORKDIR}/build" "${FLUTTER_WORKDIR}/android/app/src/main/assets/runtime/"*.gbag || true
+          (cd "${FLUTTER_WORKDIR}/android" && ./gradlew --stop) >/dev/null 2>&1 || true
+          df -h /

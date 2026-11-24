@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 540" fill="none">
+  <defs>
+    <linearGradient id="archBgD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B1320"/>
+      <stop offset="50%" stop-color="#111F31"/>
+      <stop offset="100%" stop-color="#0D1928"/>
+    </linearGradient>
+    <linearGradient id="layerBlueD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4AA3DF" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#296E96" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="layerMintD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4CC9B0" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#22685B" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="layerVioletD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#9A8CF7" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#4E4299" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="layerAmberD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F2B86B" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#8B5A1E" stop-opacity="0.05"/>
+    </linearGradient>
+    <marker id="arrowD" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9 z" fill="#7AC4F0"/>
+    </marker>
+    <clipPath id="archClipD">
+      <rect width="1200" height="540" rx="24"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#archClipD)">
+    <rect width="1200" height="540" fill="url(#archBgD)"/>
+
+    <!-- Header -->
+    <text x="44" y="44" fill="#E8F3FC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="18" font-weight="700">GrassBag 全链路零侵入系统架构</text>
+    <text x="330" y="44" fill="#7D9FB8" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13">Zero-Patch Cordis Bridge · Offline ARM64 Container · Dual-Mode Remote Transport</text>
+
+    <!-- LAYER 1: Flutter Native Client -->
+    <rect x="44" y="68" width="1112" height="106" rx="20" fill="url(#layerBlueD)" stroke="#6AB9EC" stroke-opacity="0.34" stroke-width="1.2"/>
+    <text x="68" y="96" fill="#8AD0F8" font-family="-apple-system, sans-serif" font-size="12" font-weight="700" letter-spacing="0.8">01 · FLUTTER NATIVE LIQUID GLASS CLIENT  (app/)</text>
+    <g font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600" fill="#ECF5FD">
+      <rect x="68" y="110" width="196" height="46" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+      <text x="86" y="130">流式对话 &amp; 思维链</text>
+      <text x="86" y="147" fill="#8EAEC6" font-size="11" font-weight="400">120fps 锁底 · 队列插话 · 分叉</text>
+
+      <rect x="280" y="110" width="196" height="46" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+      <text x="298" y="130">工作台 &amp; 多标签终端</text>
+      <text x="298" y="147" fill="#8EAEC6" font-size="11" font-weight="400">文件树 · Git Diff · xterm PTY</text>
+
+      <rect x="492" y="110" width="206" height="46" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+      <text x="510" y="130">Schemastery &amp; SDUI</text>
+      <text x="510" y="147" fill="#8EAEC6" font-size="11" font-weight="400">动态设置 · 插件市场 · 官方逃生舱</text>
+
+      <rect x="714" y="110" width="206" height="46" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+      <text x="732" y="130">统一权限与手机操控</text>
+      <text x="732" y="147" fill="#8EAEC6" font-size="11" font-weight="400">无障碍 · 急停悬浮球 · SafetyGate</text>
+
+      <rect x="936" y="110" width="196" height="46" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+      <text x="954" y="130">应用内版本检测</text>
+      <text x="954" y="147" fill="#8EAEC6" font-size="11" font-weight="400">GitHub Releases · APK 原生安装</text>
+    </g>
+
+    <!-- Connector 1->2 -->
+    <line x1="600" y1="174" x2="600" y2="204" stroke="#7AC4F0" stroke-width="1.6" marker-end="url(#arrowD)"/>
+
+    <!-- LAYER 2: Pure Dart Protocol SDK -->
+    <rect x="44" y="208" width="1112" height="74" rx="18" fill="url(#layerVioletD)" stroke="#A79AF8" stroke-opacity="0.34" stroke-width="1.2"/>
+    <text x="68" y="234" fill="#C4BCFC" font-family="-apple-system, sans-serif" font-size="12" font-weight="700" letter-spacing="0.8">02 · PURE DART PROTOCOL SDK  (packages/gbridge-client-dart)</text>
+    <text x="68" y="262" fill="#DFEBFA" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13.5">
+      双模传输内核：满血桥接模式（/gbridge/v1 SSE + WS + Terminal）  ·  免插件原生直连模式（兼容原生 dsh web / DSH Desktop）  ·  多主机严格上下文隔离
+    </text>
+
+    <!-- Connectors 2->3 Left & Right -->
+    <path d="M 320 282 L 320 314" stroke="#7AC4F0" stroke-width="1.6" marker-end="url(#arrowD)"/>
+    <path d="M 880 282 L 880 314" stroke="#7AC4F0" stroke-width="1.6" marker-end="url(#arrowD)"/>
+
+    <!-- LAYER 3 LEFT: Local Android Container -->
+    <rect x="44" y="318" width="540" height="190" rx="20" fill="url(#layerMintD)" stroke="#5BD3B8" stroke-opacity="0.36" stroke-width="1.2"/>
+    <text x="68" y="346" fill="#7CE4CC" font-family="-apple-system, sans-serif" font-size="12" font-weight="700" letter-spacing="0.8">03A · 本机离线 ARM64 LINUX 容器  (Android Kotlin + runtime/)</text>
+
+    <rect x="68" y="362" width="238" height="60" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+    <text x="84" y="384" fill="#ECF5FD" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">tawcroot (主) + PRoot (备)</text>
+    <text x="84" y="405" fill="#9BBCC0" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">免 Root 执行 · Ubuntu 24.04.5 + Node 24</text>
+
+    <rect x="322" y="362" width="238" height="60" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+    <text x="338" y="384" fill="#ECF5FD" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">A/B 引擎槽位在线热升级</text>
+    <text x="338" y="405" fill="#9BBCC0" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">四分离持久卷 · 自动健康检查与回滚</text>
+
+    <rect x="68" y="434" width="492" height="54" rx="12" fill="#0F2625" fill-opacity="0.72" stroke="#5BD3B8" stroke-opacity="0.3"/>
+    <text x="84" y="457" fill="#E8FAF5" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">原版未修改 @deepseek-ai/dsh  +  dsh-gbridge  +  droid-* CLI</text>
+    <text x="84" y="476" fill="#95C5BC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">零侵入 Cordis 插件加载 · Android 无障碍 / 剪贴板 / 语音 / 相机 / 文件系统双向桥接</text>
+
+    <!-- LAYER 3 RIGHT: Remote Hosts + CI -->
+    <rect x="616" y="318" width="540" height="190" rx="20" fill="url(#layerAmberD)" stroke="#F2B86B" stroke-opacity="0.34" stroke-width="1.2"/>
+    <text x="640" y="346" fill="#F6C987" font-family="-apple-system, sans-serif" font-size="12" font-weight="700" letter-spacing="0.8">03B · 远程主机互联 &amp; 双分支自动发版体系</text>
+
+    <rect x="640" y="362" width="238" height="60" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+    <text x="656" y="384" fill="#ECF5FD" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">远程 dsh web / Desktop</text>
+    <text x="656" y="405" fill="#C9BA9F" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">局域网扫描 · 一键装桥 · 30 天 Cookie 授权</text>
+
+    <rect x="894" y="362" width="238" height="60" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.15"/>
+    <text x="910" y="384" fill="#ECF5FD" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">零侵入 dsh-gbridge 插件</text>
+    <text x="910" y="405" fill="#C9BA9F" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">packages/dsh-gbridge · 标准 Cordis 扩展</text>
+
+    <rect x="640" y="434" width="492" height="54" rx="12" fill="#231D13" fill-opacity="0.72" stroke="#F2B86B" stroke-opacity="0.3"/>
+    <text x="656" y="457" fill="#FFF3E0" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">GitHub Actions 双分支自增发版（main ↔ release-version）</text>
+    <text x="656" y="476" fill="#D5BC96" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="11.5">自动拉取离线容器包 → 递增 versionName/versionCode → 签名 APK → 发布 Release</text>
+
+    <rect x="0.6" y="0.6" width="1198.8" height="538.8" rx="23.4" stroke="#9AC8EB" stroke-opacity="0.18" stroke-width="1.2"/>
+  </g>
+</svg>

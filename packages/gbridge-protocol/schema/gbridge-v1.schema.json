@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grassbag.local/schemas/gbridge-v1.schema.json",
+  "title": "GrassBag gbridge v1 Wire Protocol Schema",
+  "type": "object",
+  "$defs": {
+    "ErrorEnvelope": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "retryable"],
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "details": { "type": "object" }
+          }
+        }
+      }
+    },
+    "DomainCapability": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "version": { "type": "integer" },
+        "features": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "CapabilitiesResponse": {
+      "type": "object",
+      "required": ["v", "bridgeVersion", "dshVersion", "bootId", "host", "transport", "domains"],
+      "properties": {
+        "v": { "const": 1 },
+        "bridgeVersion": { "type": "string" },
+        "dshVersion": { "type": "string" },
+        "bootId": { "type": "string" },
+        "endpointsCount": { "type": "integer", "minimum": 0 },
+        "host": {
+          "type": "object",
+          "required": ["name", "platform", "arch", "isLocalAndroid", "homeDir"],
+          "properties": {
+            "name": { "type": "string" },
+            "platform": { "type": "string" },
+            "arch": { "type": "string" },
+            "isLocalAndroid": { "type": "boolean" },
+            "homeDir": { "type": "string" }
+          }
+        },
+        "transport": {
+          "type": "object",
+          "required": ["wsPath", "coalesceMs", "replayCapacity"],
+          "properties": {
+            "wsPath": { "const": "/gbridge/v1/stream" },
+            "coalesceMs": { "type": "integer" },
+            "replayCapacity": { "type": "integer" }
+          }
+        },
+        "domains": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/DomainCapability" }
+        }
+      }
+    },
+    "NormalizedTurn": {
+      "type": "object",
+      "required": ["turnId", "seqStart", "seqEnd", "status", "steps", "assistantText", "deliverables"],
+      "properties": {
+        "turnId": { "type": "string" },
+        "seqStart": { "type": "integer" },
+        "seqEnd": { "type": "integer" },
+        "status": { "enum": ["streaming", "completed", "cancelled", "error"] },
+        "assistantText": { "type": "string" },
+        "deliverables": { "type": "array" },
+        "steps": { "type": "array" },
+        "usage": { "type": "object" }
+      }
+    },
+    "SduiNode": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "column", "row", "card", "section", "tabs", "text", "markdown",
+            "code_diff", "metric", "kv_list", "progress", "badge",
+            "table", "chart", "schema_form", "actions"
+          ]
+        }
+      }
+    },
+    "WsHello": {
+      "type": "object",
+      "required": ["op", "v"],
+      "properties": {
+        "op": { "const": "hello" },
+        "v": { "const": 1 },
+        "clientId": { "type": "string" },
+        "lastBootId": { "type": ["string", "null"] },
+        "resumeFromSeq": { "type": ["integer", "null"] },
+        "coalesceMs": { "type": "integer", "minimum": 0, "maximum": 250 },
+        "channels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "WsWelcome": {
+      "type": "object",
+      "required": ["op", "v", "bootId", "currentSeq", "resumed", "replayedCount", "heartbeatMs"],
+      "properties": {
+        "op": { "const": "welcome" },
+        "v": { "const": 1 },
+        "bootId": { "type": "string" },
+        "currentSeq": { "type": "integer" },
+        "resumed": { "type": "boolean" },
+        "replayedCount": { "type": "integer" },
+        "heartbeatMs": { "type": "integer" },
+        "pendingInteractions": { "type": "array" }
+      }
+    }
+  }
+}

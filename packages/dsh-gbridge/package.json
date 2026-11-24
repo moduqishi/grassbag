@@ -1,0 +1,29 @@
+{
+  "name": "dsh-gbridge",
+  "version": "0.1.0",
+  "description": "Zero-invasive Cordis bridge plugin (/gbridge/v1) for GrassBag native DSH client",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "grassbag",
+    "gbridge"
+  ],
+  "private": true
+}

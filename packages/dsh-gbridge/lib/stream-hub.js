@@ -1,0 +1,1018 @@
+import { randomUUID } from 'node:crypto';
+import { isPlainObject } from './http-util.js';
+import { extractFailureInfo } from './normalizer.js';
+
+const DEFAULT_REPLAY_CAPACITY = 2000;
+const DEFAULT_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
+const DEFAULT_COALESCE_MS = 35;
+const HEARTBEAT_MS = 20000;
+
+/**
+ * Plane A Multiplexed Stream Hub (`/gbridge/v1/stream`):
+ * - Global monotonic `seq` + bounded ring buffer for `resumeFromSeq` reconnect replay
+ * - Ref-counted upstream DSH streams (`session/follow`, `terminal/follow`, `job/follow`)
+ * - Single shared `$events` pump tracking live pending interactions (approvals / questions / cordis)
+ * - Per-client 35ms delta coalescing for smooth 120Hz mobile streaming
+ */
+function createAsyncQueue(signal) {
+  const items = [];
+  const waiters = [];
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    while (waiters.length > 0) waiters.shift()({ value: undefined, done: true });
+  };
+  signal?.addEventListener?.('abort', close, { once: true });
+  return {
+    push(value) {
+      if (closed) return;
+      if (waiters.length > 0) waiters.shift()({ value, done: false });
+      else items.push(value);
+    },
+    close,
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          if (items.length > 0) return Promise.resolve({ value: items.shift(), done: false });
+          if (closed) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => waiters.push(resolve));
+        },
+        return() {
+          close();
+          return Promise.resolve({ value: undefined, done: true });
+        },
+      };
+    },
+  };
+}
+
+function sessionFollowUsesAddress(gateway) {
+  try {
+    const desc = gateway?.typert?.local?.get?.('session/follow');
+    return Boolean(desc?.parameters?.[0]?.codec?.jsonSchema?.properties?.address);
+  } catch {
+    return false;
+  }
+}
+
+export class StreamHub {
+  constructor({ bootId, gateway, normalizer, logger, replayCapacity = DEFAULT_REPLAY_CAPACITY } = {}) {
+    this.bootId = bootId || randomUUID();
+    this.gateway = gateway;
+    this.normalizer = normalizer;
+    this.logger = logger;
+    this.replayCapacity = replayCapacity;
+
+    this.seq = 0;
+    this.ring = []; // { seq, bytes, frame }
+    this.durableRing = []; // { seq, frame } (bounded non-delta events protected from high-rate delta eviction)
+    this.latestSnapshots = new Map(); // channel -> latest snapshot frame for late-joining subscribers
+    this.ringBytes = 0;
+
+    this.clients = new Map(); // clientId -> ClientState
+    this.upstreamStreams = new Map(); // channel -> { subscribers: Set<clientId>, abort: AbortController }
+    this.activeTurns = new Map(); // sessionId -> active server turnId (e.g. 'turn-1')
+    this.pendingInteractions = new Map(); // interactionId -> { id, kind, event, eventId, gatewayClientId, sessionId, payload, createdAt }
+    this.sessionAlwaysAllowed = new Map(); // sessionId -> Set<toolKey> (honors 'always' approval within the session)
+
+    this._eventsAbort = null;
+    this._eventsClientId = null;
+    this._eventsPeer = null;
+    this._eventsReconnectTimer = null;
+    this._disposed = false;
+    this._heartbeatTimer = setInterval(() => this._sendHeartbeats(), HEARTBEAT_MS);
+    this._heartbeatTimer.unref?.();
+  }
+
+  /** Start background pump consuming DSH's official `$events` stream. */
+  startHostEventPump() {
+    if (this._disposed || this._eventsAbort) return;
+    if (!this.gateway?.ready) return;
+    const peer = this.gateway.resolvePeer();
+    if (!peer) {
+      if (!this._eventsReconnectTimer && !this._disposed) {
+        this._eventsReconnectTimer = setTimeout(() => {
+          this._eventsReconnectTimer = null;
+          this.startHostEventPump();
+        }, 500);
+        this._eventsReconnectTimer.unref?.();
+      }
+      return;
+    }
+    this._eventsPeer = peer;
+    const abort = new AbortController();
+    this._eventsAbort = abort;
+    const stream = this.gateway.openRemoteEvents(abort.signal, peer);
+    if (!stream) {
+      this._eventsAbort = null;
+      this._eventsPeer = null;
+      return;
+    }
+    const signal = abort.signal;
+    (async () => {
+      try {
+        for await (const frame of stream) {
+          if (signal.aborted || this._disposed) break;
+          this._handleHostEventFrame(frame);
+        }
+      } catch (err) {
+        if (!signal.aborted && !this._disposed) {
+          this.logger?.warn?.('[gbridge] host $events pump ended:', err?.message || err);
+        }
+      } finally {
+        const staleClientId = this._eventsClientId;
+        this._eventsClientId = null;
+        this._eventsAbort = null;
+        this._eventsPeer = null;
+        if (staleClientId) {
+          for (const [id, item] of [...this.pendingInteractions.entries()]) {
+            if (item.gatewayClientId === staleClientId) {
+              this.pendingInteractions.delete(id);
+              this.publish('host', 'interaction.resolved', { id, kind: item.kind, reason: 'host_disconnected' });
+            }
+          }
+        }
+        if (!this._disposed && this.gateway?.ready) {
+          this._eventsReconnectTimer = setTimeout(() => {
+            this._eventsReconnectTimer = null;
+            this.startHostEventPump();
+          }, 1500);
+          this._eventsReconnectTimer.unref?.();
+        }
+      }
+    })();
+  }
+
+  _handleHostEventFrame(frame) {
+    if (!frame || typeof frame !== 'object') return;
+    if (frame.type === 'ready') {
+      this._eventsClientId = frame.clientId || null;
+      this.publish('host', 'host.ready', { home: frame.host?.home ?? null });
+      return;
+    }
+    if (frame.type === 'emit') {
+      const ev = String(frame.event || '');
+      const args = Array.isArray(frame.args) ? frame.args : [];
+      if (ev === 'cordis/request-run') {
+        const req = args[0] ?? {};
+        const id = String(req.id || req.requestId || randomUUID());
+        const item = {
+          id,
+          kind: 'cordis_run',
+          event: ev,
+          sessionId: req.agentId ?? req.sessionId ?? null,
+          gatewayPeer: this._eventsPeer,
+          payload: req,
+          createdAt: Date.now(),
+        };
+        this.pendingInteractions.set(id, item);
+        this.publish('host', 'interaction.requested', sanitizeInteraction(item));
+        return;
+      }
+      if (ev === 'cordis/request-run-resolved') {
+        const req = args[0] ?? {};
+        const id = String(req.id || req.requestId || '');
+        if (id && this.pendingInteractions.delete(id)) {
+          this.publish('host', 'interaction.resolved', { id, kind: 'cordis_run', resolution: req });
+        }
+        return;
+      }
+      if (ev === 'api-session/removed' || ev === 'api-session/archived') {
+        const sid = args[0]?.sessionId ?? args[0]?.id ?? (typeof args[0] === 'string' ? args[0] : null);
+        if (sid) this.sessionAlwaysAllowed.delete(String(sid));
+      }
+      const mapped = mapHostEmitEvent(ev, args);
+      this.publish(mapped.channel, mapped.type, mapped.data);
+      return;
+    }
+    if (frame.type === 'waterfall' || frame.type === 'request') {
+      const ev = String(frame.event || '');
+      const eventId = String(frame.eventId || randomUUID());
+      const kind = ev === 'approval/request'
+        ? 'approval'
+        : ev === 'user-questions/request'
+          ? 'user_questions'
+          : 'request';
+      const item = {
+        id: eventId,
+        kind,
+        event: ev,
+        eventId,
+        gatewayClientId: this._eventsClientId,
+        gatewayPeer: this._eventsPeer,
+        sessionId: frame.agentId ?? frame.request?.sessionId ?? null,
+        payload: frame.request ?? frame.payload ?? frame,
+        createdAt: Date.now(),
+      };
+      // Honor prior session-wide "本次均允许" (`always`) for the exact same session & tool!
+      // NEVER auto-approve `phone_*` tools across turns — SafetyGate enforces strict per-turn user confirmation!
+      if (kind === 'approval' && item.sessionId && item.gatewayClientId) {
+        const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
+        const allowedTools = this.sessionAlwaysAllowed.get(item.sessionId);
+        if (!toolKey.startsWith('phone_') && allowedTools && (allowedTools.has(toolKey) || allowedTools.has('*'))) {
+          this.gateway.respondRemoteEvent(
+            item.gatewayClientId,
+            item.eventId,
+            { kind: 'result', value: 'allowed-once' },
+            undefined,
+            item.gatewayPeer,
+          ).catch(() => {});
+          return;
+        }
+      }
+      this.pendingInteractions.set(eventId, item);
+      this.publish('host', 'interaction.requested', sanitizeInteraction(item));
+      return;
+    }
+    if (frame.type === 'cancel' || frame.type === 'resolved') {
+      const eventId = String(frame.eventId || '');
+      if (eventId && this.pendingInteractions.delete(eventId)) {
+        this.publish('host', 'interaction.resolved', { id: eventId, reason: frame.reason || 'settled_elsewhere' });
+      }
+    }
+  }
+
+  listPendingInteractions() {
+    return [...this.pendingInteractions.values()].map(sanitizeInteraction);
+  }
+
+  async respondInteraction(id, { decision, answers, outcome } = {}, signal) {
+    const item = this.pendingInteractions.get(id);
+    if (!item) return null;
+    if (item.kind === 'cordis_run') {
+      const isAllow = decision === 'allow' || decision === 'approve' || decision === 'allowed-once' || decision === 'always';
+      if (this.gateway?.has('dynamicCordisRunner/resolveRequestRun')) {
+        let resolution;
+        if (isAllow) {
+          let pluginRunId = null;
+          if (this.gateway?.has('dynamicCordisRunner/runHostHalf') && item.payload?.pluginId && item.payload?.packageId) {
+            const runRes = await this.gateway.call('dynamicCordisRunner/runHostHalf', {
+              agentId: item.sessionId ?? item.payload.agentId,
+              pluginId: item.payload.pluginId,
+              packageId: item.payload.packageId,
+              mode: item.payload.mode ?? 'host',
+              requestId: id,
+              approveFutureVersions: decision === 'always',
+            }, { signal, peer: item.gatewayPeer });
+            pluginRunId = runRes?.pluginRunId ?? runRes?.id ?? null;
+          }
+          resolution = pluginRunId ? { ok: true, pluginRunId } : { ok: true, approved: true };
+        } else {
+          resolution = { ok: false, reason: 'rejected' };
+        }
+        await this.gateway.call('dynamicCordisRunner/resolveRequestRun', {
+          requestId: id,
+          resolution,
+        }, { signal, peer: item.gatewayPeer });
+      } else if (isAllow) {
+        throw new Error('host DSH does not expose dynamicCordisRunner/resolveRequestRun');
+      }
+    } else if (item.gatewayClientId && item.eventId) {
+      let wireOutcome = outcome;
+      if (!wireOutcome) {
+        if (decision === 'pass') {
+          wireOutcome = { kind: 'next' };
+        } else if (item.kind === 'approval') {
+          const d = String(decision || '').toLowerCase();
+          if (d === 'always' && item.sessionId) {
+            const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
+            if (!toolKey.startsWith('phone_')) {
+              let set = this.sessionAlwaysAllowed.get(item.sessionId);
+              if (!set) {
+                if (this.sessionAlwaysAllowed.size >= 256) {
+                  const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
+                  if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
+                }
+                set = new Set();
+                this.sessionAlwaysAllowed.set(item.sessionId, set);
+              }
+              set.add(toolKey);
+            }
+          }
+          const normalized = (d === 'allow' || d === 'approve' || d === 'allowed-once' || d === 'always')
+            ? 'allowed-once'
+            : (d === 'cancel' || d === 'cancelled')
+              ? 'cancelled'
+              : 'rejected';
+          wireOutcome = { kind: 'result', value: normalized };
+        } else if (item.kind === 'user_questions') {
+          const rawAns = answers !== undefined ? answers : decision;
+          let wrapped = rawAns;
+          if (Array.isArray(rawAns)) {
+            const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
+            const alreadyStructured = rawAns.every((a) => a && typeof a === 'object' && typeof a.id === 'string');
+            wrapped = {
+              answers: alreadyStructured
+                ? rawAns
+                : [{ id: String(qs[0]?.id ?? 'q-0'), selected: rawAns.map(String) }],
+            };
+          } else if (typeof rawAns === 'string') {
+            const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
+            wrapped = { answers: [{ id: String(qs[0]?.id ?? 'q-0'), selected: [rawAns], custom: rawAns }] };
+          } else if (rawAns && typeof rawAns === 'object' && !Array.isArray(rawAns.answers)) {
+            wrapped = {
+              answers: Object.entries(rawAns).map(([qid, val]) => ({
+                id: qid,
+                selected: Array.isArray(val) ? val.map(String) : [String(val)],
+              })),
+            };
+          }
+          wireOutcome = { kind: 'result', value: wrapped };
+        } else {
+          wireOutcome = { kind: 'result', value: answers !== undefined ? answers : decision };
+        }
+      }
+      await this.gateway.respondRemoteEvent(
+        item.gatewayClientId,
+        item.eventId,
+        wireOutcome,
+        signal,
+        item.gatewayPeer,
+      );
+    }
+    this.pendingInteractions.delete(id);
+    this.publish('host', 'interaction.resolved', { id, kind: item.kind, settledBy: 'gbridge' });
+    return { id, settled: true };
+  }
+
+  /** Publish a durable event into the ring buffer and deliver to subscribed clients. */
+  publish(channel, type, data, { isDelta = false } = {}) {
+    const seq = ++this.seq;
+    const frame = {
+      op: isDelta ? 'delta' : 'event',
+      seq,
+      channel,
+      type,
+      ts: Date.now(),
+      data,
+    };
+    const serialized = JSON.stringify(frame);
+    const bytes = Buffer.byteLength(serialized);
+    this.ring.push({ seq, bytes, frame });
+    this.ringBytes += bytes;
+    while (this.ring.length > this.replayCapacity || (this.ringBytes > DEFAULT_REPLAY_MAX_BYTES && this.ring.length > 1)) {
+      const dropped = this.ring.shift();
+      this.ringBytes -= dropped.bytes;
+    }
+    if (!isDelta) {
+      this.durableRing.push({ seq, frame });
+      if (this.durableRing.length > 250) this.durableRing.shift();
+      if (type === 'turn.snapshot' || type === 'term.snapshot') {
+        this.latestSnapshots.set(channel, frame);
+        if (this.latestSnapshots.size > 64) {
+          const oldestCh = this.latestSnapshots.keys().next().value;
+          if (oldestCh !== undefined) this.latestSnapshots.delete(oldestCh);
+        }
+      }
+    }
+
+    const MAX_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024;
+    for (const client of this.clients.values()) {
+      if (!client.welcomed || !client.channels.has(channel)) continue;
+      const buffered = client.ws.socket?.writableLength ?? 0;
+      if (isDelta && buffered > MAX_CLIENT_BUFFER_BYTES) {
+        continue; // Drop non-durable delta on congested slow mobile link; client stays synced via durable events.
+      }
+      if (isDelta && client.coalesceMs > 0) {
+        this._enqueueDelta(client, frame);
+      } else {
+        this._flushClientDeltas(client);
+        client.ws.sendText(serialized);
+      }
+    }
+    return frame;
+  }
+
+  /** Attach an upgraded WebSocket connection to the hub. */
+  attachClient(ws, { peer } = {}) {
+    if (this._disposed) {
+      try { ws.close(1001, 'gbridge reloading'); } catch {}
+      return null;
+    }
+    const connId = randomUUID();
+    const state = {
+      id: connId,
+      clientId: null,
+      ws,
+      peer,
+      welcomed: false,
+      coalesceMs: DEFAULT_COALESCE_MS,
+      channels: new Set(['host']),
+      pendingDeltas: new Map(), // `${channel}:${type}` -> merged frame
+      coalesceTimer: null,
+      lastAckSeq: 0,
+      missedPongs: 0,
+    };
+    this.clients.set(connId, state);
+
+    ws.on('pong', () => {
+      state.missedPongs = 0;
+    });
+
+    ws.on('message', (raw, isBinary) => {
+      state.missedPongs = 0;
+      if (isBinary) return;
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch {
+        ws.sendJson({ op: 'error', code: 'gbridge/invalid_frame', message: 'frame must be valid JSON' });
+        return;
+      }
+      if (!isPlainObject(msg) || typeof msg.op !== 'string') {
+        ws.sendJson({ op: 'error', code: 'gbridge/invalid_frame', message: 'frame requires string op' });
+        return;
+      }
+      this._onClientMessage(state, msg);
+    });
+
+    ws.on('close', () => this._detachClient(state));
+    ws.on('error', () => this._detachClient(state));
+    return connId;
+  }
+
+  _onClientMessage(client, msg) {
+    switch (msg.op) {
+      case 'hello': {
+        client.clientId = typeof msg.clientId === 'string' ? msg.clientId.slice(0, 128) : client.id;
+        if (typeof msg.coalesceMs === 'number' && Number.isFinite(msg.coalesceMs)) {
+          client.coalesceMs = Math.max(0, Math.min(250, Math.round(msg.coalesceMs)));
+        }
+        const requestedChannels = [];
+        if (Array.isArray(msg.channels)) {
+          for (const ch of msg.channels) {
+            if (typeof ch === 'string' && ch.length > 0 && ch.length <= 160) {
+              requestedChannels.push(ch);
+            }
+          }
+        }
+        const replayChannelSet = new Set([...client.channels, ...requestedChannels]);
+        client.welcomed = true;
+
+        const oldestRingSeq = this.ring.length > 0 ? this.ring[0].seq : this.seq + 1;
+        const oldestDurableSeq = this.durableRing.length > 0 ? this.durableRing[0].seq : oldestRingSeq;
+        const oldestSeq = Math.min(oldestRingSeq, oldestDurableSeq);
+        const canResume = msg.lastBootId === this.bootId &&
+          typeof msg.resumeFromSeq === 'number' &&
+          Number.isInteger(msg.resumeFromSeq) &&
+          msg.resumeFromSeq >= oldestSeq - 1 &&
+          msg.resumeFromSeq <= this.seq;
+
+        let replayFrames = [];
+        if (canResume) {
+          const bySeq = new Map();
+          for (const entry of this.durableRing) {
+            if (entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
+              bySeq.set(entry.seq, entry);
+            }
+          }
+          for (const entry of this.ring) {
+            if (entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
+              bySeq.set(entry.seq, entry);
+            }
+          }
+          replayFrames = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+        }
+
+        client.ws.sendJson({
+          op: 'welcome',
+          v: 1,
+          bootId: this.bootId,
+          currentSeq: this.seq,
+          resumed: canResume,
+          replayedCount: replayFrames.length,
+          heartbeatMs: HEARTBEAT_MS,
+          pendingInteractions: this.listPendingInteractions(),
+        });
+        let lastDeliveredSeq = canResume ? msg.resumeFromSeq : 0;
+        for (const entry of replayFrames) {
+          client.ws.sendJson(entry.frame);
+          if (typeof entry.seq === 'number' && entry.seq > lastDeliveredSeq) {
+            lastDeliveredSeq = entry.seq;
+          }
+        }
+        // Start upstream channel pumps AFTER `welcome` is sent so any synchronous `.unavailable`
+        // error frame reaches the welcomed client and never skews `welcome.currentSeq`!
+        // Pass `minSnapshotSeq` on resumed reconnects so cached snapshots older than already-replayed
+        // frames NEVER rewind client state!
+        for (const ch of requestedChannels) {
+          this._subscribeChannel(client, ch, { minSnapshotSeq: canResume ? lastDeliveredSeq : 0 });
+        }
+        break;
+      }
+      case 'sub': {
+        const list = Array.isArray(msg.channels) ? msg.channels : (typeof msg.channel === 'string' ? [msg.channel] : []);
+        for (const ch of list) {
+          if (typeof ch === 'string' && ch.length > 0 && ch.length <= 160) {
+            this._subscribeChannel(client, ch);
+          }
+        }
+        break;
+      }
+      case 'unsub': {
+        const list = Array.isArray(msg.channels) ? msg.channels : (typeof msg.channel === 'string' ? [msg.channel] : []);
+        for (const ch of list) {
+          if (typeof ch === 'string' && ch !== 'host') {
+            this._unsubscribeChannel(client, ch);
+          }
+        }
+        break;
+      }
+      case 'ack': {
+        if (typeof msg.seq === 'number') client.lastAckSeq = Math.max(client.lastAckSeq, msg.seq);
+        break;
+      }
+      case 'ping': {
+        client.ws.sendJson({ op: 'pong', ts: Date.now(), ...(msg.id !== undefined ? { id: msg.id } : {}) });
+        break;
+      }
+      case 'term.input': {
+        if (typeof msg.terminalId === 'string' && typeof msg.data === 'string') {
+          const entry = this._findTerminalUpstream(msg.terminalId);
+          if (entry?.uplink) {
+            entry.uplinkSeq = (entry.uplinkSeq || 0) + 1;
+            entry.uplink.push({ type: 'write', sequence: entry.uplinkSeq, data: msg.data, typed: true });
+          } else if (this.gateway?.has('terminal/write')) {
+            this.gateway.call('terminal/write', {
+              terminalId: msg.terminalId,
+              data: msg.data,
+            }, { peer: client.peer }).catch((err) => {
+              client.ws.sendJson({ op: 'error', code: 'terminal/write_failed', message: err?.message || 'write failed' });
+            });
+          }
+        }
+        break;
+      }
+      case 'term.resize': {
+        if (typeof msg.terminalId === 'string' && typeof msg.cols === 'number' && typeof msg.rows === 'number') {
+          const cols = Math.max(1, Math.round(msg.cols));
+          const rows = Math.max(1, Math.round(msg.rows));
+          const entry = this._findTerminalUpstream(msg.terminalId);
+          if (entry?.uplink) {
+            entry.uplinkSeq = (entry.uplinkSeq || 0) + 1;
+            entry.uplink.push({ type: 'resize', sequence: entry.uplinkSeq, cols, rows });
+          } else if (this.gateway?.has('terminal/resize')) {
+            this.gateway.call('terminal/resize', {
+              terminalId: msg.terminalId,
+              cols,
+              rows,
+            }, { peer: client.peer }).catch(() => {});
+          }
+        }
+        break;
+      }
+      default:
+        client.ws.sendJson({ op: 'error', code: 'gbridge/unknown_op', message: `unknown op ${msg.op}` });
+    }
+  }
+
+  _subscribeChannel(client, channel, opts = {}) {
+    if (client.channels.has(channel)) return;
+    client.channels.add(channel);
+    if (channel.startsWith('session:') || channel.startsWith('terminal:') || channel.startsWith('job:')) {
+      this._retainUpstreamStream(channel, client.id, client.peer, opts);
+    }
+  }
+
+  _unsubscribeChannel(client, channel) {
+    if (!client.channels.delete(channel)) return;
+    this._releaseUpstreamStream(channel, client.id);
+  }
+
+  _findTerminalUpstream(terminalId) {
+    const direct = this.upstreamStreams.get(`terminal:${terminalId}`);
+    if (direct) return direct;
+    for (const [ch, entry] of this.upstreamStreams.entries()) {
+      if (ch.startsWith('terminal:') && (ch.endsWith(`:${terminalId}`) || entry.terminalId === terminalId)) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  _retainUpstreamStream(channel, clientId, peer, { minSnapshotSeq = 0 } = {}) {
+    let entry = this.upstreamStreams.get(channel);
+    if (entry) {
+      if (entry.releaseTimer) {
+        clearTimeout(entry.releaseTimer);
+        entry.releaseTimer = null;
+      }
+      entry.subscribers.add(clientId);
+      const cachedSnap = this.latestSnapshots.get(channel);
+      const joining = this.clients.get(clientId);
+      if (cachedSnap && joining?.welcomed && !(minSnapshotSeq > 0 && (cachedSnap.seq ?? 0) <= minSnapshotSeq)) {
+        joining.ws.sendJson(cachedSnap);
+      }
+      return;
+    }
+    const abort = new AbortController();
+    const [prefix, targetId] = [channel.slice(0, channel.indexOf(':')), channel.slice(channel.indexOf(':') + 1)];
+
+    let endpoint;
+    let args;
+    let uplink;
+    let effectiveTermId = targetId;
+
+    if (prefix === 'session') {
+      endpoint = 'session/follow';
+      args = sessionFollowUsesAddress(this.gateway)
+        ? { address: { kind: 'session', sessionId: targetId }, assistantStream: true, activate: true }
+        : { sessionId: targetId };
+    } else if (prefix === 'terminal') {
+      if (this.gateway?.has('terminal/attach')) {
+        endpoint = 'terminal/attach';
+        const sep = targetId.indexOf(':');
+        const agentId = sep > 0 ? targetId.slice(0, sep) : targetId;
+        effectiveTermId = sep > 0 ? targetId.slice(sep + 1) : targetId;
+        args = { agentId, id: effectiveTermId };
+        uplink = createAsyncQueue(abort.signal);
+      } else {
+        endpoint = 'terminal/follow';
+        args = { terminalId: targetId };
+      }
+    } else {
+      endpoint = 'job/follow';
+      const sep = targetId.indexOf(':');
+      if (sep > 0) {
+        const sid = targetId.slice(0, sep);
+        effectiveTermId = targetId.slice(sep + 1);
+        args = { request: { sessionId: sid, jobId: effectiveTermId } };
+      } else {
+        args = { request: { jobId: targetId } };
+      }
+    }
+
+    if (!this.gateway?.has(endpoint)) {
+      this.publish(channel, `${prefix}.unavailable`, { id: targetId, endpoint });
+      return;
+    }
+
+    entry = { subscribers: new Set([clientId]), abort, uplink, uplinkSeq: 0, terminalId: effectiveTermId };
+    this.upstreamStreams.set(channel, entry);
+
+    (async () => {
+      try {
+        const iterable = await this.gateway.openStream(endpoint, args, {
+          signal: abort.signal,
+          peer,
+          ...(uplink ? { uplink } : {}),
+        });
+        for await (const item of iterable) {
+          if (abort.signal.aborted || this._disposed) break;
+          this._forwardUpstreamStreamItem(prefix, effectiveTermId, channel, item);
+        }
+        if (!abort.signal.aborted && !this._disposed) {
+          this.publish(channel, `${prefix}.stream_end`, { id: effectiveTermId });
+        }
+      } catch (err) {
+        if (!abort.signal.aborted && !this._disposed) {
+          this.publish(channel, `${prefix}.stream_error`, { id: effectiveTermId, message: err?.message || String(err) });
+        }
+      } finally {
+        uplink?.close?.();
+        if (this.upstreamStreams.get(channel) === entry) {
+          this.upstreamStreams.delete(channel);
+        }
+      }
+    })();
+  }
+
+  _forwardUpstreamStreamItem(prefix, targetId, channel, item) {
+    if (prefix === 'terminal') {
+      if (item?.type === 'snapshot' && typeof item.screen === 'string') {
+        this.publish(channel, 'term.snapshot', { terminalId: targetId, screen: item.screen });
+        return;
+      }
+      if (item?.type === 'output' && typeof item.data === 'string') {
+        this.publish(channel, 'term.data', { terminalId: targetId, chunk: item.data }, { isDelta: true });
+        return;
+      }
+      if (item?.type === 'state' && item.info?.state === 'exited') {
+        this.publish(channel, 'term.exit', { terminalId: targetId, code: item.info.exitCode ?? null });
+        return;
+      }
+      const data = typeof item === 'string' ? item : (item?.data ?? item?.chunk ?? '');
+      if (data) {
+        this.publish(channel, 'term.data', { terminalId: targetId, chunk: String(data) }, { isDelta: true });
+      } else if (item?.type === 'exit') {
+        this.publish(channel, 'term.exit', { terminalId: targetId, code: item.code ?? null });
+      }
+      return;
+    }
+    if (prefix === 'job') {
+      let chunk = '';
+      if (item?.type === 'output' && Array.isArray(item.chunks)) {
+        chunk = item.chunks.map((c) => String(c?.text ?? '')).join('');
+      } else {
+        chunk = typeof item === 'string' ? item : String(item?.chunk ?? item?.data ?? '');
+      }
+      if (chunk) {
+        this.publish(channel, 'job.output', { jobId: targetId, chunk }, { isDelta: true });
+      } else {
+        this.publish(channel, 'job.event', { jobId: targetId, raw: item });
+      }
+      return;
+    }
+    // session/follow
+    const kind = item?.type || '';
+    if (kind === 'assistant-stream') {
+      const frame = item.frame ?? item;
+      const activeTid = this.activeTurns.get(targetId);
+      if (frame?.type === 'chunk' && frame.chunk) {
+        const inner = frame.chunk;
+        const activity = this.normalizer?.observeStreamChunk(targetId, inner);
+        this.publish(channel, 'turn.delta', {
+          sessionId: targetId,
+          ...(activeTid ? { turnId: activeTid } : {}),
+          chunk: inner,
+          ...(activity ? { activity } : {}),
+        }, { isDelta: true });
+      } else if (frame?.type === 'start') {
+        const tid = frame.turn !== undefined ? `turn-${frame.turn}` : activeTid;
+        if (tid) this.activeTurns.set(targetId, tid);
+        this.publish(channel, 'turn.delta', {
+          sessionId: targetId,
+          ...(tid ? { turnId: tid } : {}),
+          chunk: { type: 'turn/start', turn: frame.turn, step: frame.step },
+        });
+      } else if (frame?.type === 'end' && frame?.outcome?.kind === 'abandoned') {
+        this.publish(channel, 'turn.delta', {
+          sessionId: targetId,
+          ...(activeTid ? { turnId: activeTid } : {}),
+          chunk: { type: 'assistant-stream/abandoned', turn: frame.turn, step: frame.step },
+        });
+      }
+      return;
+    }
+    if (kind === 'text-chunks' || kind === 'reasoning-chunks' || kind === 'tool-call-chunks' || kind === 'chunk') {
+      const activeTid = this.activeTurns.get(targetId);
+      const activity = this.normalizer?.observeStreamChunk(targetId, item);
+      this.publish(channel, 'turn.delta', {
+        sessionId: targetId,
+        ...(activeTid ? { turnId: activeTid } : {}),
+        chunk: item,
+        ...(activity ? { activity } : {}),
+      }, { isDelta: true });
+      return;
+    }
+    if (kind === 'snapshot') {
+      const rawRecords = item.records ?? item.events ?? item.history ?? [];
+      const turns = this.normalizer?.normalizeEvents(targetId, rawRecords) ?? [];
+      const last = turns.length > 0 ? turns[turns.length - 1] : null;
+      if (last && last.status === 'streaming' && last.turnId) {
+        this.activeTurns.set(targetId, last.turnId);
+      } else {
+        this.activeTurns.delete(targetId);
+      }
+      this.publish(channel, 'turn.snapshot', {
+        sessionId: targetId,
+        turns,
+        projections: item.projections ?? {},
+        rawRevision: item.revision ?? item.cursor ?? null,
+      });
+      return;
+    }
+    if (kind === 'event' && item.event) {
+      const ev = item.event;
+      const eventSeq = typeof ev.seq === 'number' ? ev.seq : undefined;
+      if (ev.type === 'turn/start' || ev.type === 'turn_start') {
+        const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : `turn-${ev.seq ?? Date.now()}`);
+        this.activeTurns.set(targetId, turnId);
+        this.publish(channel, 'turn.start', {
+          sessionId: targetId,
+          turnId,
+          ...(eventSeq !== undefined ? { eventSeq } : {}),
+          raw: ev,
+        });
+        return;
+      }
+      if (ev.type === 'turn/end') {
+        const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : this.activeTurns.get(targetId));
+        this.activeTurns.delete(targetId);
+        this.normalizer?.clearSessionStat(targetId);
+        const fail = extractFailureInfo(ev.data?.reason, ev.data ?? ev);
+        this.publish(channel, 'turn.completed', {
+          sessionId: targetId,
+          ...(turnId ? { turnId } : {}),
+          ...(eventSeq !== undefined ? { eventSeq } : {}),
+          raw: ev,
+          ...(fail ? { errorMessage: fail.message, ...(fail.code ? { errorCode: fail.code } : {}) } : {}),
+        });
+        return;
+      }
+      const activeTurnId = this.activeTurns.get(targetId) ?? null;
+      const deltaTurns = this.normalizer?.normalizeEvents(targetId, [ev], {
+        incremental: true,
+        activeTurnId,
+      }) ?? [];
+      this.publish(channel, 'session.event', {
+        sessionId: targetId,
+        ...(eventSeq !== undefined ? { eventSeq } : {}),
+        raw: ev,
+        ...(deltaTurns.length > 0 ? { normalizedTurn: deltaTurns[0] } : {}),
+      });
+      return;
+    }
+    if (kind === 'projections' || kind === 'projection') {
+      this.publish(channel, 'projection.updated', {
+        sessionId: targetId,
+        projections: item.projections ?? item.data ?? item,
+      });
+      return;
+    }
+    if (kind === 'turn/end' || item?.event?.type === 'turn/end') {
+      const evData = item?.event?.data ?? item?.data ?? item;
+      const turnId = evData?.turnId || (evData?.turn !== undefined ? `turn-${evData.turn}` : this.activeTurns.get(targetId));
+      this.activeTurns.delete(targetId);
+      this.normalizer?.clearSessionStat(targetId);
+      const fail = extractFailureInfo(evData?.reason, evData);
+      this.publish(channel, 'turn.completed', {
+        sessionId: targetId,
+        ...(turnId ? { turnId } : {}),
+        raw: item,
+        ...(fail ? { errorMessage: fail.message, ...(fail.code ? { errorCode: fail.code } : {}) } : {}),
+      });
+      return;
+    }
+    this.publish(channel, 'session.event', { sessionId: targetId, raw: item });
+  }
+
+  _releaseUpstreamStream(channel, clientId) {
+    const entry = this.upstreamStreams.get(channel);
+    if (!entry) return;
+    entry.subscribers.delete(clientId);
+    if (entry.subscribers.size === 0) {
+      const teardown = () => {
+        if (this.upstreamStreams.get(channel) !== entry || entry.subscribers.size > 0) return;
+        this.upstreamStreams.delete(channel);
+        if (channel.startsWith('session:')) {
+          const sid = channel.slice(8);
+          this.activeTurns.delete(sid);
+          this.normalizer?.clearSessionStat(sid);
+        }
+        entry.abort.abort();
+      };
+      // Brief 8s grace window for `session:` streams so mobile Wi-Fi/5G drops reconnect with zero-gap deltas!
+      if (channel.startsWith('session:') && !this._disposed) {
+        if (entry.releaseTimer) clearTimeout(entry.releaseTimer);
+        entry.releaseTimer = setTimeout(teardown, 8000);
+        entry.releaseTimer.unref?.();
+      } else {
+        teardown();
+      }
+    }
+  }
+
+  _enqueueDelta(client, frame) {
+    const key = `${frame.channel}:${frame.type}`;
+    const existing = client.pendingDeltas.get(key);
+    if (!existing) {
+      client.pendingDeltas.set(key, { ...frame, batch: [frame.data] });
+    } else {
+      existing.seq = frame.seq;
+      existing.ts = frame.ts;
+      existing.batch.push(frame.data);
+      existing.data = frame.data;
+    }
+    if (!client.coalesceTimer) {
+      client.coalesceTimer = setTimeout(() => this._flushClientDeltas(client), client.coalesceMs);
+      client.coalesceTimer.unref?.();
+    }
+  }
+
+  _flushClientDeltas(client) {
+    if (client.coalesceTimer) {
+      clearTimeout(client.coalesceTimer);
+      client.coalesceTimer = null;
+    }
+    if (client.pendingDeltas.size === 0) return;
+    for (const merged of client.pendingDeltas.values()) {
+      if (merged.batch.length === 1) {
+        client.ws.sendJson({
+          op: 'delta',
+          seq: merged.seq,
+          channel: merged.channel,
+          type: merged.type,
+          ts: merged.ts,
+          data: merged.batch[0],
+        });
+      } else if (merged.type === 'term.data' || merged.type === 'job.output') {
+        const joined = merged.batch.map((b) => b.chunk || '').join('');
+        client.ws.sendJson({
+          op: 'delta',
+          seq: merged.seq,
+          channel: merged.channel,
+          type: merged.type,
+          ts: merged.ts,
+          data: { ...merged.batch[merged.batch.length - 1], chunk: joined },
+        });
+      } else {
+        client.ws.sendJson({
+          op: 'delta',
+          seq: merged.seq,
+          channel: merged.channel,
+          type: merged.type,
+          ts: merged.ts,
+          data: {
+            ...merged.batch[merged.batch.length - 1],
+            chunks: merged.batch.map((b) => b.chunk ?? b),
+          },
+        });
+      }
+    }
+    client.pendingDeltas.clear();
+  }
+
+  _detachClient(client) {
+    if (!this.clients.delete(client.id)) return;
+    if (client.coalesceTimer) clearTimeout(client.coalesceTimer);
+    for (const ch of client.channels) {
+      this._releaseUpstreamStream(ch, client.id);
+    }
+    client.channels.clear();
+  }
+
+  _sendHeartbeats() {
+    for (const client of [...this.clients.values()]) {
+      if (client.ws.closed) continue;
+      if (client.missedPongs >= 2) {
+        client.ws.terminate();
+        this._detachClient(client);
+        continue;
+      }
+      client.missedPongs += 1;
+      client.ws.ping();
+    }
+  }
+
+  dispose() {
+    this._disposed = true;
+    clearInterval(this._heartbeatTimer);
+    if (this._eventsReconnectTimer) {
+      clearTimeout(this._eventsReconnectTimer);
+      this._eventsReconnectTimer = null;
+    }
+    if (this._eventsAbort) this._eventsAbort.abort();
+    for (const entry of this.upstreamStreams.values()) {
+      if (entry.releaseTimer) clearTimeout(entry.releaseTimer);
+      entry.abort.abort();
+    }
+    this.upstreamStreams.clear();
+    this.pendingInteractions.clear();
+    this.sessionAlwaysAllowed.clear();
+    this.activeTurns.clear();
+    this.ring.length = 0;
+    this.durableRing.length = 0;
+    this.latestSnapshots.clear();
+    this.ringBytes = 0;
+    for (const client of [...this.clients.values()]) {
+      client.ws.close(1001, 'gbridge shutting down');
+    }
+    this.clients.clear();
+  }
+}
+
+function sanitizeInteraction(item) {
+  return {
+    id: item.id,
+    kind: item.kind,
+    event: item.event,
+    sessionId: item.sessionId,
+    payload: item.payload,
+    createdAt: item.createdAt,
+  };
+}
+
+function mapHostEmitEvent(event, args) {
+  if (event.startsWith('api-session/')) {
+    return { channel: 'host', type: `session.${event.slice('api-session/'.length)}`, data: { args } };
+  }
+  if (event.startsWith('plugin-manager/')) {
+    const suffix = event.slice('plugin-manager/'.length);
+    const reqId = args[0]?.requestId;
+    if (reqId && (suffix === 'install-log' || suffix === 'install-state')) {
+      return { channel: `install:${reqId}`, type: `install.${suffix.replace('install-', '')}`, data: args[0] };
+    }
+    return { channel: 'host', type: `plugins.${suffix}`, data: { args } };
+  }
+  if (event.startsWith('deepseek-account/')) {
+    return { channel: 'host', type: 'auth.notice', data: { event, args } };
+  }
+  if (event === 'schedule/changed') return { channel: 'host', type: 'schedule.changed', data: { args } };
+  if (event === 'settings/document-updated' || event === 'web/providers-changed') {
+    return { channel: 'host', type: 'settings.updated', data: { event, args } };
+  }
+  if (event === 'commands/change') return { channel: 'host', type: 'commands.changed', data: { args } };
+  if (event === 'llm/adapters-updated' || event === 'llm/models-updated') {
+    return { channel: 'host', type: 'models.updated', data: { event, args } };
+  }
+  if (event === 'credentials/reference-updated' || event === 'credentials/record-updated') {
+    return { channel: 'host', type: 'credentials.updated', data: { event, args } };
+  }
+  if (event === 'goal/activation-changed') return { channel: 'host', type: 'goal.changed', data: { args } };
+  if (event === 'agent-preset/selected' || event === 'permission-presets/catalog-changed') {
+    return { channel: 'host', type: 'presets.changed', data: { event, args } };
+  }
+  return { channel: 'host', type: 'host.event', data: { event, args } };
+}

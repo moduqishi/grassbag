@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: '3.41.4'
+
+jobs:
+  release_scripts:
+    name: Release Scripts (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm run test:release
+
+  dsh_gbridge:
+    name: dsh-gbridge (npm test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - working-directory: packages/dsh-gbridge
+        run: npm test
+
+  gbridge_client_dart:
+    name: gbridge-client-dart (analyze + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - working-directory: packages/gbridge-client-dart
+        run: |
+          dart pub get
+          dart analyze
+          dart test
+
+  flutter_app:
+    name: Flutter App (analyze + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          pub-cache-key: flutter-pub-:os:-:channel:-${{ env.FLUTTER_VERSION }}-:arch:-${{ hashFiles('app/pubspec.lock') }}
+      - working-directory: app
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test

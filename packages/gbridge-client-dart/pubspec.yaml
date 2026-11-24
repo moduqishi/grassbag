@@ -1,0 +1,14 @@
+name: gbridge_client
+description: Pure Dart client SDK for GrassBag's zero-invasive /gbridge/v1 Cordis bridge protocol (TCP/HTTPS + Unix Domain Socket + WebSocket resume + Remote Bootstrap Mode).
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  meta: ^1.16.0
+
+dev_dependencies:
+  lints: ^5.1.1
+  test: ^1.25.15

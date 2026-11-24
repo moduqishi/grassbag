@@ -1,0 +1,41 @@
+# OS & Editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Node / pnpm
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+*.tgz
+
+# Flutter / Dart
+.dart_tool/
+.packages
+build/
+**/build/
+*.iml
+*.ipr
+*.iws
+
+# Android
+local.properties
+*.jks
+*.keystore
+*.p12
+key.properties
+
+# Runtime build outputs, staging downloads & generated >100MB .gbag bundles
+# (Reproducibly built via `bash runtime/scripts/build-runtime-bundle.sh --fetch`)
+runtime/.cache/
+runtime/.work/
+runtime/.staging/
+runtime/out/
+app/android/app/src/main/assets/runtime/*.gbag
+app/android/app/src/main/assets/runtime/runtime-manifest.json
+
+# Local secrets & logs
+.env
+.env.*
+*.log

@@ -1,0 +1,1250 @@
+package dev.grassbag.grassbag
+
+import android.Manifest
+import android.app.Activity
+import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.provider.Settings
+import android.util.Base64
+import android.webkit.CookieManager
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.Socket
+import java.net.URL
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+
+class GrassBagBridgePlugin(private val activity: Activity) :
+    MethodChannel.MethodCallHandler,
+    EventChannel.StreamHandler {
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val bgPool = Executors.newCachedThreadPool()
+    // Single-threaded FIFO executor for local PTY writes/resizes/signals so rapid typing never reorders!
+    private val termIoExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "grassbag-term-io").apply { isDaemon = true }
+    }
+    private val vault by lazy { KeystoreVault.getInstance(activity.applicationContext) }
+    private val runtimeReadyLatch = CountDownLatch(1)
+    @Volatile
+    private var runtime: RuntimeController? = null
+    @Volatile
+    private var runtimeInitError: String? = null
+    @Volatile
+    private var detached = false
+
+    private var methodChannel: MethodChannel? = null
+    private var eventChannel: EventChannel? = null
+    @Volatile
+    private var eventSink: EventChannel.EventSink? = null
+    private var pendingPickResult: MethodChannel.Result? = null
+    private var pendingPermResult: MethodChannel.Result? = null
+    private var pendingCameraFile: File? = null
+    private val runtimeListener: (String, Map<String, Any?>) -> Unit = { type, payload ->
+        sendEvent(type, payload)
+    }
+    private val a11yStateListener: (Boolean) -> Unit = { connected ->
+        sendEvent("accessibility_state", mapOf("connected" to connected))
+    }
+
+    private inline fun withRuntime(
+        result: MethodChannel.Result,
+        crossinline block: (RuntimeController) -> Unit
+    ) {
+        bgPool.execute {
+            runCatching { runtimeReadyLatch.await() }
+            val rt = runtime
+            if (rt == null) {
+                val err = runtimeInitError ?: "本机运行时控制器初始化失败"
+                mainHandler.post { result.error("runtime_init_failed", err, null) }
+                return@execute
+            }
+            block(rt)
+        }
+    }
+
+    fun attach(engine: FlutterEngine) {
+        detached = false
+        GrassBagAccessibilityService.addStateListener(a11yStateListener)
+        bgPool.execute {
+            try {
+                SafetyGate.init(activity.applicationContext)
+                // Clean up any orphaned camera/share temp files from previous interrupted sessions.
+                runCatching {
+                    val cutoff = System.currentTimeMillis() - 6 * 3600 * 1000L
+                    listOf(File(activity.cacheDir, "camera"), File(activity.cacheDir, "share")).forEach { dir ->
+                        dir.listFiles()?.forEach { f ->
+                            if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
+                        }
+                    }
+                }
+                val rt = RuntimeController.getInstance(activity.applicationContext, vault)
+                runtime = rt
+                if (!detached) {
+                    rt.addListener(runtimeListener)
+                    replayCurrentRuntimeSnapshot(rt)
+                }
+            } catch (t: Throwable) {
+                runtimeInitError = t.message ?: t.javaClass.simpleName
+            } finally {
+                runtimeReadyLatch.countDown()
+            }
+        }
+        methodChannel = MethodChannel(engine.dartExecutor.binaryMessenger, METHOD_CHANNEL).also {
+            it.setMethodCallHandler(this)
+        }
+        eventChannel = EventChannel(engine.dartExecutor.binaryMessenger, EVENT_CHANNEL).also {
+            it.setStreamHandler(this)
+        }
+    }
+
+    private fun replayCurrentRuntimeSnapshot(rt: RuntimeController) {
+        if (detached || eventSink == null) return
+        val snap = rt.currentEngineStateEvent()
+        sendEvent("engine_state", snap)
+    }
+
+    fun detach() {
+        detached = true
+        GrassBagAccessibilityService.removeStateListener(a11yStateListener)
+        methodChannel?.setMethodCallHandler(null)
+        methodChannel = null
+        eventChannel?.setStreamHandler(null)
+        eventChannel = null
+        eventSink = null
+        pendingPickResult?.let { runCatching { it.success(null) } }
+        pendingPickResult = null
+        pendingPermResult?.let {
+            runCatching { it.success(mapOf("granted" to false, "permanentlyDenied" to false)) }
+        }
+        pendingPermResult = null
+        pendingCameraFile = null
+        // Only detach this Activity's event listener; keep the singleton Ubuntu + DSH container alive!
+        runtime?.removeListener(runtimeListener)
+        // Graceful shutdown so in-flight Keystore writes / status reads complete cleanly without InterruptedException.
+        runCatching { bgPool.shutdown() }
+    }
+
+    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+        eventSink = events
+        sendEvent("accessibility_state", mapOf("connected" to GrassBagAccessibilityService.isRunning()))
+        runtime?.let { rt ->
+            bgPool.execute { replayCurrentRuntimeSnapshot(rt) }
+        }
+    }
+
+    fun notifyForegroundResumed() {
+        if (detached) return
+        sendEvent("accessibility_state", mapOf("connected" to GrassBagAccessibilityService.isRunning()))
+        // Re-check slightly after resume because OEM AccessibilityManagerService may finish
+        // `onServiceConnected()` 150-350ms after the user navigates back from System Settings.
+        mainHandler.postDelayed({
+            if (!detached) {
+                sendEvent("accessibility_state", mapOf("connected" to GrassBagAccessibilityService.isRunning()))
+            }
+        }, 400L)
+    }
+
+    override fun onCancel(arguments: Any?) {
+        eventSink = null
+    }
+
+    private fun sendEvent(type: String, payload: Map<String, Any?>) {
+        mainHandler.post {
+            eventSink?.success(mapOf("type" to type, "data" to payload))
+        }
+    }
+
+    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "runtime.status" -> withRuntime(result) { rt ->
+                val res = rt.getStatus()
+                mainHandler.post { result.success(res) }
+            }
+            "runtime.bootstrap" -> withRuntime(result) { rt ->
+                rt.bootstrapRuntime { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.startEngine" -> withRuntime(result) { rt ->
+                rt.startEngine { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.stopEngine" -> withRuntime(result) { rt ->
+                val res = rt.stopEngine()
+                mainHandler.post { result.success(res) }
+            }
+            "runtime.restartEngine" -> withRuntime(result) { rt ->
+                rt.restartEngine { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.cleanCache" -> withRuntime(result) { rt ->
+                val res = rt.cleanCache()
+                mainHandler.post { result.success(res) }
+            }
+            "runtime.rebuildContainer" -> withRuntime(result) { rt ->
+                rt.rebuildContainerPreserveHome { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.engineLogs" -> withRuntime(result) { rt ->
+                val logs = rt.getEngineLogs()
+                mainHandler.post { result.success(logs) }
+            }
+            "runtime.upgradeAb" -> {
+                val version = call.argument<String>("version") ?: "0.2.3"
+                val url = call.argument<String>("remoteUrl")
+                withRuntime(result) { rt ->
+                    rt.performAbUpgrade(version, url) { res ->
+                        mainHandler.post { result.success(res) }
+                    }
+                }
+            }
+            "runtime.rollback" -> withRuntime(result) { rt ->
+                rt.rollbackLkg { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.setExecutor" -> {
+                val mode = call.argument<String>("mode") ?: "tawcroot"
+                withRuntime(result) { rt ->
+                    val res = rt.setExecutorMode(mode)
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.setSdcardMounted" -> {
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                withRuntime(result) { rt ->
+                    val res = rt.setSdcardMounted(enabled)
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.setSystemProxy" -> {
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                withRuntime(result) { rt ->
+                    val res = rt.setSystemProxy(enabled)
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.installToolkit" -> {
+                val id = call.argument<String>("id") ?: ""
+                val packages = call.argument<List<String>>("packages") ?: emptyList()
+                withRuntime(result) { rt ->
+                    rt.installToolkit(id, packages) { res ->
+                        mainHandler.post { result.success(res) }
+                    }
+                }
+            }
+            "runtime.exportBackup" -> {
+                val pass = call.argument<String>("passphrase") ?: "grassbag"
+                withRuntime(result) { rt ->
+                    val res = rt.exportEncryptedBackup(pass)
+                    mainHandler.post { result.success(res) }
+                }
+            }
+
+            // Local real shell sessions for xterm
+            "term.start" -> {
+                val tabId = call.argument<String>("tabId") ?: "local-1"
+                val cwd = call.argument<String>("cwd")
+                val cols = call.argument<Int>("cols") ?: 80
+                val rows = call.argument<Int>("rows") ?: 24
+                withRuntime(result) { rt ->
+                    val res = rt.startLocalShell(tabId, cwd, cols, rows)
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "term.write" -> {
+                val tabId = call.argument<String>("tabId") ?: "local-1"
+                val data = call.argument<String>("data") ?: ""
+                termIoExecutor.execute {
+                    runCatching { runtimeReadyLatch.await() }
+                    val rt = runtime
+                    val ok = rt?.writeLocalShell(tabId, data) ?: false
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "term.resize" -> {
+                val tabId = call.argument<String>("tabId") ?: "local-1"
+                val cols = call.argument<Int>("cols") ?: 80
+                val rows = call.argument<Int>("rows") ?: 24
+                termIoExecutor.execute {
+                    runCatching { runtimeReadyLatch.await() }
+                    val rt = runtime
+                    val ok = rt?.resizeLocalShell(tabId, cols, rows) ?: false
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "term.signal" -> {
+                val tabId = call.argument<String>("tabId") ?: "local-1"
+                val signal = call.argument<String>("signal") ?: "SIGINT"
+                termIoExecutor.execute {
+                    runCatching { runtimeReadyLatch.await() }
+                    val rt = runtime
+                    val ok = rt?.signalLocalShell(tabId, signal) ?: false
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "term.close" -> {
+                val tabId = call.argument<String>("tabId") ?: "local-1"
+                withRuntime(result) { rt ->
+                    rt.closeLocalShell(tabId)
+                    mainHandler.post { result.success(true) }
+                }
+            }
+
+            // Keystore secrets (run off UI thread with OEM Keystore exception safety)
+            "vault.put" -> {
+                val k = call.argument<String>("key") ?: ""
+                val v = call.argument<String>("value") ?: ""
+                bgPool.execute {
+                    val ok = if (k.isNotEmpty()) runCatching { vault.putSecret(k, v); true }.getOrDefault(false) else false
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "vault.get" -> {
+                val k = call.argument<String>("key") ?: ""
+                bgPool.execute {
+                    val v = if (k.isEmpty()) null else runCatching { vault.getSecret(k) }.getOrNull()
+                    mainHandler.post { result.success(v) }
+                }
+            }
+            "vault.delete" -> {
+                val k = call.argument<String>("key") ?: ""
+                bgPool.execute {
+                    if (k.isNotEmpty()) runCatching { vault.deleteSecret(k) }
+                    mainHandler.post { result.success(true) }
+                }
+            }
+
+            // SafetyGate & Phone Control (dispatched off Android UI thread!)
+            "safety.status" -> {
+                bgPool.execute {
+                    val snap = SafetyGate.statusSnapshot()
+                    mainHandler.post { result.success(snap) }
+                }
+            }
+            "safety.setPolicy" -> {
+                val raw = (call.argument<String>("policy") ?: "ask").uppercase()
+                val tier = runCatching { SafetyGate.PolicyTier.valueOf(raw) }
+                    .getOrDefault(SafetyGate.PolicyTier.ASK)
+                bgPool.execute {
+                    val ok = SafetyGate.setPolicy(tier)
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "safety.setConfirmHighRisk" -> {
+                val enabled = call.argument<Boolean>("enabled") ?: true
+                bgPool.execute {
+                    SafetyGate.setConfirmHighRisk(enabled)
+                    mainHandler.post { result.success(true) }
+                }
+            }
+            "safety.emergencyStop" -> {
+                bgPool.execute {
+                    SafetyGate.triggerEmergencyStop()
+                    mainHandler.post { result.success(true) }
+                }
+            }
+            "safety.resetStop" -> {
+                bgPool.execute {
+                    SafetyGate.resetEmergencyStop()
+                    mainHandler.post { result.success(true) }
+                }
+            }
+
+            // Background foreground service & alert notifications (off UI thread to avoid Binder stalls)
+            "service.start" -> {
+                val title = call.argument<String>("title") ?: "GrassBag 本机环境运行中"
+                val text = call.argument<String>("text") ?: "对话与终端后台保活通道已就绪"
+                bgPool.execute {
+                    GrassBagEngineService.startOrUpdate(activity.applicationContext, title, text)
+                    mainHandler.post { result.success(true) }
+                }
+            }
+            "service.stop" -> {
+                bgPool.execute {
+                    GrassBagEngineService.stop(activity.applicationContext)
+                    mainHandler.post { result.success(true) }
+                }
+            }
+            "service.notify" -> {
+                val title = call.argument<String>("title") ?: "GrassBag"
+                val text = call.argument<String>("text") ?: ""
+                bgPool.execute {
+                    GrassBagEngineService.postAlertNotification(activity.applicationContext, title, text)
+                    mainHandler.post { result.success(true) }
+                }
+            }
+
+            // Permissions status & OS settings deep links (off UI thread: avoids 6+ Binder IPCs on UI Looper!)
+            "permissions.status" -> {
+                bgPool.execute {
+                    val status = readPermissionsStatus()
+                    mainHandler.post { result.success(status) }
+                }
+            }
+            "permissions.openSettings" -> {
+                val target = call.argument<String>("target") ?: "app"
+                openPermissionScreen(target)
+                result.success(true)
+            }
+            "permissions.requestRuntime" -> {
+                val target = call.argument<String>("target") ?: ""
+                requestRuntimePermission(target, result)
+            }
+
+            // Native attachment pickers (gallery / camera / file)
+            "picker.pickFile" -> {
+                val mime = call.argument<String>("mime") ?: "*/*"
+                launchDocumentPicker(mime, result)
+            }
+            "picker.takePhoto" -> launchCameraPicker(result)
+
+            // Native share sheet, external browser & LAN DSH host discovery
+            "device.openUrl" -> {
+                val rawUrl = call.argument<String>("url")?.trim() ?: ""
+                val uri = runCatching { Uri.parse(rawUrl) }.getOrNull()
+                val scheme = uri?.scheme?.lowercase()
+                if (uri != null && (scheme == "http" || scheme == "https")) {
+                    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    val ok = runCatching {
+                        activity.startActivity(intent)
+                        true
+                    }.getOrDefault(false)
+                    result.success(ok)
+                } else {
+                    result.success(false)
+                }
+            }
+            "device.shareText" -> {
+                val text = call.argument<String>("text") ?: ""
+                bgPool.execute {
+                    val ok = runCatching {
+                        val utf8 = text.toByteArray(Charsets.UTF_8)
+                        val intent = if (utf8.size > 96 * 1024) {
+                            // Large session exports exceed Android Binder's 1MB IPC buffer: share as a FileProvider attachment.
+                            val shareDir = File(activity.cacheDir, "share").apply { mkdirs() }
+                            val file = File(shareDir, "grassbag-export-${System.currentTimeMillis()}.md")
+                            file.writeBytes(utf8)
+                            val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/markdown"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                        } else {
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, text)
+                            }
+                        }
+                        mainHandler.post {
+                            runCatching { activity.startActivity(Intent.createChooser(intent, "分享内容")) }
+                        }
+                        true
+                    }.getOrDefault(false)
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "lan.scan" -> {
+                val port = call.argument<Int>("port") ?: 3080
+                bgPool.execute {
+                    val found = scanLanHosts(port)
+                    mainHandler.post { result.success(found) }
+                }
+            }
+            "device.localIps" -> {
+                bgPool.execute {
+                    val ips = collectAllLocalDeviceIps().toList()
+                    mainHandler.post { result.success(ips) }
+                }
+            }
+            "webview.getCookies" -> {
+                val url = call.argument<String>("url") ?: ""
+                if (url.isBlank()) {
+                    result.success(null)
+                    return
+                }
+                bgPool.execute {
+                    val cookies = runCatching {
+                        val cm = CookieManager.getInstance()
+                        cm.flush()
+                        cm.getCookie(url)
+                    }.getOrNull()
+                    mainHandler.post { result.success(cookies) }
+                }
+            }
+            "webview.setCookies" -> {
+                val url = call.argument<String>("url") ?: ""
+                val header = call.argument<String>("cookieHeader") ?: ""
+                if (url.isBlank() || header.isBlank()) {
+                    result.success(false)
+                    return
+                }
+                bgPool.execute {
+                    val ok = runCatching {
+                        val cm = CookieManager.getInstance()
+                        cm.setAcceptCookie(true)
+                        for (part in header.split(";")) {
+                            val trimmed = part.trim()
+                            if (trimmed.contains("=")) {
+                                cm.setCookie(url, "$trimmed; Path=/")
+                            }
+                        }
+                        cm.flush()
+                        true
+                    }.getOrDefault(false)
+                    mainHandler.post { result.success(ok) }
+                }
+            }
+            "app.getVersion" -> {
+                val info = runCatching {
+                    val pm = activity.packageManager
+                    val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        pm.getPackageInfo(
+                            activity.packageName,
+                            android.content.pm.PackageManager.PackageInfoFlags.of(0),
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pm.getPackageInfo(activity.packageName, 0)
+                    }
+                    val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        pkgInfo.longVersionCode
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pkgInfo.versionCode.toLong()
+                    }
+                    mapOf(
+                        "versionName" to (pkgInfo.versionName ?: "0.1.0"),
+                        "buildNumber" to versionCode.toInt(),
+                        "packageName" to activity.packageName,
+                    )
+                }.getOrElse {
+                    mapOf(
+                        "versionName" to "0.1.0",
+                        "buildNumber" to 1,
+                        "packageName" to activity.packageName,
+                    )
+                }
+                result.success(info)
+            }
+            "app.getUpdatesDir" -> {
+                val dir = File(activity.cacheDir, "updates").apply { mkdirs() }
+                result.success(dir.absolutePath)
+            }
+            "app.installApk" -> {
+                val rawPath = call.argument<String>("path")?.trim() ?: ""
+                if (rawPath.isEmpty()) {
+                    result.success("error:missing_path")
+                    return
+                }
+                val apkFile = File(rawPath)
+                if (!apkFile.isFile || apkFile.length() <= 0L) {
+                    result.success("error:file_not_found")
+                    return
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                    !activity.packageManager.canRequestPackageInstalls()
+                ) {
+                    runCatching {
+                        val settingsIntent = Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${activity.packageName}"),
+                        ).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        activity.startActivity(settingsIntent)
+                    }
+                    result.success("permission_required")
+                    return
+                }
+                val outcome = runCatching {
+                    val apkUri = FileProvider.getUriForFile(
+                        activity,
+                        "${activity.packageName}.fileprovider",
+                        apkFile,
+                    )
+                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(apkUri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    activity.startActivity(installIntent)
+                    "started"
+                }.getOrElse { err ->
+                    "error:${err.message ?: err.javaClass.simpleName}"
+                }
+                result.success(outcome)
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun readPermissionsStatus(): Map<String, Any> {
+        val ctx = activity.applicationContext
+        val pm = ctx.getSystemService(Activity.POWER_SERVICE) as PowerManager
+        val batteryIgnored = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            pm.isIgnoringBatteryOptimizations(ctx.packageName)
+        } else true
+        val overlayOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(ctx)
+        } else true
+        val storageOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+        val notificationsOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else true
+        val microphoneOk = ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val a11yRunning = GrassBagAccessibilityService.isRunning()
+        val a11ySystemBound = GrassBagAccessibilityService.isSystemServiceActive(ctx)
+        val a11ySettingOn = GrassBagAccessibilityService.isSettingEnabled(ctx, precheckedSystemBound = a11ySystemBound)
+        val shizukuInstalled = runCatching {
+            ctx.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
+            true
+        }.getOrDefault(false)
+        return mapOf(
+            "accessibilityEnabled" to a11yRunning,
+            "accessibilitySettingEnabled" to a11ySettingOn,
+            "accessibilitySystemBound" to a11ySystemBound,
+            "overlayGranted" to overlayOk,
+            "allFilesGranted" to storageOk,
+            "batteryOptIgnored" to batteryIgnored,
+            "notificationsGranted" to notificationsOk,
+            "microphoneGranted" to microphoneOk,
+            "shizukuInstalled" to shizukuInstalled,
+            "sdkInt" to Build.VERSION.SDK_INT
+        )
+    }
+
+    private fun requestRuntimePermission(target: String, result: MethodChannel.Result) {
+        val perms = when (target) {
+            "notifications" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+            } else emptyArray()
+            "microphone" -> arrayOf(Manifest.permission.RECORD_AUDIO)
+            "storage" -> if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } else emptyArray()
+            else -> emptyArray()
+        }
+        if (perms.isEmpty()) {
+            val alreadyGranted = when (target) {
+                "notifications" -> true
+                "storage" -> Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
+                else -> false
+            }
+            if (!alreadyGranted) {
+                openPermissionScreen(target)
+            }
+            result.success(mapOf("granted" to alreadyGranted, "permanentlyDenied" to false))
+            return
+        }
+        val allGranted = perms.all {
+            ContextCompat.checkSelfPermission(activity, it) == PackageManager.PERMISSION_GRANTED
+        }
+        if (allGranted) {
+            result.success(mapOf("granted" to true, "permanentlyDenied" to false))
+            return
+        }
+        pendingPermResult?.let {
+            runCatching { it.success(mapOf("granted" to false, "permanentlyDenied" to false)) }
+        }
+        pendingPermResult = result
+        runCatching {
+            ActivityCompat.requestPermissions(activity, perms, REQ_RUNTIME_PERM)
+        }.onFailure {
+            pendingPermResult = null
+            result.success(mapOf("granted" to false, "permanentlyDenied" to false))
+        }
+    }
+
+    fun handleRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ): Boolean {
+        if (requestCode != REQ_RUNTIME_PERM) return false
+        val res = pendingPermResult ?: return false
+        pendingPermResult = null
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        val permanentlyDenied = !granted && permissions.isNotEmpty() && permissions.any { perm ->
+            !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+        }
+        res.success(mapOf("granted" to granted, "permanentlyDenied" to permanentlyDenied))
+        return true
+    }
+
+    private fun openPermissionScreen(target: String) {
+        val pkgUri = Uri.parse("package:${activity.packageName}")
+        val appDetails = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkgUri)
+        val candidates: List<Intent> = when (target) {
+            "accessibility" -> {
+                val componentName = ComponentName(
+                    activity.packageName,
+                    GrassBagAccessibilityService::class.java.name
+                ).flattenToString()
+                val highlightArgs = Bundle().apply {
+                    putString(":settings:fragment_args_key", componentName)
+                }
+                val highlighted = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                    putExtra(":settings:fragment_args_key", componentName)
+                    putExtra(":settings:show_fragment_args", highlightArgs)
+                }
+                listOf(highlighted, Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), appDetails)
+            }
+            "overlay" -> listOf(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkgUri),
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION),
+                appDetails
+            )
+            "storage" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                listOf(
+                    Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, pkgUri),
+                    Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                    appDetails
+                )
+            } else {
+                listOf(appDetails)
+            }
+            "battery" -> listOf(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkgUri),
+                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
+                appDetails
+            )
+            "notifications" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                listOf(
+                    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName),
+                    appDetails
+                )
+            } else {
+                listOf(appDetails)
+            }
+            "shizuku" -> {
+                val launch = activity.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                if (launch != null) listOf(launch, appDetails) else listOf(appDetails)
+            }
+            else -> listOf(appDetails)
+        }
+        for (intent in candidates) {
+            val ok = runCatching {
+                activity.startActivity(intent)
+                true
+            }.getOrDefault(false)
+            if (ok) return
+        }
+    }
+
+    private fun launchDocumentPicker(mime: String, result: MethodChannel.Result) {
+        pendingPickResult?.success(null)
+        pendingPickResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mime
+        }
+        runCatching {
+            activity.startActivityForResult(intent, REQ_PICK_FILE)
+        }.onFailure {
+            pendingPickResult = null
+            result.success(null)
+        }
+    }
+
+    private fun launchCameraPicker(result: MethodChannel.Result) {
+        pendingPickResult?.success(null)
+        pendingPickResult = result
+        runCatching {
+            val camDir = File(activity.cacheDir, "camera").apply { mkdirs() }
+            val photo = File(camDir, "gb_photo_${System.currentTimeMillis()}.jpg")
+            pendingCameraFile = photo
+            val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", photo)
+            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            activity.startActivityForResult(intent, REQ_CAMERA)
+        }.onFailure {
+            pendingPickResult = null
+            pendingCameraFile = null
+            result.success(null)
+        }
+    }
+
+    fun handleActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        val res = pendingPickResult ?: return false
+        if (requestCode != REQ_PICK_FILE && requestCode != REQ_CAMERA) return false
+        pendingPickResult = null
+
+        if (resultCode != Activity.RESULT_OK) {
+            pendingCameraFile?.let { runCatching { it.delete() } }
+            pendingCameraFile = null
+            res.success(null)
+            return true
+        }
+
+        if (requestCode == REQ_CAMERA) {
+            val photo = pendingCameraFile
+            pendingCameraFile = null
+            if (photo == null || !photo.exists()) {
+                res.success(null)
+                return true
+            }
+            bgPool.execute {
+                val payload = readAndCompressCameraPhoto(photo)
+                mainHandler.post { res.success(payload) }
+            }
+            return true
+        }
+
+        val uri = data?.data
+        if (uri == null) {
+            res.success(null)
+            return true
+        }
+        bgPool.execute {
+            val meta = readPickedUri(uri)
+            mainHandler.post { res.success(meta) }
+        }
+        return true
+    }
+
+    private fun compressAndRotateImageBytes(
+        rawBytes: ByteArray,
+        origMime: String,
+        maxBytes: Int = 2 * 1024 * 1024
+    ): Pair<ByteArray, String> {
+        val lowerMime = origMime.lowercase()
+        val isHeic = lowerMime.contains("heic") || lowerMime.contains("heif")
+        val orientation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            runCatching {
+                ExifInterface(ByteArrayInputStream(rawBytes)).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+        } else {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+        val needsRotation = orientation != ExifInterface.ORIENTATION_NORMAL &&
+            orientation != ExifInterface.ORIENTATION_UNDEFINED
+        if (!isHeic && !needsRotation && rawBytes.size <= maxBytes) {
+            return rawBytes to origMime
+        }
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, bounds)
+        var sample = 1
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        while (maxDim > 0 && maxDim / sample > 2048) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        var bmp = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size, opts) ?: return rawBytes to origMime
+        try {
+            if (needsRotation) {
+                val matrix = Matrix()
+                when (orientation) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                    ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                    ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                    ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+                    ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+                    ExifInterface.ORIENTATION_TRANSPOSE -> {
+                        matrix.postRotate(90f); matrix.preScale(-1f, 1f)
+                    }
+                    ExifInterface.ORIENTATION_TRANSVERSE -> {
+                        matrix.postRotate(270f); matrix.preScale(-1f, 1f)
+                    }
+                }
+                if (!matrix.isIdentity) {
+                    val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                    if (rotated !== bmp) {
+                        bmp.recycle()
+                        bmp = rotated
+                    }
+                }
+            }
+            var quality = 86
+            var compressed: ByteArray
+            do {
+                val baos = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+                compressed = baos.toByteArray()
+                quality -= 12
+            } while (compressed.size > maxBytes && quality >= 35)
+            return compressed to "image/jpeg"
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    private fun readAndCompressCameraPhoto(photo: File): Map<String, Any>? {
+        return try {
+            val rawBytes = photo.readBytes()
+            val (finalBytes, finalMime) = compressAndRotateImageBytes(rawBytes, "image/jpeg")
+            if (finalBytes.size > 4 * 1024 * 1024) {
+                mapOf("name" to photo.name, "mimeType" to finalMime, "error" to "拍摄照片超过 4 MB 大小上限")
+            } else {
+                mapOf(
+                    "name" to photo.name,
+                    "mimeType" to finalMime,
+                    "size" to finalBytes.size,
+                    "bytes" to finalBytes
+                )
+            }
+        } catch (e: Throwable) {
+            mapOf("name" to photo.name, "mimeType" to "image/jpeg", "error" to (e.message ?: "读取照片失败"))
+        } finally {
+            runCatching { photo.delete() }
+        }
+    }
+
+    private fun readPickedUri(uri: Uri): Map<String, Any>? = runCatching {
+        val cr = activity.contentResolver
+        var displayName = "attachment"
+        cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) displayName = c.getString(0) ?: displayName
+        }
+        val mime = cr.getType(uri) ?: "application/octet-stream"
+        val isImage = mime.startsWith("image/", ignoreCase = true) ||
+            displayName.lowercase().let { n ->
+                n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") ||
+                    n.endsWith(".webp") || n.endsWith(".heic") || n.endsWith(".heif")
+            }
+        // Allow up to 24 MB raw input for gallery photos (compressed & EXIF-rotated to <= 2 MB JPEG).
+        val maxReadBytes = if (isImage) 24 * 1024 * 1024 else 4 * 1024 * 1024
+        val baos = ByteArrayOutputStream()
+        var exceeded = false
+        cr.openInputStream(uri)?.use { ins ->
+            val buf = ByteArray(16384)
+            while (true) {
+                val n = ins.read(buf)
+                if (n <= 0) break
+                if (baos.size() + n > maxReadBytes) {
+                    exceeded = true
+                    break
+                }
+                baos.write(buf, 0, n)
+            }
+        }
+        if (exceeded) {
+            return@runCatching mapOf(
+                "name" to displayName,
+                "mimeType" to mime,
+                "error" to (if (isImage) "图片原始体积超过 24 MB 上限" else "文件超过 4 MB 大小上限")
+            )
+        }
+        var bytes = baos.toByteArray()
+        var finalMime = mime
+        var finalName = displayName
+        if (isImage && !mime.equals("image/gif", ignoreCase = true)) {
+            val (compBytes, compMime) = compressAndRotateImageBytes(bytes, mime)
+            bytes = compBytes
+            finalMime = compMime
+            if (finalMime == "image/jpeg" && (displayName.endsWith(".heic", true) || displayName.endsWith(".heif", true))) {
+                finalName = displayName.replace(Regex("""\.(heic|heif)$""", RegexOption.IGNORE_CASE), ".jpg")
+            }
+        }
+        if (bytes.size > 4 * 1024 * 1024) {
+            return@runCatching mapOf(
+                "name" to finalName,
+                "mimeType" to finalMime,
+                "error" to "文件超过 4 MB 大小上限"
+            )
+        }
+        mapOf(
+            "name" to finalName,
+            "mimeType" to finalMime,
+            "size" to bytes.size,
+            "bytes" to bytes
+        )
+    }.getOrNull()
+
+    /**
+     * Collect ALL local IP addresses across EVERY active network interface on this Android device
+     * (Wi-Fi, dual-Wi-Fi, hotspot/ap0/swlan0, Ethernet, cellular, VPN, loopback) so LAN discovery
+     * and remote host creation NEVER treat the phone itself as a remote host.
+     */
+    private fun collectAllLocalDeviceIps(): Set<String> {
+        val ips = LinkedHashSet<String>()
+        ips.add("127.0.0.1")
+        ips.add("::1")
+        ips.add("0.0.0.0")
+        runCatching {
+            val ifaces = NetworkInterface.getNetworkInterfaces()
+            while (ifaces.hasMoreElements()) {
+                val iface = ifaces.nextElement()
+                val addrs = iface.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val raw = addrs.nextElement().hostAddress ?: continue
+                    val clean = raw.substringBefore('%').lowercase()
+                    if (clean.isNotEmpty()) ips.add(clean)
+                }
+            }
+        }
+        return ips
+    }
+
+    /**
+     * Wi-Fi / Ethernet /24 parallel LAN probe skipping cellular (`rmnet*`), VPN (`tun*`), and ALL
+     * local device IPs across every interface. Probes both standard `dsh web` (:3080) and
+     * DSH Desktop LAN Bridge (:3081) simultaneously.
+     */
+    private fun scanLanHosts(port: Int): List<Map<String, Any>> {
+        val selfIps = collectAllLocalDeviceIps()
+        val portsToScan = if (port == 3080) listOf(3080, 3081) else listOf(port)
+        val candidates = LinkedHashSet<String>()
+        val isEmulator = Build.FINGERPRINT.contains("generic", true) ||
+            Build.MODEL.contains("Emulator", true) ||
+            Build.MODEL.contains("sdk_gphone", true) ||
+            Build.HARDWARE.contains("ranchu", true) ||
+            Build.HARDWARE.contains("goldfish", true)
+        if (isEmulator) {
+            candidates.add("10.0.2.2")
+        }
+        runCatching {
+            val ifaces = NetworkInterface.getNetworkInterfaces()
+            while (ifaces.hasMoreElements()) {
+                val iface = ifaces.nextElement()
+                if (!iface.isUp || iface.isLoopback) continue
+                val n = iface.name.lowercase()
+                val isLanIface = n.startsWith("wlan") || n.startsWith("eth") || n.startsWith("ap") ||
+                    n.startsWith("swlan") || n.startsWith("rndis") || n.startsWith("usb")
+                if (!isLanIface) continue
+                val addrs = iface.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        val ip = addr.hostAddress ?: continue
+                        val prefix = ip.substringBeforeLast('.')
+                        for (last in 1..254) {
+                            val probe = "$prefix.$last"
+                            if (probe !in selfIps && !probe.startsWith("127.") && probe != "0.0.0.0") {
+                                candidates.add(probe)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val endpoints = ArrayList<Pair<String, Int>>(candidates.size * portsToScan.size)
+        for (ip in candidates) {
+            if (ip in selfIps || ip.startsWith("127.") || ip == "0.0.0.0") continue
+            for (p in portsToScan) {
+                endpoints.add(ip to p)
+            }
+        }
+
+        val discovered = java.util.Collections.synchronizedList(ArrayList<Map<String, Any>>())
+        val latches = java.util.concurrent.CountDownLatch(endpoints.size)
+        // Bounded 48-thread sweep balances full-subnet coverage against Android OEM thread/FD limits.
+        val scanPool = Executors.newFixedThreadPool(48)
+        try {
+            for ((ip, p) in endpoints) {
+                scanPool.execute {
+                    val t0 = System.currentTimeMillis()
+                    runCatching {
+                        Socket().use { s ->
+                            s.connect(InetSocketAddress(ip, p), 220)
+                            val ms = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+                            val baseUrl = "http://$ip:$p"
+                            val meta = probeLanDshHost(baseUrl)
+                            // Skip non-DSH web servers / routers listening on :3080/:3081 unless emulator host alias.
+                            if (!meta.isDsh && !meta.hasGbridge && ip != "10.0.2.2") {
+                                return@use
+                            }
+                            val isDesktopSurface = meta.surface == "desktop" || (p == 3081 && meta.hasGbridge)
+                            val displayName = when {
+                                ip == "10.0.2.2" && isDesktopSurface -> "宿主机 DSH 桌面端"
+                                ip == "10.0.2.2" && meta.dshVersion != null -> "宿主机 DSH ${meta.dshVersion}"
+                                ip == "10.0.2.2" -> "宿主机 (LAN)"
+                                isDesktopSurface -> "DSH 桌面端 ($ip)"
+                                meta.dshVersion != null -> "DSH ${meta.dshVersion} ($ip)"
+                                else -> "局域网主机 $ip:$p"
+                            }
+                            val row = LinkedHashMap<String, Any>()
+                            row["name"] = displayName
+                            row["address"] = baseUrl
+                            row["latencyMs"] = ms
+                            row["isDsh"] = meta.isDsh
+                            row["hasGbridge"] = meta.hasGbridge
+                            row["requiresAuth"] = meta.requiresAuth
+                            if (meta.surface != null) row["surface"] = meta.surface
+                            if (meta.dshVersion != null) row["dshVersion"] = meta.dshVersion
+                            discovered.add(row)
+                        }
+                    }
+                    latches.countDown()
+                }
+            }
+            runCatching { latches.await(5500, java.util.concurrent.TimeUnit.MILLISECONDS) }
+        } finally {
+            runCatching { scanPool.shutdownNow() }
+        }
+        val snapshot = synchronized(discovered) {
+            discovered.filter { row ->
+                val addr = row["address"]?.toString() ?: ""
+                val host = runCatching { Uri.parse(addr).host?.lowercase() }.getOrNull() ?: ""
+                host.isNotEmpty() && host !in selfIps && !host.startsWith("127.") && host != "0.0.0.0"
+            }
+        }
+        return snapshot.sortedWith(
+            compareByDescending<Map<String, Any>> { it["isDsh"] == true }
+                .thenByDescending { it["hasGbridge"] == true }
+                .thenBy { (it["latencyMs"] as? Long) ?: 999L }
+        )
+    }
+
+    private data class LanDshProbeMeta(
+        val isDsh: Boolean,
+        val dshVersion: String?,
+        val hasGbridge: Boolean,
+        val requiresAuth: Boolean,
+        val surface: String?,
+    )
+
+    private fun probeLanDshHost(baseUrl: String): LanDshProbeMeta {
+        var isDsh = false
+        var dshVersion: String? = null
+        var hasGbridge = false
+        var requiresAuth = false
+        var surface: String? = null
+
+        // 1) Public unauthenticated stock DSH & Desktop LAN Bridge SSE endpoint `/plugins/events`
+        runCatching {
+            val conn = (URL("$baseUrl/plugins/events").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 350
+                readTimeout = 450
+                setRequestProperty("Accept", "text/event-stream")
+            }
+            try {
+                val code = conn.responseCode
+                val ct = conn.contentType?.lowercase() ?: ""
+                if (code == 200 && ct.contains("event-stream")) {
+                    isDsh = true
+                    val buf = ByteArray(4096)
+                    val sb = StringBuilder()
+                    var totalRead = 0
+                    val ins = conn.inputStream
+                    while (totalRead < 16384) {
+                        val n = runCatching { ins.read(buf) }.getOrDefault(-1)
+                        if (n <= 0) break
+                        totalRead += n
+                        sb.append(String(buf, 0, n, Charsets.UTF_8))
+                        if (sb.contains("\n\n") || sb.contains("\"version\"")) break
+                    }
+                    val text = sb.toString()
+                    if (text.isNotEmpty()) {
+                        val match = Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                        if (match != null) dshVersion = match.groupValues[1]
+                        val surfMatch = Regex("\"surface\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                        if (surfMatch != null) surface = surfMatch.groupValues[1]
+                        if (text.contains("\"hasGbridge\":true")) hasGbridge = true
+                    }
+                }
+            } finally {
+                conn.disconnect()
+            }
+        }
+
+        // 2) Check `/gbridge/v1/capabilities` status
+        runCatching {
+            val conn = (URL("$baseUrl/gbridge/v1/capabilities").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 300
+                readTimeout = 350
+                setRequestProperty("Accept", "application/json")
+            }
+            try {
+                val code = conn.responseCode
+                val ct = conn.contentType?.lowercase() ?: ""
+                if (code == 200 && ct.contains("application/json")) {
+                    isDsh = true
+                    hasGbridge = true
+                    val body = runCatching { conn.inputStream.bufferedReader().readText() }.getOrDefault("")
+                    if (dshVersion == null) {
+                        val m = Regex("\"dshVersion\"\\s*:\\s*\"([^\"]+)\"").find(body)
+                        if (m != null) dshVersion = m.groupValues[1]
+                    }
+                } else if (code == 401 || code == 403) {
+                    requiresAuth = true
+                    val body = runCatching { conn.errorStream?.bufferedReader()?.readText() ?: "" }.getOrDefault("")
+                    if (body.contains("gbridge/")) {
+                        isDsh = true
+                        hasGbridge = true
+                    }
+                }
+            } finally {
+                conn.disconnect()
+            }
+        }
+
+        if (isDsh && !hasGbridge && !requiresAuth) {
+            // Check whether stock DSH root requires auth
+            runCatching {
+                val conn = (URL("$baseUrl/").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "HEAD"
+                    connectTimeout = 250
+                    readTimeout = 300
+                }
+                try {
+                    if (conn.responseCode == 401 || conn.responseCode == 403) {
+                        requiresAuth = true
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+            }
+        }
+
+        return LanDshProbeMeta(
+            isDsh = isDsh,
+            dshVersion = dshVersion,
+            hasGbridge = hasGbridge,
+            requiresAuth = requiresAuth,
+            surface = surface,
+        )
+    }
+
+    companion object {
+        const val METHOD_CHANNEL = "dev.grassbag/native"
+        const val EVENT_CHANNEL = "dev.grassbag/native_events"
+        private const val REQ_PICK_FILE = 4101
+        private const val REQ_CAMERA = 4102
+        private const val REQ_RUNTIME_PERM = 4103
+    }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "grassbag-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GrassBag monorepo tooling & release automation",
+  "scripts": {
+    "test:release": "node --test scripts/*.test.mjs",
+    "test:bridge": "npm --prefix packages/dsh-gbridge test"
+  }
+}

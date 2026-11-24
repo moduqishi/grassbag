@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" fill="none">
+  <defs>
+    <linearGradient id="bgDark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B1320"/>
+      <stop offset="48%" stop-color="#132236"/>
+      <stop offset="100%" stop-color="#0F1C2C"/>
+    </linearGradient>
+    <radialGradient id="orbA" cx="18%" cy="22%" r="48%">
+      <stop offset="0%" stop-color="#4AA3DF" stop-opacity="0.34"/>
+      <stop offset="60%" stop-color="#296E96" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#0B1320" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orbB" cx="84%" cy="76%" r="46%">
+      <stop offset="0%" stop-color="#4CC9B0" stop-opacity="0.24"/>
+      <stop offset="55%" stop-color="#2D746D" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#0B1320" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orbC" cx="54%" cy="10%" r="36%">
+      <stop offset="0%" stop-color="#87B8FF" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#0B1320" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glassCard" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.11"/>
+      <stop offset="50%" stop-color="#CFE7FA" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.09"/>
+    </linearGradient>
+    <linearGradient id="glassBorder" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.34"/>
+      <stop offset="45%" stop-color="#7AC4F0" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.22"/>
+    </linearGradient>
+    <linearGradient id="mascotGrad" x1="14%" y1="6%" x2="86%" y2="94%">
+      <stop offset="0%" stop-color="#76C2F0"/>
+      <stop offset="52%" stop-color="#3B8EC2"/>
+      <stop offset="100%" stop-color="#1E587D"/>
+    </linearGradient>
+    <linearGradient id="titleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#F7FBFF"/>
+      <stop offset="65%" stop-color="#DCEEFF"/>
+      <stop offset="100%" stop-color="#9BD4F6"/>
+    </linearGradient>
+    <linearGradient id="chipBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.11"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+    </linearGradient>
+    <mask id="markCut">
+      <rect width="64" height="64" fill="white"/>
+      <path d="M21 21.6 Q32 25.6 43 21.6" fill="none" stroke="black" stroke-width="2.7" stroke-linecap="round"/>
+      <rect x="25.6" y="34.2" width="4.4" height="7.4" rx="2.2" fill="black"/>
+      <rect x="36.4" y="34.2" width="4.4" height="7.4" rx="2.2" fill="black"/>
+    </mask>
+    <clipPath id="outerClip">
+      <rect width="1200" height="380" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#outerClip)">
+    <rect width="1200" height="380" fill="url(#bgDark)"/>
+    <rect width="1200" height="380" fill="url(#orbA)"/>
+    <rect width="1200" height="380" fill="url(#orbB)"/>
+    <rect width="1200" height="380" fill="url(#orbC)"/>
+
+    <!-- Subtle liquid wave contours -->
+    <path d="M-40 278 C 210 218, 430 336, 700 264 C 930 202, 1080 250, 1240 210 L 1240 400 L -40 400 Z" fill="#FFFFFF" opacity="0.025"/>
+    <path d="M-40 118 C 260 64, 520 156, 820 96 C 1010 58, 1120 92, 1240 76 L 1240 0 L -40 0 Z" fill="#7AC4F0" opacity="0.035"/>
+
+    <!-- Fine architectural grid lines -->
+    <g stroke="#9BCBEE" stroke-opacity="0.055" stroke-width="1">
+      <line x1="0" y1="95" x2="1200" y2="95"/>
+      <line x1="0" y1="190" x2="1200" y2="190"/>
+      <line x1="0" y1="285" x2="1200" y2="285"/>
+      <line x1="240" y1="0" x2="240" y2="380"/>
+      <line x1="600" y1="0" x2="600" y2="380"/>
+      <line x1="960" y1="0" x2="960" y2="380"/>
+    </g>
+
+    <!-- Main Liquid Glass Hero Plaque -->
+    <rect x="44" y="34" width="1112" height="312" rx="26" fill="url(#glassCard)" stroke="url(#glassBorder)" stroke-width="1.2"/>
+    <path d="M 78 35.5 L 1122 35.5" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="1" stroke-linecap="round"/>
+
+    <!-- Mascot Glass Squircle -->
+    <g transform="translate(100, 94)">
+      <rect x="0" y="0" width="128" height="128" rx="34" fill="#FFFFFF" fill-opacity="0.08" stroke="url(#glassBorder)" stroke-width="1.4"/>
+      <rect x="8" y="8" width="112" height="112" rx="28" fill="#102033" fill-opacity="0.72"/>
+      <g transform="translate(16, 15) scale(1.5)" mask="url(#markCut)">
+        <path d="M30.2 19.6 C24.6 15.8 20.4 10.6 23.6 7.4 C26.6 4.4 31.8 9.2 32.4 18.2 Z" fill="url(#mascotGrad)"/>
+        <path d="M33.4 19.2 C34.8 9.6 41.2 4.6 45.2 7.2 C49.0 9.6 45.2 16.0 37.2 19.8 Z" fill="url(#mascotGrad)"/>
+        <path d="M24.2 19.8 C27.2 18.6 36.8 18.6 39.8 19.8 C40.8 20.2 41.6 21.0 42.2 21.8 C49.4 25.4 52.8 34.4 51.6 43.4 C50.3 52.6 42.8 57.2 32 57.2 C21.2 57.2 13.7 52.6 12.4 43.4 C11.2 34.4 14.6 25.4 21.8 21.8 C22.4 21.0 23.2 20.2 24.2 19.8 Z" fill="url(#mascotGrad)"/>
+        <path d="M22.5 25.5 C17.6 29.2 15.8 35.8 16.8 42.5 C18.5 34.8 23.6 29.2 33.5 27.6 C28.5 25.2 25.0 24.6 22.5 25.5 Z" fill="#FFFFFF" opacity="0.28"/>
+      </g>
+    </g>
+
+    <!-- Eyebrow Pill -->
+    <g transform="translate(262, 86)">
+      <rect x="0" y="0" width="286" height="28" rx="14" fill="#4AA3DF" fill-opacity="0.16" stroke="#7AC4F0" stroke-opacity="0.34" stroke-width="1"/>
+      <circle cx="16" cy="14" r="4" fill="#52D19A"/>
+      <text x="30" y="18.5" fill="#BFE4FC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif" font-size="12.5" font-weight="600" letter-spacing="0.4">DEEPSEEK HARNESS · NATIVE ANDROID</text>
+    </g>
+
+    <!-- Title & Subtitle -->
+    <text x="262" y="176" fill="url(#titleGrad)" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', 'Segoe UI', sans-serif" font-size="60" font-weight="700" letter-spacing="-1.6">GrassBag</text>
+    <text x="556" y="170" fill="#8BB7D6" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif" font-size="22" font-weight="500">把完整的 DeepSeek Harness 装进口袋</text>
+
+    <text x="262" y="216" fill="#C4D7E8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', sans-serif" font-size="16.5" font-weight="400">
+      原生液态玻璃界面 · 内置免 Root ARM64 Ubuntu + Node 24 离线容器 · 零侵入远程直连与手机自动化操控
+    </text>
+
+    <!-- Bottom Specular Glass Feature Pills -->
+    <g transform="translate(262, 250)">
+      <rect x="0" y="0" width="184" height="36" rx="18" fill="url(#chipBg)" stroke="url(#glassBorder)" stroke-width="1"/>
+      <circle cx="18" cy="18" r="3.5" fill="#66C2F5"/>
+      <text x="31" y="22.5" fill="#E6F2FC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">Liquid Glass 120fps</text>
+
+      <rect x="198" y="0" width="212" height="36" rx="18" fill="url(#chipBg)" stroke="url(#glassBorder)" stroke-width="1"/>
+      <circle cx="216" cy="18" r="3.5" fill="#52D19A"/>
+      <text x="229" y="22.5" fill="#E6F2FC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">Ubuntu 24 + DSH 容器</text>
+
+      <rect x="424" y="0" width="196" height="36" rx="18" fill="url(#chipBg)" stroke="url(#glassBorder)" stroke-width="1"/>
+      <circle cx="442" cy="18" r="3.5" fill="#A594F9"/>
+      <text x="455" y="22.5" fill="#E6F2FC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">Zero-Patch 桥接协议</text>
+
+      <rect x="634" y="0" width="204" height="36" rx="18" fill="url(#chipBg)" stroke="url(#glassBorder)" stroke-width="1"/>
+      <circle cx="652" cy="18" r="3.5" fill="#F2B86B"/>
+      <text x="665" y="22.5" fill="#E6F2FC" font-family="-apple-system, 'PingFang SC', sans-serif" font-size="13" font-weight="600">应用内检测与自动发版</text>
+    </g>
+
+    <!-- Subtle outer border -->
+    <rect x="0.6" y="0.6" width="1198.8" height="378.8" rx="27.4" stroke="#9AC8EB" stroke-opacity="0.18" stroke-width="1.2"/>
+  </g>
+</svg>

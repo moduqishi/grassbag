@@ -1004,9 +1004,8 @@ class ModelCatalogEntry {
 
   String get shortLabel {
     final clean = name.trim();
-    if (clean.length <= 16) return clean;
-    final tail = clean.split('/').last.trim();
-    return tail.length <= 18 ? tail : '${tail.substring(0, 17)}…';
+    final tail = clean.contains('/') ? clean.split('/').last.trim() : clean;
+    return tail.length <= 28 ? tail : '${tail.substring(0, 27)}…';
   }
 }
 

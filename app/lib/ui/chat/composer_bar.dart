@@ -666,8 +666,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final showQuestion = !showApproval && state.activeQuestion != null;
     final showCordis = !showApproval && !showQuestion && state.activeCordisRequest != null;
     final hasTakeover = showApproval || showQuestion || showCordis;
-    final showRiskPill = perm.risky && !hasTakeover && !state.isEmptyChat;
-    final showPlanPill = state.planMode && !hasTakeover;
+    final showRiskPill = perm.risky && !hasTakeover && !state.isEmptyChat && !_plusOpen;
+    final showPlanPill = state.planMode && !hasTakeover && !_plusOpen;
     final screenW = MediaQuery.sizeOf(context).width;
     final isWide = screenW >= 540;
 
@@ -781,9 +781,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
             AnimatedSize(
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOutCubic,
+              clipBehavior: Clip.none,
               child: (showRiskPill || showPlanPill)
                   ? Padding(
-                      padding: const EdgeInsets.only(left: 4, bottom: 8),
+                      padding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
                       child: Align(
                         alignment: Alignment.centerLeft,
                         child: GrassBagGlassBarLayer(
@@ -1612,9 +1613,27 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   height: 36,
                                   decoration: BoxDecoration(
                                     color: _plusOpen
-                                        ? t.primary.withValues(alpha: t.isDark ? 0.28 : 0.16)
-                                        : t.fill1,
+                                        ? (t.isDark
+                                            ? t.primary.withValues(alpha: 0.28)
+                                            : Color.lerp(Colors.white, t.primary, 0.18)!
+                                                .withValues(alpha: 0.80))
+                                        : Colors.white.withValues(alpha: t.isDark ? 0.11 : 0.62),
                                     shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: _plusOpen
+                                          ? t.primary.withValues(alpha: t.isDark ? 0.42 : 0.30)
+                                          : Colors.white.withValues(alpha: t.isDark ? 0.18 : 0.90),
+                                      width: 0.65,
+                                    ),
+                                    boxShadow: t.isDark
+                                        ? null
+                                        : const [
+                                            BoxShadow(
+                                              color: Color(0x0D000000),
+                                              blurRadius: 6,
+                                              offset: Offset(0, 2),
+                                            ),
+                                          ],
                                   ),
                                   child: AnimatedRotation(
                                     turns: _plusOpen ? 0.125 : 0.0,
@@ -1635,111 +1654,149 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 child: Align(
                                   alignment: Alignment.centerLeft,
                                   child: () {
-                                    final IconData pillIcon;
-                                    final Color pillIconColor;
-                                    final String pillLabel;
-                                    final Color pillTextColor;
-                                    final VoidCallback pillTap;
-                                    if (isHostNeedsAuth) {
-                                      pillIcon = CupertinoIcons.lock_shield_fill;
-                                      pillIconColor = t.primary;
-                                      pillLabel = '待授权';
-                                      pillTextColor = t.primary;
-                                      pillTap = () => showRemoteHostAuthSheet(
-                                            context,
-                                            ref,
-                                            ref.read(appProvider).activeHost,
-                                          );
-                                    } else if (isHostConnecting) {
-                                      pillIcon = CupertinoIcons.sparkles;
-                                      pillIconColor = t.text3;
-                                      pillLabel = '连接中…';
-                                      pillTextColor = t.text3;
-                                      pillTap = () => showHostQuickSheet(
-                                            context,
-                                            ref,
-                                            onOpenHostSettings: widget.onOpenHostSettings,
-                                          );
-                                    } else if (!isHostConnected) {
-                                      pillIcon = CupertinoIcons.wifi_exclamationmark;
-                                      pillIconColor = t.warn;
-                                      pillLabel = '未连接';
-                                      pillTextColor = t.warn;
-                                      pillTap = () => showHostQuickSheet(
-                                            context,
-                                            ref,
-                                            onOpenHostSettings: widget.onOpenHostSettings,
-                                          );
-                                    } else if (needsModelConfig || state.activeModelId.isEmpty) {
-                                      pillIcon = CupertinoIcons.sparkles;
-                                      pillIconColor = t.warn;
-                                      pillLabel = '配置模型';
-                                      pillTextColor = t.warn;
-                                      pillTap = () {
-                                        if (widget.onOpenModelSettings != null) {
-                                          widget.onOpenModelSettings!();
-                                        } else {
-                                          showModelSheet(
-                                            context,
-                                            ref,
-                                            onOpenModelSettings: widget.onOpenModelSettings,
-                                          );
-                                        }
-                                      };
-                                    } else {
-                                      pillIcon = CupertinoIcons.sparkles;
-                                      pillIconColor = t.primary;
-                                      pillLabel = state.modelEffort.isNotEmpty
-                                          ? '${state.modelShort} · 思考${state.modelEffort}'
-                                          : state.modelShort;
-                                      pillTextColor = t.isDark ? t.text : t.text2;
-                                      pillTap = () => showModelSheet(
-                                            context,
-                                            ref,
-                                            onOpenModelSettings: widget.onOpenModelSettings,
-                                          );
-                                    }
-                                    return GrassBagSpringTap(
-                                      onTap: pillTap,
-                                      pressedScale: 0.94,
-                                      haptic: true,
-                                      child: Container(
-                                        height: 36,
-                                        padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                        decoration: BoxDecoration(
-                                          color: t.fill1,
-                                          borderRadius: BorderRadius.circular(999),
-                                          border: Border.all(
-                                            color: t.isDark
-                                                ? Colors.white.withValues(alpha: 0.08)
-                                                : Colors.white.withValues(alpha: 0.45),
-                                            width: 0.5,
+                                      final IconData pillIcon;
+                                      final Color pillIconColor;
+                                      final String pillLabel;
+                                      final String? effortBadge;
+                                      final Color pillTextColor;
+                                      final VoidCallback pillTap;
+                                      if (isHostNeedsAuth) {
+                                        pillIcon = CupertinoIcons.lock_shield_fill;
+                                        pillIconColor = t.primary;
+                                        pillLabel = '待授权';
+                                        effortBadge = null;
+                                        pillTextColor = t.primary;
+                                        pillTap = () => showRemoteHostAuthSheet(
+                                              context,
+                                              ref,
+                                              ref.read(appProvider).activeHost,
+                                            );
+                                      } else if (isHostConnecting) {
+                                        pillIcon = CupertinoIcons.sparkles;
+                                        pillIconColor = t.text3;
+                                        pillLabel = '连接中…';
+                                        effortBadge = null;
+                                        pillTextColor = t.text3;
+                                        pillTap = () => showHostQuickSheet(
+                                              context,
+                                              ref,
+                                              onOpenHostSettings: widget.onOpenHostSettings,
+                                            );
+                                      } else if (!isHostConnected) {
+                                        pillIcon = CupertinoIcons.wifi_exclamationmark;
+                                        pillIconColor = t.warn;
+                                        pillLabel = '未连接';
+                                        effortBadge = null;
+                                        pillTextColor = t.warn;
+                                        pillTap = () => showHostQuickSheet(
+                                              context,
+                                              ref,
+                                              onOpenHostSettings: widget.onOpenHostSettings,
+                                            );
+                                      } else if (needsModelConfig || state.activeModelId.isEmpty) {
+                                        pillIcon = CupertinoIcons.sparkles;
+                                        pillIconColor = t.warn;
+                                        pillLabel = '配置模型';
+                                        effortBadge = null;
+                                        pillTextColor = t.warn;
+                                        pillTap = () {
+                                          if (widget.onOpenModelSettings != null) {
+                                            widget.onOpenModelSettings!();
+                                          } else {
+                                            showModelSheet(
+                                              context,
+                                              ref,
+                                              onOpenModelSettings: widget.onOpenModelSettings,
+                                            );
+                                          }
+                                        };
+                                      } else {
+                                        pillIcon = CupertinoIcons.sparkles;
+                                        pillIconColor = t.primary;
+                                        pillLabel = state.modelShort;
+                                        effortBadge = state.modelEffort.isNotEmpty
+                                            ? state.modelEffort
+                                            : null;
+                                        pillTextColor = t.text;
+                                        pillTap = () => showModelSheet(
+                                              context,
+                                              ref,
+                                              onOpenModelSettings: widget.onOpenModelSettings,
+                                            );
+                                      }
+                                      return GrassBagSpringTap(
+                                        onTap: pillTap,
+                                        pressedScale: 0.94,
+                                        haptic: true,
+                                        child: Container(
+                                          height: 36,
+                                          padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
+                                          decoration: BoxDecoration(
+                                            color: Colors.white.withValues(alpha: t.isDark ? 0.10 : 0.60),
+                                            borderRadius: BorderRadius.circular(999),
+                                            border: Border.all(
+                                              color: Colors.white.withValues(
+                                                alpha: t.isDark ? 0.18 : 0.90,
+                                              ),
+                                              width: 0.65,
+                                            ),
+                                            boxShadow: t.isDark
+                                                ? null
+                                                : const [
+                                                    BoxShadow(
+                                                      color: Color(0x0C000000),
+                                                      blurRadius: 6,
+                                                      offset: Offset(0, 2),
+                                                    ),
+                                                  ],
                                           ),
-                                        ),
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(pillIcon, size: 13.5, color: pillIconColor),
-                                            const SizedBox(width: 5),
-                                            Flexible(
-                                              child: Text(
-                                                pillLabel,
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  fontSize: 12.5,
-                                                  fontWeight: FontWeight.w500,
-                                                  letterSpacing: -0.1,
-                                                  color: pillTextColor,
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(pillIcon, size: 13.5, color: pillIconColor),
+                                              const SizedBox(width: 5),
+                                              Flexible(
+                                                child: Text(
+                                                  pillLabel,
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 12.5,
+                                                    fontWeight: FontWeight.w500,
+                                                    letterSpacing: -0.1,
+                                                    color: pillTextColor,
+                                                  ),
                                                 ),
                                               ),
-                                            ),
-                                            const SizedBox(width: 3),
-                                            Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
-                                          ],
+                                              if (effortBadge != null) ...[
+                                                const SizedBox(width: 5),
+                                                Container(
+                                                  padding: const EdgeInsets.symmetric(
+                                                    horizontal: 5.5,
+                                                    vertical: 1.5,
+                                                  ),
+                                                  decoration: BoxDecoration(
+                                                    color: t.primary.withValues(
+                                                      alpha: t.isDark ? 0.22 : 0.12,
+                                                    ),
+                                                    borderRadius: BorderRadius.circular(999),
+                                                  ),
+                                                  child: Text(
+                                                    effortBadge,
+                                                    style: TextStyle(
+                                                      fontSize: 10.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.primary,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                              const SizedBox(width: 3),
+                                              Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
+                                            ],
+                                          ),
                                         ),
-                                      ),
-                                    );
+                                      );
                                   }(),
                                 ),
                               ),
@@ -1885,8 +1942,23 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                         ? null
                                         : state.isStreaming
                                             ? t.errSoft
-                                            : (state.speechConfigured ? t.fill2 : t.fill1),
+                                            : Colors.white.withValues(
+                                                alpha: t.isDark ? 0.11 : 0.62,
+                                              ),
                                     shape: BoxShape.circle,
+                                    border: (hasText || _submitting)
+                                        ? Border.all(
+                                            color: Colors.white.withValues(alpha: 0.28),
+                                            width: 0.6,
+                                          )
+                                        : Border.all(
+                                            color: state.isStreaming
+                                                ? t.err.withValues(alpha: 0.30)
+                                                : Colors.white.withValues(
+                                                    alpha: t.isDark ? 0.18 : 0.90,
+                                                  ),
+                                            width: 0.65,
+                                          ),
                                     boxShadow: (hasText || _submitting)
                                         ? [
                                             BoxShadow(
@@ -1895,7 +1967,15 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               offset: const Offset(0, 3),
                                             ),
                                           ]
-                                        : null,
+                                        : (t.isDark
+                                            ? null
+                                            : const [
+                                                BoxShadow(
+                                                  color: Color(0x0D000000),
+                                                  blurRadius: 6,
+                                                  offset: Offset(0, 2),
+                                                ),
+                                              ]),
                                   ),
                                   child: AnimatedSwitcher(
                                     duration: const Duration(milliseconds: 200),
@@ -2063,10 +2143,11 @@ class _PlusQuickAction extends StatelessWidget {
             GrassBagSquircleIcon(
               icon: icon,
               color: color,
-              size: 46,
-              iconSize: 21,
+              size: 50,
+              iconSize: 22,
+              filled: true,
             ),
-            const SizedBox(height: 6),
+            const SizedBox(height: 7),
             Text(
               label,
               style: TextStyle(
@@ -2183,7 +2264,7 @@ class _PlusDeckContent extends ConsumerWidget {
             defaultTargetPlatform == TargetPlatform.iOS);
 
     return Padding(
-      padding: const EdgeInsets.fromLTRB(14, 14, 14, 10),
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2231,7 +2312,7 @@ class _PlusDeckContent extends ConsumerWidget {
               Expanded(
                 child: _PlusQuickAction(
                   icon: CupertinoIcons.chevron_left_slash_chevron_right,
-                  color: t.isDark ? const Color(0xFF94A3B8) : const Color(0xFF3E5368),
+                  color: t.isDark ? const Color(0xFF64748B) : const Color(0xFF3E5368),
                   label: '终端',
                   onTap: () {
                     onClose();
@@ -2242,8 +2323,8 @@ class _PlusDeckContent extends ConsumerWidget {
             ],
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(vertical: 10),
-            child: Divider(height: 0.5, color: t.sepStrong),
+            padding: const EdgeInsets.symmetric(vertical: 11),
+            child: Divider(height: 0.5, indent: 4, endIndent: 4, color: t.sep),
           ),
           _PopoverActionRow(
             icon: CupertinoIcons.compass_fill,
@@ -2697,7 +2778,7 @@ class _ComposerContextRingButton extends ConsumerWidget {
         (s) => (isEmptyChat: s.isEmptyChat, contextPct: s.contextPct),
       ),
     );
-    if (slice.isEmptyChat && slice.contextPct <= 0) {
+    if (slice.contextPct <= 0) {
       return const SizedBox.shrink();
     }
     final t = GrassBagTokens.of(context);
@@ -2713,13 +2794,32 @@ class _ComposerContextRingButton extends ConsumerWidget {
             haptic: true,
             child: Container(
               height: 36,
-              padding: EdgeInsets.symmetric(horizontal: pctInt >= 65 ? 8 : 8.5),
-              decoration: pctInt >= 65
-                  ? BoxDecoration(
-                      color: pctInt >= 85 ? t.errSoft : t.warnSoft,
-                      borderRadius: BorderRadius.circular(999),
-                    )
-                  : null,
+              padding: EdgeInsets.symmetric(horizontal: pctInt >= 65 ? 9 : 8.5),
+              decoration: BoxDecoration(
+                color: pctInt >= 85
+                    ? t.errSoft
+                    : pctInt >= 65
+                        ? t.warnSoft
+                        : Colors.white.withValues(alpha: t.isDark ? 0.10 : 0.60),
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(
+                  color: pctInt >= 85
+                      ? t.err.withValues(alpha: 0.28)
+                      : pctInt >= 65
+                          ? t.warn.withValues(alpha: 0.28)
+                          : Colors.white.withValues(alpha: t.isDark ? 0.18 : 0.90),
+                  width: 0.65,
+                ),
+                boxShadow: t.isDark
+                    ? null
+                    : const [
+                        BoxShadow(
+                          color: Color(0x0C000000),
+                          blurRadius: 6,
+                          offset: Offset(0, 2),
+                        ),
+                      ],
+              ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [

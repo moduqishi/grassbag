@@ -1919,8 +1919,8 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
                     begin: Alignment.bottomCenter,
                     end: Alignment.topCenter,
                     colors: [
-                      t.bgSolid.withValues(alpha: t.isDark ? 0.34 : 0.26),
-                      t.bgSolid.withValues(alpha: t.isDark ? 0.08 : 0.06),
+                      t.bgSolid.withValues(alpha: t.isDark ? 0.18 : 0.10),
+                      t.bgSolid.withValues(alpha: t.isDark ? 0.04 : 0.02),
                       t.bgSolid.withValues(alpha: 0.0),
                     ],
                     stops: const [0.0, 0.56, 1.0],

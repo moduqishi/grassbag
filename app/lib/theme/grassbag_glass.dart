@@ -137,65 +137,64 @@ abstract final class GrassBagGlassConfig {
 
     if (t.isDark) {
       return LiquidGlassSettings(
-        glassColor: Colors.white.withValues(alpha: elevated ? 0.14 : 0.10),
-        blur: 4.0,
+        glassColor: Colors.white.withValues(alpha: elevated ? 0.09 : 0.06),
+        blur: 1.5,
         frost: 0.0,
         frostOpacity: 0.0,
-        thickness: 24.0,
-        refractiveIndex: 1.26,
+        thickness: 30.0,
+        refractiveIndex: 1.34,
         lensModel: GlassLensModel.spherical,
-        chromaticAberration: 0.0,
-        saturation: 1.48,
+        chromaticAberration: 0.14,
+        saturation: 1.62,
         lightAngle: 0.75 * math.pi,
-        lightIntensity: 0.88,
-        ambientStrength: 0.14,
+        lightIntensity: 1.15,
+        ambientStrength: 0.18,
         ambientRim: 0.0,
-        fresnelStrength: 1.15,
-        edgeAbsorption: 0.06,
+        fresnelStrength: 1.35,
+        edgeAbsorption: 0.035,
         rimShade: 0.0,
-        rimLight: 0.0,
-        bodyShade: elevated ? 0.16 : 0.10,
-        specularSharpness: GlassSpecularSharpness.medium,
+        rimLight: 1.05,
+        bodyShade: elevated ? 0.06 : 0.03,
+        specularSharpness: GlassSpecularSharpness.sharp,
         shadow: const [],
       );
     }
 
     return LiquidGlassSettings(
-      glassColor: Colors.white.withValues(alpha: elevated ? 0.34 : 0.24),
-      blur: 4.0,
+      glassColor: Colors.white.withValues(alpha: elevated ? 0.14 : 0.08),
+      blur: 1.5,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 24.0,
-      refractiveIndex: 1.24,
+      thickness: 30.0,
+      refractiveIndex: 1.32,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.0,
-      saturation: 1.65,
+      chromaticAberration: 0.12,
+      saturation: 1.85,
       lightAngle: 0.75 * math.pi,
-      lightIntensity: 0.60,
-      ambientStrength: 0.09,
+      lightIntensity: 0.95,
+      ambientStrength: 0.12,
       ambientRim: 0.0,
-      fresnelStrength: 0.78,
-      whitenStrength: elevated ? 0.16 : 0.12,
+      fresnelStrength: 1.18,
+      whitenStrength: 0.0,
       whitenGated: true,
-      edgeAbsorption: 0.04,
+      edgeAbsorption: 0.025,
       rimShade: 0.0,
-      rimLight: 0.0,
+      rimLight: 0.92,
       bodyShade: 0.0,
-      specularSharpness: GlassSpecularSharpness.medium,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: [
         BoxShadow(
-          color: const Color(0x16000000),
-          blurRadius: elevated ? 22 : 16,
-          offset: Offset(0, elevated ? 8 : 5),
+          color: const Color(0x14000000),
+          blurRadius: elevated ? 20 : 14,
+          offset: Offset(0, elevated ? 7 : 4),
         ),
       ],
     );
   }
 
-  /// Sculpted Liquid Glass for modal sheets, '+' deck, menus, dialogs, and floating phone drawer:
-  /// single Gaussian bokeh blur (`10dp`) + smooth spherical bevel (`thickness: 28`, `n: 1.22`) with
-  /// `rimLight: 0, rimShade: 0, ambientRim: 0, chromaticAberration: 0` so Pass 2 never expands
-  /// beyond Pass 1a's blur clip — completely eliminating the double-border / ghosted outer rim!
+  /// Crystal-clear sculpted Liquid Glass for modal sheets, '+' deck, menus, dialogs, and drawer:
+  /// silky low-haze bokeh (`3.4dp`) + lush spherical refraction (`thickness: 32`, `n: 1.28`) with
+  /// crisp dual-lobe `rimLight` and ZERO `rimShade` / `ambientRim` double-border cliff!
   static LiquidGlassSettings sheetSettings(GrassBagTokens t, GrassBagGlassTier tier) {
     final base = surfaceSettings(t, tier, elevated: true);
     if (tier == GrassBagGlassTier.solid) {
@@ -204,48 +203,48 @@ abstract final class GrassBagGlassConfig {
     if (tier != GrassBagGlassTier.liquid || kIsWeb) {
       return base.copyWith(
         glassColor: t.isDark
-            ? Colors.white.withValues(alpha: 0.16)
-            : Colors.white.withValues(alpha: 0.66),
-        blur: kIsWeb ? 9.0 : 8.0,
+            ? Colors.white.withValues(alpha: 0.14)
+            : Colors.white.withValues(alpha: 0.56),
+        blur: kIsWeb ? 8.5 : 7.0,
         saturation: 1.0,
         rimLight: 0.0,
         rimShade: 0.0,
         ambientRim: 0.0,
         chromaticAberration: 0.0,
-        bodyShade: t.isDark ? 0.34 : 0.0,
+        bodyShade: t.isDark ? 0.24 : 0.0,
       );
     }
     return base.copyWith(
       glassColor: t.isDark
-          ? Colors.white.withValues(alpha: 0.14)
-          : Colors.white.withValues(alpha: 0.56),
-      blur: 7.5,
+          ? Colors.white.withValues(alpha: 0.11)
+          : Colors.white.withValues(alpha: 0.34),
+      blur: 4.6,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 28.0,
-      refractiveIndex: 1.22,
+      thickness: 32.0,
+      refractiveIndex: 1.28,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.0,
-      saturation: t.isDark ? 1.44 : 1.58,
-      bodyShade: t.isDark ? 0.34 : 0.0,
-      whitenStrength: t.isDark ? 0.0 : 0.22,
+      chromaticAberration: 0.10,
+      saturation: t.isDark ? 1.56 : 1.72,
+      bodyShade: t.isDark ? 0.14 : 0.0,
+      whitenStrength: t.isDark ? 0.0 : 0.06,
       whitenGated: true,
       lightAngle: 0.75 * math.pi,
-      lightIntensity: t.isDark ? 0.82 : 0.56,
-      ambientStrength: t.isDark ? 0.14 : 0.09,
+      lightIntensity: t.isDark ? 1.05 : 0.88,
+      ambientStrength: t.isDark ? 0.16 : 0.12,
       ambientRim: 0.0,
-      fresnelStrength: t.isDark ? 1.05 : 0.72,
-      edgeAbsorption: 0.04,
-      rimLight: 0.0,
+      fresnelStrength: t.isDark ? 1.25 : 1.08,
+      edgeAbsorption: t.isDark ? 0.03 : 0.025,
+      rimLight: t.isDark ? 0.96 : 0.86,
       rimShade: 0.0,
-      specularSharpness: GlassSpecularSharpness.medium,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: t.isDark
           ? const []
           : const [
               BoxShadow(
                 color: Color(0x16000000),
-                blurRadius: 16,
-                offset: Offset(0, 6),
+                blurRadius: 18,
+                offset: Offset(0, 7),
               ),
             ],
     );
@@ -273,24 +272,25 @@ abstract final class GrassBagGlassConfig {
       style: GlassStyle.ios27,
       light: GlassThemeVariant.ios27Light.copyWith(
         settings: GlassThemeSettings.ios27Light.copyWith(
-          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.40 : 0.24),
-          blur: isFrosted ? (kIsWeb ? 8.0 : 6.5) : 4.0,
+          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.38 : 0.08),
+          blur: isFrosted ? (kIsWeb ? 8.0 : 6.5) : 1.5,
           frost: 0.0,
           frostOpacity: 0.0,
-          thickness: isFrosted ? 0.5 : 24.0,
-          refractiveIndex: isFrosted ? 1.01 : 1.24,
+          thickness: isFrosted ? 0.5 : 30.0,
+          refractiveIndex: isFrosted ? 1.01 : 1.32,
           lensModel: GlassLensModel.spherical,
-          chromaticAberration: 0.0,
-          saturation: isFrosted ? 1.0 : 1.65,
+          chromaticAberration: isFrosted ? 0.0 : 0.12,
+          saturation: isFrosted ? 1.0 : 1.85,
           lightAngle: 0.75 * math.pi,
-          lightIntensity: isFrosted ? 0.56 : 0.60,
-          ambientStrength: isFrosted ? 0.10 : 0.09,
-          fresnelStrength: isFrosted ? 0.64 : 0.78,
-          edgeAbsorption: isFrosted ? 0.03 : 0.04,
+          lightIntensity: isFrosted ? 0.56 : 0.95,
+          ambientStrength: isFrosted ? 0.10 : 0.12,
+          fresnelStrength: isFrosted ? 0.64 : 1.18,
+          edgeAbsorption: isFrosted ? 0.03 : 0.025,
           rimShade: 0.0,
-          rimLight: 0.0,
+          rimLight: isFrosted ? 0.0 : 0.92,
           bodyShade: 0.0,
-          specularSharpness: GlassSpecularSharpness.medium,
+          specularSharpness:
+              isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
         ),
         glowColors: GlassGlowColors(
           primary: lightTokens.primaryHi.withValues(alpha: 0.28),
@@ -305,24 +305,25 @@ abstract final class GrassBagGlassConfig {
       ),
       dark: GlassThemeVariant.ios27Dark.copyWith(
         settings: GlassThemeSettings.ios27Dark.copyWith(
-          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.11 : 0.10),
-          blur: isFrosted ? (kIsWeb ? 8.0 : 6.5) : 4.0,
+          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.11 : 0.06),
+          blur: isFrosted ? (kIsWeb ? 8.0 : 6.5) : 1.5,
           frost: 0.0,
           frostOpacity: 0.0,
-          thickness: isFrosted ? 0.5 : 24.0,
-          refractiveIndex: isFrosted ? 1.01 : 1.26,
+          thickness: isFrosted ? 0.5 : 30.0,
+          refractiveIndex: isFrosted ? 1.01 : 1.34,
           lensModel: GlassLensModel.spherical,
-          chromaticAberration: 0.0,
-          saturation: isFrosted ? 1.0 : 1.48,
+          chromaticAberration: isFrosted ? 0.0 : 0.14,
+          saturation: isFrosted ? 1.0 : 1.62,
           lightAngle: 0.75 * math.pi,
-          lightIntensity: isFrosted ? 0.68 : 0.88,
-          ambientStrength: isFrosted ? 0.14 : 0.14,
-          fresnelStrength: isFrosted ? 0.72 : 1.15,
-          edgeAbsorption: isFrosted ? 0.04 : 0.06,
+          lightIntensity: isFrosted ? 0.68 : 1.15,
+          ambientStrength: isFrosted ? 0.14 : 0.18,
+          fresnelStrength: isFrosted ? 0.72 : 1.35,
+          edgeAbsorption: isFrosted ? 0.04 : 0.035,
           rimShade: 0.0,
-          rimLight: 0.0,
-          bodyShade: isFrosted ? 0.14 : 0.10,
-          specularSharpness: GlassSpecularSharpness.medium,
+          rimLight: isFrosted ? 0.0 : 1.05,
+          bodyShade: isFrosted ? 0.14 : 0.03,
+          specularSharpness:
+              isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
         ),
         glowColors: GlassGlowColors(
           primary: darkTokens.primary.withValues(alpha: 0.34),
@@ -668,9 +669,9 @@ class GrassBagGlassSwitch extends StatelessWidget {
       value: value,
       onChanged: onChanged,
       activeColor: activeColor ?? t.ok,
-      inactiveColor: t.isDark ? const Color(0x3DFFFFFF) : const Color(0x453C3C43),
-      width: 62,
-      height: 28,
+      inactiveColor: t.isDark ? const Color(0x36FFFFFF) : const Color(0x2A3C3C43),
+      width: 52,
+      height: 30,
       useOwnLayer: false,
       quality: tier == GrassBagGlassTier.solid ? GlassQuality.minimal : null,
       enableHaptics: true,
@@ -1565,14 +1566,14 @@ class GrassBagSquircleIcon extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final radius = size * 0.30;
     final topCol = filled
-        ? Color.lerp(color, Colors.white, 0.16)!
-        : color.withValues(alpha: t.isDark ? 0.25 : 0.17);
+        ? Color.lerp(color, Colors.white, 0.22)!
+        : color.withValues(alpha: t.isDark ? 0.28 : 0.20);
     final botCol = filled
         ? color
-        : color.withValues(alpha: t.isDark ? 0.11 : 0.08);
+        : color.withValues(alpha: t.isDark ? 0.13 : 0.09);
 
     final fgColor = filled
-        ? (color.computeLuminance() > 0.48 ? const Color(0xFF0F1C26) : Colors.white)
+        ? (color.computeLuminance() > 0.56 ? const Color(0xFF0F1C26) : Colors.white)
         : color;
 
     return Container(
@@ -1580,19 +1581,30 @@ class GrassBagSquircleIcon extends StatelessWidget {
       height: size,
       decoration: ShapeDecoration(
         gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
           colors: [topCol, botCol],
         ),
         shape: RoundedSuperellipseBorder(
           borderRadius: BorderRadius.circular(radius),
           side: BorderSide(
             color: filled
-                ? Colors.white.withValues(alpha: 0.22)
-                : color.withValues(alpha: t.isDark ? 0.30 : 0.18),
-            width: 0.65,
+                ? Colors.white.withValues(alpha: t.isDark ? 0.26 : 0.42)
+                : (t.isDark
+                    ? color.withValues(alpha: 0.34)
+                    : Colors.white.withValues(alpha: 0.78)),
+            width: 0.75,
           ),
         ),
+        shadows: filled
+            ? [
+                BoxShadow(
+                  color: color.withValues(alpha: t.isDark ? 0.30 : 0.24),
+                  blurRadius: 10,
+                  offset: const Offset(0, 3),
+                ),
+              ]
+            : null,
       ),
       child: Icon(
         icon,

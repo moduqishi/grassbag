@@ -9262,7 +9262,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             activeModelProvider: defProv.isNotEmpty ? defProv : (matched?.providerId ?? ''),
             activeModelId: defModelId,
             modelName: displayName,
-            modelShort: shortLabel.length > 18 ? '${shortLabel.substring(0, 17)}…' : shortLabel,
+            modelShort: shortLabel.length > 28 ? '${shortLabel.substring(0, 27)}…' : shortLabel,
             modelEffortId: resolvedEff,
             modelEffort: _effortIdToZhLabel(resolvedEff),
           );

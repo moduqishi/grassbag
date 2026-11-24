@@ -2046,7 +2046,8 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Liquid Glass optics strictly use spherical lens model with zero frost/ambientRim/rimLight/CA artifacts!
+      // 3) Crystal-clear Liquid Glass optics: spherical lens, zero frost/ambientRim/rimShade,
+      //    low-haze refraction blur, luminous dual-lobe rimLight, and subtle edge prism CA!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
@@ -2056,14 +2057,19 @@ void main() {
         final sheet = GrassBagGlassConfig.sheetSettings(tokens, GrassBagGlassTier.liquid);
         expect(surf.lensModel, GlassLensModel.spherical);
         expect(surf.frost, 0.0);
-        expect(surf.rimLight, 0.0);
         expect(surf.ambientRim, 0.0);
-        expect(surf.chromaticAberration, 0.0);
+        expect(surf.rimShade, 0.0);
+        expect(surf.rimLight, greaterThan(0.5));
+        expect(surf.chromaticAberration, greaterThan(0.0));
+        expect(surf.blur, lessThanOrEqualTo(2.0));
+        expect(surf.whitenStrength, 0.0);
         expect(sheet.lensModel, GlassLensModel.spherical);
         expect(sheet.frost, 0.0);
-        expect(sheet.rimLight, 0.0);
-        expect(sheet.blur, greaterThanOrEqualTo(7.0));
+        expect(sheet.rimShade, 0.0);
+        expect(sheet.rimLight, greaterThan(0.5));
         expect(sheet.blur, greaterThan(surf.blur));
+        expect(sheet.blur, lessThanOrEqualTo(5.0));
+        expect(sheet.whitenStrength, lessThanOrEqualTo(0.08));
       }
 
       // 4) RemoteHostConnectCard shows Desktop GUI (免命令) 1-click prompt + concrete-IP CLI tab (zero 0.0.0.0)
@@ -2308,23 +2314,23 @@ void main() {
   testWidgets(
     'v12 regression: Liquid Glass optics calibration, nested italic+bold, streaming code stability, fractional slider & Cron weekdays',
     (tester) async {
-      // 1) Liquid Glass optics calibration: zero CA, zero ambientRim/rimLight/rimShade, matched blur 4.0, pure achromatic glassColor
+      // 1) Crystal-clear Liquid Glass calibration: zero ambientRim/rimShade, matched low-haze blur, pure achromatic glassColor
       for (final brightness in Brightness.values) {
         final t = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
         final norm = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: false);
         final elev = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: true);
         final sheet = GrassBagGlassConfig.sheetSettings(t, GrassBagGlassTier.liquid);
-        expect(norm.chromaticAberration, 0.0);
-        expect(elev.chromaticAberration, 0.0);
-        expect(sheet.chromaticAberration, 0.0);
+        expect(norm.chromaticAberration, greaterThan(0.0));
+        expect(elev.chromaticAberration, greaterThan(0.0));
+        expect(sheet.chromaticAberration, greaterThan(0.0));
         expect(norm.ambientRim, 0.0);
-        expect(norm.rimLight, 0.0);
+        expect(norm.rimLight, greaterThan(0.5));
         expect(norm.rimShade, 0.0);
         expect(sheet.ambientRim, 0.0);
-        expect(sheet.rimLight, 0.0);
+        expect(sheet.rimLight, greaterThan(0.5));
         expect(sheet.rimShade, 0.0);
-        expect(norm.blur, 4.0);
-        expect(elev.blur, 4.0);
+        expect(norm.blur, 1.5);
+        expect(elev.blur, 1.5);
         expect(norm.glassColor.r, closeTo(1.0, 0.01));
         expect(norm.glassColor.g, closeTo(1.0, 0.01));
         expect(norm.glassColor.b, closeTo(1.0, 0.01));

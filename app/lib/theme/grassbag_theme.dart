@@ -887,8 +887,8 @@ class _AtmosphericSilkPainter extends CustomPainter {
       Paint()
         ..shader = RadialGradient(
           colors: [
-            glowTopRight.withValues(alpha: isDark ? 0.30 : 0.48),
-            primaryHi.withValues(alpha: isDark ? 0.11 : 0.18),
+            glowTopRight.withValues(alpha: isDark ? 0.34 : 0.56),
+            primaryHi.withValues(alpha: isDark ? 0.13 : 0.22),
             Colors.transparent,
           ],
           stops: const [0.0, 0.42, 1.0],
@@ -903,8 +903,8 @@ class _AtmosphericSilkPainter extends CustomPainter {
       Paint()
         ..shader = RadialGradient(
           colors: [
-            glowBottomLeft.withValues(alpha: isDark ? 0.24 : 0.40),
-            dusk.withValues(alpha: isDark ? 0.09 : 0.14),
+            glowBottomLeft.withValues(alpha: isDark ? 0.28 : 0.48),
+            dusk.withValues(alpha: isDark ? 0.11 : 0.18),
             Colors.transparent,
           ],
           stops: const [0.0, 0.45, 1.0],

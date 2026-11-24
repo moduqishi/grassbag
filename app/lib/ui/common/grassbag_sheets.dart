@@ -392,7 +392,8 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
   }
 }
 
-/// Authentic iOS 26 centered Liquid Glass confirmation alert ([GlassDialog.show]).
+/// Sculpted Apple iOS 26 centered Liquid Glass confirmation dialog with crystal readability
+/// and unmistakable button visual hierarchy (subtle secondary Cancel vs accented/destructive Confirm).
 Future<bool> showGrassBagConfirmDialog(
   BuildContext context, {
   required String title,
@@ -405,24 +406,104 @@ Future<bool> showGrassBagConfirmDialog(
   final tier = ProviderScope.containerOf(context, listen: false).read(appProvider).glassTier;
   HapticFeedback.mediumImpact();
 
-  final result = await GlassDialog.show<bool>(
+  final result = await showGeneralDialog<bool>(
     context: context,
-    title: title,
-    message: message,
-    quality: GrassBagGlassConfig.chromeQualityFor(tier),
-    settings: GrassBagGlassConfig.sheetSettings(t, tier),
-    actions: [
-      GlassDialogAction(
-        label: cancelLabel,
-        onPressed: () => Navigator.of(context).pop(false),
-      ),
-      GlassDialogAction(
-        label: confirmLabel,
-        isDestructive: isDestructive,
-        isPrimary: !isDestructive,
-        onPressed: () => Navigator.of(context).pop(true),
-      ),
-    ],
+    barrierDismissible: true,
+    barrierLabel: cancelLabel,
+    barrierColor: t.isDark ? const Color(0x88080C12) : const Color(0x42182230),
+    transitionDuration: const Duration(milliseconds: 220),
+    pageBuilder: (dialogCtx, animation, secondaryAnimation) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 332),
+            child: Material(
+              type: MaterialType.transparency,
+              child: GrassBagGlass(
+                tier: tier,
+                borderRadius: 28,
+                useSheetSettings: true,
+                padding: EdgeInsets.zero,
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(28),
+                    color: t.isDark
+                        ? const Color(0xCC1B2432)
+                        : Colors.white.withValues(alpha: 0.78),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.3,
+                          color: t.text,
+                        ),
+                      ),
+                      if (message.trim().isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          message,
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            height: 1.48,
+                            color: t.text2,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 20),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: GrassBagSecondaryGlassButton(
+                              label: cancelLabel,
+                              height: 42,
+                              tier: tier,
+                              insideGlass: true,
+                              onTap: () => Navigator.of(dialogCtx).pop(false),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: GrassBagPrimaryGlassButton(
+                              label: confirmLabel,
+                              height: 42,
+                              tier: tier,
+                              insideGlass: true,
+                              color: isDestructive
+                                  ? (t.isDark ? const Color(0xFFD94444) : t.err)
+                                  : t.primary,
+                              foregroundColor: isDestructive ? Colors.white : t.onPrimary,
+                              onTap: () => Navigator.of(dialogCtx).pop(true),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+    transitionBuilder: (ctx, anim, secondaryAnim, child) {
+      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutBack);
+      return FadeTransition(
+        opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
+        child: ScaleTransition(
+          scale: Tween<double>(begin: 0.92, end: 1.0).animate(curved),
+          child: child,
+        ),
+      );
+    },
   );
   return result == true;
 }
@@ -585,6 +666,11 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
     }
   }
 
+  void _onDragCancel() {
+    _dragging = false;
+    _dragSpring.animateTo(0.0);
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
@@ -611,6 +697,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
               onVerticalDragStart: isDesktopDialog ? null : _onDragStart,
               onVerticalDragUpdate: isDesktopDialog ? null : _onDragUpdate,
               onVerticalDragEnd: isDesktopDialog ? null : _onDragEnd,
+              onVerticalDragCancel: isDesktopDialog ? null : _onDragCancel,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2403,15 +2490,19 @@ void showContextSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor? mo
                             ),
                           ),
                           const SizedBox(width: 8),
-                          Text(
-                            '已用 ${state.contextUsedK}k / ${state.contextMaxK}k',
-                            style: TextStyle(
-                              fontSize: 12.5,
-                              fontFeatures: const [FontFeature.tabularFigures()],
-                              color: t.text3,
+                          Expanded(
+                            child: Text(
+                              '已用 ${state.contextUsedK}k / ${state.contextMaxK}k',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontFeatures: const [FontFeature.tabularFigures()],
+                                color: t.text3,
+                              ),
                             ),
                           ),
-                          const Spacer(),
+                          const SizedBox(width: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                             decoration: BoxDecoration(
@@ -2442,12 +2533,12 @@ void showContextSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor? mo
                                     if (tel.systemTokens > 0)
                                       Expanded(
                                         flex: tel.systemTokens.clamp(1, win),
-                                        child: Container(color: const Color(0xFF6366F1)),
+                                        child: Container(color: t.dusk),
                                       ),
                                     if (tel.toolsTokens > 0)
                                       Expanded(
                                         flex: tel.toolsTokens.clamp(1, win),
-                                        child: Container(color: const Color(0xFFA855F7)),
+                                        child: Container(color: t.ok),
                                       ),
                                     if (tel.messageTokens > 0)
                                       Expanded(
@@ -2486,14 +2577,14 @@ void showContextSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor? mo
                           children: [
                             Expanded(
                               child: _LegendDot(
-                                color: const Color(0xFF6366F1),
+                                color: t.dusk,
                                 label: '系统提示',
                                 value: formatCompactTokens(tel.systemTokens),
                               ),
                             ),
                             Expanded(
                               child: _LegendDot(
-                                color: const Color(0xFFA855F7),
+                                color: t.ok,
                                 label: '工具定义',
                                 value: formatCompactTokens(tel.toolsTokens),
                               ),
@@ -3625,17 +3716,14 @@ class _SheetOptionRow extends StatelessWidget {
               const SizedBox(width: 4),
               trailingExtra!,
             ],
-            const SizedBox(width: 6),
-            AnimatedScale(
-              scale: selected ? 1.0 : 0.0,
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              child: Icon(
+            if (selected) ...[
+              const SizedBox(width: 6),
+              Icon(
                 CupertinoIcons.checkmark_circle_fill,
                 size: 21,
                 color: accent,
               ),
-            ),
+            ],
           ],
         ),
       ),

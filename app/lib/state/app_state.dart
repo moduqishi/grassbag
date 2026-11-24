@@ -1650,6 +1650,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   int _streamRunId = 0;
   int _hostConnectGen = 0;
   int _modelSelectionGen = 0;
+  int _inFlightModelSelections = 0;
   String? _lastAutoSyncedDefaultKey;
   int _marketSearchSeq = 0;
   int _wsDirSeq = 0;
@@ -5044,6 +5045,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       'model': nextModelId,
       if (nextEffortId.isNotEmpty) 'reasoningEffort': nextEffortId,
     };
+    _inFlightModelSelections++;
     try {
       final sid = state.activeSessionId;
       if (sid != null && !sid.startsWith('pending-session-')) {
@@ -5093,6 +5095,19 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           return;
         }
       }
+      // Re-assert user's confirmed choice in case any background hydrate finished during await.
+      if (state.activeModelId != nextModelId ||
+          state.activeModelProvider != nextProvider ||
+          state.modelEffortId != nextEffortId) {
+        state = state.copyWith(
+          activeModelProvider: nextProvider,
+          activeModelId: nextModelId,
+          modelName: resolvedName,
+          modelShort: resolvedShort,
+          modelEffort: nextEffortLabel,
+          modelEffortId: nextEffortId,
+        );
+      }
       _lastAutoSyncedDefaultKey = '${state.activeHostId}|$nextProvider|$nextModelId|$nextEffortId';
       if (!silent) {
         showToast(
@@ -5110,6 +5125,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         modelEffortId: prevEffortId,
       );
       showError('切换模型失败', error: e);
+    } finally {
+      _inFlightModelSelections = (_inFlightModelSelections - 1).clamp(0, 9999);
     }
   }
 
@@ -6099,13 +6116,21 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!silent) showToast(msg, tone: ToastTone.warn);
       return msg;
     }
-    var currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+    final prevList = List<DshSettingsNamespace>.of(state.dshNamespaces);
+    var currentList = List<DshSettingsNamespace>.of(prevList);
     var idx = currentList.indexWhere((e) => e.ns == ns);
     var existing = idx >= 0 ? currentList[idx] : null;
     final nextVal = replace || existing == null
         ? Map<String, dynamic>.from(patch)
         : {...existing.value, ...patch};
     var nextRev = (existing?.revision ?? 0) + 1;
+
+    // Frame-0 optimistic update for instant tactile switch/form responsiveness (rolled back on error).
+    if (!replace && existing != null) {
+      final optimisticList = List<DshSettingsNamespace>.of(prevList);
+      optimisticList[idx] = existing.copyWith(value: Map<String, dynamic>.from(nextVal));
+      state = state.copyWith(dshNamespaces: optimisticList);
+    }
 
     Future<Map<String, dynamic>> sendPatch(int? expectedRev) {
       final body = <String, dynamic>{
@@ -6142,6 +6167,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
     } catch (err) {
       if (!_isStillLive(client)) return null;
+      // Roll back optimistic local patch if server rejected the update
+      if (!replace && existing != null) {
+        state = state.copyWith(dshNamespaces: prevList);
+      }
       final readable = formatReadableError(err);
       if (_isRevisionConflictError(err)) {
         unawaited(_hydrateLiveDomains(client));
@@ -7918,7 +7947,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         uploadedRefs = previewRefs;
       }
 
-      if (mounted && sendGen == _hostConnectGen && attached.isNotEmpty) {
+      if (mounted &&
+          sendGen == _hostConnectGen &&
+          attached.isNotEmpty &&
+          (sendClient != null || sendBootstrap != null)) {
         final sentIds = attached.map((a) => a.id).toSet();
         state = state.copyWith(
           pendingAttachments: state.pendingAttachments
@@ -9770,7 +9802,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           );
         } else {
           // Model list is non-empty -> selector MUST resolve to a real available model in `groups`.
-          final userUpdatedInFlight = _modelSelectionGen != hydrateModelGen;
+          final userUpdatedInFlight =
+              _modelSelectionGen != hydrateModelGen || _inFlightModelSelections > 0;
           final candProv = userUpdatedInFlight
               ? state.activeModelProvider
               : (defProv.isNotEmpty ? defProv : state.activeModelProvider);
@@ -10156,7 +10189,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!skipAutoDefaultSync &&
           autoFallbackModel != null &&
           identical(_liveClient, client) &&
-          _modelSelectionGen == hydrateModelGen) {
+          _modelSelectionGen == hydrateModelGen &&
+          _inFlightModelSelections == 0) {
         final syncKey =
             '${state.activeHostId}|${autoFallbackModel.providerId}|${autoFallbackModel.id}|$autoFallbackEffort';
         if (_lastAutoSyncedDefaultKey != syncKey) {

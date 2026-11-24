@@ -640,6 +640,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
   bool _dirty = false;
   bool _saving = false;
   bool _jsonMode = false;
+  bool _copiedError = false;
   String? _saveError;
   String? _jsonParseError;
   final Map<String, String> _fieldErrors = <String, String>{};
@@ -857,6 +858,8 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                   height: 34,
                   onSelected: (idx) {
                       if (idx == 1 && !_jsonMode) {
+                        _numValidateTimer?.cancel();
+                        _pendingFieldErrors.clear();
                         _fieldErrors.clear();
                         _syncJsonText(force: true);
                         setState(() => _jsonMode = true);
@@ -864,6 +867,8 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                         try {
                           final parsed = jsonDecode(_jsonCtrl.text);
                           if (parsed is Map) {
+                            _numValidateTimer?.cancel();
+                            _pendingFieldErrors.clear();
                             setState(() {
                               _values = _deepCopyMap(Map<String, dynamic>.from(parsed));
                               _fieldErrors.clear();
@@ -915,10 +920,25 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                       ),
                     ),
                     GestureDetector(
-                      onTap: () => Clipboard.setData(ClipboardData(text: _saveError!)),
-                      child: Text(
-                        '复制报错',
-                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.err),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(text: _saveError!));
+                        HapticFeedback.selectionClick();
+                        setState(() => _copiedError = true);
+                        Future<void>.delayed(const Duration(milliseconds: 1400), () {
+                          if (mounted) setState(() => _copiedError = false);
+                        });
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                        child: Text(
+                          _copiedError ? '已复制' : '复制报错',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: _copiedError ? t.ok : t.err,
+                          ),
+                        ),
                       ),
                     ),
                   ],
@@ -1086,6 +1106,8 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                                 }
                               }
                             }
+                            _numValidateTimer?.cancel();
+                            _pendingFieldErrors.clear();
                             setState(() {
                               _values = nextMap;
                               _fieldErrors.clear();
@@ -1407,13 +1429,12 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                 width: double.infinity,
                 child: () {
                   final divs = (rawMax - rawMin).round();
-                  return CupertinoSlider(
+                  return GrassBagGlassSlider(
                     value: numCur,
                     min: rawMin,
                     max: rawMax,
                     divisions: isInt && divs > 0 && divs <= 100 ? divs : null,
                     activeColor: t.primary,
-                    thumbColor: Colors.white,
                     onChanged: widget.readOnly
                         ? null
                         : (v) => _writePath(path, isInt ? v.round() : double.parse(v.toStringAsFixed(2))),
@@ -2135,9 +2156,23 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                     child: Row(
                       children: [
                         Expanded(
-                          child: Text(
-                            entry.key,
-                            style: TextStyle(fontFamily: 'monospace', fontSize: 12.5, color: t.text),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: widget.readOnly
+                                ? null
+                                : () {
+                                    HapticFeedback.lightImpact();
+                                    final next = Map<String, dynamic>.from(map);
+                                    next[entry.key] = !(entry.value == true);
+                                    _writePath(path, next);
+                                  },
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4),
+                              child: Text(
+                                entry.key,
+                                style: TextStyle(fontFamily: 'monospace', fontSize: 12.5, color: t.text),
+                              ),
+                            ),
                           ),
                         ),
                         GrassBagGlassSwitch(

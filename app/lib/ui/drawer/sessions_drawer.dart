@@ -324,8 +324,10 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                 iconSize: 15,
               ),
               title: const Text('重命名'),
-              onTap: () {
+              onTap: () async {
                 Navigator.of(ctx).pop();
+                await Future<void>.delayed(const Duration(milliseconds: 120));
+                if (!mounted || !context.mounted) return;
                 _openRenameSheet(context, s);
               },
             ),
@@ -352,6 +354,8 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               title: Text('删除对话', style: TextStyle(color: t.err, fontWeight: FontWeight.w600)),
               onTap: () async {
                 Navigator.of(ctx).pop();
+                await Future<void>.delayed(const Duration(milliseconds: 120));
+                if (!mounted || !context.mounted) return;
                 final ok = await showGrassBagConfirmDialog(
                   context,
                   title: '删除「${s.title}」？',
@@ -388,6 +392,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           activeHostId: s.activeHostId,
           activeHost: s.activeHost,
           localHost: s.localHost,
+          hasUnignoredAppUpdate: s.hasUnignoredAppUpdate,
           isActiveHostDesktop: s.isActiveHostDesktop,
           hostStatusLabel: s.hostStatusLabel(s.activeHost),
           hostIsHealthy: s.hostIsHealthy(s.activeHost),
@@ -565,24 +570,23 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           ),
         ),
 
-        // Four Horizontal Editorial Filter Pills (dsh-Go Ink Style)
-        Padding(
+        // Horizontal Editorial Filter Pills (edge-to-edge scroll padding so last pill never clips!)
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          physics: const BouncingScrollPhysics(),
           padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                for (final f in SessionFilter.values) ...[
-                  _FilterChipPill(
-                    label: f.label,
-                    active: state.filter == f,
-                    showWarnDot: f == SessionFilter.pending && hasPending && state.filter != f,
-                    onTap: () => ctrl.setFilter(f),
-                  ),
-                  if (f != SessionFilter.values.last) const SizedBox(width: 5),
-                ],
+          child: Row(
+            children: [
+              for (final f in SessionFilter.values) ...[
+                _FilterChipPill(
+                  label: f.label,
+                  active: state.filter == f,
+                  showWarnDot: f == SessionFilter.pending && hasPending && state.filter != f,
+                  onTap: () => ctrl.setFilter(f),
+                ),
+                if (f != SessionFilter.values.last) const SizedBox(width: 4.5),
               ],
-            ),
+            ],
           ),
         ),
 
@@ -1409,7 +1413,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               _FooterIconButton(
                 icon: CupertinoIcons.gear_solid,
                 tooltip: '设置',
-                showBadge: state.localHost.hasLocalUpdates,
+                showBadge: state.localHost.hasLocalUpdates || state.hasUnignoredAppUpdate,
                 onTap: () {
                   widget.onCloseDrawer?.call();
                   widget.onOpenSettings();
@@ -1472,7 +1476,7 @@ class _FilterChipPill extends StatelessWidget {
       label: label,
       selected: active,
       showDot: showWarnDot,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 5),
       fontSize: 11.5,
       onTap: onTap,
     );
@@ -1666,7 +1670,7 @@ class _SessionListRowState extends State<_SessionListRow> {
                           size: 14,
                           color: (_hovered || widget.active)
                               ? t.text2
-                              : t.text3.withValues(alpha: 0.55),
+                              : t.text3.withValues(alpha: 0.78),
                         ),
                       ),
                     ),

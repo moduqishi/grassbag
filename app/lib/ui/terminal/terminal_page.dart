@@ -1232,7 +1232,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                             deleteDetection: !kIsWeb &&
                                                 (defaultTargetPlatform == TargetPlatform.android ||
                                                     defaultTargetPlatform == TargetPlatform.iOS),
-                                            keyboardType: TextInputType.text,
+                                            keyboardType: TextInputType.visiblePassword,
                                             textStyle: TerminalStyle(
                                               fontSize: _fontSize,
                                               fontFamily: kIsWeb ? 'Menlo' : 'monospace',
@@ -1245,31 +1245,37 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                                 'monospace',
                                               ],
                                             ),
-                                            theme: TerminalTheme(
-                                              cursor: t.primary,
-                                              selection: t.primary.withValues(alpha: 0.35),
-                                              foreground: t.codeFg,
-                                              background: t.codeBg,
-                                              black: const Color(0xFF1A2026),
-                                              red: const Color(0xFFE69089),
-                                              green: const Color(0xFF5DD199),
-                                              yellow: const Color(0xFFEDB060),
-                                              blue: const Color(0xFF8CB9D7),
-                                              magenta: const Color(0xFFB8ABD2),
-                                              cyan: const Color(0xFF72C6D8),
-                                              white: const Color(0xFFE5EBF0),
-                                              brightBlack: const Color(0xFF6B7D8C),
-                                              brightRed: const Color(0xFFF3A7A1),
-                                              brightGreen: const Color(0xFF7CE0AF),
-                                              brightYellow: const Color(0xFFF4C582),
-                                              brightBlue: const Color(0xFFA8D0EC),
-                                              brightMagenta: const Color(0xFFCEC3E5),
-                                              brightCyan: const Color(0xFF93DBE9),
-                                              brightWhite: const Color(0xFFFFFFFF),
-                                              searchHitBackground: const Color(0x66EDB060),
-                                              searchHitBackgroundCurrent: const Color(0xAAEDB060),
-                                              searchHitForeground: Colors.black,
-                                            ),
+                                            theme: () {
+                                              final darkAccent = GrassBagTokens.resolve(
+                                                t.accent,
+                                                Brightness.dark,
+                                              ).primaryHi;
+                                              return TerminalTheme(
+                                                cursor: darkAccent,
+                                                selection: darkAccent.withValues(alpha: 0.35),
+                                                foreground: t.codeFg,
+                                                background: t.codeBg,
+                                                black: const Color(0xFF1A2026),
+                                                red: const Color(0xFFE69089),
+                                                green: const Color(0xFF5DD199),
+                                                yellow: const Color(0xFFEDB060),
+                                                blue: const Color(0xFF8CB9D7),
+                                                magenta: const Color(0xFFB8ABD2),
+                                                cyan: const Color(0xFF72C6D8),
+                                                white: const Color(0xFFE5EBF0),
+                                                brightBlack: const Color(0xFF6B7D8C),
+                                                brightRed: const Color(0xFFF3A7A1),
+                                                brightGreen: const Color(0xFF7CE0AF),
+                                                brightYellow: const Color(0xFFF4C582),
+                                                brightBlue: const Color(0xFFA8D0EC),
+                                                brightMagenta: const Color(0xFFCEC3E5),
+                                                brightCyan: const Color(0xFF93DBE9),
+                                                brightWhite: const Color(0xFFFFFFFF),
+                                                searchHitBackground: const Color(0x66EDB060),
+                                                searchHitBackgroundCurrent: const Color(0xAAEDB060),
+                                                searchHitForeground: Colors.black,
+                                              );
+                                            }(),
                                             autofocus: false,
                                           ),
                                               ),
@@ -1313,6 +1319,10 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                             : (k.$2 == 'alt' ? _alt : _ModLatch.off);
                                         final isActive = latch != _ModLatch.off ||
                                             k.$2 == 'copy';
+                                        final darkAccent = GrassBagTokens.resolve(
+                                          t.accent,
+                                          Brightness.dark,
+                                        ).primaryHi;
                                         return GrassBagSpringTap(
                                           onTap: () => _sendExtraKey(k.$2),
                                           pressedScale: 0.90,
@@ -1323,12 +1333,12 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                             alignment: Alignment.center,
                                             decoration: ShapeDecoration(
                                               color: isActive
-                                                  ? t.primary.withValues(alpha: 0.28)
+                                                  ? darkAccent.withValues(alpha: 0.24)
                                                   : Colors.white.withValues(alpha: 0.085),
                                               shape: RoundedSuperellipseBorder(
                                                 borderRadius: BorderRadius.circular(10),
                                                 side: latch == _ModLatch.locked
-                                                    ? BorderSide(color: t.primary, width: 1.0)
+                                                    ? BorderSide(color: darkAccent, width: 1.0)
                                                     : BorderSide(
                                                         color: Colors.white.withValues(alpha: 0.07),
                                                         width: 0.5,
@@ -1341,7 +1351,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                                 fontFamily: 'monospace',
                                                 fontSize: 11.5,
                                                 fontWeight: FontWeight.w600,
-                                                color: isActive ? t.primaryHi : t.codeFg,
+                                                color: isActive ? darkAccent : t.codeFg,
                                               ),
                                             ),
                                           ),

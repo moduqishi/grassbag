@@ -194,7 +194,8 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
       title: diff.path,
       subtitle: '${diff.summary} · +${diff.added} -${diff.removed}',
       bodyBuilder: (ctx) {
-        final tier = ref.read(appProvider).glassTier;
+        final container = ProviderScope.containerOf(ctx, listen: false);
+        final tier = container.read(appProvider).glassTier;
         return Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -207,7 +208,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
               insideGlass: true,
               onTap: () {
                 Clipboard.setData(ClipboardData(text: diff.unifiedDiff));
-                ref.read(appProvider.notifier).showToast('已复制改动补丁');
+                container.read(appProvider.notifier).showToast('已复制改动补丁');
                 Navigator.of(ctx).pop();
               },
             ),
@@ -1427,17 +1428,23 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                           g.id,
                           g.status == 'active' ? 'paused' : 'active',
                         ),
-                        child: Text(
-                          g.status == 'active' ? '暂停' : '恢复',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                          child: Text(
+                            g.status == 'active' ? '暂停' : '恢复',
+                            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
+                          ),
                         ),
                       ),
-                      const SizedBox(width: 14),
+                      const SizedBox(width: 8),
                       GrassBagSpringTap(
                         onTap: () => ctrl.updateGoalStatus(g.id, 'completed'),
-                        child: Text(
-                          '标记达成',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.ok),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                          child: Text(
+                            '标记达成',
+                            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.ok),
+                          ),
                         ),
                       ),
                     ] else
@@ -2097,7 +2104,9 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 165),
                     child: Text(
-                      '${state.modelName} · ${state.modelEffort}',
+                      state.modelEffort.trim().isNotEmpty
+                          ? '${state.modelName} · ${state.modelEffort}'
+                          : state.modelName,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 12.5, color: t.text3),
@@ -2320,20 +2329,23 @@ class _WorkbenchTelemetryCard extends ConsumerWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2.5),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Text(
-                    tel.lastModel.isNotEmpty ? tel.lastModel : slice.modelShort,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
-                      color: t.primary,
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 132),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2.5),
+                    decoration: BoxDecoration(
+                      color: t.primarySoft,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      tel.lastModel.isNotEmpty ? tel.lastModel : slice.modelShort,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        color: t.primary,
+                      ),
                     ),
                   ),
                 ),
@@ -2618,11 +2630,15 @@ class _UnifiedDiffCodeBox extends StatelessWidget {
     final allLines = diffText.split('\n');
     final clipped = maxPreviewLines != null && allLines.length > maxPreviewLines!;
     final lines = clipped ? allLines.sublist(0, maxPreviewLines!) : allLines;
-    var maxChars = 40;
+    var maxCols = 40;
     for (final l in lines) {
-      if (l.length > maxChars) maxChars = l.length;
+      var cols = 0;
+      for (final cu in l.codeUnits) {
+        cols += cu > 0xFF ? 2 : 1;
+      }
+      if (cols > maxCols) maxCols = cols;
     }
-    final contentWidth = (maxChars * 7.2 + 24.0).clamp(280.0, 2200.0);
+    final contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
 
     final horizontalView = SingleChildScrollView(
       scrollDirection: Axis.horizontal,

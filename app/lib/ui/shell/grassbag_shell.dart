@@ -1166,7 +1166,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                Expanded(
+                                Flexible(
                                   child: GestureDetector(
                                     behavior: HitTestBehavior.opaque,
                                     onTap: () => unawaited(showAppUpdateSheet(context, ref)),
@@ -1579,6 +1579,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTap: () => _plusOpenNotifier.value = false,
+                        onPanStart: (_) => _plusOpenNotifier.value = false,
                         child: const SizedBox.expand(),
                       ),
                     );
@@ -1710,7 +1711,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                   },
                   onHorizontalDragEnd: (d) {
                     final vel = d.velocity.pixelsPerSecond.dx / _phoneDrawerWidth;
-                    if (vel < -0.5 || _drawerCtrl.value < 0.65) {
+                    if (vel > 0.5) {
+                      _animateDrawerTo(1.0, velocity: vel);
+                    } else if (vel < -0.5 || _drawerCtrl.value < 0.65) {
                       _animateDrawerTo(0.0, velocity: vel);
                     } else {
                       _animateDrawerTo(1.0, velocity: vel);
@@ -1760,7 +1763,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                             },
                             onHorizontalDragEnd: (d) {
                               final vel = d.velocity.pixelsPerSecond.dx / _phoneDrawerWidth;
-                              if (vel < -0.5 || _drawerCtrl.value < 0.65) {
+                              if (vel > 0.5) {
+                                _animateDrawerTo(1.0, velocity: vel);
+                              } else if (vel < -0.5 || _drawerCtrl.value < 0.65) {
                                 _animateDrawerTo(0.0, velocity: vel);
                               } else {
                                 _animateDrawerTo(1.0, velocity: vel);
@@ -1794,7 +1799,24 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             },
           );
 
-    return CallbackShortcuts(
+    return ListenableBuilder(
+      listenable: Listenable.merge([_drawerCtrl, _plusOpenNotifier]),
+      builder: (context, child) {
+        final hasOpenOverlay = (!isTab && _drawerCtrl.value > 0.05) || _plusOpenNotifier.value;
+        return PopScope(
+          canPop: !hasOpenOverlay,
+          onPopInvokedWithResult: (didPop, _) {
+            if (didPop) return;
+            if (!isTab && _drawerCtrl.value > 0.05) {
+              _closePhoneDrawer();
+            } else if (_plusOpenNotifier.value) {
+              _plusOpenNotifier.value = false;
+            }
+          },
+          child: child!,
+        );
+      },
+      child: CallbackShortcuts(
       bindings: <ShortcutActivator, VoidCallback>{
         const SingleActivator(LogicalKeyboardKey.keyN, meta: true): () => ctrl.startNewChat(),
         const SingleActivator(LogicalKeyboardKey.keyN, control: true): () => ctrl.startNewChat(),
@@ -1824,6 +1846,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             ],
           ),
         ),
+      ),
       ),
     );
   }
@@ -2361,7 +2384,7 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
             20,
             topPad,
             20,
-            restingBottomReserve,
+            math.max(restingBottomReserve, kbInset + compH + 32.0),
           ),
           child: ConstrainedBox(
             constraints: BoxConstraints(
@@ -2399,7 +2422,7 @@ class _KeyboardAwareToastSlot extends StatelessWidget {
       builder: (_, plusOpen, __) => ValueListenableBuilder<double>(
         valueListenable: composerHeightNotifier,
         builder: (_, compH, __) => GrassBagToastOverlay(
-          bottomOffset: baseComposerBottom + compH + (plusOpen ? 268.0 : 16.0),
+          bottomOffset: baseComposerBottom + compH + (plusOpen ? 308.0 : 16.0),
           includeKeyboardInset: true,
         ),
       ),

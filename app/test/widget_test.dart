@@ -68,7 +68,7 @@ void main() {
       expect(find.text('标准模式'), findsOneWidget);
       expect(find.text('工作区内修改'), findsOneWidget);
 
-      // Open '+' GlassPopover and verify NO WebUI tile inside '+' panel + GlassSwitch present!
+      // Open '+' GlassPopover and verify NO WebUI tile inside '+' panel + GrassBagGlassSwitch present!
       await tester.tap(find.byKey(const ValueKey('composer-plus-btn')));
       await tester.pumpAndSettle();
       expect(find.text('相册'), findsOneWidget);
@@ -76,7 +76,7 @@ void main() {
       expect(find.text('文件'), findsOneWidget);
       expect(find.text('终端'), findsOneWidget);
       expect(find.text('官方网页版'), findsNothing);
-      expect(find.byType(GlassSwitch), findsOneWidget);
+      expect(find.byType(GrassBagGlassSwitch), findsOneWidget);
 
       // Dismiss '+' GlassPopover by tapping outside barrier
       await tester.tapAt(const Offset(200, 120));
@@ -197,8 +197,8 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('外观与主题'));
       await tester.pumpAndSettle();
-      expect(find.byType(GlassSwitch), findsOneWidget);
-      expect(find.byType(GlassSegmentedControl), findsOneWidget);
+      expect(find.byType(GrassBagGlassSwitch), findsOneWidget);
+      expect(find.byType(GrassBagSegmentedControl), findsOneWidget);
     },
   );
 
@@ -232,13 +232,13 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey('composer-plus-btn')));
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(GlassSwitch));
+      await tester.tap(find.byType(GrassBagGlassSwitch));
       for (int i = 0; i < 12; i++) {
         await tester.pump(const Duration(milliseconds: 40));
       }
       expect(find.text('已开启计划模式'), findsOneWidget);
 
-      await tester.tap(find.byType(GlassSwitch));
+      await tester.tap(find.byType(GrassBagGlassSwitch));
       for (int i = 0; i < 12; i++) {
         await tester.pump(const Duration(milliseconds: 40));
       }
@@ -435,7 +435,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(firedAction, 'ping');
 
-    await tester.tap(find.byType(GlassSwitch).first);
+    await tester.tap(find.byType(GrassBagGlassSwitch).first);
     await tester.pumpAndSettle();
     await tester.tap(find.text('保存配置（有未保存改动）'));
     await tester.pumpAndSettle();
@@ -2408,7 +2408,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
-      expect(find.byType(CupertinoSlider), findsOneWidget);
+      expect(find.byType(GrassBagGlassSlider), findsOneWidget);
 
       // 5) No-op Schemastery mutation returns empty ops (protecting masked secrets)
       final ops = computeSchemasteryMutationOps(
@@ -2717,6 +2717,148 @@ void main() {
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 1));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'v18 Controls & UX polish: GrassBagGlassSwitch, full-row tile toggle, SegmentedControl, Slider, ConfirmDialog & offline attachment retention',
+    (tester) async {
+      // 1) GrassBagGlassSwitch tap + drag + GrassBagListTile full-row tap + simultaneous trailing & chevron
+      var switched = false;
+      var segIdx = 0;
+      var sliderVal = 0.25;
+      bool? dialogRes;
+
+      await tester.pumpWidget(
+        ProviderScope(
+          child: MaterialApp(
+            theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+            home: StatefulBuilder(
+              builder: (ctx, setLocal) => Scaffold(
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    GrassBagGroupedSection(
+                      children: [
+                        GrassBagListTile(
+                          title: const Text('深色模式开关测试'),
+                          trailing: GrassBagGlassSwitch(
+                            value: switched,
+                            tier: GrassBagGlassTier.liquid,
+                            onChanged: (v) => setLocal(() => switched = v),
+                          ),
+                        ),
+                        GrassBagListTile(
+                          title: const Text('账号详情入口'),
+                          trailing: const Text('已登录'),
+                          showChevron: true,
+                          onTap: () {},
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    GrassBagSegmentedControl(
+                      labels: const ['液态', '磨砂', '纯色'],
+                      selectedIndex: segIdx,
+                      tier: GrassBagGlassTier.liquid,
+                      onSelected: (i) => setLocal(() => segIdx = i),
+                    ),
+                    const SizedBox(height: 8),
+                    // 1-item safety: must render cleanly with zero division-by-zero
+                    GrassBagSegmentedControl(
+                      labels: const ['唯一选项'],
+                      selectedIndex: 0,
+                      tier: GrassBagGlassTier.liquid,
+                      onSelected: (_) {},
+                    ),
+                    const SizedBox(height: 12),
+                    GrassBagGlassSlider(
+                      value: sliderVal,
+                      min: 0.0,
+                      max: 1.0,
+                      divisions: 4,
+                      onChanged: (v) => setLocal(() => sliderVal = v),
+                    ),
+                    const SizedBox(height: 12),
+                    GrassBagPrimaryGlassButton(
+                      label: '打开确认框',
+                      tier: GrassBagGlassTier.liquid,
+                      onTap: () async {
+                        dialogRes = await showGrassBagConfirmDialog(
+                          ctx,
+                          title: '重建容器？',
+                          message: '将重新校验并刷新本机环境。',
+                          confirmLabel: '开始重建',
+                          isDestructive: true,
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Full-row tap on title toggles trailing GrassBagGlassSwitch automatically!
+      await tester.tap(find.text('深色模式开关测试'));
+      await tester.pumpAndSettle();
+      expect(switched, isTrue);
+
+      // Direct switch tap toggles back off
+      await tester.tap(find.byType(GrassBagGlassSwitch));
+      await tester.pumpAndSettle();
+      expect(switched, isFalse);
+
+      // Horizontal drag right turns switch back on
+      await tester.drag(find.byType(GrassBagGlassSwitch), const Offset(36, 0));
+      await tester.pumpAndSettle();
+      expect(switched, isTrue);
+
+      // Trailing text AND chevron render together on GrassBagListTile
+      expect(find.text('已登录'), findsOneWidget);
+      expect(find.byIcon(CupertinoIcons.chevron_right), findsOneWidget);
+
+      // Segmented control switches selection smoothly
+      await tester.tap(find.text('纯色'));
+      await tester.pumpAndSettle();
+      expect(segIdx, 2);
+
+      // Glass slider drags cleanly to max
+      await tester.drag(find.byType(GrassBagGlassSlider), const Offset(240, 0));
+      await tester.pumpAndSettle();
+      expect(sliderVal, greaterThan(0.5));
+
+      // Sculpted confirm dialog renders clear Cancel & Destructive Confirm buttons
+      await tester.tap(find.text('打开确认框'));
+      await tester.pumpAndSettle();
+      expect(find.text('重建容器？'), findsOneWidget);
+      expect(find.text('取消'), findsOneWidget);
+      expect(find.text('开始重建'), findsOneWidget);
+      await tester.tap(find.text('开始重建'));
+      await tester.pumpAndSettle();
+      expect(dialogRes, isTrue);
+
+      // 2) Offline sendPrompt must NOT silently discard pending attachments
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final ctrl = container.read(appProvider.notifier);
+      ctrl.addPendingAttachment(
+        const ComposerAttachment(
+          id: 'att-offline-1',
+          name: 'spec.md',
+          mimeType: 'text/markdown',
+          sizeBytes: 2048,
+        ),
+      );
+      expect(container.read(appProvider).pendingAttachments.length, 1);
+      await ctrl.sendPrompt('离线发送测试');
+      expect(container.read(appProvider).pendingAttachments.length, 1);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 6));
       expect(tester.takeException(), isNull);
     },
   );

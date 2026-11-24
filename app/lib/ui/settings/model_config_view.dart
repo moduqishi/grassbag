@@ -1660,11 +1660,11 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     });
   }
 
-  void _addCustomModel() {
+  bool _addCustomModel() {
     final id = _newModelIdCtrl.text.trim();
     if (id.isEmpty) {
       setState(() => _errorMsg = '请先填写模型 ID，例如 gpt-4.1 或 claude-sonnet-4-5');
-      return;
+      return false;
     }
     final parsedCtx = int.tryParse(_newModelCtxCtrl.text.trim()) ?? _newModelCtx;
     final parsedMaxTok = int.tryParse(_newModelMaxTokCtrl.text.trim()) ?? _newModelMaxTok;
@@ -1672,7 +1672,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     final safeMaxTok = parsedMaxTok > 0 ? parsedMaxTok : 16384;
     if (safeMaxTok > safeCtx) {
       setState(() => _errorMsg = '最大输出 Token ($safeMaxTok) 不能大于上下文窗口 ($safeCtx)');
-      return;
+      return false;
     }
     final isEditing = _editingModelIndex != null &&
         _editingModelIndex! >= 0 &&
@@ -1683,7 +1683,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           );
       if (duplicate) {
         setState(() => _errorMsg = '模型 ID「$id」已存在于当前渠道列表中');
-        return;
+        return false;
       }
     }
     final name = _newModelNameCtrl.text.trim().isEmpty ? id : _newModelNameCtrl.text.trim();
@@ -1726,6 +1726,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _newModelIdCtrl.clear();
       _newModelNameCtrl.clear();
     });
+    return true;
   }
 
   Future<void> _save() async {
@@ -1750,7 +1751,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       }
     }
     if (_showAddModel && _newModelIdCtrl.text.trim().isNotEmpty) {
-      _addCustomModel();
+      if (!_addCustomModel()) return;
     }
     if (widget.isCustomNew && _models.isEmpty) {
       setState(() => _errorMsg = '自定义中转站请至少添加或自动拉取 1 个模型后再保存');
@@ -3024,7 +3025,6 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
               trailing: GrassBagGlassSwitch(
                 value: _setDefault,
                 tier: tier,
-                activeColor: t.primary,
                 onChanged: (v) => setState(() => _setDefault = v),
               ),
             ),

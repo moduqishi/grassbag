@@ -595,24 +595,34 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
                         ),
                         const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                '信任自签名 HTTPS 证书（Tailscale / Caddy / 内网）',
-                                style: TextStyle(fontSize: 12, color: t.text2),
-                              ),
+                        GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setState(() {
+                            _allowBadCerts = !_allowBadCerts;
+                            _diagnosis = null;
+                          }),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    '信任自签名 HTTPS 证书（Tailscale / Caddy / 内网）',
+                                    style: TextStyle(fontSize: 12, color: t.text2),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                GrassBagGlassSwitch(
+                                  value: _allowBadCerts,
+                                  tier: slice.glassTier,
+                                  onChanged: (v) => setState(() {
+                                    _allowBadCerts = v;
+                                    _diagnosis = null;
+                                  }),
+                                ),
+                              ],
                             ),
-                            GrassBagGlassSwitch(
-                              value: _allowBadCerts,
-                              tier: slice.glassTier,
-                              activeColor: t.primary,
-                              onChanged: (v) => setState(() {
-                                _allowBadCerts = v;
-                                _diagnosis = null;
-                              }),
-                            ),
-                          ],
+                          ),
                         ),
                       ],
                     ),
@@ -1164,7 +1174,7 @@ class _OsChip extends StatelessWidget {
           style: TextStyle(
             fontSize: 11,
             fontWeight: FontWeight.w600,
-            color: selected ? const Color(0xFFFFFFFF) : t.text2,
+            color: selected ? t.onPrimary : t.text2,
           ),
         ),
       ),

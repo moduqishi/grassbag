@@ -1411,6 +1411,8 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
               insideGlass: true,
               onTap: () {
                 Clipboard.setData(ClipboardData(text: fullOut));
+                HapticFeedback.selectionClick();
+                ref.read(appProvider.notifier).showToast('已复制完整输出', tone: ToastTone.ok);
                 Navigator.of(ctx).pop();
               },
             ),
@@ -3809,7 +3811,11 @@ class _AssistantBodyState extends State<_AssistantBody>
                         ),
                         const SizedBox(height: 1.5),
                         Text(
-                          '${item['note'] ?? '生成产物'} · ${item['size'] ?? ''}',
+                          () {
+                            final note = (item['note'] ?? '生成产物').toString().trim();
+                            final size = (item['size'] ?? '').toString().trim();
+                            return size.isEmpty ? note : '$note · $size';
+                          }(),
                           style: TextStyle(
                             fontSize: 11.5,
                             fontFeatures: const [FontFeature.tabularFigures()],
@@ -3892,6 +3898,7 @@ class _AssistantBodyState extends State<_AssistantBody>
                       : CupertinoIcons.hand_thumbsdown,
                   label: '踩',
                   active: widget.feedback == 'down',
+                  warnActive: true,
                   onTap: () => widget.onFeedback('down'),
                 ),
                 if (widget.usage != null &&
@@ -4600,6 +4607,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   final ScrollController _hCtrl = ScrollController();
   bool _copied = false;
   bool _softWrap = false;
+  bool _userToggled = false;
   late bool _expanded;
 
   @override
@@ -4613,7 +4621,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   @override
   void didUpdateWidget(covariant _FencedCodeBlock oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if ((widget.isStreaming || widget.initiallyExpanded) && !_expanded) {
+    if (!_userToggled && (widget.isStreaming || widget.initiallyExpanded) && !_expanded) {
       _expanded = true;
     }
   }
@@ -4743,7 +4751,10 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                       const Spacer(),
                       if (isLong) ...[
                         GrassBagSpringTap(
-                          onTap: () => setState(() => _expanded = !_expanded),
+                          onTap: () => setState(() {
+                            _userToggled = true;
+                            _expanded = !_expanded;
+                          }),
                           child: Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                             child: Text(
@@ -4767,7 +4778,9 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
-                              color: _softWrap ? t.primaryHi : const Color(0xFF94A3B8),
+                              color: _softWrap
+                                  ? GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi
+                                  : const Color(0xFF94A3B8),
                             ),
                           ),
                         ),
@@ -4825,7 +4838,10 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                 SelectionContainer.disabled(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: () => setState(() => _expanded = true),
+                    onTap: () => setState(() {
+                      _userToggled = true;
+                      _expanded = true;
+                    }),
                     child: Container(
                       padding: const EdgeInsets.symmetric(vertical: 8),
                       decoration: BoxDecoration(
@@ -4903,17 +4919,21 @@ class _QuietReplyAction extends StatelessWidget {
     required this.label,
     required this.onTap,
     this.active = false,
+    this.warnActive = false,
   });
 
   final IconData icon;
   final String label;
   final VoidCallback onTap;
   final bool active;
+  final bool warnActive;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final fg = active ? t.ok : t.text3;
+    final activeFg = warnActive ? t.warn : t.ok;
+    final activeBg = warnActive ? t.warnSoft : t.okSoft;
+    final fg = active ? activeFg : t.text3;
     return GrassBagSpringTap(
       onTap: onTap,
       pressedScale: 0.92,
@@ -4923,7 +4943,7 @@ class _QuietReplyAction extends StatelessWidget {
         curve: Curves.easeOutCubic,
         padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
         decoration: BoxDecoration(
-          color: active ? t.okSoft : t.fill1.withValues(alpha: t.isDark ? 0.08 : 0.06),
+          color: active ? activeBg : t.fill1.withValues(alpha: t.isDark ? 0.08 : 0.06),
           borderRadius: BorderRadius.circular(999),
         ),
         child: Row(

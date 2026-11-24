@@ -19,11 +19,13 @@ bool _signInFlowLaunching = false;
 /// - On Android / iOS: initiates OAuth via DSH and opens the authorization flow **entirely inside GrassBag**
 ///   using an embedded WebView that auto-closes the instant DSH finishes storing credentials.
 /// - On Web / Desktop: opens in a new browser tab as standard.
-Future<void> launchDeepSeekSignInFlow(BuildContext context, WidgetRef ref) async {
-  if (_signInFlowLaunching) return;
+Future<void> launchDeepSeekSignInFlow(BuildContext context, [WidgetRef? ref]) async {
+  if (_signInFlowLaunching || !context.mounted) return;
   _signInFlowLaunching = true;
   try {
-    final ctrl = ref.read(appProvider.notifier);
+    // Always resolve via `context`'s ProviderScope so callers launching after popping a modal sheet
+    // never crash with `Cannot use "ref" after the widget was disposed`!
+    final ctrl = ProviderScope.containerOf(context, listen: false).read(appProvider.notifier);
     final useInAppWebView = !kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.android ||
             defaultTargetPlatform == TargetPlatform.iOS);

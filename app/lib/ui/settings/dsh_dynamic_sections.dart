@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
@@ -302,20 +301,9 @@ class DshGeneralSettingsView extends ConsumerWidget {
               trailing: GrassBagGlassSwitch(
                 value: state.autoFoldSteps,
                 tier: state.glassTier,
-                activeColor: t.ok,
                 onChanged: (v) => ctrl.setEngineFlags(autoFold: v),
               ),
             ),
-            if (GrassBagNativeBridge.instance.isAndroidNative && state.activeHost.isLocal)
-              GrassBagListTile(
-                title: const Text('使用系统网络代理'),
-                trailing: GrassBagGlassSwitch(
-                  value: state.useSystemProxy,
-                  tier: state.glassTier,
-                  activeColor: t.ok,
-                  onChanged: (v) => ctrl.setEngineFlags(proxy: v),
-                ),
-              ),
           ],
         ),
       ],
@@ -653,6 +641,8 @@ class DshPluginsSettingsView extends ConsumerWidget {
           plugins: s.plugins,
           dynamicCordis: s.dynamicCordis,
           glassTier: s.glassTier,
+          isDshConnected: s.isDshConnected,
+          activeHostName: s.activeHost.name,
         ),
       ),
     );
@@ -665,6 +655,14 @@ class DshPluginsSettingsView extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (!state.isDshConnected) ...[
+          _DshOfflineBannerCard(
+            hostName: state.activeHost.name,
+            tier: state.glassTier,
+            onRetry: () => ctrl.probeAndRefreshHost(state.activeHostId),
+          ),
+          const SizedBox(height: 14),
+        ],
         GrassBagPrimaryGlassButton(
           label: '打开插件市场与动态扩展中心',
           icon: CupertinoIcons.sparkles,

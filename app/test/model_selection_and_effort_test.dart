@@ -299,11 +299,14 @@ void main() {
       ],
     );
     await ctrl.switchHost(ctrl.state.localHost.id, savePreviousContext: false);
-    // Allow initial hydrate to finish
-    for (var i = 0; i < 30 && ctrl.state.connectionPhase != ConnectionPhase.connected; i++) {
+    // Allow initial hydrate to finish deterministically (wait for WS + settings namespaces)
+    for (var i = 0;
+        i < 40 &&
+            (ctrl.state.connectionPhase != ConnectionPhase.connected ||
+                ctrl.state.dshNamespaces.isEmpty);
+        i++) {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
-    await Future<void>.delayed(const Duration(milliseconds: 150));
 
     // 1. Model list is empty -> model selector MUST be empty (NOT stale deepseek-chat!)
     expect(ctrl.state.hasAvailableModels, false);

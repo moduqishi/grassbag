@@ -1022,7 +1022,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                         Expanded(
                                           child: Text(
                                             state.activeWorkspace.isEmpty
-                                                ? '暂未选择工作区，先在顶部选择文件夹后可用 @ 引用文件'
+                                                ? '暂未选择工作区，请先选择工作区后可用 @ 引用文件'
                                                 : '未找到匹配文件，可继续输入路径关键词',
                                             style: TextStyle(fontSize: 12, color: t.text3),
                                           ),
@@ -1260,30 +1260,30 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 child: GrassBagSecondaryGlassButton(
                                   label: '拒绝',
                                   height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                                  padding: const EdgeInsets.symmetric(horizontal: 6),
                                   tier: state.glassTier,
                                   insideGlass: true,
                                   destructive: true,
                                   onTap: () => ctrl.resolveApproval('deny'),
                                 ),
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: 6),
                               Expanded(
                                 child: GrassBagSecondaryGlassButton(
-                                  label: '本会话均允许',
+                                  label: '本会话允许',
                                   height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                                  padding: const EdgeInsets.symmetric(horizontal: 6),
                                   tier: state.glassTier,
                                   insideGlass: true,
                                   onTap: () => ctrl.resolveApproval('always'),
                                 ),
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(width: 6),
                               Expanded(
                                 child: GrassBagPrimaryGlassButton(
                                   label: '允许一次',
                                   height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                                  padding: const EdgeInsets.symmetric(horizontal: 6),
                                   tier: state.glassTier,
                                   insideGlass: true,
                                   onTap: () => ctrl.resolveApproval('allow'),
@@ -1483,80 +1483,87 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                 borderRadius: BorderRadius.circular(14),
                                                 border: Border.all(color: t.sep, width: 0.5),
                                               ),
-                                              child: Column(
-                                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                                children: [
-                                                  Text(
-                                                    '待发送队列 (${state.queuedMessages.length})',
-                                                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.text3),
-                                                  ),
-                                                  const SizedBox(height: 4),
-                                                  for (final q in state.queuedMessages)
-                                                    Padding(
-                                                      padding: const EdgeInsets.only(top: 3),
-                                                      child: Row(
-                                                        children: [
-                                                          Container(
-                                                            padding: const EdgeInsets.symmetric(
-                                                              horizontal: 6,
-                                                              vertical: 2,
-                                                            ),
-                                                            decoration: BoxDecoration(
-                                                              color: q.mode == 'steer'
-                                                                  ? t.primarySoft
-                                                                  : t.fill2,
-                                                              borderRadius: BorderRadius.circular(6),
-                                                            ),
-                                                            child: Text(
-                                                              q.mode == 'steer' ? '插话' : '排队',
-                                                              style: TextStyle(
-                                                                fontSize: 10,
-                                                                fontWeight: FontWeight.w600,
-                                                                color: q.mode == 'steer'
-                                                                    ? t.primary
-                                                                    : t.text2,
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(width: 6),
-                                                          Expanded(
-                                                            child: Text(
-                                                              q.text,
-                                                              maxLines: 1,
-                                                              overflow: TextOverflow.ellipsis,
-                                                              style: TextStyle(fontSize: 12.5, color: t.text),
-                                                            ),
-                                                          ),
-                                                          GestureDetector(
-                                                            behavior: HitTestBehavior.opaque,
-                                                            onTap: () => ctrl.promoteQueuedMessage(q.id),
-                                                            child: Padding(
-                                                              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-                                                              child: Text(
-                                                                '立即发',
-                                                                style: TextStyle(
-                                                                  fontSize: 11.5,
-                                                                  fontWeight: FontWeight.w600,
-                                                                  color: t.primary,
+                                              child: ConstrainedBox(
+                                                constraints: const BoxConstraints(maxHeight: 112),
+                                                child: SingleChildScrollView(
+                                                  physics: const BouncingScrollPhysics(),
+                                                  child: Column(
+                                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                                    mainAxisSize: MainAxisSize.min,
+                                                    children: [
+                                                      Text(
+                                                        '待发送队列 (${state.queuedMessages.length})',
+                                                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.text3),
+                                                      ),
+                                                      const SizedBox(height: 4),
+                                                      for (final q in state.queuedMessages)
+                                                        Padding(
+                                                          padding: const EdgeInsets.only(top: 3),
+                                                          child: Row(
+                                                            children: [
+                                                              Container(
+                                                                padding: const EdgeInsets.symmetric(
+                                                                  horizontal: 6,
+                                                                  vertical: 2,
+                                                                ),
+                                                                decoration: BoxDecoration(
+                                                                  color: q.mode == 'steer'
+                                                                      ? t.primarySoft
+                                                                      : t.fill2,
+                                                                  borderRadius: BorderRadius.circular(6),
+                                                                ),
+                                                                child: Text(
+                                                                  q.mode == 'steer' ? '插话' : '排队',
+                                                                  style: TextStyle(
+                                                                    fontSize: 10,
+                                                                    fontWeight: FontWeight.w600,
+                                                                    color: q.mode == 'steer'
+                                                                        ? t.primary
+                                                                        : t.text2,
+                                                                  ),
                                                                 ),
                                                               ),
-                                                            ),
-                                                          ),
-                                                          GestureDetector(
-                                                            behavior: HitTestBehavior.opaque,
-                                                            onTap: () => ctrl.removeQueuedMessage(q.id),
-                                                            child: SizedBox(
-                                                              width: 26,
-                                                              height: 26,
-                                                              child: Center(
-                                                                child: Icon(CupertinoIcons.xmark, size: 13, color: t.text3),
+                                                              const SizedBox(width: 6),
+                                                              Expanded(
+                                                                child: Text(
+                                                                  q.text,
+                                                                  maxLines: 1,
+                                                                  overflow: TextOverflow.ellipsis,
+                                                                  style: TextStyle(fontSize: 12.5, color: t.text),
+                                                                ),
                                                               ),
-                                                            ),
+                                                              GestureDetector(
+                                                                behavior: HitTestBehavior.opaque,
+                                                                onTap: () => ctrl.promoteQueuedMessage(q.id),
+                                                                child: Padding(
+                                                                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                                                                  child: Text(
+                                                                    '立即发',
+                                                                    style: TextStyle(
+                                                                      fontSize: 11.5,
+                                                                      fontWeight: FontWeight.w600,
+                                                                      color: t.primary,
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                              GestureDetector(
+                                                                behavior: HitTestBehavior.opaque,
+                                                                onTap: () => ctrl.removeQueuedMessage(q.id),
+                                                                child: SizedBox(
+                                                                  width: 26,
+                                                                  height: 26,
+                                                                  child: Center(
+                                                                    child: Icon(CupertinoIcons.xmark, size: 13, color: t.text3),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
                                                           ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                ],
+                                                        ),
+                                                    ],
+                                                  ),
+                                                ),
                                               ),
                                             ),
                                           ),
@@ -1610,8 +1617,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                           ),
                           LayoutBuilder(
                             builder: (ctx, rowBox) {
-                              final tightRow = rowBox.maxWidth < 316;
-                              final showInlineRing = !(tightRow && state.isStreaming && hasText);
+                              final hasExtraStreamActions = state.isStreaming && hasText;
+                              final tightRow = rowBox.maxWidth < (hasExtraStreamActions ? 364 : 316);
+                              final showInlineRing = !(tightRow && hasExtraStreamActions);
                               return Row(
                             children: [
                               // Crisp spring-animated '+' toggle button (rotates 45° into '×')
@@ -1746,7 +1754,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                             );
                                       }
                                       return GrassBagSpringTap(
-                                        onTap: pillTap,
+                                        onTap: () {
+                                          if (_plusOpen) _setPlusOpen(false);
+                                          pillTap();
+                                        },
                                         pressedScale: 0.94,
                                         haptic: true,
                                         child: Container(
@@ -1789,7 +1800,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   ),
                                                 ),
                                               ),
-                                              if (effortBadge != null) ...[
+                                              if (effortBadge != null &&
+                                                  !(tightRow && hasExtraStreamActions)) ...[
                                                 const SizedBox(width: 5),
                                                 Container(
                                                   padding: const EdgeInsets.symmetric(
@@ -1884,7 +1896,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               ],
 
                               // Isolated RepaintBoundary Context Ring (updates NEVER rebuild composer pill or TextField!)
-                              if (showInlineRing) const _ComposerContextRingButton(),
+                              if (showInlineRing)
+                                _ComposerContextRingButton(
+                                  onBeforeOpen: () {
+                                    if (_plusOpen) _setPlusOpen(false);
+                                  },
+                                ),
 
                               // Compact Stop orb remains accessible when streaming AND drafting follow-up text!
                               if (state.isStreaming && hasText) ...[
@@ -2372,43 +2389,49 @@ class _PlusDeckContent extends ConsumerWidget {
             },
           ),
           Divider(height: 0.5, indent: 42, color: t.sep),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
-            child: Row(
-              children: [
-                GrassBagSquircleIcon(
-                  icon: CupertinoIcons.list_bullet_indent,
-                  color: t.dusk,
-                  size: 30,
-                  iconSize: 15,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '计划模式',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500,
-                          color: t.text,
-                        ),
-                      ),
-                      Text(
-                        '先规划步骤再动手执行',
-                        style: TextStyle(fontSize: 11.5, color: t.text3),
-                      ),
-                    ],
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () {
+              HapticFeedback.lightImpact();
+              ctrl.setPlanMode(!slice.planMode);
+            },
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
+              child: Row(
+                children: [
+                  GrassBagSquircleIcon(
+                    icon: CupertinoIcons.list_bullet_indent,
+                    color: t.dusk,
+                    size: 30,
+                    iconSize: 15,
                   ),
-                ),
-                GrassBagGlassSwitch(
-                  value: slice.planMode,
-                  tier: slice.glassTier,
-                  activeColor: t.ok,
-                  onChanged: ctrl.setPlanMode,
-                ),
-              ],
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '计划模式',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                            color: t.text,
+                          ),
+                        ),
+                        Text(
+                          '先规划步骤再动手执行',
+                          style: TextStyle(fontSize: 11.5, color: t.text3),
+                        ),
+                      ],
+                    ),
+                  ),
+                  GrassBagGlassSwitch(
+                    value: slice.planMode,
+                    tier: slice.glassTier,
+                    onChanged: ctrl.setPlanMode,
+                  ),
+                ],
+              ),
             ),
           ),
         ],
@@ -2790,7 +2813,9 @@ class _CordisRunTakeoverCard extends StatelessWidget {
 /// Isolated context-pressure ring button so `contextPct` ticks during streaming
 /// repaint ONLY this 19×19 ring inside a `RepaintBoundary` and NEVER rebuild `ChatComposerDock`!
 class _ComposerContextRingButton extends ConsumerWidget {
-  const _ComposerContextRingButton();
+  const _ComposerContextRingButton({this.onBeforeOpen});
+
+  final VoidCallback? onBeforeOpen;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -2810,7 +2835,10 @@ class _ComposerContextRingButton extends ConsumerWidget {
         Tooltip(
           message: '上下文占用 $pctInt%（点击查看与精简）',
           child: GrassBagSpringTap(
-            onTap: () => showContextSheet(context, ref),
+            onTap: () {
+              onBeforeOpen?.call();
+              showContextSheet(context, ref);
+            },
             pressedScale: 0.88,
             haptic: true,
             child: Container(

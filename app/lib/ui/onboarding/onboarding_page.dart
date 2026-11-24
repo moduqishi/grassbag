@@ -180,7 +180,14 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
         localReady || remoteConnected || slice.connectionPhase == ConnectionPhase.connected;
     final modelReady = slice.routableCount > 0;
 
-    return Scaffold(
+    return PopScope(
+      canPop: _currentPage == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _currentPage > 0) {
+          _goToPage(_currentPage - 1);
+        }
+      },
+      child: Scaffold(
       backgroundColor: t.bgSolid,
       resizeToAvoidBottomInset: true,
       body: Stack(
@@ -360,6 +367,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
             ),
           ),
         ],
+      ),
       ),
     );
   }
@@ -834,7 +842,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                   child: Icon(
                     allReady ? CupertinoIcons.checkmark_alt : CupertinoIcons.sparkles,
                     size: 36,
-                    color: Colors.white,
+                    color: allReady ? Colors.white : t.onPrimary,
                   ),
                 ),
               ),

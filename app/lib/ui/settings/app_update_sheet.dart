@@ -432,7 +432,15 @@ class AppAboutAndUpdateView extends ConsumerWidget {
                 if (s.hasAppUpdate) {
                   unawaited(showAppUpdateSheet(context, ref));
                 } else if (!s.checkingAppUpdate) {
-                  unawaited(ctrl.checkForAppUpdate(manual: true));
+                  unawaited(() async {
+                    final res = await ctrl.checkForAppUpdate(manual: true);
+                    if (context.mounted &&
+                        res.ok &&
+                        res.release != null &&
+                        ref.read(appProvider).hasAppUpdate) {
+                      await showAppUpdateSheet(context, ref);
+                    }
+                  }());
                 }
               },
             ),

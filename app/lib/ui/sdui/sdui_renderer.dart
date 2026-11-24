@@ -430,11 +430,15 @@ class SduiNodeRenderer extends StatelessWidget {
     final path = node['path']?.toString() ?? 'diff';
     final diff = node['diff']?.toString() ?? '';
     final lines = diff.split('\n');
-    var maxChars = 40;
+    var maxCols = 40;
     for (final l in lines) {
-      if (l.length > maxChars) maxChars = l.length;
+      var cols = 0;
+      for (final cu in l.codeUnits) {
+        cols += cu > 0xFF ? 2 : 1;
+      }
+      if (cols > maxCols) maxCols = cols;
     }
-    final contentWidth = (maxChars * 7.2 + 24.0).clamp(280.0, 2200.0);
+    final contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
 
     return RepaintBoundary(
       child: ClipRSuperellipse(

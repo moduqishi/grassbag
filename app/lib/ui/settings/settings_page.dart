@@ -1598,7 +1598,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                           ? _buildDioramaPills(t, state, tierHint)
                           : AdaptiveLiquidGlassLayer(
                               settings: GrassBagGlassConfig.surfaceSettings(t, state.glassTier)
-                                  .copyWith(blur: 4.0, shadow: const []),
+                                  .copyWith(shadow: const []),
                               quality: GrassBagGlassConfig.chromeQualityFor(state.glassTier),
                               blendAmount: 0.0,
                               child: _buildDioramaPills(t, state, tierHint),
@@ -2802,25 +2802,32 @@ class _HostDetailSection extends ConsumerWidget {
                   ),
                   title: const Text('容器启动器模式'),
                   subtitle: const Text('高速模式启动快 8 倍；如真机受内核限制可切换 PRoot 兼容模式'),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        () {
-                          final configuredProot =
-                              rt.configuredExecutorMode.startsWith('proot');
-                          final fellBackToProot = !configuredProot &&
-                              rt.engineRunning &&
-                              rt.executorMode.startsWith('proot');
-                          if (configuredProot) return '兼容 (PRoot)';
-                          if (fellBackToProot) return '高速 (当前回退 PRoot)';
-                          return '高速 (tawcroot)';
-                        }(),
-                        style: TextStyle(fontSize: 12.5, color: t.text3),
-                      ),
-                      const SizedBox(width: 4),
-                      Icon(CupertinoIcons.chevron_right, size: 13.5, color: t.text3),
-                    ],
+                  trailing: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 148),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            () {
+                              final configuredProot =
+                                  rt.configuredExecutorMode.startsWith('proot');
+                              final fellBackToProot = !configuredProot &&
+                                  rt.engineRunning &&
+                                  rt.executorMode.startsWith('proot');
+                              if (configuredProot) return '兼容 (PRoot)';
+                              if (fellBackToProot) return '高速 (回退 PRoot)';
+                              return '高速 (tawcroot)';
+                            }(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 12.5, color: t.text3),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(CupertinoIcons.chevron_right, size: 13.5, color: t.text3),
+                      ],
+                    ),
                   ),
                   onTap: () {
                     final isProot = rt.configuredExecutorMode.startsWith('proot');
@@ -2903,7 +2910,6 @@ class _HostDetailSection extends ConsumerWidget {
                   trailing: GrassBagGlassSwitch(
                     value: appState.useSystemProxy,
                     tier: tier,
-                    activeColor: t.primary,
                     onChanged: (v) => ctrl.setEngineFlags(proxy: v),
                   ),
                 ),
@@ -3473,7 +3479,6 @@ class _HostDetailSection extends ConsumerWidget {
               trailing: GrassBagGlassSwitch(
                 value: host.allowBadCertificates,
                 tier: tier,
-                activeColor: t.primary,
                 onChanged: (v) => ctrl.setHostAllowBadCertificates(host.id, v),
               ),
             ),
@@ -4019,7 +4024,11 @@ class _EngineLogsConsole extends ConsumerWidget {
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     child: Text(
                       '刷新',
-                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi,
+                      ),
                     ),
                   ),
                 ),

@@ -15,6 +15,7 @@ import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../web/deepseek_signin_page.dart';
 import '../web/remote_web_login_page.dart';
+import 'qr_pair_scanner_page.dart';
 import 'remote_host_connect_card.dart';
 
 /// Root navigator key used by [GrassBagGlobalToastHost] so toasts tapped above
@@ -2829,19 +2830,66 @@ void showHostQuickSheet(
               ),
             ],
             const SizedBox(height: 12),
-            GrassBagPrimaryGlassButton(
-              label: '连接新远程设备',
-              icon: CupertinoIcons.plus_circle_fill,
-              tier: state.glassTier,
-              insideGlass: true,
-              onTap: () {
-                Navigator.of(ctx).pop();
-                Future<void>.delayed(const Duration(milliseconds: 160), () {
-                  if (outerCtx.mounted) {
-                    showQuickRemoteConnectSheet(outerCtx);
-                  }
-                });
-              },
+            Row(
+              children: [
+                if (!kIsWeb &&
+                    (defaultTargetPlatform == TargetPlatform.android ||
+                        defaultTargetPlatform == TargetPlatform.iOS ||
+                        defaultTargetPlatform == TargetPlatform.macOS)) ...[
+                  Expanded(
+                    child: GrassBagPrimaryGlassButton(
+                      label: '扫码连接',
+                      icon: CupertinoIcons.qrcode_viewfinder,
+                      tier: state.glassTier,
+                      insideGlass: true,
+                      onTap: () async {
+                        Navigator.of(ctx).pop();
+                        await Future<void>.delayed(const Duration(milliseconds: 140));
+                        if (!outerCtx.mounted) return;
+                        final raw = await Navigator.of(outerCtx).push<String>(
+                          GrassBagPageRoute<String>(
+                            builder: (_) => const QrPairScannerPage(),
+                          ),
+                        );
+                        if (!outerCtx.mounted || raw == null || raw.trim().isEmpty) return;
+                        final parsed = parseRemoteHostInput(raw.trim());
+                        if (parsed == null) {
+                          ctrl.showToast('未识别到有效的 GrassBag 配对链接', tone: ToastTone.warn);
+                          return;
+                        }
+                        ctrl.showToast('已扫码识别「${parsed.suggestedName ?? parsed.address}」，正在接入…',
+                            tone: ToastTone.info);
+                        final outcome = await ctrl.connectRemoteInput(
+                          raw.trim(),
+                          name: parsed.suggestedName,
+                        );
+                        if (!outerCtx.mounted) return;
+                        if (!outcome.connected) {
+                          showQuickRemoteConnectSheet(outerCtx);
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                Expanded(
+                  child: GrassBagSecondaryGlassButton(
+                    label: '手动 / 发现设备',
+                    icon: CupertinoIcons.plus_circle_fill,
+                    tier: state.glassTier,
+                    insideGlass: true,
+                    accentForeground: true,
+                    onTap: () {
+                      Navigator.of(ctx).pop();
+                      Future<void>.delayed(const Duration(milliseconds: 160), () {
+                        if (outerCtx.mounted) {
+                          showQuickRemoteConnectSheet(outerCtx);
+                        }
+                      });
+                    },
+                  ),
+                ),
+              ],
             ),
             if (onOpenHostSettings != null) ...[
               const SizedBox(height: 8),

@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir, networkInterfaces } from 'node:os';
+import { homedir, hostname, networkInterfaces } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import {
@@ -8,6 +8,7 @@ import {
   Router,
   admitRequest,
   applyLoopbackCors,
+  lanCookieNameForPort,
   parseUrl,
   readRawBody,
   safeEqualString,
@@ -21,6 +22,8 @@ import { SessionNormalizer } from './normalizer.js';
 import { StreamHub } from './stream-hub.js';
 import { SduiRegistry } from './sdui.js';
 import { mountPhoneTools } from './phone-tools.js';
+import { buildQrPathData, encodeQrMatrix } from './qr-svg.js';
+import { renderPairingDashboardHtml } from './pairing-ui.js';
 import { detectDshVersion, registerMetaDomain } from './domains/meta.js';
 import { registerChatAndInteractionsDomain } from './domains/chat.js';
 import { registerWorkspaceDomain } from './domains/workspace.js';
@@ -29,6 +32,8 @@ import { registerSystemDomain } from './domains/system.js';
 export const name = 'gbridge';
 export const PREFIX = '/gbridge/v1';
 export const STREAM_PATH = `${PREFIX}/stream`;
+export const UI_PATH = '/gbridge/ui';
+export const PAIRING_API_PATH = '/api/gbridge/pairing';
 
 const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
@@ -54,12 +59,27 @@ let udsGenCounter = 0;
 let lanGenCounter = 0;
 let pidFileGenCounter = 0;
 
+function isLoopbackHost(rawHost) {
+  const h = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  return h === 'localhost' ||
+    h.endsWith('.localhost') ||
+    h === '::1' ||
+    h === '0:0:0:0:0:0:0:1' ||
+    h.startsWith('127.') ||
+    h.startsWith('::ffff:127.');
+}
+
+function getLanTokenFilePath() {
+  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
+  return { dshHome, tokenFile: join(dshHome, 'gbridge-lan-token') };
+}
+
 function resolveOrCreateLanToken(explicitToken) {
   if (typeof explicitToken === 'string' && explicitToken.trim().length >= 8) {
     return explicitToken.trim();
   }
-  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
-  const tokenFile = join(dshHome, 'gbridge-lan-token');
+  const { dshHome, tokenFile } = getLanTokenFilePath();
   try {
     if (existsSync(tokenFile)) {
       const saved = readFileSync(tokenFile, 'utf8').trim();
@@ -74,29 +94,85 @@ function resolveOrCreateLanToken(explicitToken) {
   }
 }
 
-function listLocalLanIpv4s() {
-  const preferred = [];
-  const fallback = [];
-  const virtualIfaceRe = /^(docker|br-|veth|utun|tun|tap|wg|virbr|vmnet|lo|awdl|llw)/i;
+function persistRotatedLanToken() {
+  const fresh = randomBytes(18).toString('base64url');
+  const { dshHome, tokenFile } = getLanTokenFilePath();
+  try {
+    mkdirSync(dshHome, { recursive: true, mode: 0o700 });
+    writeFileSync(tokenFile, `${fresh}\n`, { mode: 0o600 });
+  } catch {}
+  return fresh;
+}
+
+/**
+ * Enumerate reachable LAN & Tailscale IPv4 addresses sorted by recommendation priority.
+ */
+export function listReachableNetworkInterfaces() {
+  const lan = [];
+  const tailscale = [];
+  const other = [];
+  const skipIfaceRe = /^(docker|br-|veth|virbr|vmnet|lo|awdl|llw|anpi|bridge)/i;
+  const seen = new Set();
   try {
     const ifaces = networkInterfaces();
     for (const [ifaceName, addrs] of Object.entries(ifaces)) {
-      if (virtualIfaceRe.test(ifaceName)) continue;
+      if (skipIfaceRe.test(ifaceName)) continue;
       for (const a of addrs || []) {
         if (!a || a.family !== 'IPv4' || a.internal || !a.address) continue;
-        if (a.address.startsWith('169.254.')) continue; // skip APIPA link-local
-        if (a.address.startsWith('192.168.') || a.address.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(a.address)) {
-          preferred.push(a.address);
-        } else {
-          fallback.push(a.address);
+        const ip = a.address;
+        if (seen.has(ip) || ip.startsWith('169.254.') || ip.startsWith('127.')) continue;
+        seen.add(ip);
+        const isTailscale = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip) || /^tailscale/i.test(ifaceName);
+        const isPrivate = ip.startsWith('192.168.') || ip.startsWith('10.') || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+        if (isTailscale) {
+          tailscale.push({ iface: ifaceName, ip, label: 'Tailscale', kind: 'tailscale' });
+        } else if (isPrivate) {
+          const isWifi = /^(en0|wlan|wi-fi|wifi|wlp)/i.test(ifaceName);
+          lan.push({ iface: ifaceName, ip, label: isWifi ? 'Wi-Fi 局域网' : '局域网', kind: 'lan' });
+        } else if (!/^(utun|tun|tap|wg)/i.test(ifaceName)) {
+          other.push({ iface: ifaceName, ip, label: ifaceName, kind: 'other' });
         }
       }
     }
   } catch {}
-  return preferred.length > 0 ? preferred : fallback;
+  const combined = [...lan, ...tailscale, ...other];
+  return combined.map((item, idx) => ({ ...item, recommended: idx === 0 }));
 }
 
-function scheduleLanTeardown(listenKey, expectedGen) {
+function inspectWebServerBinding(ctx) {
+  const ws = ctx?.get?.('webServer');
+  const conn = ctx?.get?.('connection');
+  let host = ws?.host ?? null;
+  let port = Number(ws?.port || 0) || null;
+  if ((!host || !port) && ws?.url) {
+    try {
+      const u = new URL(ws.url);
+      if (!host) host = u.hostname;
+      if (!port && u.port) port = Number(u.port);
+    } catch {}
+  }
+  if ((!host || !port) && typeof ws?.server?.address === 'function') {
+    try {
+      const addr = ws.server.address();
+      if (addr && typeof addr === 'object') {
+        if (!host) host = addr.address;
+        if (!port) port = addr.port;
+      }
+    } catch {}
+  }
+  const loopback = isLoopbackHost(host);
+  const allowsRemote = Boolean(conn?.allowsRemoteAuthorities);
+  return {
+    available: Boolean(ws),
+    host: host || '127.0.0.1',
+    port,
+    isLoopback: loopback,
+    allowsRemote,
+    isRemotelyReachable: Boolean(ws && port && (!loopback || allowsRemote)),
+  };
+}
+
+function scheduleLanTeardown(listenKey, expectedGen, { immediate = false } = {}) {
   const entry = activeLanListeners.get(listenKey);
   if (!entry || entry.gen !== expectedGen) return;
   const closeNow = () => {
@@ -106,27 +182,68 @@ function scheduleLanTeardown(listenKey, expectedGen) {
     try { cur.server?.closeAllConnections?.(); } catch {}
     try { cur.server?.close(); } catch {}
   };
+  if (immediate) {
+    if (entry.closeTimer) {
+      clearTimeout(entry.closeTimer);
+      entry.closeTimer = null;
+    }
+    closeNow();
+    return;
+  }
   entry.closeTimer = setTimeout(closeNow, 5000);
   entry.closeTimer.unref?.();
 }
 
 /**
- * Standalone LAN HTTP + WebSocket bridge listener for DSH Desktop (which binds its own
- * webServer strictly to `127.0.0.1:0`). Reuses the live in-process `typertGateway` without
- * disturbing Desktop's internal loopback server or modifying `@deepseek-ai/dsh`.
+ * Build ordered candidate port list avoiding `avoidPorts` (e.g. DSH's own `webServer.port`),
+ * probing `preferredPort`, then `3081..3099`, and finally OS ephemeral port `0` so port
+ * conflicts NEVER happen!
+ */
+export function buildZeroConflictPortCandidates(preferredPort = 3081, avoidPorts = []) {
+  const avoid = new Set(
+    (Array.isArray(avoidPorts) ? avoidPorts : [avoidPorts])
+      .map((p) => Number(p))
+      .filter((p) => Number.isInteger(p) && p > 0),
+  );
+  const out = [];
+  const push = (p) => {
+    if (!Number.isInteger(p) || p < 0 || p > 65535) return;
+    if (p > 0 && avoid.has(p)) return;
+    if (!out.includes(p)) out.push(p);
+  };
+  if (preferredPort === 0) {
+    push(0);
+    return out;
+  }
+  push(preferredPort);
+  for (let p = 3081; p <= 3099; p++) push(p);
+  push(0);
+  return out;
+}
+
+/**
+ * Standalone zero-conflict LAN HTTP + WebSocket bridge listener for DSH Desktop (which binds its own
+ * webServer strictly to `127.0.0.1:0`). Reuses the live in-process `typertGateway` with 0ms startup,
+ * automatically avoids `avoidPorts` and falls back through `3081..3099 -> :0` on `EADDRINUSE`!
  */
 export function startLanBridgeListener(core, {
   host = '0.0.0.0',
   port = 3081,
+  avoidPorts = [],
   token,
   surface = 'desktop',
   logger = console,
+  getPairingSnapshot,
+  onListening,
 } = {}) {
   const bearerToken = resolveOrCreateLanToken(token);
-  const listenKey = `${host}:${port}`;
+  const preferredPort = Number.isFinite(Number(port)) && Number(port) >= 0 && Number(port) <= 65535
+    ? Number(port)
+    : 3081;
+  const listenKey = `${host}:${preferredPort}`;
   const myGen = ++lanGenCounter;
   const existing = activeLanListeners.get(listenKey);
-  if (existing) {
+  if (existing && existing.server?.listening) {
     if (existing.closeTimer) {
       clearTimeout(existing.closeTimer);
       existing.closeTimer = null;
@@ -136,11 +253,20 @@ export function startLanBridgeListener(core, {
     existing.bearerToken = bearerToken;
     existing.surface = surface;
     existing.logger = logger;
-    logger?.info?.(`[gbridge] LAN bridge hot-swapped on ${listenKey}`);
+    existing.getPairingSnapshot = getPairingSnapshot;
+    const bound = existing.server.address();
+    const boundPort = typeof bound === 'object' && bound ? bound.port : existing.boundPort;
+    logger?.info?.(`[gbridge] LAN bridge hot-swapped on ${host}:${boundPort}`);
+    onListening?.({ host, port: boundPort, preferredPort, conflictAvoided: boundPort !== preferredPort });
     return {
-      token: bearerToken,
-      address: () => existing.server?.address?.() ?? { address: host, port },
-      dispose: () => scheduleLanTeardown(listenKey, myGen),
+      get token() { return existing.bearerToken; },
+      setToken(nextToken) { existing.bearerToken = nextToken; },
+      address: () => existing.server?.address?.() ?? { address: host, port: boundPort },
+      isListening: () => Boolean(existing.server?.listening),
+      conflictAvoided: () => Boolean(existing.conflictAvoided),
+      error: () => existing.lastError,
+      ready: Promise.resolve({ host, port: boundPort, conflictAvoided: Boolean(existing.conflictAvoided) }),
+      dispose: (opts) => scheduleLanTeardown(listenKey, myGen, opts),
     };
   }
 
@@ -150,7 +276,12 @@ export function startLanBridgeListener(core, {
     bearerToken,
     surface,
     logger,
+    getPairingSnapshot,
     server: null,
+    boundPort: preferredPort,
+    preferredPort,
+    conflictAvoided: false,
+    lastError: null,
     closeTimer: null,
   };
 
@@ -169,6 +300,7 @@ export function startLanBridgeListener(core, {
       return;
     }
     const rawPath = parsedUrl.pathname;
+    const currentPort = entry.boundPort;
 
     // 1) Public unauthenticated LAN discovery probe (matching GrassBag LAN scanner).
     if (rawPath === '/plugins/events' && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -185,6 +317,8 @@ export function startLanBridgeListener(core, {
           hasGbridge: true,
           requiresAuth: true,
           bridgeVersion: entry.core.version,
+          hostName: hostname(),
+          port: currentPort,
         });
         res.write(`data: ${payload}\n\n`);
       }
@@ -192,16 +326,17 @@ export function startLanBridgeListener(core, {
       return;
     }
 
-    // 2) Root launch-token -> 30-day cookie exchange (GET /?token=... for 1-click launch URLs + POST /connect form without leaking token in URL/history).
-    if (rawPath === '/' || rawPath === '/connect') {
+    // 2) Root launch-token -> 30-day port-scoped cookie exchange + authorized pairing status / HTML dashboard
+    if (rawPath === '/' || rawPath === '/connect' || rawPath === UI_PATH) {
       const renderLoginHtml = (errMsg = '') =>
-        `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GrassBag 桌面端远程授权</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f5f7fb;color:#111827;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:20px}main{background:#fff;border-radius:20px;padding:24px;max-width:380px;width:100%;box-shadow:0 12px 32px rgba(0,0,0,.08)}h1{font-size:18px;margin:0 0 8px}p{font-size:13px;color:#6b7280;line-height:1.5;margin:0 0 16px}.err{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:10px;padding:9px 12px;font-size:12.5px;margin-bottom:12px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d1d5db;border-radius:12px;font-size:14px;margin-bottom:12px}button{width:100%;padding:12px;border:0;border-radius:12px;background:#111827;color:#fff;font-size:14px;font-weight:600;cursor:pointer}</style></head><body><main><h1>DeepSeek Harness 桌面端授权</h1><p>输入桌面端 GrassBag 连接插件显示的连接令牌（Token），授权后 30 天免填。</p>${errMsg ? `<div class="err">${errMsg}</div>` : ''}<form method="POST" action="/connect"><input name="token" placeholder="粘贴连接 Token" autocomplete="off" required><button type="submit">验证并授权连接</button></form></main></body></html>`;
+        `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GrassBag 桌面端远程授权</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f7f6;color:#0f172a;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:20px}main{background:#fff;border-radius:22px;padding:26px;max-width:390px;width:100%;box-shadow:0 16px 40px rgba(0,0,0,.08)}h1{font-size:18px;margin:0 0 8px}p{font-size:13px;color:#64748b;line-height:1.5;margin:0 0 16px}.err{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca;border-radius:10px;padding:9px 12px;font-size:12.5px;margin-bottom:12px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #cbd5e1;border-radius:12px;font-size:14px;margin-bottom:12px}button{width:100%;padding:12px;border:0;border-radius:12px;background:#0f766e;color:#fff;font-size:14px;font-weight:600;cursor:pointer}</style></head><body><main><h1>GrassBag 连接授权</h1><p>输入电脑端 GrassBag 连接插件显示的连接令牌（Token），或直接使用手机 GrassBag 扫描二维码秒连。</p>${errMsg ? `<div class="err">${errMsg}</div>` : ''}<form method="POST" action="/connect"><input name="token" placeholder="粘贴连接 Token" autocomplete="off" required><button type="submit">验证并授权连接</button></form></main></body></html>`;
 
       const issueCookieRedirect = () => {
         const cookieVal = signLanCookieValue(entry.bearerToken);
+        const cookieName = lanCookieNameForPort(currentPort);
         res.writeHead(303, {
-          'set-cookie': `gbridge-lan-auth=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
-          'location': '/',
+          'set-cookie': `${cookieName}=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
+          'location': rawPath === UI_PATH ? UI_PATH : '/',
           'cache-control': 'no-store',
         });
         res.end();
@@ -237,12 +372,26 @@ export function startLanBridgeListener(core, {
         issueCookieRedirect();
         return;
       }
-      const auth = admitRequest(req, { mode: 'lan', ctx: entry.core.gateway?.ctx ?? {}, bearerToken: entry.bearerToken });
+      const auth = admitRequest(req, {
+        mode: 'lan',
+        ctx: entry.core.gateway?.ctx ?? {},
+        bearerToken: entry.bearerToken,
+        lanPort: currentPort,
+      });
       if (auth.ok) {
+        if (rawPath === UI_PATH && typeof entry.getPairingSnapshot === 'function') {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+          });
+          res.end(renderPairingDashboardHtml(entry.getPairingSnapshot(), { apiPath: `${PREFIX}/pairing` }));
+          return;
+        }
         sendJson(res, 200, {
           ok: true,
           surface: entry.surface,
           bridgeVersion: entry.core.version,
+          port: currentPort,
           message: 'GrassBag Desktop LAN Bridge authorized',
         });
         return;
@@ -258,7 +407,7 @@ export function startLanBridgeListener(core, {
     // 3) All `/gbridge/v1/*` routes served via LAN bearer/cookie auth.
     if (rawPath === PREFIX || rawPath.startsWith(`${PREFIX}/`)) {
       Promise.resolve(
-        entry.core.handleHttp(req, res, { mode: 'lan', bearerToken: entry.bearerToken }),
+        entry.core.handleHttp(req, res, { mode: 'lan', bearerToken: entry.bearerToken, lanPort: currentPort }),
       ).catch((err) => {
         entry.logger?.warn?.('[gbridge] LAN request error:', err?.message || err);
       });
@@ -268,12 +417,6 @@ export function startLanBridgeListener(core, {
     sendError(res, new GbridgeError(404, 'gbridge/route_not_found', `unknown LAN route ${rawPath}`));
   });
 
-  server.on('error', (err) => {
-    if (!server.listening && activeLanListeners.get(listenKey) === entry) {
-      activeLanListeners.delete(listenKey);
-    }
-    entry.logger?.warn?.(`[gbridge] LAN bridge listener error on ${listenKey}:`, err?.message || err);
-  });
   server.on('upgrade', (req, socket, head) => {
     try {
       if (entry.core?.hub?._disposed) {
@@ -285,7 +428,11 @@ export function startLanBridgeListener(core, {
         rejectUpgrade(socket, 404, 'Not Found');
         return;
       }
-      entry.core.handleUpgrade(req, socket, head, { mode: 'lan', bearerToken: entry.bearerToken });
+      entry.core.handleUpgrade(req, socket, head, {
+        mode: 'lan',
+        bearerToken: entry.bearerToken,
+        lanPort: entry.boundPort,
+      });
     } catch {
       rejectUpgrade(socket, 400, 'Bad Request');
     }
@@ -294,25 +441,78 @@ export function startLanBridgeListener(core, {
   entry.server = server;
   activeLanListeners.set(listenKey, entry);
 
-  try {
-    server.listen(port, host, () => {
+  const candidates = buildZeroConflictPortCandidates(preferredPort, avoidPorts);
+  let candIdx = 0;
+
+  let resolveReady;
+  const ready = new Promise((resolve) => {
+    resolveReady = resolve;
+  });
+
+  const tryListenNext = () => {
+    if (candIdx >= candidates.length) {
+      if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
+      entry.lastError = 'no available port for LAN bridge';
+      entry.logger?.warn?.(`[gbridge] LAN bridge failed on all candidate ports`);
+      resolveReady({ host, port: null, error: entry.lastError });
+      return;
+    }
+    const candidatePort = candidates[candIdx++];
+    const onError = (err) => {
+      server.removeListener('listening', onBound);
+      const code = err?.code || '';
+      if ((code === 'EADDRINUSE' || code === 'EACCES') && candIdx < candidates.length) {
+        entry.logger?.info?.(`[gbridge] port ${candidatePort} busy (${code}), probing next conflict-free port...`);
+        tryListenNext();
+        return;
+      }
+      if (!server.listening && activeLanListeners.get(listenKey) === entry) {
+        activeLanListeners.delete(listenKey);
+      }
+      entry.lastError = err?.message || String(err);
+      entry.logger?.warn?.(`[gbridge] LAN bridge listen error on ${host}:${candidatePort}:`, entry.lastError);
+      resolveReady({ host, port: null, error: entry.lastError });
+    };
+    const onBound = () => {
+      server.removeListener('error', onError);
+      server.on('error', (err) => {
+        entry.lastError = err?.message || String(err);
+        entry.logger?.warn?.(`[gbridge] LAN bridge runtime error:`, entry.lastError);
+      });
       const bound = server.address();
-      const boundPort = typeof bound === 'object' && bound ? bound.port : port;
-      const ips = listLocalLanIpv4s();
-      const sampleIp = ips[0] || '127.0.0.1';
+      const actualPort = typeof bound === 'object' && bound ? bound.port : candidatePort;
+      entry.boundPort = actualPort;
+      entry.conflictAvoided = preferredPort > 0 && actualPort !== preferredPort;
+      entry.lastError = null;
+      const ifaces = listReachableNetworkInterfaces();
+      const sampleIp = ifaces[0]?.ip || '127.0.0.1';
       entry.logger?.info?.(
-        `[gbridge] Desktop LAN Bridge ready: http://${sampleIp}:${boundPort}/?token=${bearerToken}`,
+        `[gbridge] Zero-conflict LAN Bridge ready on :${actualPort}${entry.conflictAvoided ? ` (avoided busy :${preferredPort})` : ''}: http://${sampleIp}:${actualPort}/?token=${entry.bearerToken}`,
       );
-    });
-  } catch (err) {
-    activeLanListeners.delete(listenKey);
-    logger?.warn?.(`[gbridge] LAN bridge listen failed on ${listenKey}:`, err?.message || err);
-  }
+      onListening?.({ host, port: actualPort, preferredPort, conflictAvoided: entry.conflictAvoided });
+      resolveReady({ host, port: actualPort, conflictAvoided: entry.conflictAvoided });
+    };
+
+    server.once('error', onError);
+    server.once('listening', onBound);
+    try {
+      server.listen(candidatePort, host);
+    } catch (err) {
+      onError(err);
+    }
+  };
+
+  tryListenNext();
 
   return {
-    token: bearerToken,
-    address: () => server.address(),
-    dispose: () => scheduleLanTeardown(listenKey, myGen),
+    get token() { return entry.bearerToken; },
+    setToken(nextToken) { entry.bearerToken = nextToken; },
+    address: () => (server.listening ? server.address() : null),
+    isListening: () => Boolean(server.listening),
+    conflictAvoided: () => Boolean(entry.conflictAvoided),
+    error: () => entry.lastError,
+    ready,
+    dispose: (opts) => scheduleLanTeardown(listenKey, myGen, opts),
   };
 }
 
@@ -359,6 +559,9 @@ export function createGbridgeCore(ctx, options = {}) {
     logger,
   });
 
+  // Live pairing controller wired by `apply(ctx)` (and safely usable standalone in tests).
+  let pairingController = options.pairingController ?? null;
+
   const router = new Router();
   const deps = { ctx, gateway, hub, normalizer, sdui, bridgeVersion: PKG_VERSION, bootId, phoneState, isLocalAndroid };
 
@@ -366,6 +569,38 @@ export function createGbridgeCore(ctx, options = {}) {
   registerIsolated('chat', () => registerChatAndInteractionsDomain(router, deps), logger);
   registerIsolated('workspace', () => registerWorkspaceDomain(router, deps), logger);
   registerIsolated('system', () => registerSystemDomain(router, deps), logger);
+
+  // Pairing snapshot & live control endpoints under `/gbridge/v1/pairing`
+  router.get('/pairing', async (_req, res) => {
+    const snap = pairingController ? pairingController.getSnapshot() : {
+      v: 1,
+      bridgeVersion: PKG_VERSION,
+      dshVersion: detectDshVersion(ctx),
+      hostName: hostname(),
+      platform: process.platform,
+      arch: process.arch,
+      surface: isLocalAndroid ? 'android' : 'web',
+      mode: 'shared-webserver',
+      connectedClients: hub.clients.size,
+      endpoints: [],
+    };
+    sendJson(res, 200, snap);
+  }, { domain: 'meta' });
+
+  router.post('/pairing', async (req, res) => {
+    if (!pairingController) {
+      throw new GbridgeError(501, 'gbridge/pairing_unavailable', 'pairing controller not attached');
+    }
+    const raw = await readRawBody(req, 16384);
+    let body = {};
+    if (raw.length > 0) {
+      try { body = JSON.parse(raw.toString('utf8')); } catch {
+        throw new GbridgeError(400, 'gbridge/invalid_json', 'invalid JSON payload');
+      }
+    }
+    const next = await pairingController.applyAction(body);
+    sendJson(res, 200, next);
+  }, { domain: 'meta' });
 
   const myPidGen = ++pidFileGenCounter;
   if (capturedPidFile) {
@@ -380,7 +615,7 @@ export function createGbridgeCore(ctx, options = {}) {
     delete process.env.GBRIDGE_PHONE_TOKEN;
   }
 
-  const handleHttp = async (req, res, { mode = 'webServer', bearerToken } = {}) => {
+  const handleHttp = async (req, res, { mode = 'webServer', bearerToken, lanPort } = {}) => {
     try {
       applyLoopbackCors(req, res);
       if (req.method === 'OPTIONS') {
@@ -388,7 +623,7 @@ export function createGbridgeCore(ctx, options = {}) {
         res.end();
         return;
       }
-      const auth = admitRequest(req, { mode, ctx, bearerToken: bearerToken ?? capturedBridgeToken });
+      const auth = admitRequest(req, { mode, ctx, bearerToken: bearerToken ?? capturedBridgeToken, lanPort });
       if (!auth.ok) {
         sendError(res, new GbridgeError(auth.status, auth.code, auth.message));
         return;
@@ -417,9 +652,9 @@ export function createGbridgeCore(ctx, options = {}) {
     }
   };
 
-  const handleUpgrade = (req, socket, head, { mode = 'webServer', bearerToken } = {}) => {
+  const handleUpgrade = (req, socket, head, { mode = 'webServer', bearerToken, lanPort } = {}) => {
     try {
-      const auth = admitRequest(req, { mode, ctx, bearerToken: bearerToken ?? capturedBridgeToken });
+      const auth = admitRequest(req, { mode, ctx, bearerToken: bearerToken ?? capturedBridgeToken, lanPort });
       if (!auth.ok) {
         rejectUpgrade(socket, auth.status, auth.status === 401 ? 'Unauthorized' : 'Forbidden');
         return;
@@ -453,6 +688,7 @@ export function createGbridgeCore(ctx, options = {}) {
     sdui,
     phoneState,
     router,
+    setPairingController(ctrl) { pairingController = ctrl; },
     handleHttp,
     handleUpgrade,
     dispose,
@@ -462,8 +698,6 @@ export function createGbridgeCore(ctx, options = {}) {
 function scheduleUdsTeardown(socketPath, expectedGen) {
   const entry = activeUdsListeners.get(socketPath);
   if (!entry || entry.gen !== expectedGen) return;
-  // Defer actual UDS close briefly so Cordis plugin reloads hot-swap seamlessly without
-  // unlinking `bridge.sock` or dropping Android local clients.
   const closeNow = () => {
     const cur = activeUdsListeners.get(socketPath);
     if (!cur || cur.gen !== expectedGen) return;
@@ -573,31 +807,278 @@ function startUdsListener(core, socketPath, bearerToken, logger) {
 }
 
 /**
+ * Create the live zero-conflict Pairing & LAN Bridge controller shared by:
+ *   - `/api/gbridge/pairing` (DSH Desktop Electron IPC + `dsh web` HTTP)
+ *   - `/gbridge/v1/pairing` (GrassBag mobile API)
+ *   - `/gbridge/ui` (standalone browser QR dashboard)
+ *   - `/grassbag` slash command
+ */
+export function createPairingController(ctx, core, config = {}) {
+  const logger = ctx.logger ?? console;
+  const udsPath = core.udsPath;
+  const profileName = ctx.get?.('profileContext')?.name;
+  const isDesktopProfile = profileName === 'desktop';
+  const surface = udsPath ? 'android' : (isDesktopProfile ? 'desktop' : 'web');
+
+  const envLanPort = Number(process.env.GBRIDGE_LAN_PORT || 0);
+  const cfgPort = Number(config.lanPort ?? (envLanPort > 0 ? envLanPort : 3081));
+  let preferredPort = Number.isFinite(cfgPort) && cfgPort >= 0 && cfgPort <= 65535 ? cfgPort : 3081;
+  const lanHost = typeof config.lanHost === 'string' && config.lanHost.trim()
+    ? config.lanHost.trim()
+    : (process.env.GBRIDGE_LAN_HOST || '0.0.0.0');
+  let lanToken = resolveOrCreateLanToken(config.lanToken ?? process.env.GBRIDGE_LAN_TOKEN);
+  let lanHandle = null;
+  let lanWanted = false;
+
+  const computeShouldAutoEnableLan = () => {
+    if (udsPath) return false;
+    if (config.lanEnabled === false || process.env.GBRIDGE_LAN_ENABLED === '0') return false;
+    const wsInfo = inspectWebServerBinding(ctx);
+    // ZERO-CONFLICT RULE: If `dsh web` is ALREADY bound to a non-loopback LAN/proxy host,
+    // NEVER open a redundant second port unless the user explicitly forced `lanEnabled: true`!
+    if (wsInfo.isRemotelyReachable && config.lanEnabled !== true && process.env.GBRIDGE_LAN_ENABLED !== '1') {
+      return false;
+    }
+    return config.lanEnabled === true ||
+      process.env.GBRIDGE_LAN_ENABLED === '1' ||
+      (Number.isFinite(envLanPort) && envLanPort > 0) ||
+      isDesktopProfile;
+  };
+
+  const stopLan = (immediate = true) => {
+    lanWanted = false;
+    if (lanHandle) {
+      try { lanHandle.dispose({ immediate }); } catch {}
+      lanHandle = null;
+    }
+  };
+
+  const startLan = async (portOverride) => {
+    if (udsPath) return;
+    if (portOverride !== undefined) preferredPort = portOverride;
+    const wsInfo = inspectWebServerBinding(ctx);
+    const avoidPorts = wsInfo.port ? [wsInfo.port] : [];
+    if (lanHandle) {
+      try { lanHandle.dispose({ immediate: true }); } catch {}
+      lanHandle = null;
+    }
+    lanWanted = true;
+    lanHandle = startLanBridgeListener(core, {
+      host: lanHost,
+      port: preferredPort,
+      avoidPorts,
+      token: lanToken,
+      surface,
+      logger,
+      getPairingSnapshot: () => getSnapshot(),
+    });
+    await lanHandle.ready;
+  };
+
+  const buildEndpoints = (port, tokenForUrl) => {
+    if (!port) return [];
+    const hostLabel = hostname() || 'DSH';
+    const ifaces = listReachableNetworkInterfaces();
+    return ifaces.map((item) => {
+      const base = `http://${item.ip}:${port}`;
+      const qs = new URLSearchParams();
+      if (tokenForUrl) qs.set('token', tokenForUrl);
+      if (hostLabel) qs.set('name', hostLabel);
+      const url = qs.toString() ? `${base}/?${qs.toString()}` : base;
+      const pairQs = new URLSearchParams({ url: base });
+      if (tokenForUrl) pairQs.set('token', tokenForUrl);
+      if (hostLabel) pairQs.set('name', hostLabel);
+      const pairUri = `grassbag://pair?${pairQs.toString()}`;
+      let qr = null;
+      try {
+        qr = buildQrPathData(encodeQrMatrix(url), 3);
+      } catch {}
+      return {
+        iface: item.iface,
+        label: item.label,
+        kind: item.kind,
+        ip: item.ip,
+        port,
+        recommended: item.recommended,
+        url,
+        pairUri,
+        qr,
+      };
+    });
+  };
+
+  const getSnapshot = () => {
+    const wsInfo = inspectWebServerBinding(ctx);
+    const lanBound = lanHandle?.address?.();
+    const lanPort = (lanBound && typeof lanBound === 'object') ? lanBound.port : null;
+    const lanListening = Boolean(lanHandle?.isListening?.() && lanPort);
+
+    let mode = 'loopback-only';
+    let activePort = null;
+    let activeToken = null;
+    let portConflictAvoided = false;
+
+    if (wsInfo.isRemotelyReachable && !lanListening) {
+      mode = 'shared-webserver';
+      activePort = wsInfo.port;
+      activeToken = core.udsToken || process.env.GBRIDGE_TOKEN || null;
+    } else if (lanListening) {
+      mode = 'lan-bridge';
+      activePort = lanPort;
+      activeToken = lanHandle.token;
+      portConflictAvoided = Boolean(lanHandle.conflictAvoided?.());
+    } else if (wsInfo.isRemotelyReachable) {
+      mode = 'shared-webserver';
+      activePort = wsInfo.port;
+      activeToken = core.udsToken || process.env.GBRIDGE_TOKEN || null;
+    }
+
+    const endpoints = buildEndpoints(activePort, activeToken);
+
+    return {
+      v: 1,
+      bridgeVersion: core.version,
+      dshVersion: detectDshVersion(ctx),
+      hostName: hostname() || 'DSH',
+      platform: process.platform,
+      arch: process.arch,
+      surface,
+      mode,
+      activePort,
+      portConflictAvoided,
+      hasBridgeToken: mode === 'lan-bridge' || Boolean(activeToken),
+      token: activeToken,
+      connectedClients: core.hub.clients.size,
+      webServer: {
+        available: wsInfo.available,
+        host: wsInfo.host,
+        port: wsInfo.port,
+        isLoopback: wsInfo.isLoopback,
+        isRemotelyReachable: wsInfo.isRemotelyReachable,
+      },
+      lan: {
+        enabled: lanWanted,
+        listening: lanListening,
+        host: lanHost,
+        port: lanPort,
+        preferredPort,
+        error: lanHandle?.error?.() ?? null,
+      },
+      endpoints,
+      primaryEndpoint: endpoints[0] ?? null,
+    };
+  };
+
+  const applyAction = async (body = {}) => {
+    const action = String(body?.action || '').trim();
+    if (action === 'rotateToken') {
+      lanToken = persistRotatedLanToken();
+      if (lanHandle) lanHandle.setToken(lanToken);
+      return getSnapshot();
+    }
+    if (action === 'setLanEnabled') {
+      const enabled = Boolean(body?.enabled);
+      if (enabled) {
+        await startLan();
+      } else {
+        stopLan(true);
+      }
+      return getSnapshot();
+    }
+    if (action === 'setLanPort') {
+      const nextPort = Number(body?.port);
+      if (!Number.isInteger(nextPort) || nextPort < 0 || nextPort > 65535) {
+        throw new GbridgeError(400, 'gbridge/invalid_port', 'port must be an integer between 0 and 65535');
+      }
+      await startLan(nextPort);
+      return getSnapshot();
+    }
+    throw new GbridgeError(400, 'gbridge/unknown_action', `unsupported pairing action: ${action || '(empty)'}`);
+  };
+
+  return {
+    computeShouldAutoEnableLan,
+    startLan,
+    stopLan,
+    getSnapshot,
+    applyAction,
+    dispose: () => {
+      if (lanHandle) {
+        try { lanHandle.dispose({ immediate: false }); } catch {}
+        lanHandle = null;
+      }
+    },
+  };
+}
+
+/**
  * Standard Cordis plugin entrypoint (`dsh plugin add` / `dsh web --patch`).
  */
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console;
   const core = createGbridgeCore(ctx, config);
+  const pairing = createPairingController(ctx, core, config);
+  core.setPairingController(pairing);
 
   // Public Cordis service allowing other plugins to register native SDUI views on GrassBag.
   if (typeof ctx.provide === 'function') {
     ctx.provide('gbridge', {
       version: core.version,
       bootId: core.bootId,
+      getPairingSnapshot: () => pairing.getSnapshot(),
       registerSurface: (surface) => core.sdui.register(surface),
       publishEvent: (channel, type, data) => core.hub.publish(channel, type, data),
     });
   }
 
-  ctx.effect(() => () => core.dispose(), 'gbridge: core lifecycle');
+  ctx.effect(() => () => {
+    pairing.dispose();
+    core.dispose();
+  }, 'gbridge: core lifecycle');
 
-  // Start host event pump once typertGateway is mounted.
   if (typeof ctx.inject === 'function') {
+    // Start host event pump once typertGateway is mounted.
     ctx.inject(['typertGateway'], () => {
       core.hub.startHostEventPump();
     });
 
-    // Mount `/gbridge/v1` HTTP prefix + `/gbridge/v1/stream` WS on DSH's webServer.
+    // Register `/api/gbridge/pairing` on DSH's `connection.fetch` so BOTH Electron Desktop (IPC)
+    // and `dsh web` (HTTP cookie auth) can query & control QR pairing seamlessly!
+    ctx.inject(['connection'], (connCtx) => {
+      if (typeof connCtx.connection?.fetch?.register === 'function') {
+        connCtx.effect(() => connCtx.connection.fetch.register({
+          path: PAIRING_API_PATH,
+          methods: ['GET', 'POST'],
+          requestBody: 'buffered',
+          fetch: async (request) => {
+            try {
+              if (request.method === 'POST') {
+                const text = await request.text();
+                const body = text ? JSON.parse(text) : {};
+                const next = await pairing.applyAction(body);
+                return new Response(JSON.stringify(next), {
+                  status: 200,
+                  headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+                });
+              }
+              return new Response(JSON.stringify(pairing.getSnapshot()), {
+                status: 200,
+                headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+              });
+            } catch (err) {
+              const status = err instanceof GbridgeError ? err.status : 500;
+              const code = err instanceof GbridgeError ? err.code : 'gbridge/internal_error';
+              return new Response(JSON.stringify({ error: { code, message: err?.message || String(err) } }), {
+                status,
+                headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+              });
+            }
+          },
+        }), 'gbridge: /api/gbridge/pairing');
+      }
+    });
+
+    // Mount `/gbridge/v1`, `/gbridge/v1/stream`, AND `/gbridge/ui` HTML QR dashboard on DSH's webServer!
     ctx.inject(['webServer'], (webCtx) => {
       webCtx.effect(() => webCtx.webServer.register({
         kind: 'prefix',
@@ -609,11 +1090,52 @@ export function apply(ctx, config = {}) {
         path: STREAM_PATH,
         handler: (req, socket, head) => core.handleUpgrade(req, socket, head, { mode: 'webServer' }),
       }), 'gbridge: WS /gbridge/v1/stream');
+
+      webCtx.effect(() => webCtx.webServer.register({
+        kind: 'exact',
+        path: UI_PATH,
+        handler: (req, res) => {
+          const auth = admitRequest(req, { mode: 'webServer', ctx: webCtx });
+          if (!auth.ok) {
+            sendError(res, new GbridgeError(auth.status, auth.code, auth.message));
+            return;
+          }
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+          });
+          res.end(renderPairingDashboardHtml(pairing.getSnapshot(), { apiPath: PAIRING_API_PATH }));
+        },
+      }), 'gbridge: HTML /gbridge/ui');
+    });
+
+    // Optional `/grassbag` slash command so users can inspect their QR/pairing URL from any chat!
+    ctx.inject(['commands'], (cmdCtx) => {
+      if (typeof cmdCtx.commands?.register === 'function') {
+        try {
+          cmdCtx.effect(() => cmdCtx.commands.register({
+            name: 'grassbag',
+            description: '显示 GrassBag 手机连接链接与端口状态',
+            execute: async () => {
+              const snap = pairing.getSnapshot();
+              const lines = [
+                `GrassBag 连接助手 v${snap.bridgeVersion}（${snap.mode === 'shared-webserver' ? `复用 DSH Web :${snap.activePort}` : snap.mode === 'lan-bridge' ? `内置局域网桥接 :${snap.activePort}` : '仅本机回环'}）`,
+              ];
+              if (snap.primaryEndpoint?.url) {
+                lines.push(`推荐配对链接：${snap.primaryEndpoint.url}`);
+              } else {
+                lines.push('提示：请在左侧栏「手机连接」面板开启局域网桥接，即可显示扫码二维码。');
+              }
+              lines.push(`已连接手机客户端：${snap.connectedClients}`);
+              return { message: lines.join('\n') };
+            },
+          }), 'gbridge: /grassbag command');
+        } catch {}
+      }
     });
   }
 
   // Optional Android local UID-isolated Unix Domain Socket listener.
-  // Use core.udsPath & core.udsToken captured BEFORE createGbridgeCore() scrubs process.env!
   const udsPath = core.udsPath;
   const udsToken = core.udsToken;
   if (udsPath && udsToken) {
@@ -626,41 +1148,18 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // Optional Desktop / standalone LAN Bridge listener (so DSH Desktop, which binds its own
-  // webServer strictly to `127.0.0.1:0`, becomes directly reachable from GrassBag over LAN!).
-  const profileName = ctx.get?.('profileContext')?.name;
-  const isDesktopProfile = profileName === 'desktop';
-  const envLanPort = Number(process.env.GBRIDGE_LAN_PORT || 0);
-  const lanEnabled = !udsPath && (
-    config.lanEnabled === true ||
-    process.env.GBRIDGE_LAN_ENABLED === '1' ||
-    (Number.isFinite(envLanPort) && envLanPort > 0) ||
-    (isDesktopProfile && config.lanEnabled !== false)
-  );
-  if (lanEnabled) {
-    const lanHost = typeof config.lanHost === 'string' && config.lanHost.trim()
-      ? config.lanHost.trim()
-      : (process.env.GBRIDGE_LAN_HOST || '0.0.0.0');
-    const cfgPort = Number(config.lanPort ?? (envLanPort > 0 ? envLanPort : 3081));
-    const lanPort = Number.isFinite(cfgPort) && cfgPort >= 0 && cfgPort <= 65535 ? cfgPort : 3081;
-    const lanToken = config.lanToken ?? process.env.GBRIDGE_LAN_TOKEN;
-    const surface = isDesktopProfile ? 'desktop' : 'web';
-    const mountLan = (targetCtx) => {
-      targetCtx.effect(() => {
-        const handle = startLanBridgeListener(core, {
-          host: lanHost,
-          port: lanPort,
-          token: lanToken,
-          surface,
-          logger,
-        });
-        return () => handle.dispose();
-      }, 'gbridge: Desktop LAN bridge');
-    };
-    if (ctx.get?.('typertGateway') || typeof ctx.inject !== 'function') {
-      mountLan(ctx);
-    } else {
-      ctx.inject(['typertGateway'], (readyCtx) => mountLan(readyCtx));
+  // Zero-conflict Desktop / loopback LAN Bridge startup:
+  // Wait for `typertGateway` so Desktop's internal webServer binding is already known and avoided!
+  const maybeStartLan = () => {
+    if (pairing.computeShouldAutoEnableLan()) {
+      void pairing.startLan();
     }
+  };
+  if (ctx.get?.('typertGateway') || typeof ctx.inject !== 'function') {
+    maybeStartLan();
+  } else {
+    ctx.inject(['typertGateway'], () => {
+      maybeStartLan();
+    });
   }
 }

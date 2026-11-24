@@ -725,6 +725,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       appProvider.select(
         (s) => (
           isEmptyChat: s.isEmptyChat,
+          activeSessionId: s.activeSessionId,
           activeSessionTitle: s.activeSession?.title ?? '新对话',
           hasActiveSession: s.activeSession != null,
           hostId: s.activeHost.id,
@@ -968,7 +969,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                             key: ValueKey(
                                               shellSlice.isEmptyChat
                                                   ? 'host:${shellSlice.hostId}:${shellSlice.hostName}'
-                                                  : '${shellSlice.hostId}:${shellSlice.activeSessionTitle}',
+                                                  : '${shellSlice.hostId}:${shellSlice.activeSessionId ?? '__new__'}:${shellSlice.activeSessionTitle}',
                                             ),
                                             mainAxisSize: MainAxisSize.min,
                                             children: [
@@ -2020,7 +2021,9 @@ class _ChatCanvasArea extends ConsumerWidget {
           sessionLoadError: s.sessionLoadError,
           isEmptyChat: s.isEmptyChat,
           loadingSession: s.loadingSession,
+          activeHostId: s.activeHostId,
           activeSessionId: s.activeSessionId,
+          sessionRenderGen: s.sessionRenderGen,
           glassTier: s.glassTier,
         ),
       ),
@@ -2059,8 +2062,10 @@ class _ChatCanvasArea extends ConsumerWidget {
                 findChildIndexCallback: () {
                   final liveTurns = ref.read(appProvider).turns;
                   final offset = slice.hasMoreTurns ? 1 : 0;
+                  final scopePrefix = '${slice.activeHostId}:${slice.sessionRenderGen}:';
                   final indexByKey = <String, int>{
-                    for (var i = 0; i < liveTurns.length; i++) liveTurns[i].stableKey: offset + i,
+                    for (var i = 0; i < liveTurns.length; i++)
+                      '$scopePrefix${liveTurns[i].stableKey}': offset + i,
                   };
                   return (Key key) {
                     if (key is! ValueKey<String>) return null;
@@ -2132,9 +2137,11 @@ class _ChatCanvasArea extends ConsumerWidget {
                   }
                   final turns = ref.read(appProvider).turns;
                   final turnKey = index < turns.length ? turns[index].stableKey : 'turn-idx-$index';
+                  final scopedKey = '${slice.activeHostId}:${slice.sessionRenderGen}:$turnKey';
                   return _TurnListItem(
-                    key: ValueKey(turnKey),
+                    key: ValueKey(scopedKey),
                     index: index,
+                    scopePrefix: '${slice.activeHostId}:${slice.sessionRenderGen}',
                     activeSessionId: slice.activeSessionId,
                     animatedTurnIds: animatedTurnIds,
                     onOpenTerminal: onOpenTerminal,
@@ -2276,6 +2283,7 @@ class _TurnListItem extends ConsumerWidget {
   const _TurnListItem({
     super.key,
     required this.index,
+    required this.scopePrefix,
     required this.activeSessionId,
     required this.animatedTurnIds,
     required this.onOpenTerminal,
@@ -2283,6 +2291,7 @@ class _TurnListItem extends ConsumerWidget {
   });
 
   final int index;
+  final String scopePrefix;
   final String? activeSessionId;
   final Set<String> animatedTurnIds;
   final VoidCallback onOpenTerminal;
@@ -2300,17 +2309,18 @@ class _TurnListItem extends ConsumerWidget {
     );
     final turn = slice.turn;
     if (turn == null) return const SizedBox.shrink();
-    // Use `turn.stableKey` (preserved across optimistic `pending-session-*` / `client-turn-*`
-    // -> real server `sessionId` / `turnId` reconciliation!) so TurnView NEVER unmounts & flickers!
-    final turnKeyStr = turn.stableKey;
+    // Scope by `(activeHostId, sessionRenderGen, turn.stableKey)` so optimistic
+    // `pending-session-*` -> real server `sessionId` promotion keeps the exact TurnView
+    // mounted (zero flicker!), while switching hosts or sessions ALWAYS remounts fresh!
+    final scopedTurnKey = '$scopePrefix:${turn.stableKey}';
     final shouldAnimate = turn.isStreaming &&
         slice.isLast &&
-        animatedTurnIds.add(turnKeyStr);
+        animatedTurnIds.add(scopedTurnKey);
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 680),
         child: TurnView(
-          key: ValueKey(turnKeyStr),
+          key: ValueKey(scopedTurnKey),
           turn: turn,
           animateEntrance: shouldAnimate,
           onOpenTerminal: onOpenTerminal,

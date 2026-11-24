@@ -1,7 +1,11 @@
-/// Smart parser for remote DSH host addresses & pasted terminal output.
+import 'dart:convert';
+
+/// Smart parser for remote DSH host addresses, GrassBag QR pairing codes & pasted terminal output.
 ///
 /// Handles:
-/// - Full `dsh web` terminal lines (`dsh web: http://192.168.1.8:3080/?token=abc...`)
+/// - GrassBag QR pairing links (`grassbag://pair?url=...&token=...&name=...`)
+/// - Full `dsh web` / `dsh-gbridge` links (`http://192.168.1.8:3081/?token=abc...&name=MacBook`)
+/// - JSON QR payloads (`{"url":"http://...","token":"...","name":"..."}`)
 /// - Multi-line terminal blocks containing an `http(s)://` URL or `GBRIDGE_TOKEN=...`
 /// - Bare IPv4 / Tailscale IPs (`192.168.1.8`, `100.64.1.2`) -> auto `:3080`
 /// - `IP:port` / `localhost:3080` -> auto `http://`
@@ -55,6 +59,68 @@ ParsedRemoteHostInput? parseRemoteHostInput(
 }) {
   final trimmed = rawInput.trim();
   if (trimmed.isEmpty) return null;
+
+  // 0a) Dedicated GrassBag QR pairing scheme: `grassbag://pair?url=http%3A%2F%2F...&token=...&name=...`
+  final pairSchemeMatch = RegExp(r'grassbag://pair\?[^\s<>"\x27`]+', caseSensitive: false)
+      .firstMatch(trimmed);
+  if (pairSchemeMatch != null) {
+    final pairUri = Uri.tryParse(_stripTrailingPunctuation(pairSchemeMatch.group(0)!));
+    final innerUrl = pairUri?.queryParameters['url']?.trim();
+    if (innerUrl != null && innerUrl.isNotEmpty) {
+      final innerTok = pairUri?.queryParameters['token']?.trim();
+      final innerName = pairUri?.queryParameters['name']?.trim();
+      final nested = parseRemoteHostInput(
+        innerUrl,
+        explicitToken: (explicitToken != null && explicitToken.trim().isNotEmpty)
+            ? explicitToken
+            : innerTok,
+        defaultDshPort: defaultDshPort,
+      );
+      if (nested != null) {
+        return ParsedRemoteHostInput(
+          address: nested.address,
+          token: nested.token,
+          suggestedName: (innerName != null && innerName.isNotEmpty)
+              ? innerName
+              : nested.suggestedName,
+          wasAutoPorted: nested.wasAutoPorted,
+          wasExtractedFromText: true,
+        );
+      }
+    }
+  }
+
+  // 0b) JSON QR payload (`{"url":"http://...","token":"...","name":"..."}`)
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map) {
+        final rawUrl = (decoded['url'] ?? decoded['address'] ?? decoded['host'])?.toString().trim();
+        if (rawUrl != null && rawUrl.isNotEmpty) {
+          final jsonTok = decoded['token']?.toString().trim();
+          final jsonName = (decoded['name'] ?? decoded['hostName'])?.toString().trim();
+          final nested = parseRemoteHostInput(
+            rawUrl,
+            explicitToken: (explicitToken != null && explicitToken.trim().isNotEmpty)
+                ? explicitToken
+                : jsonTok,
+            defaultDshPort: defaultDshPort,
+          );
+          if (nested != null) {
+            return ParsedRemoteHostInput(
+              address: nested.address,
+              token: nested.token,
+              suggestedName: (jsonName != null && jsonName.isNotEmpty)
+                  ? jsonName
+                  : nested.suggestedName,
+              wasAutoPorted: nested.wasAutoPorted,
+              wasExtractedFromText: true,
+            );
+          }
+        }
+      }
+    } catch (_) {}
+  }
 
   var candidate = trimmed;
   var extractedFromText = false;
@@ -141,8 +207,9 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     autoPorted = true;
   }
 
-  // 4) Extract `?token=` from query parameters and strip it from the stored address.
+  // 4) Extract `?token=` & optional `?name=` from query parameters and strip them from the stored address.
   final queryToken = parsed.queryParameters['token']?.trim();
+  final queryName = parsed.queryParameters['name']?.trim();
   final resolvedToken = (explicitToken != null && explicitToken.trim().isNotEmpty)
       ? explicitToken.trim()
       : (queryToken != null && queryToken.isNotEmpty)
@@ -150,9 +217,11 @@ ParsedRemoteHostInput? parseRemoteHostInput(
           : (extraToken != null && extraToken.isNotEmpty ? extraToken : null);
 
   final remainingQuery = Map<String, String>.from(parsed.queryParameters)
-    ..remove('token');
+    ..remove('token')
+    ..remove('name');
   var cleanPath = parsed.path == '/' ? '' : parsed.path.replaceFirst(RegExp(r'/+$'), '');
   if (cleanPath == '/connect' ||
+      cleanPath == '/gbridge/ui' ||
       cleanPath == '/gbridge/v1' ||
       cleanPath.startsWith('/gbridge/v1/') ||
       cleanPath == '/sessions' ||
@@ -175,7 +244,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
   return ParsedRemoteHostInput(
     address: cleanUri.toString(),
     token: resolvedToken,
-    suggestedName: parsed.host,
+    suggestedName: (queryName != null && queryName.isNotEmpty) ? queryName : parsed.host,
     wasAutoPorted: autoPorted,
     wasExtractedFromText: extractedFromText,
   );

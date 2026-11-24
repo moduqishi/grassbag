@@ -275,9 +275,26 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   }
 
   bool _suppressDraftSync = false;
+  String? _draftScopeHostId;
+  String? _draftScopeSessionId;
+  bool _hasUnsyncedDraftEdit = false;
+
+  void _flushPendingDraftToOutgoingScope(String? outgoingHostId, String? outgoingSessionId) {
+    _draftSyncTimer?.cancel();
+    _draftSyncTimer = null;
+    if (!_hasUnsyncedDraftEdit || outgoingHostId == null || outgoingHostId.isEmpty) return;
+    _hasUnsyncedDraftEdit = false;
+    ref.read(appProvider.notifier).setComposerDraftForScope(
+          outgoingHostId,
+          outgoingSessionId,
+          widget.controller.text,
+        );
+  }
 
   void _setControllerDraftSafely(String draft) {
     _draftSyncTimer?.cancel();
+    _draftSyncTimer = null;
+    _hasUnsyncedDraftEdit = false;
     if (widget.controller.text == draft) return;
     _suppressDraftSync = true;
     try {
@@ -296,6 +313,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
 
   void _flushDraftSync() {
     _draftSyncTimer?.cancel();
+    _draftSyncTimer = null;
+    _hasUnsyncedDraftEdit = false;
     if (!mounted) return;
     final raw = widget.controller.text;
     final ctrl = ref.read(appProvider.notifier);
@@ -316,12 +335,16 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final snap = ref.read(appProvider);
     final draftHostId = snap.activeHostId;
     final draftSessionId = snap.activeSessionId;
+    _draftScopeHostId = draftHostId;
+    _draftScopeSessionId = draftSessionId;
+    _hasUnsyncedDraftEdit = true;
     _draftSyncTimer = Timer(const Duration(milliseconds: 400), () {
       if (!mounted) return;
       final cur = ref.read(appProvider);
       if (cur.activeHostId != draftHostId || cur.activeSessionId != draftSessionId) {
         return;
       }
+      _hasUnsyncedDraftEdit = false;
       final ctrl = ref.read(appProvider.notifier);
       final latest = widget.controller.text;
       if (ctrl.getComposerDraftForActiveHost() != latest) {
@@ -598,6 +621,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   Widget build(BuildContext context) {
     ref.listen<String>(appProvider.select((s) => s.activeHostId), (prev, next) {
       if (prev != null && prev != next) {
+        _flushPendingDraftToOutgoingScope(_draftScopeHostId ?? prev, _draftScopeSessionId);
+        _draftScopeHostId = next;
+        _draftScopeSessionId = ref.read(appProvider).activeSessionId;
         _setControllerDraftSafely(ref.read(appProvider.notifier).getComposerDraftForActiveHost());
         _resetTransientComposerUi();
       }
@@ -612,8 +638,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                 next != null &&
                 !next.startsWith('pending-session-'));
         if (!isNewChatPromotion) {
+          final curHostId = ref.read(appProvider).activeHostId;
+          _flushPendingDraftToOutgoingScope(_draftScopeHostId ?? curHostId, prev);
+          _draftScopeHostId = curHostId;
+          _draftScopeSessionId = next;
           _setControllerDraftSafely(ref.read(appProvider.notifier).getComposerDraftForActiveHost());
           _resetTransientComposerUi();
+        } else {
+          _draftScopeSessionId = next;
         }
       }
     });
@@ -645,7 +677,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           queuedMessages: s.queuedMessages,
           slashCommands: s.slashCommands,
           workspaceFiles: s.workspaceFiles,
-          activeWorkspace: s.activeWorkspace,
+          activeWorkspace: s.activeWorkspaceDisplayName,
           isEmptyChat: s.isEmptyChat,
           isStreaming: s.isStreaming,
           activeModelId: s.activeModelId,

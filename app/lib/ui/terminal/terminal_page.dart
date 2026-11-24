@@ -198,7 +198,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     final native = GrassBagNativeBridge.instance;
     final appState = ref.read(appProvider);
     final host = appState.activeHost;
-    final ws = appState.activeWorkspace;
+    final ws = appState.activeWorkspaceDisplayName;
     _boundHostId = host.id;
 
     // Strictly isolate host backends: Android local shell is ONLY allowed for `host.isLocal`!
@@ -282,7 +282,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         : (canUseAndroidLocal ? _TermBackend.androidLocal : _TermBackend.simulated);
     final cwd = backend == _TermBackend.androidLocal
         ? _resolveLocalCwd(appState)
-        : (appState.activeWorkspace.isEmpty ? '~' : appState.activeWorkspace);
+        : (appState.activeWorkspaceDisplayName.isEmpty ? '~' : appState.activeWorkspaceDisplayName);
     final replacement = _createTab(
       id: _nextTabId(host.id),
       hostId: host.id,
@@ -740,7 +740,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     final native = GrassBagNativeBridge.instance;
     final appState = ref.read(appProvider);
     final host = appState.activeHost;
-    final ws = appState.activeWorkspace;
+    final ws = appState.activeWorkspaceDisplayName;
     final canUseAndroidLocal = native.isAndroidNative && host.isLocal;
 
     final backend = (live != null && !canUseAndroidLocal)

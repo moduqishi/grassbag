@@ -119,7 +119,7 @@ echo "[GrassBag Runtime] shims.gbag: $SHIMS_BYTES bytes"
 BASE_STAGE="$WORK_DIR/base-arm64"
 mkdir -p "$BASE_STAGE"
 echo "[GrassBag Runtime] Staging Ubuntu $UBUNTU_RELEASE ARM64..."
-tar "${TAR_EXTRACT_FLAGS[@]}" -xzf "$UBUNTU_TAR" -C "$BASE_STAGE" \
+tar ${TAR_EXTRACT_FLAGS[@]+"${TAR_EXTRACT_FLAGS[@]}"} -xzf "$UBUNTU_TAR" -C "$BASE_STAGE" \
   --exclude='./dev/*' --exclude='dev/*' \
   --exclude='./usr/share/doc/*' --exclude='./usr/share/man/*' \
   --exclude='./usr/share/info/*' --exclude='./usr/share/locale/*'
@@ -127,7 +127,7 @@ tar "${TAR_EXTRACT_FLAGS[@]}" -xzf "$UBUNTU_TAR" -C "$BASE_STAGE" \
 echo "[GrassBag Runtime] Overlaying Node.js v$NODE_VERSION ARM64..."
 NODE_EXTRACT="$WORK_DIR/node-extract"
 mkdir -p "$NODE_EXTRACT"
-tar "${TAR_EXTRACT_FLAGS[@]}" -xJf "$NODE_TAR" -C "$NODE_EXTRACT"
+tar ${TAR_EXTRACT_FLAGS[@]+"${TAR_EXTRACT_FLAGS[@]}"} -xJf "$NODE_TAR" -C "$NODE_EXTRACT"
 NODE_SRC="$NODE_EXTRACT/node-v${NODE_VERSION}-linux-arm64"
 mkdir -p "$BASE_STAGE/usr/local/bin" "$BASE_STAGE/usr/local/lib"
 cp -a "$NODE_SRC/bin/node" "$BASE_STAGE/usr/local/bin/node"
@@ -198,6 +198,8 @@ BRIDGE_STAGE="$ENGINE_STAGE/dsh-gbridge"
 mkdir -p "$BRIDGE_STAGE"
 cp -R "$ROOT_DIR/packages/dsh-gbridge/package.json" \
       "$ROOT_DIR/packages/dsh-gbridge/lib" \
+      "$ROOT_DIR/packages/dsh-gbridge/locale" \
+      "$ROOT_DIR/packages/dsh-gbridge/icon.svg" \
       "$BRIDGE_STAGE/"
 cat > "$BRIDGE_STAGE/cordis.patch.yml" <<'EOF'
 - insert:
@@ -221,6 +223,7 @@ ENGINE_SHA="$(sha256_file "$ENGINE_TAR")"
 ENGINE_BYTES="$(file_bytes "$ENGINE_TAR")"
 echo "[GrassBag Runtime] engine-init.gbag: $((ENGINE_BYTES / 1024 / 1024)) MiB ($ENGINE_BYTES bytes)"
 
+BRIDGE_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('$ROOT_DIR/packages/dsh-gbridge/package.json','utf8')).version" 2>/dev/null || echo '0.2.0')"
 # 4. Emit runtime-manifest.json consumed by Android RuntimeController
 cat > "$OUT_DIR/runtime-manifest.json" <<EOF
 {
@@ -230,7 +233,7 @@ cat > "$OUT_DIR/runtime-manifest.json" <<EOF
   "nodeVersion": "$NODE_VERSION",
   "dshVersion": "$DSH_VERSION",
   "dshSpec": "$DSH_SPEC",
-  "bridgeVersion": "0.1.0",
+  "bridgeVersion": "$BRIDGE_VERSION",
   "artifacts": {
     "shims": {
       "asset": "runtime/shims.gbag",

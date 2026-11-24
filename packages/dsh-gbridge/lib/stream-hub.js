@@ -858,6 +858,7 @@ export class StreamHub {
       const teardown = () => {
         if (this.upstreamStreams.get(channel) !== entry || entry.subscribers.size > 0) return;
         this.upstreamStreams.delete(channel);
+        this.latestSnapshots.delete(channel);
         if (channel.startsWith('session:')) {
           const sid = channel.slice(8);
           this.activeTurns.delete(sid);

@@ -64,6 +64,8 @@ function main() {
   const versionLabel = options.version ?? '';
   const apkName = options['apk-name'] ?? '';
   const apkSha = options['apk-sha256'] ?? '';
+  const pluginName = options['plugin-name'] ?? '';
+  const pluginSha = options['plugin-sha256'] ?? '';
   const manifestPath = options['runtime-manifest'] ?? '';
   const outputPath = path.resolve(options.output ?? 'release_notes.md');
 
@@ -89,10 +91,26 @@ function main() {
     );
   }
   if (apkName) {
-    lines.push(`- 安装包：\`${apkName}\``);
+    lines.push(`- Android 安装包：\`${apkName}\``);
   }
   if (apkSha) {
-    lines.push(`- SHA-256：\`${apkSha}\``);
+    lines.push(`- APK SHA-256：\`${apkSha}\``);
+  }
+  if (pluginName) {
+    lines.push(`- 官方电脑端连接插件：\`${pluginName}\`（零端口冲突 · 内置二维码配对面板）`);
+  }
+  if (pluginSha) {
+    lines.push(`- 插件 SHA-256：\`${pluginSha}\``);
+  }
+  if (pluginName) {
+    lines.push(
+      '',
+      '### 电脑端一键安装官方连接插件（国内镜像加速）',
+      '',
+      '```bash',
+      'dsh plugin add https://gh-proxy.com/https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz',
+      '```',
+    );
   }
 
   lines.push('', '## 更新内容', '');

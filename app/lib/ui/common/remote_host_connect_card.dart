@@ -11,14 +11,16 @@ import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../web/remote_web_login_page.dart';
+import 'qr_pair_scanner_page.dart';
 
 /// Unified, frictionless Remote DSH Host connector shared by Onboarding, Quick Connect Sheet,
 /// and Settings:
+/// - 1-tap QR code scan (`扫码连接`) matching `dsh-gbridge` Desktop/Web native QR pairing UI
 /// - Auto-scans LAN on mount with 1-tap connect for discovered open DSH hosts
-/// - Smart clipboard paste (recognizes `dsh web: http://.../?token=...`, bare IPs, and dotted/JWT tokens)
+/// - Smart clipboard paste (recognizes `grassbag://pair?...`, `dsh web: http://.../?token=...`, bare IPs, and tokens)
 /// - Preserves freshly minted 30-day session cookies across diagnose -> connect (never burns a one-time token twice!)
 /// - Non-destructive pre-flight diagnosis: never hijacks activeHostId when unreachable or awaiting auth
-/// - Single clear primary action (`连接设备`) with clean 2-tab Desktop GUI + OS-switched CLI guide below the fold
+/// - Clean 2-tab Official Accelerated Plugin (Zero Port Conflict + QR UI) + Zero-Plugin CLI guide
 class RemoteHostConnectCard extends ConsumerStatefulWidget {
   const RemoteHostConnectCard({
     super.key,
@@ -29,12 +31,19 @@ class RemoteHostConnectCard extends ConsumerStatefulWidget {
     this.autoScanLan = true,
   });
 
+  /// Official 1-line CLI command installing `dsh-gbridge.tgz` via China GitHub mirror (zero port conflict!).
+  static const String acceleratedInstallCommand =
+      'dsh plugin add $kOfficialGbridgeAcceleratedUrl';
+
   /// Shared Desktop GUI 1-tap AI prompt used across Onboarding, Quick Connect, Auth Sheet, and Host Detail.
-  static const String desktopGuiPrompt = '''请帮我开启当前电脑的局域网远程连接，让手机上的 GrassBag 可以连接这台电脑上的 DeepSeek Harness：
-1. 先查询本机当前 Wi-Fi / 局域网 IPv4 地址（切勿使用 127.0.0.1 或 0.0.0.0）；
-2. 若已安装 dsh-gbridge 桌面桥接插件并监听在 3081 端口，请读取 ~/.dsh/gbridge-lan-token 并直接给出 http://<局域网IP>:3081/?token=<令牌>；
-3. 否则请使用本机 dsh 或 DeepSeek Harness 桌面端自带运行时（macOS: "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"，Windows: "%LOCALAPPDATA%\\Programs\\DeepSeek Harness\\resources\\runtime\\cli\\bin\\dsh.cmd"）在后台启动 Web 入口（与桌面端共享全部会话与模型配置）：dsh web --host <局域网IP> --port 3080 --no-open；
-4. 启动后把完整可点击的 http://<局域网IP>:<端口>/?token=... 链接直接发给我。''';
+  /// Installs our official zero-conflict `dsh-gbridge` plugin via GitHub mirror directly into the
+  /// running DeepSeek Harness instance (NO slow second `dsh web` process, NO port conflict, shows QR UI!).
+  static const String desktopGuiPrompt = '''请帮我安装并启用 GrassBag 官方连接助手插件（零端口冲突、无需另开第二套 dsh web 服务，安装后会在桌面端左侧出现「手机连接」二维码面板）：
+1. 请直接使用当前 DeepSeek Harness 的插件管理能力（或本机 dsh CLI）安装官方加速包：
+   $kOfficialGbridgeAcceleratedUrl
+   （若主加速源下载失败，可自动改用备用源 $kOfficialGbridgeDirectUrl ）
+2. 插件启用后会自动复用当前运行的 DSH 实例（桌面端自动在 3081+ 零冲突端口开启局域网桥接，dsh web 直接复用原端口），无需额外启动新的 dsh web 进程；
+3. 安装完成后，请查看本机局域网 IPv4 地址与 ~/.dsh/gbridge-lan-token（或直接在左侧栏点开「手机连接」显示二维码），把配对链接发给我即可用手机 GrassBag 扫码或一键连接。''';
 
   /// Called after a host is added (and connected when [connectImmediately] is true).
   final ValueChanged<ManagedHost>? onConnectedHost;
@@ -78,6 +87,56 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS);
+
+  bool get _supportsQrScan =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS ||
+          defaultTargetPlatform == TargetPlatform.macOS);
+
+  Future<void> _scanQrCode() async {
+    if (_connecting) return;
+    final raw = await Navigator.of(context).push<String>(
+      GrassBagPageRoute<String>(
+        builder: (_) => const QrPairScannerPage(),
+      ),
+    );
+    if (!mounted || raw == null || raw.trim().isEmpty) return;
+    await _applyParsedRemoteText(raw.trim(), sourceLabel: '二维码');
+  }
+
+  Future<void> _applyParsedRemoteText(String text, {required String sourceLabel}) async {
+    final parsed = parseRemoteHostInput(text);
+    if (parsed == null) {
+      _addrCtrl.text = text;
+      setState(() {
+        _capturedCookie = null;
+        _diagnosis = null;
+      });
+      ref.read(appProvider.notifier).showToast('已填入$sourceLabel内容，请核对地址格式', tone: ToastTone.info);
+      return;
+    }
+    final addrChanged = _addrCtrl.text.trim() != parsed.address;
+    _addrCtrl.text = parsed.address;
+    if (parsed.token != null && parsed.token!.isNotEmpty) {
+      _tokenCtrl.text = parsed.token!;
+    }
+    if (_nameCtrl.text.trim().isEmpty && parsed.suggestedName != null) {
+      _nameCtrl.text = parsed.suggestedName!;
+    }
+    setState(() {
+      if (addrChanged) _capturedCookie = null;
+      _selectedLanAddr = null;
+      _diagnosis = null;
+    });
+    if (parsed.token != null && parsed.token!.isNotEmpty) {
+      ref.read(appProvider.notifier).showToast('已识别$sourceLabel配对信息，正在一键接入…', tone: ToastTone.ok);
+      await _connectNow();
+    } else {
+      ref.read(appProvider.notifier).showToast('已识别远程地址，正在检测连通性…', tone: ToastTone.ok);
+      await _diagnoseOnly();
+    }
+  }
 
   @override
   void initState() {
@@ -133,35 +192,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
       await _connectNow();
       return;
     }
-    if (parsed == null) {
-      _addrCtrl.text = text;
-      setState(() {
-        _capturedCookie = null;
-        _diagnosis = null;
-      });
-      ref.read(appProvider.notifier).showToast('已填入剪贴板内容，请核对地址格式', tone: ToastTone.info);
-      return;
-    }
-    final addrChanged = _addrCtrl.text.trim() != parsed.address;
-    _addrCtrl.text = parsed.address;
-    if (parsed.token != null && parsed.token!.isNotEmpty) {
-      _tokenCtrl.text = parsed.token!;
-    }
-    if (_nameCtrl.text.trim().isEmpty && parsed.suggestedName != null) {
-      _nameCtrl.text = parsed.suggestedName!;
-    }
-    setState(() {
-      if (addrChanged) _capturedCookie = null;
-      _selectedLanAddr = null;
-      _diagnosis = null;
-    });
-    if (parsed.token != null && parsed.token!.isNotEmpty) {
-      ref.read(appProvider.notifier).showToast('已识别地址与令牌，正在一键接入…', tone: ToastTone.ok);
-      await _connectNow();
-    } else {
-      ref.read(appProvider.notifier).showToast('已自动识别远程地址，正在检测连通性…', tone: ToastTone.ok);
-      await _diagnoseOnly();
-    }
+    await _applyParsedRemoteText(text, sourceLabel: '剪贴板');
   }
 
   Future<RemoteHostDiagnosis?> _diagnoseOnly() async {
@@ -396,7 +427,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        '免装插件直连原版 DSH · 认证一次 30 天免填',
+                        '支持扫码秒连官方插件 · 也支持免插件直连原版 DSH',
                         style: TextStyle(fontSize: 11.5, color: t.text3),
                       ),
                     ],
@@ -405,6 +436,39 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
               ],
             ),
             const SizedBox(height: 12),
+          ],
+
+          // Quick-Action Top Pair Bar: 1-tap QR Scan + Smart Clipboard Paste
+          if (_supportsQrScan) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: GrassBagPrimaryGlassButton(
+                    label: '扫码连接',
+                    icon: CupertinoIcons.qrcode_viewfinder,
+                    height: 40,
+                    tier: slice.glassTier,
+                    insideGlass: true,
+                    enabled: !_connecting,
+                    onTap: _connecting ? null : _scanQrCode,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: GrassBagSecondaryGlassButton(
+                    label: '智能粘贴链接',
+                    icon: CupertinoIcons.doc_on_clipboard,
+                    height: 40,
+                    tier: slice.glassTier,
+                    insideGlass: true,
+                    accentForeground: true,
+                    enabled: !_connecting,
+                    onTap: _connecting ? null : _pasteFromClipboard,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 11),
           ],
 
           // LAN Auto-Discovery Live Radar Strip
@@ -696,7 +760,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                           children: [
                             Expanded(
                               child: _GuideSegmentPill(
-                                label: '桌面端（免命令）',
+                                label: '官方插件（扫码推荐）',
                                 selected: _guideTab == 0,
                                 onTap: () => setState(() => _guideTab = 0),
                               ),
@@ -704,7 +768,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                             const SizedBox(width: 6),
                             Expanded(
                               child: _GuideSegmentPill(
-                                label: '命令行（dsh web）',
+                                label: '免插件直连（dsh web）',
                                 selected: _guideTab == 1,
                                 onTap: () => setState(() => _guideTab = 1),
                               ),
@@ -715,37 +779,61 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                         if (_guideTab == 0) ...[
                           const _CompactStepRow(
                             step: '1',
-                            text: '确保手机与电脑在同一个 Wi-Fi / 局域网，打开电脑上的 DeepSeek Harness。',
+                            text: '在电脑端 DeepSeek Harness 安装 GrassBag 官方插件（国内镜像加速，零额外服务、零端口冲突）：',
                           ),
-                          const SizedBox(height: 6),
+                          const SizedBox(height: 7),
+                          _CommandCopyRow(
+                            label: '终端一键安装（或在桌面端「插件 → 添加插件」直接粘贴 .tgz 地址）',
+                            command: RemoteHostConnectCard.acceleratedInstallCommand,
+                            onCopy: _copyCommand,
+                          ),
+                          const SizedBox(height: 8),
                           const _CompactStepRow(
                             step: '2',
-                            text: '点击下方按钮复制一键指令，直接发给电脑端对话框，它会自动开启共享入口。',
-                          ),
-                          const SizedBox(height: 6),
-                          const _CompactStepRow(
-                            step: '3',
-                            text: '复制电脑回复的 http://... 链接，回到这里点输入框里的「粘贴」即可自动连上。',
+                            text: '启用后桌面端左侧栏出现「手机连接」并立即弹出配对二维码，点击上方「扫码连接」1 秒接入。',
                           ),
                           const SizedBox(height: 10),
-                          GrassBagSecondaryGlassButton(
-                            label: '复制桌面端一键指令',
-                            icon: CupertinoIcons.sparkles,
-                            height: 36,
-                            tier: slice.glassTier,
-                            insideGlass: true,
-                            accentForeground: true,
-                            onTap: () {
-                              Clipboard.setData(
-                                const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
-                              );
-                              ctrl.showToast('已复制一键指令，粘贴发给电脑上的 DeepSeek Harness 即可',
-                                  tone: ToastTone.ok);
-                            },
+                          Row(
+                            children: [
+                              Expanded(
+                                child: GrassBagSecondaryGlassButton(
+                                  label: '复制加速包地址',
+                                  icon: CupertinoIcons.link,
+                                  height: 36,
+                                  tier: slice.glassTier,
+                                  insideGlass: true,
+                                  accentForeground: true,
+                                  onTap: () {
+                                    Clipboard.setData(
+                                      const ClipboardData(text: kOfficialGbridgeAcceleratedUrl),
+                                    );
+                                    ctrl.showToast('已复制 .tgz 加速地址，可直接粘贴到 DSH 插件安装框',
+                                        tone: ToastTone.ok);
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: GrassBagSecondaryGlassButton(
+                                  label: '复制 AI 安装指令',
+                                  icon: CupertinoIcons.sparkles,
+                                  height: 36,
+                                  tier: slice.glassTier,
+                                  insideGlass: true,
+                                  onTap: () {
+                                    Clipboard.setData(
+                                      const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
+                                    );
+                                    ctrl.showToast('已复制 AI 安装指令，发给电脑端 DSH 即可自动安装',
+                                        tone: ToastTone.ok);
+                                  },
+                                ),
+                              ),
+                            ],
                           ),
                           const SizedBox(height: 7),
                           Text(
-                            '已在桌面端安装 dsh-gbridge 插件的设备会自动在 :3081 广播，上方雷达将自动发现。',
+                            '官方插件直接复用运行中的 DSH 实例：dsh web 共享原端口不另开服务，桌面端自动避让冲突端口并支持实时切换。',
                             style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
                           ),
                         ] else ...[

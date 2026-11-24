@@ -3,6 +3,46 @@ import 'dart:async';
 import 'models.dart';
 import 'transport.dart';
 
+/// Official GitHub Release `.tgz` distribution URLs for `dsh-gbridge` (zero runtime dependencies,
+/// strictly ending in `.tgz` without query parameters so DSH `0.2.2+` `TARBALL_SPEC` installs
+/// directly in ~1-2s without hitting npmjs or git!).
+const String kOfficialGbridgeDirectUrl =
+    'https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz';
+
+/// Primary China-accelerated GitHub mirror URL for `dsh-gbridge.tgz`.
+const String kOfficialGbridgeAcceleratedUrl =
+    'https://gh-proxy.com/https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz';
+
+/// Ordered fallback list tried automatically when installing the official `dsh-gbridge` plugin.
+const List<String> kOfficialGbridgeInstallSpecs = [
+  kOfficialGbridgeAcceleratedUrl,
+  'https://ghfast.top/https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz',
+  kOfficialGbridgeDirectUrl,
+];
+
+/// Detailed result of remotely installing `dsh-gbridge` via DSH's `pluginManager/installBundle`.
+class HelperInstallResult {
+  const HelperInstallResult({
+    this.capabilities,
+    this.restartRequired = false,
+    this.installedSpec = '',
+    this.message,
+  });
+
+  /// Live `/gbridge/v1/capabilities` once active (null when [restartRequired] is true).
+  final Capabilities? capabilities;
+
+  /// True when DSH installed the bundle cleanly (`application: 'restart-required'`)
+  /// and needs a restart to mount `/gbridge/v1` + client UI.
+  final bool restartRequired;
+
+  /// The tarball/package spec that succeeded.
+  final String installedSpec;
+
+  /// Optional human-readable status message.
+  final String? message;
+}
+
 /// Structured result of probing a DSH host so GrassBag automatically selects:
 /// - [HostProbeFull]: Full `dsh-gbridge` enhanced mode (`/gbridge/v1` + replay stream)
 /// - [HostProbeVanillaDirect]: Zero-plugin direct stock `dsh web` mode (`POST /api/*` + `WS /api/remote.mux`)
@@ -246,38 +286,85 @@ class RemoteBootstrapClient {
   }
 
   /// Trigger optional remote installation of `dsh-gbridge` on a stock `dsh web` host
-  /// using DSH's standard `pluginManager/installBundle` RPC (supports npm package,
-  /// git URL, local path, or tarball spec), then poll `/gbridge/v1/capabilities`.
-  Future<Capabilities> installHelperBundle({
-    String packageSpec = 'dsh-gbridge',
+  /// using DSH's standard `pluginManager/installBundle` RPC.
+  ///
+  /// When [packageSpec] is omitted, empty, or the bare alias `'dsh-gbridge'`, automatically
+  /// tries [kOfficialGbridgeInstallSpecs] (China-accelerated GitHub Release `.tgz` mirrors
+  /// falling back to direct GitHub Release `.tgz`).
+  ///
+  /// Properly inspects DSH `0.2.2+` `ChangeResult` (`applied` / `restart-required` / `failed`),
+  /// recovers transient timeouts via `pluginManager/waitForInstall`, and surfaces exact
+  /// diagnostics (`pnpm-missing`, `not-bundle`, `build-blocked`, etc.) immediately.
+  Future<HelperInstallResult> installHelperBundleDetailed({
+    String packageSpec = kOfficialGbridgeAcceleratedUrl,
     String? registryUrl,
-    Duration pollTimeout = const Duration(seconds: 45),
+    Duration pollTimeout = const Duration(seconds: 35),
     Duration pollInterval = const Duration(milliseconds: 900),
     void Function(String stage)? onProgress,
   }) async {
-    onProgress?.call('正在向远程主机下发连接助手安装指令…');
-    try {
-      await _typertRpc('pluginManager/installBundle', {
-        'spec': packageSpec,
-        'options': {
-          'enabled': true,
-          if (registryUrl != null && registryUrl.isNotEmpty) 'registry': registryUrl,
-        },
-      });
-    } on GbridgeException catch (e) {
-      if (!e.isNotFound) rethrow;
-      await _transport.requestJson(
-        'POST',
-        '/api/rpc/pluginManager/installBundle',
-        body: {
-          'spec': packageSpec,
-          if (registryUrl != null && registryUrl.isNotEmpty) 'registry': registryUrl,
-          'enable': true,
-          'options': {
-            'enabled': true,
-            if (registryUrl != null && registryUrl.isNotEmpty) 'registry': registryUrl,
-          },
-        },
+    final trimmedSpec = packageSpec.trim();
+    final useOfficialMirrors = trimmedSpec.isEmpty ||
+        trimmedSpec == 'dsh-gbridge' ||
+        trimmedSpec == '@grassbag/dsh-gbridge';
+    final candidateSpecs = useOfficialMirrors
+        ? kOfficialGbridgeInstallSpecs
+        : <String>[trimmedSpec];
+
+    Map<String, dynamic>? installValue;
+    String succeededSpec = candidateSpecs.first;
+    GbridgeException? lastFailure;
+
+    for (var i = 0; i < candidateSpecs.length; i++) {
+      final spec = candidateSpecs[i];
+      final requestId = 'gb-inst-${DateTime.now().microsecondsSinceEpoch}-$i';
+      onProgress?.call(
+        candidateSpecs.length > 1
+            ? '正在通过${i == 0 ? '加速镜像' : (i == candidateSpecs.length - 1 ? 'GitHub 直连' : '备用镜像')}安装连接助手 (${i + 1}/${candidateSpecs.length})…'
+            : '正在向远程主机下发连接助手安装指令…',
+      );
+      try {
+        final rawResult = await _invokeInstallBundleWithRecovery(
+          spec: spec,
+          requestId: requestId,
+          registryUrl: registryUrl,
+        );
+        final err = _extractInstallFailure(rawResult);
+        if (err != null) {
+          lastFailure = err;
+          // Non-network local environment blockers (missing pnpm, not a bundle, build blocked)
+          // won't be cured by trying another mirror — fail fast with clear diagnosis!
+          if (!_isRetryableMirrorError(err)) {
+            throw err;
+          }
+          continue;
+        }
+        installValue = rawResult;
+        succeededSpec = spec;
+        break;
+      } on GbridgeException catch (e) {
+        lastFailure = e;
+        if (!_isRetryableMirrorError(e) || i == candidateSpecs.length - 1) {
+          rethrow;
+        }
+      }
+    }
+
+    if (installValue == null) {
+      throw lastFailure ??
+          const GbridgeException(
+            status: 502,
+            code: 'bootstrap/install_failed',
+            message: '远程安装连接助手失败，请检查远程主机网络与 pnpm 环境',
+          );
+    }
+
+    final application = installValue['application']?.toString().toLowerCase() ?? '';
+    if (application == 'restart-required') {
+      onProgress?.call('插件已安装，重启远程 DeepSeek Harness 后立即生效');
+      return HelperInstallResult(
+        restartRequired: true,
+        installedSpec: succeededSpec,
+        message: '连接助手插件已安装完成，重启远程电脑上的 DeepSeek Harness 后将自动开启增强模式与扫码界面。',
       );
     }
 
@@ -288,7 +375,11 @@ class RemoteBootstrapClient {
         final raw = await _transport.requestJson('GET', '/gbridge/v1/capabilities');
         if (raw['domains'] is Map || raw['bridgeVersion'] != null) {
           onProgress?.call('已启用完整增强模式');
-          return Capabilities.fromJson(raw);
+          return HelperInstallResult(
+            capabilities: Capabilities.fromJson(raw),
+            restartRequired: false,
+            installedSpec: succeededSpec,
+          );
         }
       } on GbridgeException catch (err) {
         if (!err.isNotFound &&
@@ -302,11 +393,133 @@ class RemoteBootstrapClient {
       }
       await Future<void>.delayed(pollInterval);
     }
+
+    // Plugin installed cleanly (`application == 'applied'` or unknown) yet hot-reload did not
+    // expose `/gbridge/v1` in time — report restart-required instead of a confusing 504 error!
+    if (application == 'applied') {
+      return HelperInstallResult(
+        restartRequired: true,
+        installedSpec: succeededSpec,
+        message: '连接助手已写入远程主机配置，但未能热加载路由；重启远程 DSH 后即可生效。',
+      );
+    }
     throw const GbridgeException(
       status: 504,
       code: 'bootstrap/install_timeout',
-      message: 'timed out waiting for /gbridge/v1/capabilities after remote install',
+      message: '已下发安装指令但等待 /gbridge/v1/capabilities 超时，请检查远程主机日志或重启 DSH',
     );
+  }
+
+  /// Backwards-compatible convenience wrapper returning [Capabilities] directly.
+  Future<Capabilities> installHelperBundle({
+    String packageSpec = kOfficialGbridgeAcceleratedUrl,
+    String? registryUrl,
+    Duration pollTimeout = const Duration(seconds: 45),
+    Duration pollInterval = const Duration(milliseconds: 900),
+    void Function(String stage)? onProgress,
+  }) async {
+    final result = await installHelperBundleDetailed(
+      packageSpec: packageSpec,
+      registryUrl: registryUrl,
+      pollTimeout: pollTimeout,
+      pollInterval: pollInterval,
+      onProgress: onProgress,
+    );
+    if (result.capabilities != null) return result.capabilities!;
+    throw GbridgeException(
+      status: 202,
+      code: 'bootstrap/restart_required',
+      message: result.message ?? '连接助手已安装，请重启远程 DeepSeek Harness 以生效',
+    );
+  }
+
+  Future<Map<String, dynamic>> _invokeInstallBundleWithRecovery({
+    required String spec,
+    required String requestId,
+    String? registryUrl,
+  }) async {
+    final args = <String, dynamic>{
+      'spec': spec,
+      'options': <String, dynamic>{
+        'enabled': true,
+        'requestId': requestId,
+        if (registryUrl != null && registryUrl.isNotEmpty) 'registry': registryUrl,
+      },
+    };
+    try {
+      return await _typertRpc('pluginManager/installBundle', args);
+    } on GbridgeException catch (e) {
+      // If the initial HTTP request timed out while DSH's pnpm download was still running,
+      // recover the in-flight operation cleanly via `pluginManager/waitForInstall({ requestId })`!
+      if (e.code == 'gbridge/timeout' || e.status == 408 || e.status == 504) {
+        try {
+          return await _typertRpc('pluginManager/waitForInstall', {'requestId': requestId});
+        } catch (_) {
+          rethrow;
+        }
+      }
+      rethrow;
+    }
+  }
+
+  static GbridgeException? _extractInstallFailure(Map<String, dynamic> result) {
+    final application = result['application']?.toString().toLowerCase() ?? '';
+    final pkgRes = result['packageResult'];
+    final pkgKind = pkgRes is Map ? (pkgRes['kind']?.toString().toLowerCase() ?? '') : '';
+    final rawErr = result['error'];
+    final errMap = rawErr is Map ? rawErr : null;
+
+    if (pkgKind == 'pnpm-missing') {
+      return const GbridgeException(
+        status: 422,
+        code: 'plugin/pnpm_missing',
+        message: '远程主机未安装 pnpm，无法在线安装插件。请先在电脑安装 pnpm 或在桌面端直接运行安装命令。',
+      );
+    }
+    if (pkgKind == 'not-bundle') {
+      return const GbridgeException(
+        status: 422,
+        code: 'plugin/not_bundle',
+        message: '目标插件包缺少有效的 DSH bundle 清单，请确认下载地址指向最新版 dsh-gbridge.tgz。',
+      );
+    }
+    if (pkgKind == 'build-blocked') {
+      return const GbridgeException(
+        status: 422,
+        code: 'plugin/build_blocked',
+        message: '远程 DSH 安全策略拦截了构建脚本，请使用预打包的官方 dsh-gbridge.tgz 下载地址。',
+      );
+    }
+    if (application == 'failed' || pkgKind == 'failed' || errMap != null) {
+      final diag = errMap?['diagnostic']?.toString().trim();
+      final errMsg = errMap?['message']?.toString().trim();
+      final pkgMsg = pkgRes is Map ? pkgRes['message']?.toString().trim() : null;
+      final detail = [
+        if (errMsg != null && errMsg.isNotEmpty) errMsg,
+        if (diag != null && diag.isNotEmpty && diag != errMsg) diag,
+        if (pkgMsg != null && pkgMsg.isNotEmpty && pkgMsg != errMsg) pkgMsg,
+      ].join(' · ');
+      return GbridgeException(
+        status: 400,
+        code: 'plugin/install_failed',
+        message: detail.isNotEmpty ? detail : '远程主机插件安装失败（application=$application）',
+      );
+    }
+    return null;
+  }
+
+  static bool _isRetryableMirrorError(GbridgeException e) {
+    if (e.code == 'plugin/pnpm_missing' ||
+        e.code == 'plugin/not_bundle' ||
+        e.code == 'plugin/build_blocked' ||
+        e.status == 401 ||
+        e.status == 403 ||
+        e.status == 422) {
+      return false;
+    }
+    final lower = e.message.toLowerCase();
+    if (lower.contains('pnpm') && lower.contains('not found')) return false;
+    return true;
   }
 
   // ---------------------------------------------------------------------------

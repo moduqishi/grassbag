@@ -61,7 +61,7 @@ class ChatEmptyState extends ConsumerWidget {
           hostLastErrorCode: s.activeHost.lastErrorCode,
           activePermission: s.activePermission,
           activePreset: s.activePreset,
-          activeWorkspace: s.activeWorkspace,
+          activeWorkspace: s.activeWorkspaceDisplayName,
           connectionPhase: s.connectionPhase,
           isDshConnected: s.isDshConnected,
           hydratingDomains: s.hydratingDomains,

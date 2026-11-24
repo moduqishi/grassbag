@@ -277,7 +277,7 @@ jobs:
             --file "${FLUTTER_WORKDIR}/build/app/outputs/apk/release/output-metadata.json" \
             --pubspec "${FLUTTER_WORKDIR}/pubspec.yaml"
 
-      - name: Package APK & SHA-256 checksum
+      - name: Package APK, dsh-gbridge plugin tarball & SHA-256 checksums
         id: package
         run: |
           source_apk="${FLUTTER_WORKDIR}/build/app/outputs/apk/release/app-release.apk"
@@ -285,11 +285,21 @@ jobs:
 
           apk_name="grassbag-v${{ needs.prepare_release.outputs.version }}-arm64-v8a.apk"
           apk_path="${RUNNER_TEMP}/${apk_name}"
+          plugin_path="${RUNNER_TEMP}/dsh-gbridge.tgz"
           sums_path="${RUNNER_TEMP}/SHA256SUMS.txt"
 
           cp "${source_apk}" "${apk_path}"
           apk_sha="$(sha256sum "${apk_path}" | awk '{print $1}')"
-          printf '%s  %s\n' "${apk_sha}" "${apk_name}" > "${sums_path}"
+
+          node scripts/pack_gbridge_plugin.mjs \
+            --out "${plugin_path}" \
+            --github-output "$GITHUB_OUTPUT"
+          plugin_sha="$(sha256sum "${plugin_path}" | awk '{print $1}')"
+
+          {
+            printf '%s  %s\n' "${apk_sha}" "${apk_name}"
+            printf '%s  %s\n' "${plugin_sha}" "dsh-gbridge.tgz"
+          } > "${sums_path}"
 
           {
             echo "apk_name=${apk_name}"
@@ -297,7 +307,7 @@ jobs:
             echo "apk_sha=${apk_sha}"
             echo "sums_path=${sums_path}"
           } >> "$GITHUB_OUTPUT"
-          ls -lh "${apk_path}" "${sums_path}"
+          ls -lh "${apk_path}" "${plugin_path}" "${sums_path}"
 
       - name: Create release tag at the built commit
         if: github.ref != format('refs/tags/{0}', needs.prepare_release.outputs.release_tag)
@@ -323,6 +333,8 @@ jobs:
             --version "${{ needs.prepare_release.outputs.version_label }}" \
             --apk-name "${{ steps.package.outputs.apk_name }}" \
             --apk-sha256 "${{ steps.package.outputs.apk_sha }}" \
+            --plugin-name "${{ steps.package.outputs.plugin_name }}" \
+            --plugin-sha256 "${{ steps.package.outputs.plugin_sha }}" \
             --runtime-manifest "${FLUTTER_WORKDIR}/android/app/src/main/assets/runtime/runtime-manifest.json" \
             --output "${notes_path}"
           echo "path=${notes_path}" >> "$GITHUB_OUTPUT"
@@ -335,6 +347,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
           RELEASE_NOTES_PATH: ${{ steps.notes.outputs.path }}
           RELEASE_APK_PATH: ${{ steps.package.outputs.apk_path }}
+          RELEASE_PLUGIN_PATH: ${{ steps.package.outputs.plugin_path }}
           RELEASE_SUMS_PATH: ${{ steps.package.outputs.sums_path }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
@@ -343,10 +356,10 @@ jobs:
               --title "GrassBag ${RELEASE_TAG}" \
               --notes-file "${RELEASE_NOTES_PATH}" \
               --latest
-            gh release upload "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_SUMS_PATH}" \
+            gh release upload "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_PLUGIN_PATH}" "${RELEASE_SUMS_PATH}" \
               --repo "${RELEASE_REPO}" --clobber
           else
-            gh release create "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_SUMS_PATH}" \
+            gh release create "${RELEASE_TAG}" "${RELEASE_APK_PATH}" "${RELEASE_PLUGIN_PATH}" "${RELEASE_SUMS_PATH}" \
               --repo "${RELEASE_REPO}" \
               --title "GrassBag ${RELEASE_TAG}" \
               --notes-file "${RELEASE_NOTES_PATH}" \

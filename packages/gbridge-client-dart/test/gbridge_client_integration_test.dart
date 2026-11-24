@@ -111,10 +111,13 @@ const tcpServer = createServer(async (req, res) => {
     res.end(JSON.stringify({ ok: true, version: '0.2.2-rc.5' }));
     return;
   }
-  if (url.pathname === '/api/rpc/pluginManager/installBundle') {
+  if (url.pathname === '/api/pluginManager/installBundle') {
     bridgeInstalled = true;
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ installed: true }));
+    res.end(JSON.stringify({
+      type: 'server-response',
+      result: { ok: true, value: { application: 'applied' } },
+    }));
     return;
   }
   if (url.pathname.startsWith(PREFIX)) {

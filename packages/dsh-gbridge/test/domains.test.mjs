@@ -557,7 +557,7 @@ test('Security & robustness: workspace root confinement, >64 credentials batchin
   });
   assert.equal(goodLogin.status, 303);
   const authCookie = String(goodLogin.setCookie[0] || '').split(';')[0];
-  assert.ok(authCookie.includes('gbridge-lan-auth='));
+  assert.match(authCookie, /^gbridge-lan-auth-\d+=/);
 
   // 2. Workspace root confinement blocks `%2F` filesystem root escape
   const escapeTree = await jsonReq(port, '/workspaces/%2F/files/tree', { cookie: authCookie });

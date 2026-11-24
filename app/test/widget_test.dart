@@ -1837,15 +1837,17 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('直连远程电脑 / 服务器'), findsOneWidget);
+      expect(find.text('扫码连接'), findsOneWidget);
       expect(find.text('粘贴'), findsOneWidget);
       expect(find.text('重新扫描'), findsOneWidget);
       expect(find.text('连接远程设备'), findsOneWidget);
 
-      // Expand Desktop GUI + CLI guide
+      // Expand Official Plugin + CLI guide
       await tester.tap(find.text('如何获取电脑链接？'));
       await tester.pumpAndSettle();
-      expect(find.text('桌面端（免命令）'), findsOneWidget);
-      await tester.tap(find.text('命令行（dsh web）'));
+      expect(find.text('官方插件（扫码推荐）'), findsOneWidget);
+      expect(find.textContaining('dsh-gbridge.tgz'), findsWidgets);
+      await tester.tap(find.text('免插件直连（dsh web）'));
       await tester.pumpAndSettle();
       expect(find.textContaining('dsh web --host'), findsWidgets);
 
@@ -2091,10 +2093,11 @@ void main() {
 
       await tester.tap(find.text('如何获取电脑链接？'));
       await tester.pumpAndSettle();
-      expect(find.text('桌面端（免命令）'), findsOneWidget);
-      expect(find.text('复制桌面端一键指令'), findsOneWidget);
+      expect(find.text('官方插件（扫码推荐）'), findsOneWidget);
+      expect(find.text('复制 AI 安装指令'), findsOneWidget);
+      expect(find.text('复制加速包地址'), findsOneWidget);
 
-      await tester.tap(find.text('命令行（dsh web）'));
+      await tester.tap(find.text('免插件直连（dsh web）'));
       await tester.pumpAndSettle();
       expect(find.textContaining('--host 0.0.0.0'), findsNothing);
       expect(find.textContaining('dsh web --host'), findsWidgets);

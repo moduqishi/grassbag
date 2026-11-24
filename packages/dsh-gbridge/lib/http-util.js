@@ -269,7 +269,12 @@ export class Router {
  * Enforce DSH Connection auth on webServer routes or Bearer token auth on UDS routes.
  * Fails closed (503) if webServer mode has no connection service yet.
  */
-export function admitRequest(req, { mode, ctx, bearerToken }) {
+export function lanCookieNameForPort(port) {
+  const n = Number(port);
+  return Number.isInteger(n) && n > 0 ? `gbridge-lan-auth-${n}` : 'gbridge-lan-auth';
+}
+
+export function admitRequest(req, { mode, ctx, bearerToken, lanPort } = {}) {
   let queryToken = null;
   try {
     queryToken = new URL(req.url || '/', 'http://gbridge.local').searchParams.get('token');
@@ -286,7 +291,12 @@ export function admitRequest(req, { mode, ctx, bearerToken }) {
       };
     }
     const tokenOk = Boolean(reqToken && safeEqualString(reqToken, bearerToken));
-    const cookieOk = mode === 'lan' && verifyLanCookieValue(parseCookieValue(req, 'gbridge-lan-auth'), bearerToken);
+    const scopedCookieName = lanCookieNameForPort(lanPort);
+    const cookieOk = mode === 'lan' && (
+      verifyLanCookieValue(parseCookieValue(req, scopedCookieName), bearerToken) ||
+      (scopedCookieName !== 'gbridge-lan-auth' &&
+        verifyLanCookieValue(parseCookieValue(req, 'gbridge-lan-auth'), bearerToken))
+    );
     if (!tokenOk && !cookieOk) {
       return {
         ok: false,

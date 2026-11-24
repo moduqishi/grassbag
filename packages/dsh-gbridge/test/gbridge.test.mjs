@@ -627,7 +627,7 @@ test('Desktop LAN Bridge advertises surface="desktop", persists 0600 token, exch
   const setCookie = Array.isArray(exchange.headers['set-cookie'])
     ? exchange.headers['set-cookie'][0]
     : String(exchange.headers['set-cookie'] || '');
-  assert.ok(setCookie.includes('gbridge-lan-auth='), `expected gbridge-lan-auth cookie, got ${setCookie}`);
+  assert.match(setCookie, /^gbridge-lan-auth-\d+=/, `expected port-scoped gbridge-lan-auth cookie, got ${setCookie}`);
   assert.ok(setCookie.includes('SameSite=Strict'), `expected SameSite=Strict cookie, got ${setCookie}`);
   assert.ok(setCookie.includes('Max-Age=2592000'));
   const cookiePair = setCookie.split(';')[0];
@@ -645,7 +645,7 @@ test('Desktop LAN Bridge advertises surface="desktop", persists 0600 token, exch
     { headers: { cookie: cookiePair } },
   );
   assert.equal(cookieCaps.status, 200);
-  assert.equal(cookieCaps.json.bridgeVersion, '0.1.0');
+  assert.equal(cookieCaps.json.bridgeVersion, core.version);
 
   const bearerCaps = await httpJson(
     { host: '127.0.0.1', port, path: `${PREFIX}/capabilities` },

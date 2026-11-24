@@ -266,7 +266,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
           hostName: s.activeHost.name,
           activeSessionId: s.activeSessionId,
           sessions: s.sessions,
-          activeWorkspace: s.activeWorkspace,
+          activeWorkspace: s.activeWorkspaceDisplayName,
           tabPayload: switch (_tab) {
             0 => (s.workspaceFiles, s.workspaceCurrentPath, s.turns.length, s.connectionPhase),
             1 => (s.workspaceDiffs, s.activeDiffScope, s.connectionPhase),

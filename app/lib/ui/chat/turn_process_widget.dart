@@ -29,6 +29,7 @@ final Map<String, Uint8List> _decodedAttachmentBytesCache = <String, Uint8List>{
 void clearTurnProcessCaches() {
   _decodedAttachmentBytesCache.clear();
   _AssistantBodyState._revealedProgressByTurn.clear();
+  _ToolStepRowState._kDetailCache.clear();
 }
 
 /// Renders one `NormalizedTurn`: Apple iOS 26 luminous user bubble (with secret redaction
@@ -55,6 +56,8 @@ class TurnView extends ConsumerWidget {
     final slice = ref.watch(
       appProvider.select(
         (s) => (
+          activeHostId: s.activeHostId,
+          sessionRenderGen: s.sessionRenderGen,
           secretRevealed: s.secretRevealed,
           autoFoldSteps: s.autoFoldSteps,
           isExpanded: s.expandedTurnProcessIds.contains(turn.stableKey) ||
@@ -63,11 +66,12 @@ class TurnView extends ConsumerWidget {
               s.collapsedTurnProcessIds.contains(turn.turnId),
           canTranslateCot: s.connectionPhase == ConnectionPhase.connected,
           glassTier: s.glassTier,
-          feedback: s.turnFeedback.isEmpty
+          feedback: s.turnFeedback.isEmpty || s.activeSessionId == null
               ? null
-              : (s.turnFeedback['${s.activeSessionId ?? ''}:${turn.assistantMessageId ?? turn.turnId}'] ??
-                  s.turnFeedback['${s.activeSessionId ?? ''}:${turn.turnId}'] ??
-                  s.turnFeedback[turn.turnId]),
+              : (s.turnFeedback['${s.activeHostId}:${s.activeSessionId}:${turn.assistantMessageId ?? turn.turnId}'] ??
+                  s.turnFeedback['${s.activeHostId}:${s.activeSessionId}:${turn.turnId}'] ??
+                  s.turnFeedback['${s.activeSessionId}:${turn.assistantMessageId ?? turn.turnId}'] ??
+                  s.turnFeedback['${s.activeSessionId}:${turn.turnId}']),
           isCreatingSession: turn.isStreaming ? s.isCreatingSession : false,
         ),
       ),
@@ -232,7 +236,7 @@ class TurnView extends ConsumerWidget {
           Padding(
             padding: const EdgeInsets.only(top: 14),
             child: _AssistantBody(
-              turnId: turn.stableKey,
+              turnId: '${slice.activeHostId}:${slice.sessionRenderGen}:${turn.stableKey}',
               text: turn.assistantText,
               isStreaming: turn.isStreaming,
               deliverables: turn.deliverables,
@@ -1378,18 +1382,26 @@ class _ToolStepRow extends ConsumerStatefulWidget {
 }
 
 class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
-  /// Synchronous LRU cache so re-mounted or re-expanded tool cards render
-  /// full output immediately on frame 0 without a tiny-spinner -> full-box height jump.
+  /// Synchronous LRU cache scoped by `(hostId, sessionRenderGen, callId)` so re-mounted or
+  /// re-expanded tool cards render full output immediately on frame 0 without cross-host/session bleed.
   static final Map<String, Map<String, dynamic>> _kDetailCache = {};
 
   Map<String, dynamic>? _detail;
+  String _loadedCacheKey = '';
   bool _loading = false;
   bool _loadedOnce = false;
   bool _pendingForceReload = false;
   bool _copied = false;
 
+  String _currentCacheKey() {
+    final s = ref.read(appProvider);
+    return '${s.activeHostId}:${s.sessionRenderGen}:${widget.step.callId}';
+  }
+
   void _primeFromCache() {
-    final cached = _kDetailCache[widget.step.callId];
+    final key = _currentCacheKey();
+    _loadedCacheKey = key;
+    final cached = _kDetailCache[key];
     if (cached != null) {
       _detail = cached;
       _loadedOnce = widget.step.status != 'running';
@@ -1409,7 +1421,8 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
   void didUpdateWidget(covariant _ToolStepRow oldWidget) {
     super.didUpdateWidget(oldWidget);
     final expanded = ref.read(appProvider).expandedStepIds.contains(widget.step.callId);
-    if (oldWidget.step.callId != widget.step.callId) {
+    final nextKey = _currentCacheKey();
+    if (oldWidget.step.callId != widget.step.callId || nextKey != _loadedCacheKey) {
       _detail = null;
       _loading = false;
       _loadedOnce = false;
@@ -1435,11 +1448,12 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     }
     setState(() => _loading = true);
     final callId = widget.step.callId;
+    final cacheKey = _currentCacheKey();
     final res = await widget.onLoadToolDetail(callId, forceRefresh: forceRefresh);
-    if (!mounted || widget.step.callId != callId) return;
+    if (!mounted || widget.step.callId != callId || _currentCacheKey() != cacheKey) return;
     if (res.isNotEmpty) {
-      _kDetailCache.remove(callId);
-      _kDetailCache[callId] = res;
+      _kDetailCache.remove(cacheKey);
+      _kDetailCache[cacheKey] = res;
       if (_kDetailCache.length > 128) {
         _kDetailCache.remove(_kDetailCache.keys.first);
       }

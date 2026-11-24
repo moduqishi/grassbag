@@ -3774,7 +3774,8 @@ class _InstallHelperSheetBody extends ConsumerStatefulWidget {
 }
 
 class _InstallHelperSheetBodyState extends ConsumerState<_InstallHelperSheetBody> {
-  final TextEditingController _specCtrl = TextEditingController(text: 'dsh-gbridge');
+  final TextEditingController _specCtrl =
+      TextEditingController(text: kOfficialGbridgeAcceleratedUrl);
 
   @override
   void dispose() {
@@ -3787,7 +3788,7 @@ class _InstallHelperSheetBodyState extends ConsumerState<_InstallHelperSheetBody
     Navigator.of(context).pop();
     ref.read(appProvider.notifier).installHelperOnHost(
           widget.host.id,
-          packageSpec: spec.isEmpty ? 'dsh-gbridge' : spec,
+          packageSpec: spec.isEmpty ? kOfficialGbridgeAcceleratedUrl : spec,
         );
   }
 
@@ -3795,22 +3796,60 @@ class _InstallHelperSheetBodyState extends ConsumerState<_InstallHelperSheetBody
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
+    final curSpec = _specCtrl.text.trim();
+    final presets = <(String, String)>[
+      ('国内加速源（推荐）', kOfficialGbridgeInstallSpecs[0]),
+      ('备用加速源', kOfficialGbridgeInstallSpecs[1]),
+      ('GitHub 直连', kOfficialGbridgeDirectUrl),
+    ];
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
-          '可填 npm 包名、Git 仓库地址或远程电脑本地路径（如 /path/to/packages/dsh-gbridge）。安装失败不会影响当前免插件直连。',
+          '通过官方预打包 .tgz（零运行时依赖、~91KB）直接挂载到当前 DSH：零冲突端口、内置桌面端扫码配对面板与断线续传。失败不影响当前免插件直连。',
           style: TextStyle(fontSize: 12, height: 1.45, color: t.text2),
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final (label, url) in presets)
+              GrassBagSpringTap(
+                onTap: () => setState(() => _specCtrl.text = url),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: curSpec == url ? t.primarySoft : t.fill1,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: curSpec == url ? t.primary : t.sep,
+                      width: curSpec == url ? 0.9 : 0.6,
+                    ),
+                  ),
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: curSpec == url ? t.primary : t.text2,
+                    ),
+                  ),
+                ),
+              ),
+          ],
         ),
         const SizedBox(height: 10),
         GrassBagTextField(
           controller: _specCtrl,
           insideGlass: true,
           monospace: true,
-          placeholder: 'dsh-gbridge 或远程本地路径 / git URL',
-          fontSize: 13,
+          placeholder: '官方 .tgz 加速地址或远程本地路径',
+          fontSize: 12.5,
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+          onChanged: (_) => setState(() {}),
           onSubmitted: (_) => _install(),
         ),
         const SizedBox(height: 14),
@@ -3827,7 +3866,7 @@ class _InstallHelperSheetBodyState extends ConsumerState<_InstallHelperSheetBody
             const SizedBox(width: 10),
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '开始远程安装',
+                label: '加速远程安装',
                 icon: CupertinoIcons.arrow_down_circle_fill,
                 tier: tier,
                 insideGlass: true,

@@ -103,6 +103,10 @@ class RuntimeController private constructor(
 
     private val listeners = CopyOnWriteArraySet<(String, Map<String, Any?>) -> Unit>()
     private val worker = Executors.newCachedThreadPool()
+    private val toolkitExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "grassbag-toolkit").apply { isDaemon = true }
+    }
+    private val activeToolkitInstalls = java.util.concurrent.atomic.AtomicInteger(0)
     private val coalesceScheduler = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "grassbag-event-coalesce").apply { isDaemon = true }
     }
@@ -420,10 +424,14 @@ class RuntimeController private constructor(
             val etcDir = File(ubuntuRoot, "etc")
             etcDir.mkdirs()
             val containerTmp = File(ubuntuRoot, "tmp").apply { mkdirs() }
+            val containerVarTmp = File(ubuntuRoot, "var/tmp").apply { mkdirs() }
+            File(ubuntuRoot, "var/cache/apt/archives/partial").mkdirs()
+            File(ubuntuRoot, "var/lib/apt/lists/partial").mkdirs()
             prootTmpDir.mkdirs()
             tawcTmpDir.mkdirs()
-            // Ensure sticky 01777 permissions on /tmp dirs so apt/npm/mktemp/python never fail.
+            // Ensure sticky 01777 permissions on /tmp & /var/tmp so apt/dpkg/npm/mktemp/python never fail.
             runCatching { Os.chmod(containerTmp.absolutePath, 0x3FF) }
+            runCatching { Os.chmod(containerVarTmp.absolutePath, 0x3FF) }
             runCatching { Os.chmod(prootTmpDir.absolutePath, 0x3FF) }
             runCatching { Os.chmod(tawcTmpDir.absolutePath, 0x3FF) }
 
@@ -436,12 +444,59 @@ class RuntimeController private constructor(
                 hosts.writeText("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n")
             }
 
-            // Configure APT for single-UID unprivileged rootfs (prevents `_apt` setgroups/seccomp failures).
+            // Configure APT & dpkg for single-UID unprivileged Android containers:
+            // - Avoids `_apt` setgroups/seccomp failures and `/dev/pts` PTY hangs (`DPkg::Use-Pty "0"`)
+            // - Non-interactive config conflict handling (`--force-confdef --force-confold`)
+            // - Automatic broken-dep recovery + mobile network retries
             val aptConfDir = File(etcDir, "apt/apt.conf.d").apply { mkdirs() }
             val aptConf = File(aptConfDir, "99grassbag")
-            val wantAptConf = "APT::Sandbox::User \"root\";\nAPT::Sandbox::Seccomp \"false\";\n"
+            val wantAptConf = buildString {
+                append("APT::Sandbox::User \"root\";\n")
+                append("APT::Sandbox::Seccomp \"false\";\n")
+                append("DPkg::Use-Pty \"0\";\n")
+                append("DPkg::Options { \"--force-confdef\"; \"--force-confold\"; };\n")
+                append("APT::Get::Fix-Broken \"true\";\n")
+                append("Acquire::Languages \"none\";\n")
+                append("Acquire::GzipIndexes \"true\";\n")
+                append("Acquire::CompressionTypes::Order:: \"gz\";\n")
+                append("Acquire::http::Pipeline-Depth \"5\";\n")
+                append("Acquire::Retries \"3\";\n")
+                append("Acquire::http::Timeout \"30\";\n")
+                append("Acquire::https::Timeout \"30\";\n")
+            }
             if (!aptConf.exists() || runCatching { aptConf.readText() }.getOrNull() != wantAptConf) {
                 aptConf.writeText(wantAptConf)
+            }
+
+            // Allow pip/pip3 installs directly inside the isolated container (Ubuntu 24.04 PEP 668).
+            val pipConf = File(etcDir, "pip.conf")
+            val wantPipConf = "[global]\nbreak-system-packages = true\n"
+            if (!pipConf.exists() || runCatching { pipConf.readText() }.getOrNull() != wantPipConf) {
+                pipConf.writeText(wantPipConf)
+            }
+
+            // Speed up dpkg unpack 3-5x on Android flash (`force-unsafe-io`) and omit bulky docs/manpages.
+            val dpkgConfDir = File(etcDir, "dpkg/dpkg.cfg.d").apply { mkdirs() }
+            val dpkgConf = File(dpkgConfDir, "99grassbag")
+            val wantDpkgConf = buildString {
+                append("force-unsafe-io\n")
+                append("path-exclude=/usr/share/man/*\n")
+                append("path-exclude=/usr/share/info/*\n")
+                append("path-exclude=/usr/share/doc/*\n")
+                append("path-include=/usr/share/doc/*/copyright\n")
+            }
+            if (!dpkgConf.exists() || runCatching { dpkgConf.readText() }.getOrNull() != wantDpkgConf) {
+                dpkgConf.writeText(wantDpkgConf)
+            }
+
+            // Standard Debian/Ubuntu container policy-rc.d: prevents package postinst scripts
+            // from trying to start systemd/SysV background daemons inside the container.
+            val policyRc = File(ubuntuRoot, "usr/sbin/policy-rc.d")
+            val wantPolicyRc = "#!/bin/sh\nexit 101\n"
+            if (!policyRc.exists() || runCatching { policyRc.readText() }.getOrNull() != wantPolicyRc) {
+                policyRc.parentFile?.mkdirs()
+                policyRc.writeText(wantPolicyRc)
+                runCatching { Os.chmod(policyRc.absolutePath, 0x1ED) } // 0755
             }
 
             // Ensure system CA certificate bundle exists for curl/git/python/pip/HTTPS apt even on existing containers.
@@ -645,13 +700,26 @@ class RuntimeController private constructor(
     fun detectInstalledToolkits(): List<String> {
         val found = mutableListOf<String>()
         if (isContainerExtracted()) found.add("core-node")
-        if (File(ubuntuRoot, "usr/bin/python3").exists()) found.add("python-uv")
+        // Verify full toolkit readiness (never falsely report half-installed broken apt runs as installed!)
+        if (File(ubuntuRoot, "usr/bin/python3").exists() &&
+            File(ubuntuRoot, "usr/bin/pip3").exists()
+        ) {
+            found.add("python-uv")
+        }
         if (File(ubuntuRoot, "usr/bin/git").exists() &&
-            (File(ubuntuRoot, "usr/bin/rg").exists() || File(ubuntuRoot, "usr/bin/jq").exists())
+            File(ubuntuRoot, "usr/bin/rg").exists() &&
+            File(ubuntuRoot, "usr/bin/jq").exists() &&
+            File(ubuntuRoot, "usr/bin/sqlite3").exists() &&
+            File(ubuntuRoot, "usr/bin/curl").exists()
         ) {
             found.add("dev-git-cli")
         }
-        if (File(ubuntuRoot, "usr/bin/ffmpeg").exists()) found.add("media-office")
+        if (File(ubuntuRoot, "usr/bin/ffmpeg").exists() &&
+            File(ubuntuRoot, "usr/bin/pandoc").exists() &&
+            (File(ubuntuRoot, "usr/bin/convert").exists() || File(ubuntuRoot, "usr/bin/magick").exists())
+        ) {
+            found.add("media-office")
+        }
         return found
     }
 
@@ -1362,7 +1430,7 @@ class RuntimeController private constructor(
             clean.startsWith("/opt/dsh-slots/") -> File(slotsRoot, clean.removePrefix("/opt/dsh-slots/"))
             clean == "/sdcard" -> Environment.getExternalStorageDirectory()
             clean.startsWith("/sdcard/") -> File(Environment.getExternalStorageDirectory(), clean.removePrefix("/sdcard/"))
-            clean == "/tmp" -> tawcTmpDir
+            clean == "/tmp" -> File(ubuntuRoot, "tmp")
             clean.startsWith("/") -> File(ubuntuRoot, clean.removePrefix("/"))
             else -> File(homeDir, "workspace")
         }
@@ -1415,13 +1483,16 @@ class RuntimeController private constructor(
         val pb: ProcessBuilder
         if (wantTawc) {
             executorTag = "tawcroot"
+            // CRITICAL: Do NOT `-b` bind `/tmp`! In tawcroot (`path_orchestrate.c`), paths matched
+            // by a bind bypass the rootfs symlink resolver & linkstore, causing apt's staged symlinks
+            // (`/tmp/apt-dpkg-install-*/0-*.deb -> /var/cache/apt/archives/*.deb`) and python/pip/gcc
+            // guest symlinks in `/tmp` to fail with ENOENT! Use the native rootfs `ubuntuRoot/tmp`.
             val args = mutableListOf(
                 tawcBin.absolutePath,
                 "-s", // Create an isolated POSIX session/PGID so stop/restart cleanly reaps all child trees
                 "-r", ubuntuRoot.absolutePath,
                 "-b", "/dev:/dev",
                 "-b", "/proc:/proc",
-                "-b", "${tawcTmpDir.absolutePath}:/tmp",
                 "-b", "${homeDir.absolutePath}:/root",
                 "-b", "${sharedDir.absolutePath}:/root/shared",
                 "-b", "${slotsRoot.absolutePath}:/opt/dsh-slots",
@@ -1442,6 +1513,8 @@ class RuntimeController private constructor(
                 .redirectErrorStream(true)
         } else {
             executorTag = if (effectiveDisableSeccomp) "proot-legacy" else "proot"
+            // Keep `/tmp` inside `ubuntuRoot/tmp` for uniform rootfs semantics; `PROOT_TMP_DIR`
+            // env var still points to host `prootTmpDir` for PRoot's internal loader stubs.
             val args = mutableListOf(
                 prootBin.absolutePath,
                 "-0",
@@ -1449,7 +1522,6 @@ class RuntimeController private constructor(
                 "-r", ubuntuRoot.absolutePath,
                 "-b", "/dev",
                 "-b", "/proc",
-                "-b", "${prootTmpDir.absolutePath}:/tmp",
                 "-b", "${homeDir.absolutePath}:/root",
                 "-b", "${sharedDir.absolutePath}:/root/shared",
                 "-b", "${slotsRoot.absolutePath}:/opt/dsh-slots",
@@ -1492,7 +1564,11 @@ class RuntimeController private constructor(
             put("TZ", TimeZone.getDefault().id)
             put("TERM", "xterm-256color")
             put("LANG", "C.UTF-8")
+            put("TMPDIR", "/tmp")
             put("DEBIAN_FRONTEND", "noninteractive")
+            put("UCF_FORCE_CONFFOLD", "1")
+            put("NEEDRESTART_SUSPEND", "1")
+            put("PIP_BREAK_SYSTEM_PACKAGES", "1")
             put("PS1", "\\u@grassbag:\\w\\$ ")
             put("PATH", "/usr/local/bin:/opt/shims/droid-bin:/root/.local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             put("DSH_HOME", "/root/.dsh")
@@ -1877,13 +1953,16 @@ class RuntimeController private constructor(
         val compileCacheDir = File(homeDir, ".cache/node-compile-cache").absolutePath
         val dirs = mutableListOf(
             File(homeDir, ".npm/_cacache"),
-            File(homeDir, ".cache"),
-            File(ubuntuRoot, "tmp"),
-            File(ubuntuRoot, "var/cache/apt/archives"),
-            File(ubuntuRoot, "var/lib/apt/lists")
+            File(homeDir, ".cache")
         )
-        // Only sweep active tmp dirs when no engine or shell is using them!
-        if (!isEngineAlive() && shells.isEmpty()) {
+        // Avoid deleting active apt archives/lists while a toolkit installation is running!
+        if (activeToolkitInstalls.get() == 0) {
+            dirs.add(File(ubuntuRoot, "var/cache/apt/archives"))
+            dirs.add(File(ubuntuRoot, "var/lib/apt/lists"))
+        }
+        // Only sweep active tmp dirs when no engine, shell, or toolkit install is using them!
+        if (!isEngineAlive() && shells.isEmpty() && activeToolkitInstalls.get() == 0) {
+            dirs.add(File(ubuntuRoot, "tmp"))
             dirs.add(prootTmpDir)
             dirs.add(tawcTmpDir)
         }
@@ -2154,7 +2233,10 @@ class RuntimeController private constructor(
     }
 
     fun installToolkit(toolkitId: String, requestedPackages: List<String>, done: (Map<String, Any?>) -> Unit) {
-        worker.execute {
+        // Serialize all toolkit installs on a dedicated single-thread executor so tapping two
+        // toolkits back-to-back never races on `/var/lib/dpkg/lock-frontend`!
+        toolkitExecutor.execute {
+            activeToolkitInstalls.incrementAndGet()
             var startedFg = false
             try {
                 if (!isContainerExtracted()) {
@@ -2182,43 +2264,95 @@ class RuntimeController private constructor(
                     ctx,
                     "正在安装容器工具包",
                     "apt 安装 ${aptPkgs.joinToString(" ")}…",
-                    wakeLockMs = 10 * 60 * 1000L
+                    wakeLockMs = 15 * 60 * 1000L
                 )
                 startedFg = true
 
                 val pkgLine = aptPkgs.joinToString(" ")
-                val cmd = "apt-get update -qq && apt-get install -y --no-install-recommends $pkgLine && apt-get clean && rm -rf /var/lib/apt/lists/*"
-                appendLog("[toolkit:$toolkitId] running: $cmd")
-                val pb = buildProotProcess(listOf("/bin/sh", "-c", cmd), "/root").first
-                val proc = spawnProcess(pb)
-                val tail = LinkedList<String>()
-                val reader = Thread({
-                    runCatching {
-                        BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
-                            while (true) {
-                                val line = br.readLine() ?: break
-                                appendLog("[apt] $line")
-                                synchronized(tail) {
-                                    tail.add(line)
-                                    while (tail.size > 12) tail.removeFirst()
+                // Self-healing, fast-cached apt/dpkg transaction:
+                // 1) Recovers automatically if a prior dpkg run was interrupted halfway
+                // 2) Cleans stale apt-dpkg-install-* staging dirs & lockfiles (safe inside serialized toolkitExecutor)
+                // 3) Reuses fresh gzipped apt package lists (<4h) so sequential installs skip 60s+ index downloads,
+                //    and automatically refreshes indexes + retries if a mirror rotated package versions.
+                // 4) Uses rootfs /tmp with non-interactive confdef/confold, UCF_FORCE_CONFFOLD=1, and auto-retries.
+                val cmd = buildString {
+                    append("set -e; ")
+                    append("export DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 NEEDRESTART_SUSPEND=1 TMPDIR=/tmp; ")
+                    append("mkdir -p /tmp /var/tmp /var/cache/apt/archives/partial /var/lib/apt/lists/partial; ")
+                    append("chmod 1777 /tmp /var/tmp 2>/dev/null || true; ")
+                    append("rm -rf /tmp/apt-dpkg-install-* /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock; ")
+                    append("dpkg --configure -a --force-confdef --force-confold || true; ")
+                    append("if ! find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -240 2>/dev/null | grep -q .; then ")
+                    append("echo '[grassbag] syncing Ubuntu APT package indexes...'; ")
+                    append("apt-get update -qq; ")
+                    append("fi; ")
+                    append("apt-get -f install -y --no-install-recommends || true; ")
+                    append("if ! apt-get install -y --no-install-recommends $pkgLine; then ")
+                    append("echo '[grassbag] refreshing APT indexes and retrying install...'; ")
+                    append("apt-get update -qq; ")
+                    append("apt-get -f install -y --no-install-recommends || true; ")
+                    append("apt-get install -y --no-install-recommends $pkgLine; ")
+                    append("fi; ")
+                    append("apt-get clean; ")
+                    append("rm -rf /tmp/apt-dpkg-install-*")
+                }
+
+                fun runAptAttempt(forceProot: Boolean?): Triple<Int, String, String> {
+                    val (pb, execTag) = buildProotProcess(
+                        listOf("/bin/sh", "-c", cmd),
+                        "/root",
+                        forceProot = forceProot
+                    )
+                    appendLog("[toolkit:$toolkitId] running ($execTag): apt-get install $pkgLine")
+                    val proc = spawnProcess(pb)
+                    val tail = LinkedList<String>()
+                    val reader = Thread({
+                        runCatching {
+                            BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
+                                while (true) {
+                                    val line = br.readLine() ?: break
+                                    appendLog("[apt] $line")
+                                    synchronized(tail) {
+                                        tail.add(line)
+                                        while (tail.size > 16) tail.removeFirst()
+                                    }
                                 }
                             }
                         }
+                    }, "gb-apt-reader").apply { isDaemon = true; start() }
+                    val exitedInTime = proc.waitFor(12, java.util.concurrent.TimeUnit.MINUTES)
+                    if (!exitedInTime) {
+                        runCatching { proc.destroyForcibly() }
+                        runCatching { proc.inputStream.close() }
+                        runCatching { reader.join(1000) }
+                        return Triple(-1, "apt-get 安装超时（超过 12 分钟），请检查网络连接后重试", execTag)
                     }
-                }, "gb-apt-reader").apply { isDaemon = true; start() }
-                val exitedInTime = proc.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)
-                if (!exitedInTime) {
-                    runCatching { proc.destroyForcibly() }
-                    runCatching { proc.inputStream.close() }
-                    runCatching { reader.join(1000) }
-                    done(mapOf("ok" to false, "error" to "apt-get 安装超时（超过 5 分钟），请检查网络连接后重试", "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
-                    return@execute
+                    runCatching { reader.join(1500) }
+                    val code = proc.exitValue()
+                    val summary = synchronized(tail) { tail.joinToString("\n") }
+                    return Triple(code, summary, execTag)
                 }
-                runCatching { reader.join(1500) }
-                val code = proc.exitValue()
+
+                var (code, reason, usedExec) = runAptAttempt(forceProot = null)
+                val hasProot = File(ctx.applicationInfo.nativeLibraryDir, "libproot.so").exists()
+                val looksLikeContainerSyscallErr = code != 0 && code != -1 && usedExec == "tawcroot" && (
+                    reason.contains("cannot stat", ignoreCase = true) ||
+                        reason.contains("Function not implemented", ignoreCase = true) ||
+                        reason.contains("Bad address", ignoreCase = true) ||
+                        reason.contains("Operation not permitted", ignoreCase = true) ||
+                        reason.contains("Segmentation fault", ignoreCase = true)
+                    )
+                if (looksLikeContainerSyscallErr && hasProot) {
+                    appendLog("[toolkit:$toolkitId] tawcroot apt hit syscall error; auto-retrying via PRoot compatibility mode...")
+                    val retry = runAptAttempt(forceProot = true)
+                    code = retry.first
+                    reason = retry.second
+                    usedExec = retry.third
+                }
+
                 if (code != 0) {
-                    val reason = synchronized(tail) { tail.joinToString("\n") }.ifBlank { "apt-get exited with code $code" }
-                    done(mapOf("ok" to false, "error" to reason, "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
+                    val errText = reason.ifBlank { "apt-get exited with code $code ($usedExec)" }
+                    done(mapOf("ok" to false, "error" to errText, "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
                     return@execute
                 }
 
@@ -2233,12 +2367,13 @@ class RuntimeController private constructor(
                     aptFile.writeText(curJson.toString(2))
                 }
 
-                appendLog("[toolkit:$toolkitId] installed successfully: $pkgLine")
+                appendLog("[toolkit:$toolkitId] installed successfully ($usedExec): $pkgLine")
                 done(mapOf("ok" to true, "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
             } catch (err: Throwable) {
                 appendLog("[toolkit:$toolkitId] ERROR: ${err.message}")
                 done(mapOf("ok" to false, "error" to (err.message ?: "toolkit_install_failed"), "status" to getStatus()))
             } finally {
+                activeToolkitInstalls.decrementAndGet()
                 if (startedFg) {
                     if (isEngineAlive() && engineState == "running") {
                         val ver = lastCapabilitiesDshVersion ?: readMeta().optString("dshVersion", "0.2.2-rc.5")

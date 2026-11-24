@@ -6631,12 +6631,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       showToast('请先初始化本机 Ubuntu 容器后再安装工具链', tone: ToastTone.warn);
       return;
     }
+    final anyOtherInstalling = state.containerToolkits.any((t) => t.installing && t.id != toolkitId);
     state = state.copyWith(
       containerToolkits: [
         for (final t in state.containerToolkits) t.id == toolkitId ? t.copyWith(installing: true) : t,
       ],
     );
-    showToast('正在通过 apt 安装「${item.name}」…', tone: ToastTone.info);
+    showToast(
+      anyOtherInstalling
+          ? '已加入安装队列，前一项完成后自动部署「${item.name}」…'
+          : '正在通过 apt 安装「${item.name}」…',
+      tone: ToastTone.info,
+    );
     final res = await native.installToolkit(item.id, item.packages);
     await refreshNativeStatus();
     if (!mounted) return;

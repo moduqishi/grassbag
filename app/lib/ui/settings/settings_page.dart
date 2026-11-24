@@ -3095,7 +3095,7 @@ class _HostDetailSection extends ConsumerWidget {
                     iconSize: 15,
                   ),
                   title: const Text('清理容器临时缓存'),
-                  subtitle: const Text('清理 proot-tmp、npm 缓存与过期快照，保留 /root 资料'),
+                  subtitle: const Text('清理 /tmp、apt/npm 缓存与过期快照，保留 /root 资料'),
                   showChevron: true,
                   onTap: ctrl.cleanLocalCache,
                 ),
@@ -3153,14 +3153,27 @@ class _HostDetailSection extends ConsumerWidget {
               children: [
                 for (final tk in appState.containerToolkits)
                   GrassBagListTile(
-                    leading: GrassBagSquircleIcon(
-                      icon: tk.installed ? CupertinoIcons.checkmark_alt_circle_fill : CupertinoIcons.cube_box,
-                      color: tk.installed ? t.ok : t.primary,
-                      size: 32,
-                      iconSize: 15,
-                    ),
+                    leading: tk.installing
+                        ? Container(
+                            width: 32,
+                            height: 32,
+                            decoration: BoxDecoration(
+                              color: t.primary.withValues(alpha: t.isDark ? 0.22 : 0.14),
+                              borderRadius: BorderRadius.circular(9),
+                            ),
+                            alignment: Alignment.center,
+                            child: CupertinoActivityIndicator(radius: 7.5, color: t.primary),
+                          )
+                        : GrassBagSquircleIcon(
+                            icon: tk.installed ? CupertinoIcons.checkmark_alt_circle_fill : CupertinoIcons.cube_box,
+                            color: tk.installed ? t.ok : t.primary,
+                            size: 32,
+                            iconSize: 15,
+                          ),
                     title: Text(tk.name, style: TextStyle(fontWeight: FontWeight.w600, color: t.text)),
-                    subtitle: Text('${tk.desc} · ${tk.sizeLabel}'),
+                    subtitle: Text(
+                      tk.installing ? '正在部署中（可在上方容器日志查看实时进度）…' : '${tk.desc} · ${tk.sizeLabel}',
+                    ),
                     trailing: tk.installed
                         ? Text('已安装', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.ok))
                         : GrassBagSecondaryGlassButton(

@@ -3917,7 +3917,8 @@ class _AssistantBodyState extends State<_AssistantBody>
       RegExp(r'^\|?[\s:]*-+[\s:]*(?:\|[\s:\-]*)*$');
   static final RegExp _bulletPattern = RegExp(r'^([-*+•]|\d+[.)])\s+(.+)$');
   static final RegExp _taskPrefixPattern = RegExp(r'^\[([ xX])\]\s+(.*)$');
-  static final RegExp _standaloneImageRe = RegExp(r'^!\[([^\]]*)\]\((https?://[^\s)]+)\)$');
+  static final RegExp _standaloneImageRe =
+      RegExp(r'^!\[([^\]]*)\]\((https?://(?:[^\s()]|\([^\s()]*\))+)\)$');
   static final Map<String, int> _revealedProgressByTurn = <String, int>{};
 
   bool _copied = false;
@@ -4131,8 +4132,14 @@ class _AssistantBodyState extends State<_AssistantBody>
     } else if (widget.isStreaming && _revealedLen == 0 && targetLen > 0) {
       _revealedLen = _safeInitialReveal(widget.text);
     }
-    if (!widget.isStreaming && !oldWidget.isStreaming) {
-      // Static completed turn update -> show immediately.
+    final stillRevealingCompletedTail = !widget.isStreaming &&
+        !oldWidget.isStreaming &&
+        (_typeTicker?.isActive == true) &&
+        _revealedLen < targetLen &&
+        (oldWidget.text == widget.text || _fastStartsWithPrev(widget.text, oldWidget.text));
+    if (!widget.isStreaming && !oldWidget.isStreaming && !stillRevealingCompletedTail) {
+      // Static completed turn update -> show immediately (without snapping an active
+      // post-turn typewriter catch-up tail during session reconcile!).
       _revealedLen = targetLen;
       _revealedProgressByTurn.remove(widget.turnId);
       _stopTypeTicker();
@@ -4290,7 +4297,7 @@ class _AssistantBodyState extends State<_AssistantBody>
           mathBlockCloser = r'\]';
         }
       } else if (inMathBlock) {
-        if (exactTrim.endsWith(mathBlockCloser)) {
+        if (exactTrim.contains(mathBlockCloser)) {
           inMathBlock = false;
         }
       } else if (_isClosingFence(t, openChar!, openLen)) {
@@ -4369,48 +4376,183 @@ class _AssistantBodyState extends State<_AssistantBody>
       tail = '${tail.substring(0, linkMatch.start)}${isImg ? '' : label}';
     }
 
-    // 3d. Strip bare trailing opener tokens, OR auto-close active inline spans (`**text`, `` `code ``, `~~del`)
-    //     so bold / inline-code / strikethrough render styled immediately while streaming!
-    if (tail.endsWith('``') && !tail.endsWith('```')) {
-      return '$prefix${tail.substring(0, tail.length - 2)}';
+    // 3d. Single-pass escape- and backtick-aware scanner over the active paragraph so
+    //     code spans like `` `a**b` ``, multi-line bold `**a\nb`, `***`, and inline math
+    //     `$x+y` / `\(x+y` stabilize smoothly with zero raw-syntax flash!
+    var paraStart = settledOffset.clamp(0, prefix.length);
+    final blankBreak = prefix.lastIndexOf('\n\n');
+    if (blankBreak >= paraStart) {
+      paraStart = blankBreak + 2;
     }
-    final backticks = '`'.allMatches(tail).length;
-    if (backticks.isOdd) {
-      if (tail.endsWith('`')) {
-        return '$prefix${tail.substring(0, tail.length - 1)}';
-      }
-      // Auto-close active inline code span (`foo -> `foo`)
-      return '$prefix$tail`';
-    }
-    if (tail.endsWith('***')) {
-      return '$prefix${tail.substring(0, tail.length - 3)}';
-    }
-    if (tail.endsWith('**')) {
-      final boldCount = '**'.allMatches(tail).length;
-      if (boldCount.isOdd) return '$prefix${tail.substring(0, tail.length - 2)}';
-    } else if (tail.endsWith('*') && tail.length >= 2 && tail[tail.length - 2] != ' ') {
-      final withoutLast = tail.substring(0, tail.length - 1);
-      final boldCount = '**'.allMatches(withoutLast).length;
-      if (boldCount.isOdd) return '$prefix$withoutLast**';
-    } else {
-      final boldCount = '**'.allMatches(tail).length;
-      if (boldCount.isOdd) {
-        final lastOpen = tail.lastIndexOf('**');
-        if (lastOpen >= 0 && lastOpen + 2 < tail.length && tail[lastOpen + 2] != ' ') {
-          return '$prefix$tail**';
+    final activePara = '${prefix.substring(paraStart)}$tail';
+    int openTickLen = 0;
+    int openTickStart = -1;
+    bool openBold = false;
+    int openBoldStart = -1;
+    bool openStrike = false;
+    int openStrikeStart = -1;
+    bool openDollarMath = false;
+    int openDollarStart = -1;
+    bool openParenMath = false;
+    int openParenStart = -1;
+
+    var i = 0;
+    final pLen = activePara.length;
+    while (i < pLen) {
+      final ch = activePara[i];
+      if (openTickLen > 0) {
+        if (ch == '`') {
+          var end = i;
+          while (end < pLen && activePara[end] == '`') {
+            end++;
+          }
+          if (end - i == openTickLen) {
+            openTickLen = 0;
+            openTickStart = -1;
+          }
+          i = end;
+          continue;
         }
+        i++;
+        continue;
+      }
+      if (ch == r'\' && i + 1 < pLen) {
+        final nextCh = activePara[i + 1];
+        if (!openParenMath && nextCh == '(') {
+          openParenMath = true;
+          openParenStart = i;
+          i += 2;
+          continue;
+        }
+        if (openParenMath && nextCh == ')') {
+          openParenMath = false;
+          openParenStart = -1;
+          i += 2;
+          continue;
+        }
+        i += 2;
+        continue;
+      }
+      if (openParenMath) {
+        i++;
+        continue;
+      }
+      if (ch == '`') {
+        var end = i;
+        while (end < pLen && activePara[end] == '`') {
+          end++;
+        }
+        openTickLen = end - i;
+        openTickStart = i;
+        i = end;
+        continue;
+      }
+      if (ch == r'$') {
+        final isDouble = i + 1 < pLen && activePara[i + 1] == r'$';
+        if (isDouble) {
+          i += 2;
+          continue;
+        }
+        if (!openDollarMath) {
+          final prevWord = i > 0 && _isWordChar(activePara.codeUnitAt(i - 1));
+          final nextSpace = i + 1 < pLen && (activePara[i + 1] == ' ' || activePara[i + 1] == '\t' || activePara[i + 1] == '\n');
+          if (!prevWord && !nextSpace) {
+            openDollarMath = true;
+            openDollarStart = i;
+          }
+        } else {
+          final prevSpace = i > 0 && (activePara[i - 1] == ' ' || activePara[i - 1] == '\t');
+          if (!prevSpace) {
+            openDollarMath = false;
+            openDollarStart = -1;
+          }
+        }
+        i++;
+        continue;
+      }
+      if (openDollarMath) {
+        if (ch == '\n') {
+          openDollarMath = false;
+          openDollarStart = -1;
+        }
+        i++;
+        continue;
+      }
+      if (ch == '*' && i + 1 < pLen && activePara[i + 1] == '*') {
+        // Skip `***` if it's a bare trailing triple-asterisk opener
+        if (i + 2 < pLen && activePara[i + 2] == '*' && i + 3 == pLen) {
+          return '${prefix.substring(0, paraStart)}${activePara.substring(0, i)}';
+        }
+        if (openBold) {
+          openBold = false;
+          openBoldStart = -1;
+        } else {
+          openBold = true;
+          openBoldStart = i;
+        }
+        i += 2;
+        continue;
+      }
+      if (ch == '~' && i + 1 < pLen && activePara[i + 1] == '~') {
+        if (openStrike) {
+          openStrike = false;
+          openStrikeStart = -1;
+        } else {
+          openStrike = true;
+          openStrikeStart = i;
+        }
+        i += 2;
+        continue;
+      }
+      i++;
+    }
+
+    final basePrefix = prefix.substring(0, paraStart);
+    if (openTickLen > 0) {
+      if (openTickStart + openTickLen == pLen) {
+        return '$basePrefix${activePara.substring(0, openTickStart)}';
+      }
+      return '$basePrefix$activePara${'`' * openTickLen}';
+    }
+    if (openParenMath) {
+      final body = activePara.substring(openParenStart + 2);
+      if (body.trim().isEmpty || body == r'\') {
+        return '$basePrefix${activePara.substring(0, openParenStart)}';
+      }
+      if (activePara.endsWith(r'\')) {
+        return '$basePrefix${activePara.substring(0, pLen - 1)}\\)';
+      }
+      return '$basePrefix$activePara\\)';
+    }
+    if (openDollarMath) {
+      final body = activePara.substring(openDollarStart + 1);
+      if (body.isEmpty) {
+        return '$basePrefix${activePara.substring(0, openDollarStart)}';
+      }
+      if (!body.endsWith(' ') && !body.endsWith('\t') && !_looksLikeCurrencyNotMath(body, false)) {
+        return '$basePrefix$activePara\$';
       }
     }
-    if (tail.endsWith('~~')) {
-      final strikeCount = '~~'.allMatches(tail).length;
-      if (strikeCount.isOdd) return '$prefix${tail.substring(0, tail.length - 2)}';
-    } else {
-      final strikeCount = '~~'.allMatches(tail).length;
-      if (strikeCount.isOdd) {
-        final lastOpen = tail.lastIndexOf('~~');
-        if (lastOpen >= 0 && lastOpen + 2 < tail.length && tail[lastOpen + 2] != ' ') {
-          return '$prefix$tail~~';
-        }
+    if (openBold) {
+      if (openBoldStart + 2 == pLen) {
+        return '$basePrefix${activePara.substring(0, openBoldStart)}';
+      }
+      if (activePara.endsWith('*') && pLen >= openBoldStart + 3 && activePara[pLen - 2] != ' ') {
+        return '$basePrefix$activePara*';
+      }
+      if (openBoldStart + 2 < pLen && activePara[openBoldStart + 2] != ' ') {
+        return '$basePrefix$activePara**';
+      }
+    }
+    if (openStrike) {
+      if (openStrikeStart + 2 == pLen) {
+        return '$basePrefix${activePara.substring(0, openStrikeStart)}';
+      }
+      if (activePara.endsWith('~') && pLen >= openStrikeStart + 3 && activePara[pLen - 2] != ' ') {
+        return '$basePrefix$activePara~';
+      }
+      if (openStrikeStart + 2 < pLen && activePara[openStrikeStart + 2] != ' ') {
+        return '$basePrefix$activePara~~';
       }
     }
     return '$prefix$tail';
@@ -5067,20 +5209,47 @@ class _AssistantBodyState extends State<_AssistantBody>
     if (s.endsWith('|') && !s.endsWith(r'\|')) s = s.substring(0, s.length - 1);
     final cells = <String>[];
     final buf = StringBuffer();
-    var inCode = false;
-    for (int k = 0; k < s.length; k++) {
+    var openTickLen = 0;
+    var k = 0;
+    while (k < s.length) {
       final ch = s[k];
-      if (ch == r'\' && k + 1 < s.length && s[k + 1] == '|') {
-        buf.write('|');
-        k++;
+      if (openTickLen == 0 && ch == r'\' && k + 1 < s.length) {
+        final next = s[k + 1];
+        if (next == '|') {
+          buf.write('|');
+          k += 2;
+          continue;
+        }
+        if (next == '`') {
+          buf.write(r'\`');
+          k += 2;
+          continue;
+        }
+      }
+      if (ch == '`') {
+        var end = k;
+        while (end < s.length && s[end] == '`') {
+          end++;
+        }
+        final runLen = end - k;
+        if (openTickLen > 0) {
+          if (runLen == openTickLen) openTickLen = 0;
+        } else if (_findExactBacktickClose(s, end, runLen) >= 0) {
+          // Only enter inline code span when a matching closing backtick run exists in this row,
+          // so a lone unclosed backtick never swallows the remaining columns!
+          openTickLen = runLen;
+        }
+        buf.write(s.substring(k, end));
+        k = end;
         continue;
       }
-      if (ch == '`') inCode = !inCode;
-      if (ch == '|' && !inCode) {
+      if (ch == '|' && openTickLen == 0) {
         cells.add(buf.toString().trim());
         buf.clear();
+        k++;
       } else {
         buf.write(ch);
+        k++;
       }
     }
     cells.add(buf.toString().trim());
@@ -5164,20 +5333,19 @@ class _AssistantBodyState extends State<_AssistantBody>
           }
           // Otherwise fall through to paragraph inline math parsing!
         } else {
-          // Multi-line display math: `$$\nexpr\n$$` or `$$expr\n...$$`
+          // Multi-line display math: `$$\nexpr\n$$` or `$$expr\n...$$` (even with trailing `。` / prose)
           flushParagraph();
           final startIdx = i;
           final mathLines = <String>[if (rest.isNotEmpty) rest];
+          var trailingAfterCloser = '';
           i++;
           while (i < lines.length) {
             final curTrim = lines[i].trim();
-            if (curTrim == closer) {
-              i++;
-              break;
-            }
-            if (curTrim.endsWith(closer)) {
-              final beforeCloser = curTrim.substring(0, curTrim.length - closer.length).trim();
+            final closerPos = curTrim.indexOf(closer);
+            if (closerPos >= 0) {
+              final beforeCloser = curTrim.substring(0, closerPos).trim();
               if (beforeCloser.isNotEmpty) mathLines.add(beforeCloser);
+              trailingAfterCloser = curTrim.substring(closerPos + closer.length).trim();
               i++;
               break;
             }
@@ -5191,6 +5359,9 @@ class _AssistantBodyState extends State<_AssistantBody>
               body: mathLines.join('\n').trim(),
             ),
           );
+          if (trailingAfterCloser.isNotEmpty) {
+            paraBuf.add(trailingAfterCloser);
+          }
           continue;
         }
       }
@@ -5413,7 +5584,7 @@ class _AssistantBodyState extends State<_AssistantBody>
                       child: Image.network(
                         blk.imageUrl,
                         cacheWidth: 720,
-                        fit: BoxFit.cover,
+                        fit: BoxFit.contain,
                         gaplessPlayback: true,
                         loadingBuilder: (ctx, child, progress) {
                           if (progress == null) return child;
@@ -5745,7 +5916,7 @@ class _AssistantBodyState extends State<_AssistantBody>
           lastSafeCut = pos;
         }
       } else if (inMathBlock) {
-        if (exactTrim == mathBlockCloser || exactTrim.endsWith(mathBlockCloser)) {
+        if (exactTrim.contains(mathBlockCloser)) {
           inMathBlock = false;
         }
       } else if (_isClosingFence(trimmed, openChar as String, openLen)) {
@@ -6391,6 +6562,7 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
   int _cachedWidthRowCount = -1;
   int _cachedWidthColCount = -1;
   double _cachedWidthCardW = -1;
+  double _cachedTextScale = -1;
   String _cachedHeadersSig = '';
   String _cachedWidthSig = '';
   List<double>? _cachedRawWidths;
@@ -6406,6 +6578,12 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
   @override
   void didUpdateWidget(covariant _MarkdownTableCard oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isStreaming && !widget.isStreaming) {
+      // Recompute final settled column widths cleanly once streaming finishes so any
+      // cell that shrank or settled after streaming doesn't retain stale max widths.
+      _cachedRawWidths = null;
+      _cachedColWidths = null;
+    }
     _scheduleMetricsSync();
   }
 
@@ -6470,7 +6648,14 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
     if (delta == 0) return;
     final target = (_hCtrl.offset + delta).clamp(0.0, maxExt);
     if ((target - _hCtrl.offset).abs() > 0.1) {
-      _hCtrl.jumpTo(target);
+      GestureBinding.instance.pointerSignalResolver.register(event, (PointerSignalEvent _) {
+        if (!mounted || !_hCtrl.hasClients) return;
+        final liveMax = _hCtrl.position.maxScrollExtent;
+        final liveTarget = (_hCtrl.offset + delta).clamp(0.0, liveMax);
+        if ((liveTarget - _hCtrl.offset).abs() > 0.1) {
+          _hCtrl.jumpTo(liveTarget);
+        }
+      });
     }
   }
 
@@ -6561,10 +6746,12 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final maxCardW = constraints.maxWidth.isFinite ? constraints.maxWidth : 640.0;
-        final cellMaxW = maxCardW >= 620 ? 300.0 : (maxCardW >= 420 ? 235.0 : 195.0);
+        final textScale = MediaQuery.textScalerOf(context).scale(1.0).clamp(0.85, 2.2);
+        final cellMaxW = (maxCardW >= 620 ? 300.0 : (maxCardW >= 420 ? 235.0 : 195.0)) *
+            math.min(textScale, 1.35);
 
         // Precompute fixed column widths incrementally during streaming:
-        // when headers, colCount, and card width are unchanged and rows grow monotonically,
+        // when headers, colCount, card width, and textScale are unchanged and rows grow monotonically,
         // only measure the new/last row instead of rescanning rows 0..31 on every character!
         final sampleLimit = widget.rows.length < 32 ? widget.rows.length : 32;
         final headersSig = widget.headers.join('|');
@@ -6575,6 +6762,7 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
             _cachedWidthColCount == colCount &&
             _cachedWidthRowCount == sampleLimit &&
             (_cachedWidthCardW - maxCardW).abs() < 1.0 &&
+            (_cachedTextScale - textScale).abs() < 0.01 &&
             _cachedWidthSig == widthSig) {
           colWidths = _cachedColWidths!;
         } else {
@@ -6586,7 +6774,7 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
             for (final rune in stripped.runes) {
               units += (rune > 0x2E80) ? 1.85 : 0.96;
             }
-            final px = units * (isHeader ? 8.2 : 7.8) + 30.0;
+            final px = units * (isHeader ? 8.2 : 7.8) * textScale + 30.0;
             return px.clamp(68.0, cellMaxW);
           }
 
@@ -6595,6 +6783,7 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
               _cachedWidthColCount == colCount &&
               _cachedHeadersSig == headersSig &&
               (_cachedWidthCardW - maxCardW).abs() < 1.0 &&
+              (_cachedTextScale - textScale).abs() < 0.01 &&
               sampleLimit >= _cachedWidthRowCount &&
               _cachedWidthRowCount >= 0;
 
@@ -6647,6 +6836,7 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
           _cachedWidthColCount = colCount;
           _cachedWidthRowCount = sampleLimit;
           _cachedWidthCardW = maxCardW;
+          _cachedTextScale = textScale;
           _cachedHeadersSig = headersSig;
           _cachedWidthSig = widthSig;
         }
@@ -7056,10 +7246,7 @@ final RegExp _mdCalloutRe = RegExp(
 );
 final RegExp _latexEnvRe = RegExp(r'\\(?:begin|end)\{(?:aligned|align\*?|gather\*?|equation\*?|cases|split)\}');
 final RegExp _latexLineBreakRe = RegExp(r'\\\\(?:\[[^\]]*\])?');
-final RegExp _latexTextCmdRe = RegExp(r'\\(?:text|mathrm|mathbf|mathit|operatorname|boldsymbol)\{([^{}]+)\}');
 final RegExp _latexBbRe = RegExp(r'\\mathbb\{([RNZQC])\}');
-final RegExp _latexSqrtRe = RegExp(r'\\sqrt\{([^{}]+)\}');
-final RegExp _latexFracRe = RegExp(r'\\d?frac\{([^{}]+)\}\{([^{}]+)\}');
 final RegExp _latexSymbolRe = RegExp(r'\\[a-zA-Z]+|\\[,;!]');
 final RegExp _latexSupBracedRe = RegExp(r'\^\{([0-9+\-ni=()]+)\}');
 final RegExp _latexSubBracedRe = RegExp(r'_\{([0-9+\-ijknx=()]+)\}');
@@ -7207,10 +7394,125 @@ String _mapScriptChars(String raw, Map<String, String> table) {
   return sb.toString();
 }
 
-/// Lightweight, single-pass LaTeX -> Unicode math pretty-formatter for inline & display math.
+/// Lightweight, balanced-brace LaTeX -> Unicode math pretty-formatter for inline & display math.
 /// Preserves readability without external font bundles while display cards keep exact raw LaTeX on copy.
 @visibleForTesting
 String formatReadableLatexForTest(String tex) => _formatReadableLatex(tex);
+
+@visibleForTesting
+String stabilizeStreamingMarkdownForTest(String raw) =>
+    _AssistantBodyState._stabilizeStreamingText(raw);
+
+@visibleForTesting
+List<String> splitMarkdownBlocksSummaryForTest(String raw) =>
+    _AssistantBodyState._splitMarkdownBlocks(raw)
+        .map((b) => '${b.kind.name}:${b.body}')
+        .toList(growable: false);
+
+int _findMatchingLatexBrace(String s, int openIdx) {
+  if (openIdx < 0 || openIdx >= s.length || s.codeUnitAt(openIdx) != 0x7B /* '{' */) return -1;
+  var depth = 0;
+  for (var i = openIdx; i < s.length; i++) {
+    final cu = s.codeUnitAt(i);
+    if (cu == 0x5C /* '\' */ && i + 1 < s.length) {
+      i++;
+      continue;
+    }
+    if (cu == 0x7B) {
+      depth++;
+    } else if (cu == 0x7D) {
+      depth--;
+      if (depth == 0) return i;
+    }
+  }
+  return -1;
+}
+
+bool _isAsciiLetter(int cu) =>
+    (cu >= 0x41 && cu <= 0x5A) || (cu >= 0x61 && cu <= 0x7A);
+
+String _replaceLatexCmd1(
+  String s,
+  List<String> cmds,
+  String Function(String arg) fmt,
+) {
+  final sb = StringBuffer();
+  var i = 0;
+  final len = s.length;
+  while (i < len) {
+    if (s.codeUnitAt(i) == 0x5C /* '\' */) {
+      String? matched;
+      for (final cmd in cmds) {
+        if (s.startsWith(cmd, i)) {
+          final afterCmd = i + cmd.length;
+          if (afterCmd < len && _isAsciiLetter(s.codeUnitAt(afterCmd))) continue;
+          matched = cmd;
+          break;
+        }
+      }
+      if (matched != null) {
+        var j = i + matched.length;
+        while (j < len && (s.codeUnitAt(j) == 0x20 || s.codeUnitAt(j) == 0x09)) {
+          j++;
+        }
+        final close = _findMatchingLatexBrace(s, j);
+        if (close > j) {
+          sb.write(fmt(s.substring(j + 1, close)));
+          i = close + 1;
+          continue;
+        }
+      }
+    }
+    sb.writeCharCode(s.codeUnitAt(i));
+    i++;
+  }
+  return sb.toString();
+}
+
+String _replaceLatexCmd2(
+  String s,
+  List<String> cmds,
+  String Function(String a, String b) fmt,
+) {
+  final sb = StringBuffer();
+  var i = 0;
+  final len = s.length;
+  while (i < len) {
+    if (s.codeUnitAt(i) == 0x5C /* '\' */) {
+      String? matched;
+      for (final cmd in cmds) {
+        if (s.startsWith(cmd, i)) {
+          final afterCmd = i + cmd.length;
+          if (afterCmd < len && _isAsciiLetter(s.codeUnitAt(afterCmd))) continue;
+          matched = cmd;
+          break;
+        }
+      }
+      if (matched != null) {
+        var j = i + matched.length;
+        while (j < len && (s.codeUnitAt(j) == 0x20 || s.codeUnitAt(j) == 0x09)) {
+          j++;
+        }
+        final close1 = _findMatchingLatexBrace(s, j);
+        if (close1 > j) {
+          var k = close1 + 1;
+          while (k < len && (s.codeUnitAt(k) == 0x20 || s.codeUnitAt(k) == 0x09)) {
+            k++;
+          }
+          final close2 = _findMatchingLatexBrace(s, k);
+          if (close2 > k) {
+            sb.write(fmt(s.substring(j + 1, close1), s.substring(k + 1, close2)));
+            i = close2 + 1;
+            continue;
+          }
+        }
+      }
+    }
+    sb.writeCharCode(s.codeUnitAt(i));
+    i++;
+  }
+  return sb.toString();
+}
 
 String _formatReadableLatex(String tex) {
   var s = tex.trim();
@@ -7218,16 +7520,26 @@ String _formatReadableLatex(String tex) {
   // Unwrap aligned/equation environments & line-break markers cleanly
   s = s.replaceAll(_latexEnvRe, '').trim();
   s = s.replaceAll(_latexLineBreakRe, '\n').replaceAll('&', ' ');
-  // Expand `\mathbb{R}` & inner `\text`/`\mathrm`/`\sqrt` BEFORE `\frac` so `\frac{\sqrt{x}}{2}` works!
+  // Expand `\mathbb{R}` and balanced-brace `\text`/`\mathrm`/`\sqrt`/`\frac` commands
+  // so nested expressions like `\frac{x^{2}+1}{y_{i}-1}` and `\sqrt{a^{2}+b^{2}}` format cleanly!
   s = s.replaceAllMapped(_latexBbRe, (m) => _latexBbMap[m.group(1)!] ?? m.group(0)!);
-  s = s.replaceAllMapped(_latexTextCmdRe, (m) => m.group(1)!);
-  for (var pass = 0; pass < 2; pass++) {
+  const textCmds = <String>[
+    r'\operatorname',
+    r'\boldsymbol',
+    r'\mathrm',
+    r'\mathbf',
+    r'\mathit',
+    r'\mathsf',
+    r'\mathtt',
+    r'\text',
+  ];
+  const sqrtCmds = <String>[r'\sqrt'];
+  const fracCmds = <String>[r'\dfrac', r'\tfrac', r'\frac'];
+  for (var pass = 0; pass < 4; pass++) {
     final prev = s;
-    s = s.replaceAllMapped(_latexSqrtRe, (m) => '√(${m.group(1)!.trim()})');
-    s = s.replaceAllMapped(
-      _latexFracRe,
-      (m) => '(${m.group(1)!.trim()}) / (${m.group(2)!.trim()})',
-    );
+    s = _replaceLatexCmd1(s, textCmds, (arg) => arg);
+    s = _replaceLatexCmd1(s, sqrtCmds, (arg) => '√(${arg.trim()})');
+    s = _replaceLatexCmd2(s, fracCmds, (a, b) => '(${a.trim()}) / (${b.trim()})');
     if (s == prev) break;
   }
   s = s.replaceAllMapped(_latexSymbolRe, (m) {
@@ -7460,15 +7772,23 @@ TextSpan _highlightDiffSpan(String displayText) {
 
 /// Zero-dependency, single-pass O(N) syntax highlighter for dark code cards.
 /// Cached by `_FencedCodeBlockState` so scrolling and sibling rebuilds cost 0ms.
-final RegExp _codeTokenRe = RegExp(
-  r'(?://[^\n]*|/\*[\s\S]*?\*/|#[^\n]*)' // comments
-  r'|"(?:\\.|[^"\\\n])*"' // double-quoted strings
-  r"|'(?:\\.|[^'\\\n])*'" // single-quoted strings
-  r'|`(?:\\.|[^`\\])*`' // backtick strings
-  r'|@[A-Za-z_][A-Za-z0-9_]*' // annotations
-  r'|\b0[xX][0-9a-fA-F_]+\b|\b\d+(?:\.\d+)?\b' // numbers
-  r'|\b[A-Z][A-Za-z0-9_]*\b' // PascalCase types
-  r'|\b[a-z_][A-Za-z0-9_]*\b', // identifiers & keywords
+const String _kCodeTokenTailPattern =
+    r'|"(?:\\.|[^"\\\n])*"' // double-quoted strings
+    r"|'(?:\\.|[^'\\\n])*'" // single-quoted strings
+    r'|`(?:\\.|[^`\\])*`' // backtick strings
+    r'|@[A-Za-z_][A-Za-z0-9_]*' // annotations
+    r'|\b0[xX][0-9a-fA-F_]+\b|\b\d+(?:\.\d+)?\b' // numbers
+    r'|\b[A-Z][A-Za-z0-9_]*\b' // PascalCase types
+    r'|\b[a-z_][A-Za-z0-9_]*\b'; // identifiers & keywords
+
+final RegExp _codeTokenReGeneric = RegExp(
+  r'(?://[^\n]*|/\*[\s\S]*?\*/|#[^\n]*)' + _kCodeTokenTailPattern,
+);
+final RegExp _codeTokenReCStyle = RegExp(
+  r'(?://[^\n]*|/\*[\s\S]*?\*/)' + _kCodeTokenTailPattern,
+);
+final RegExp _codeTokenReHashOnly = RegExp(
+  r'(?:#[^\n]*)' + _kCodeTokenTailPattern,
 );
 
 const Set<String> _codeKeywords = <String>{
@@ -7491,6 +7811,17 @@ const Set<String> _hashCommentLangs = <String>{
   'py', 'python', 'sh', 'bash', 'zsh', 'shell', 'yaml', 'yml', 'toml', 'rb', 'ruby', 'r', 'perl',
 };
 
+const Set<String> _noBlockCommentLangs = <String>{
+  'py', 'python', 'sh', 'bash', 'zsh', 'shell', 'yaml', 'yml', 'toml', 'rb', 'ruby', 'r', 'perl',
+  'ini', 'conf', 'cfg', 'env', 'dockerfile', 'makefile', 'json', 'md', 'markdown', 'txt', 'text',
+  'plaintext', 'csv', 'tsv', 'html', 'xml', 'svg',
+};
+
+const TextStyle _kCodeCommentStyle = TextStyle(
+  color: Color(0xFF8B9EB5),
+  fontStyle: FontStyle.italic,
+);
+
 TextSpan _highlightCodeSpan(String code, String rawLang) {
   final lang = rawLang.trim().toLowerCase();
   if (lang == 'diff' || lang == 'patch') {
@@ -7506,23 +7837,27 @@ TextSpan _highlightCodeSpan(String code, String rawLang) {
   if (code.length > 24000) {
     return TextSpan(text: code, style: baseStyle);
   }
-  final allowHashComment = lang.isEmpty || _hashCommentLangs.contains(lang);
+  final isHashOnly = _hashCommentLangs.contains(lang);
+  final allowHashComment = lang.isEmpty || isHashOnly;
+  final tokenRe = isHashOnly
+      ? _codeTokenReHashOnly
+      : (lang.isEmpty ? _codeTokenReGeneric : _codeTokenReCStyle);
   final isJson = lang == 'json' || lang == 'jsonc';
   final spans = <TextSpan>[];
   var cursor = 0;
 
-  for (final m in _codeTokenRe.allMatches(code)) {
+  for (final m in tokenRe.allMatches(code)) {
     if (m.start > cursor) {
       spans.add(TextSpan(text: code.substring(cursor, m.start)));
     }
     final tok = m.group(0)!;
     final first = tok.codeUnitAt(0);
     TextStyle? style;
-    if (tok.startsWith('//') || tok.startsWith('/*')) {
-      style = const TextStyle(color: Color(0xFF64748B), fontStyle: FontStyle.italic);
+    if (!isHashOnly && (tok.startsWith('//') || tok.startsWith('/*'))) {
+      style = _kCodeCommentStyle;
     } else if (first == 0x23 /* '#' */) {
       if (allowHashComment) {
-        style = const TextStyle(color: Color(0xFF64748B), fontStyle: FontStyle.italic);
+        style = _kCodeCommentStyle;
       }
     } else if (first == 0x22 /* '"' */ || first == 0x27 /* "'" */ || first == 0x60 /* '`' */) {
       if (isJson && first == 0x22) {
@@ -7561,21 +7896,69 @@ TextSpan _highlightCodeSpan(String code, String rawLang) {
   return TextSpan(style: baseStyle, children: spans);
 }
 
-const TextStyle _kCodeCommentStyle = TextStyle(
-  color: Color(0xFF64748B),
-  fontStyle: FontStyle.italic,
-);
+/// Scans `line` starting at `from` for an unquoted C-style `/*` block-comment opener,
+/// skipping `'...'`, `"..."`, and `` `...` `` string literals (with `\` escapes) and
+/// stopping cleanly at unquoted `//` (or `#` when `allowHashComment` is true).
+int _findUnquotedBlockCommentOpen(
+  String line,
+  int from, {
+  required bool allowHashComment,
+}) {
+  final len = line.length;
+  var i = from;
+  while (i < len) {
+    final cu = line.codeUnitAt(i);
+    if (cu == 0x22 /* '"' */ || cu == 0x27 /* "'" */ || cu == 0x60 /* '`' */) {
+      final quote = cu;
+      i++;
+      while (i < len) {
+        final c = line.codeUnitAt(i);
+        if (c == 0x5C /* '\' */ && i + 1 < len) {
+          i += 2;
+          continue;
+        }
+        if (c == quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (allowHashComment && cu == 0x23 /* '#' */) {
+      return -1;
+    }
+    if (cu == 0x2F && i + 1 < len) {
+      final next = line.codeUnitAt(i + 1);
+      if (next == 0x2F) return -1;
+      if (next == 0x2A) return i;
+    }
+    i++;
+  }
+  return -1;
+}
+
+@visibleForTesting
+({InlineSpan span, bool endInBlockComment}) highlightCodeLineForTest(
+  String lineWithNl,
+  String rawLang, {
+  bool startInBlockComment = false,
+}) =>
+    _highlightLineIncremental(lineWithNl, rawLang, startInBlockComment);
 
 /// Highlights a single line while propagating multi-line `/* ... */` block-comment state
-/// so streaming code blocks containing block comments still highlight incrementally in O(line)!
+/// ONLY for C-style-comment languages and strictly outside string literals!
 ({InlineSpan span, bool endInBlockComment}) _highlightLineIncremental(
   String lineWithNl,
   String rawLang,
   bool startInBlockComment,
 ) {
-  if (!startInBlockComment && !lineWithNl.contains('/*')) {
+  final lang = rawLang.trim().toLowerCase();
+  final supportsBlockComments = !_noBlockCommentLangs.contains(lang);
+  if (!supportsBlockComments || (!startInBlockComment && !lineWithNl.contains('/*'))) {
     return (span: _highlightCodeSpan(lineWithNl, rawLang), endInBlockComment: false);
   }
+  final allowHashComment = lang.isEmpty || _hashCommentLangs.contains(lang);
   final spans = <InlineSpan>[];
   var cursor = 0;
   var inComment = startInBlockComment;
@@ -7591,20 +7974,17 @@ const TextStyle _kCodeCommentStyle = TextStyle(
       cursor = closeIdx + 2;
       inComment = false;
     } else {
-      final openIdx = lineWithNl.indexOf('/*', cursor);
+      final openIdx = _findUnquotedBlockCommentOpen(
+        lineWithNl,
+        cursor,
+        allowHashComment: allowHashComment,
+      );
       if (openIdx < 0) {
         spans.add(_highlightCodeSpan(lineWithNl.substring(cursor), rawLang));
         return (span: TextSpan(children: spans), endInBlockComment: false);
       }
-      // Check if an earlier `//` line comment or string swallows `/*`
-      final prefix = lineWithNl.substring(cursor, openIdx);
-      final lineCommentIdx = prefix.indexOf('//');
-      if (lineCommentIdx >= 0) {
-        spans.add(_highlightCodeSpan(lineWithNl.substring(cursor), rawLang));
-        return (span: TextSpan(children: spans), endInBlockComment: false);
-      }
-      if (prefix.isNotEmpty) {
-        spans.add(_highlightCodeSpan(prefix, rawLang));
+      if (openIdx > cursor) {
+        spans.add(_highlightCodeSpan(lineWithNl.substring(cursor, openIdx), rawLang));
       }
       final closeIdx = lineWithNl.indexOf('*/', openIdx + 2);
       if (closeIdx < 0) {
@@ -7968,7 +8348,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                                 style: const TextStyle(
                                   fontSize: 10.5,
                                   fontFeatures: [FontFeature.tabularFigures()],
-                                  color: Color(0xFF64748B),
+                                  color: Color(0xFF8B9EB5),
                                 ),
                               ),
                             ],

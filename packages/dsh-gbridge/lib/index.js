@@ -190,6 +190,7 @@ function inspectWebServerBinding(ctx) {
 function scheduleLanTeardown(listenKey, expectedGen, { immediate = false } = {}) {
   const entry = activeLanListeners.get(listenKey);
   if (!entry || entry.gen !== expectedGen) return Promise.resolve();
+  entry.disposed = true;
   const closeNow = () => new Promise((resolve) => {
     const cur = activeLanListeners.get(listenKey);
     if (!cur || cur.gen !== expectedGen) {
@@ -489,6 +490,11 @@ export function startLanBridgeListener(core, {
   });
 
   const tryListenNext = () => {
+    if (entry.disposed) {
+      if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
+      resolveReady({ host, port: null, error: 'disposed' });
+      return;
+    }
     if (candIdx >= candidates.length) {
       if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
       entry.lastError = 'no available port for LAN bridge';
@@ -499,6 +505,11 @@ export function startLanBridgeListener(core, {
     const candidatePort = candidates[candIdx++];
     const onError = (err) => {
       server.removeListener('listening', onBound);
+      if (entry.disposed) {
+        if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
+        resolveReady({ host, port: null, error: 'disposed' });
+        return;
+      }
       const code = err?.code || '';
       if ((code === 'EADDRINUSE' || code === 'EACCES') && candIdx < candidates.length) {
         entry.logger?.info?.(`[gbridge] port ${candidatePort} busy (${code}), probing next conflict-free port...`);
@@ -514,6 +525,13 @@ export function startLanBridgeListener(core, {
     };
     const onBound = () => {
       server.removeListener('error', onError);
+      if (entry.disposed) {
+        if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
+        try { server.closeAllConnections?.(); } catch {}
+        try { server.close(); } catch {}
+        resolveReady({ host, port: null, error: 'disposed' });
+        return;
+      }
       server.on('error', (err) => {
         entry.lastError = err?.message || String(err);
         entry.logger?.warn?.(`[gbridge] LAN bridge runtime error:`, entry.lastError);
@@ -656,7 +674,7 @@ export function createGbridgeCore(ctx, options = {}) {
     if (deferStop) {
       res.once('finish', () => {
         const t = setTimeout(() => {
-          try { pairingController.stopLan(true); } catch {}
+          try { pairingController.stopLanIfDisabled?.(true); } catch {}
         }, 150);
         t.unref?.();
       });
@@ -893,6 +911,7 @@ export function createPairingController(ctx, core, config = {}) {
   let lanHandle = null;
   let lanWanted = false;
   let lanOpChain = Promise.resolve();
+  let disposed = false;
 
   const runLanOp = (fn) => {
     const next = lanOpChain.then(fn, fn);
@@ -939,8 +958,18 @@ export function createPairingController(ctx, core, config = {}) {
     }
   });
 
+  const stopLanIfDisabled = (immediate = true) => runLanOp(async () => {
+    if (lanWanted || disposed) return;
+    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch {}
+    const prev = lanHandle;
+    lanHandle = null;
+    if (prev) {
+      try { await prev.dispose({ immediate }); } catch {}
+    }
+  });
+
   const startLan = (portOverride) => runLanOp(async () => {
-    if (udsPath) return;
+    if (udsPath || disposed) return;
     if (portOverride !== undefined) preferredPort = portOverride;
     const wsInfo = inspectWebServerBinding(ctx);
     const avoidPorts = wsInfo.port ? [wsInfo.port] : [];
@@ -949,6 +978,7 @@ export function createPairingController(ctx, core, config = {}) {
     if (prev) {
       try { await prev.dispose({ immediate: true }); } catch {}
     }
+    if (disposed) return;
     lanWanted = true;
     const nextHandle = startLanBridgeListener(core, {
       host: lanHost,
@@ -959,8 +989,16 @@ export function createPairingController(ctx, core, config = {}) {
       logger,
       getPairingSnapshot: () => getSnapshot(),
     });
+    if (disposed) {
+      try { await nextHandle.dispose({ immediate: true }); } catch {}
+      return;
+    }
     lanHandle = nextHandle;
     await nextHandle.ready;
+    if (disposed) {
+      lanHandle = null;
+      try { await nextHandle.dispose({ immediate: true }); } catch {}
+    }
   });
 
   const qrCache = new Map();
@@ -1128,9 +1166,12 @@ export function createPairingController(ctx, core, config = {}) {
     computeShouldAutoEnableLan,
     startLan,
     stopLan,
+    stopLanIfDisabled,
     getSnapshot,
     applyAction,
     dispose: () => {
+      disposed = true;
+      lanWanted = false;
       if (lanHandle) {
         try { lanHandle.dispose({ immediate: false }); } catch {}
         lanHandle = null;

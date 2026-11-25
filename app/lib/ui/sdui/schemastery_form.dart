@@ -821,7 +821,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
     bool removeIfNull = false,
     bool rebuild = true,
   }) {
-    if (widget.readOnly) return;
+    if (widget.readOnly || !mounted) return;
     void applyMutation() {
       _dirty = true;
       _editSeq++;
@@ -2620,7 +2620,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           final fresh = buildDefaultValueForSchema(valSchema);
           final initMap = fresh is Map<String, dynamic> ? fresh : <String, dynamic>{};
           Future<void>.delayed(const Duration(milliseconds: 180), () {
-            if (!context.mounted) return;
+            if (!mounted || !context.mounted) return;
             _openNestedObjectSheet(
               context,
               title: k,

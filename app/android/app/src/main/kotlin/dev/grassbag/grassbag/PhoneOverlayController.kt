@@ -156,8 +156,10 @@ class PhoneOverlayController(private val appContext: Context) {
     private val hudSessionActiveAtomic = AtomicBoolean(false)
 
     // Out-of-app confirmation / handoff card
+    private val promptSerializationLock = Any()
     private var activeConfirmContainer: FrameLayout? = null
     private var activeConfirmWm: WindowManager? = null
+    private var activeConfirmParams: WindowManager.LayoutParams? = null
     private var activeConfirmTick: Runnable? = null
     private var activeConfirmProgressAnim: ObjectAnimator? = null
     private val activeConfirmLatch = AtomicReference<CountDownLatch?>(null)
@@ -275,8 +277,11 @@ class PhoneOverlayController(private val appContext: Context) {
                 fxParams = null
                 fxAttachedWm = null
                 if (fx != null && fxWm != null) {
+                    val entry = fxWm to (fx as View)
+                    fadingOverlayViews.add(entry)
                     fx.fadeOutAndDetach {
-                        runCatching { fxWm.removeViewImmediate(fx) }
+                        fadingOverlayViews.remove(entry)
+                        runCatching { if (fx.isAttachedToWindow) fxWm.removeViewImmediate(fx) }
                     }
                 }
             } else {
@@ -392,7 +397,9 @@ class PhoneOverlayController(private val appContext: Context) {
         if (!isPreview && previewDemoActive.getAndSet(false)) {
             previewDemoGen.incrementAndGet()
         }
-        val startedFreshAtomic = hudSessionActiveAtomic.compareAndSet(false, true)
+        // Only real phone-control runs claim hudSessionActiveAtomic so background text-only
+        // chat turns finishing never hijack an interactive overlay preview in Settings!
+        val startedFreshAtomic = if (isPreview) false else hudSessionActiveAtomic.compareAndSet(false, true)
         if (startedFreshAtomic) {
             stepCountAtomic.set(0)
         }
@@ -729,6 +736,7 @@ class PhoneOverlayController(private val appContext: Context) {
             }
             val hud = hudContainer
             val hudWm = hudAttachedWm
+            val oldHudLp = hudParams
             hudContainer = null
             hudParams = null
             hudAttachedWm = null
@@ -738,6 +746,10 @@ class PhoneOverlayController(private val appContext: Context) {
                 if (immediate) {
                     runCatching { hudWm.removeViewImmediate(hud) }
                 } else {
+                    if (oldHudLp != null) {
+                        oldHudLp.flags = oldHudLp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        runCatching { if (hud.isAttachedToWindow) hudWm.updateViewLayout(hud, oldHudLp) }
+                    }
                     val entry = hudWm to (hud as View)
                     fadingOverlayViews.add(entry)
                     hud.animate()
@@ -811,6 +823,28 @@ class PhoneOverlayController(private val appContext: Context) {
         allowTurnOption: Boolean = true,
         timeoutMs: Long = 35_000L,
         isPreview: Boolean = false
+    ): ConfirmDecision {
+        synchronized(promptSerializationLock) {
+            return confirmSerialized(
+                title = title,
+                actionSummary = actionSummary,
+                appLabel = appLabel,
+                riskBadge = riskBadge,
+                allowTurnOption = allowTurnOption,
+                timeoutMs = timeoutMs,
+                isPreview = isPreview
+            )
+        }
+    }
+
+    private fun confirmSerialized(
+        title: String,
+        actionSummary: String,
+        appLabel: String?,
+        riskBadge: String?,
+        allowTurnOption: Boolean,
+        timeoutMs: Long,
+        isPreview: Boolean
     ): ConfirmDecision {
         if (!isPreview && SafetyGate.isEmergencyStopped()) {
             return ConfirmDecision.STOP
@@ -892,6 +926,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 wm.addView(card, params)
                 activeConfirmContainer = card
                 activeConfirmWm = wm
+                activeConfirmParams = params
                 animateCardEntrance(card)
                 true
             }.getOrDefault(false)
@@ -914,6 +949,16 @@ class PhoneOverlayController(private val appContext: Context) {
         message: String,
         appLabel: String? = null,
         timeoutMs: Long = 180_000L
+    ): HandoffDecision {
+        synchronized(promptSerializationLock) {
+            return handoffSerialized(message = message, appLabel = appLabel, timeoutMs = timeoutMs)
+        }
+    }
+
+    private fun handoffSerialized(
+        message: String,
+        appLabel: String?,
+        timeoutMs: Long
     ): HandoffDecision {
         if (SafetyGate.isEmergencyStopped()) {
             return HandoffDecision.STOP
@@ -995,6 +1040,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 wm.addView(card, params)
                 activeConfirmContainer = card
                 activeConfirmWm = wm
+                activeConfirmParams = params
                 animateCardEntrance(card)
                 true
             }.getOrDefault(false)
@@ -1079,6 +1125,7 @@ class PhoneOverlayController(private val appContext: Context) {
 
     private fun ensureFxCanvasAttached(preResolved: Triple<Context, WindowManager, Int>? = null) {
         if (fxCanvasView != null) return
+        if (activeConfirmContainer != null) return
         if (!SafetyGate.isShowEdgeAurora() && !SafetyGate.isShowGestureFx()) return
         val target = preResolved ?: resolveWindowTarget() ?: return
         val (ctx, wm, windowType) = target
@@ -2252,7 +2299,6 @@ class PhoneOverlayController(private val appContext: Context) {
             setPadding(dp(ctx, 18), dp(ctx, 15), dp(ctx, 18), dp(ctx, 16))
             background = LiquidGlassDrawable(ctx, dark, radiusDp = 30f, accentTint = accentPrimary, elevated = true)
             elevation = 24f * density
-            filterTouchesWhenObscured = true
         }
 
         // Countdown hairline progress track
@@ -2394,10 +2440,14 @@ class PhoneOverlayController(private val appContext: Context) {
         )
 
         // Guarded anti-hijack button factory with tactile press spring!
+        // Only positive approval buttons (guarded = true) enforce the 360ms arming delay and
+        // full-occlusion tapjacking rejection; Cancel / Stop / Emergency Stop / Return buttons
+        // stay ALWAYS clickable even when an OEM sidebar or floating a11y button partially overlaps!
         fun makeGuardedButton(
             label: String,
             bgDrawable: GradientDrawable,
             textColor: Int,
+            guarded: Boolean,
             action: () -> Unit
         ): TextView = object : TextView(ctx) {
             private var rejected = false
@@ -2410,14 +2460,18 @@ class PhoneOverlayController(private val appContext: Context) {
                 minimumHeight = dp(ctx, 44)
                 setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10))
                 background = bgDrawable
-                filterTouchesWhenObscured = true
+                filterTouchesWhenObscured = guarded
                 isClickable = true
             }
 
             override fun dispatchTouchEvent(event: MotionEvent): Boolean {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                    val obscured = (event.flags and (MotionEvent.FLAG_WINDOW_IS_OBSCURED or MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED)) != 0
-                    rejected = SystemClock.elapsedRealtime() < armedAtMs || gestureInjectRefCount.get() > 0 || obscured
+                    val fullyObscured = (event.flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED) != 0
+                    rejected = if (guarded) {
+                        SystemClock.elapsedRealtime() < armedAtMs || gestureInjectRefCount.get() > 0 || fullyObscured
+                    } else {
+                        gestureInjectRefCount.get() > 0
+                    }
                     if (!rejected) {
                         animate().scaleX(0.95f).scaleY(0.95f).setDuration(80L).start()
                     }
@@ -2452,6 +2506,7 @@ class PhoneOverlayController(private val appContext: Context) {
             label = if (isHandoff) "我已完成，继续" else "允许一次",
             bgDrawable = primaryBg,
             textColor = Color.WHITE,
+            guarded = true,
             action = onPrimary
         )
         primaryRow.addView(primaryBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -2469,6 +2524,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 label = "本轮允许",
                 bgDrawable = turnBg,
                 textColor = Color.WHITE,
+                guarded = true,
                 action = onSecondary
             )
             primaryRow.addView(
@@ -2491,6 +2547,7 @@ class PhoneOverlayController(private val appContext: Context) {
             label = if (isHandoff) "停止任务" else "取消此步",
             bgDrawable = cancelBg,
             textColor = if (isHandoff) (if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A")) else ink,
+            guarded = false,
             action = onCancel
         )
         secondaryRow.addView(cancelBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -2505,6 +2562,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 label = "返回 GrassBag",
                 bgDrawable = backAppBg,
                 textColor = ink,
+                guarded = false,
                 action = { bringGrassBagToFrontNow() }
             )
             secondaryRow.addView(
@@ -2523,6 +2581,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 label = "急停任务",
                 bgDrawable = stopBg,
                 textColor = if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A"),
+                guarded = false,
                 action = onStop
             )
             secondaryRow.addView(
@@ -2601,11 +2660,20 @@ class PhoneOverlayController(private val appContext: Context) {
         activeConfirmProgressAnim?.cancel()
         activeConfirmProgressAnim = null
         val wm = activeConfirmWm ?: return
+        val lp = activeConfirmParams
         activeConfirmContainer = null
         activeConfirmWm = null
+        activeConfirmParams = null
         if (!animate) {
             runCatching { wm.removeViewImmediate(view) }
             return
+        }
+        // Immediately make the fading confirmation card non-touchable BEFORE starting the 175ms
+        // exit animation (and before latch.countDown()) so bottom-screen taps/swipes dispatched
+        // 1-5ms after approval pass straight through to the target app!
+        if (lp != null) {
+            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            runCatching { if (view.isAttachedToWindow) wm.updateViewLayout(view, lp) }
         }
         val entry = wm to (view as View)
         fadingOverlayViews.add(entry)
@@ -3169,7 +3237,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 invalidate()
 
                 val stillHasFx = tapEffects.isNotEmpty() || swipeEffects.isNotEmpty() || activeTypeBadge != null || shutterAlpha > 0.01f
-                if (targetFade == 0f && fade <= 0.01f && !stillHasFx) {
+                if (targetFade == 0f && ((fade <= 0.01f && !stillHasFx) || visibility != View.VISIBLE)) {
                     running = false
                     val cb = onFadedOut
                     onFadedOut = null

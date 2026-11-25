@@ -291,7 +291,11 @@ export function admitRequest(req, { mode, ctx, bearerToken, lanPort } = {}) {
     queryToken = new URL(req.url || '/', 'http://gbridge.local').searchParams.get('token');
   } catch {}
   const reqToken = parseBearerToken(req) ?? queryToken;
-  const resolveConnPeer = (conn) => conn?.browserPeer ?? conn?.operator;
+  const resolveConnPeer = (conn) => {
+    if (conn?.browserPeer && !conn.browserPeer.signal?.aborted) return conn.browserPeer;
+    if (conn?.operator && !conn.operator.signal?.aborted) return conn.operator;
+    return undefined;
+  };
   if (mode === 'uds' || mode === 'lan') {
     if (!bearerToken) {
       return {

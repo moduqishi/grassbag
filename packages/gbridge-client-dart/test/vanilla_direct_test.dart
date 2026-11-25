@@ -1283,6 +1283,156 @@ void main() {
       });
       expect(sum.title, isNot(contains('[object Object]')));
     });
+
+    test('v35 regression: TurnStreamReducer preserves distinct Turn 1 & Turn 2 prompts and steer messages, VanillaDshAdapter cachedRead failure produces zero uncaught Zone error, mux prunes always-allow on session removal', () async {
+      // 1. Distinct Turn 2 `session.event` settles Turn 1 and appends Turn 2 (never overwrites Turn 1's prompt)
+      //    AND mid-turn steer `user/message` preserves original confirmed `local.id` prompt!
+      final reducer = TurnStreamReducer();
+      reducer.replaceAll([
+        const NormalizedTurn(
+          turnId: 't-1',
+          status: 'streaming',
+          userMessage: NormalizedUserMessage(id: 'u-1', text: 'First question'),
+          assistantText: 'Working on first...',
+        ),
+      ]);
+      // Mid-turn steer user/message inside t-1 must keep original 'First question'
+      reducer.apply(StreamFrame(
+        op: 'event',
+        seq: 1,
+        channel: 'session:s-v35',
+        type: 'session.event',
+        data: {
+          'turnId': 't-1',
+          'normalizedTurn': {
+            'turnId': 't-1',
+            'status': 'streaming',
+            'userMessage': {'id': 'u-steer', 'text': 'Steer instruction'},
+            'assistantText': 'Working on first + steer...',
+          },
+        },
+      ));
+      expect(reducer.turns.length, 1);
+      expect(reducer.turns.first.userMessage?.id, 'u-1');
+      expect(reducer.turns.first.userMessage?.text, 'First question');
+
+      // New confirmed server Turn 2 arrives -> settles t-1 and appends t-2 cleanly!
+      reducer.apply(StreamFrame(
+        op: 'event',
+        seq: 2,
+        channel: 'session:s-v35',
+        type: 'session.event',
+        data: {
+          'turnId': 't-2',
+          'normalizedTurn': {
+            'turnId': 't-2',
+            'status': 'streaming',
+            'userMessage': {'id': 'u-2', 'text': 'Second question'},
+            'assistantText': 'Answering second...',
+          },
+        },
+      ));
+      expect(reducer.turns.length, 2);
+      expect(reducer.turns[0].turnId, 't-1');
+      expect(reducer.turns[0].status, 'completed');
+      expect(reducer.turns[0].userMessage?.text, 'First question');
+      expect(reducer.turns[1].turnId, 't-2');
+      expect(reducer.turns[1].userMessage?.text, 'Second question');
+
+      // 2. VanillaDshAdapter._cachedRead failed RPC produces ZERO uncaught Zone errors
+      final uncaught = <Object>[];
+      final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => srv.close(force: true));
+      srv.listen((req) async {
+        req.response.statusCode = 500;
+        req.response.headers.contentType = ContentType.json;
+        req.response.write(jsonEncode({'result': {'ok': false, 'error': {'message': 'boom'}}}));
+        await req.response.close();
+      });
+      await runZonedGuarded(() async {
+        final transport = GbridgeHttpTransport(
+          HostEndpoint.http(baseUri: Uri.parse('http://127.0.0.1:${srv.port}')),
+          timeout: const Duration(seconds: 3),
+        );
+        final dummyMux = VanillaDshMuxEngine(
+          normalizer: VanillaDshNormalizer(),
+          autoReconnect: false,
+          openSocket: (_) => Completer<GbridgeRawWebSocket>().future,
+        );
+        final adapter = VanillaDshAdapter(
+          transport: transport,
+          mux: dummyMux,
+          normalizer: VanillaDshNormalizer(),
+          dshVersion: '0.2.2-rc.5',
+        );
+        addTearDown(() {
+          dummyMux.dispose();
+          transport.close();
+        });
+        await expectLater(adapter.getSettingsSchema(), throwsA(isA<Object>()));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }, (err, _) {
+        uncaught.add(err);
+      });
+      expect(uncaught, isEmpty);
+
+      // 3. VanillaDshMuxEngine prunes session always-allow on `api-session/removed`
+      final autoApproved = <String>[];
+      final serverCtrl = StreamController<String>.broadcast();
+      final sent = <Map<String, dynamic>>[];
+      final done = Completer<void>();
+      final mux = VanillaDshMuxEngine(
+        normalizer: VanillaDshNormalizer(),
+        autoReconnect: false,
+        openSocket: (_) async => _FakeRawWs(serverCtrl.stream, sent, done),
+        onAutoApprove: (_, eventId) async => autoApproved.add(eventId),
+      );
+      addTearDown(() async {
+        mux.dispose();
+        await serverCtrl.close();
+      });
+      final frames = <StreamFrame>[];
+      final sub = mux.frames.listen(frames.add);
+      addTearDown(sub.cancel);
+      final connectFut = mux.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final evOpen = sent.firstWhere((m) => m['endpoint'] == r'$events');
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {'type': 'ready', 'clientId': 'c-v35-prune'},
+      }));
+      await connectFut;
+
+      mux.rememberSessionAlwaysAllowed('s-prune', {'tool': 'bash'});
+      // Emit api-session/removed for s-prune -> should prune always-allow entry!
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'emit',
+          'event': 'api-session/removed',
+          'args': [{'sessionId': 's-prune'}],
+        },
+      }));
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'waterfall',
+          'event': 'approval/request',
+          'eventId': 'ev-after-prune',
+          'agentId': 's-prune',
+          'request': {'tool': 'bash', 'command': 'ls'},
+        },
+      }));
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      expect(autoApproved, isEmpty);
+      expect(
+        frames.any((f) => f.type == 'interaction.requested' && f.dataMap?['id'] == 'ev-after-prune'),
+        isTrue,
+      );
+    });
   });
 }
 

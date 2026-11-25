@@ -76,6 +76,12 @@ class GrassBagEngineService : Service() {
             (pendingStop.get() && (cmdGen < 0 || cmdGen <= stopGen.get()))
 
         if (shouldStop) {
+            serviceActive.set(false)
+            wakeLockUntilMs = 0L
+            if (cmdGen < 0 || cmdGen >= intentGen.get() || stopGen.get() >= intentGen.get()) {
+                startRequested.set(false)
+                pendingStop.set(false)
+            }
             runCatching { if (lock?.isHeld == true) lock?.release() }
             if (started) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -85,11 +91,6 @@ class GrassBagEngineService : Service() {
                     runCatching { stopForeground(true) }
                 }
             }
-            if (cmdGen < 0 || cmdGen >= intentGen.get()) {
-                startRequested.set(false)
-                pendingStop.set(false)
-            }
-            serviceActive.set(false)
             stopSelf(startId)
             return START_NOT_STICKY
         }

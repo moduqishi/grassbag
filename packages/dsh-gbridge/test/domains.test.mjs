@@ -1038,3 +1038,80 @@ test('v34 regression: slim session.event raw, durableRing byte cap & snapshot ex
   assert.equal(typeof cached?.output, 'string');
   assert.ok(cached.output.includes('已截断'), 'expected truncated marker on oversized object output');
 });
+
+test('v35 regression: StreamHub ascending coalesced seq, slow-consumer 1013 disconnect, GatewayAdapter skips aborted peer', async () => {
+  const { StreamHub } = await import('../lib/stream-hub.js');
+  const { GatewayAdapter } = await import('../lib/gateway.js');
+
+  // 1. Coalesced deltas across concurrent channels flush in strictly ascending `seq` order
+  const hub = new StreamHub({
+    bootId: 'boot-v35',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: new SessionNormalizer(),
+    gateway: { has: () => false },
+  });
+  const sentFrames = [];
+  let closedCode = null;
+  const fakeWs = {
+    socket: { writableLength: 0 },
+    sendText(payload) {
+      sentFrames.push(JSON.parse(payload));
+    },
+    sendJson(obj) {
+      sentFrames.push(obj);
+    },
+    close(code) {
+      closedCode = code;
+    },
+    terminate() {},
+    ping() {},
+    on() {},
+  };
+  const client = {
+    id: 'c-v35',
+    ws: fakeWs,
+    welcomed: true,
+    coalesceMs: 24,
+    channels: new Set(['session:s-a', 'session:s-b']),
+    pendingDeltas: new Map(),
+    coalesceTimer: null,
+    lastAckSeq: 0,
+    missedPongs: 0,
+  };
+  hub.clients.set(client.id, client);
+
+  // Interleave s-a (seq 1), s-b (seq 2), s-a (seq 3 -> coalesced onto s-a with latest seq 3)
+  hub.publish('session:s-a', 'turn.delta', { turnId: 'ta', chunk: { kind: 'text', delta: 'A1' } }, { isDelta: true });
+  hub.publish('session:s-b', 'turn.delta', { turnId: 'tb', chunk: { kind: 'text', delta: 'B1' } }, { isDelta: true });
+  hub.publish('session:s-a', 'turn.delta', { turnId: 'ta', chunk: { kind: 'text', delta: 'A2' } }, { isDelta: true });
+  hub._flushClientDeltas(client);
+
+  assert.equal(sentFrames.length, 2);
+  assert.ok(sentFrames[0].seq < sentFrames[1].seq, `expected strictly ascending seq, got ${sentFrames.map((f) => f.seq)}`);
+  assert.equal(sentFrames[0].channel, 'session:s-b');
+  assert.equal(sentFrames[1].channel, 'session:s-a');
+  assert.deepEqual(sentFrames[1].data.chunks.map((c) => c.delta), ['A1', 'A2']);
+
+  // 2. Slow consumer with > 8 MiB socket write buffer is disconnected cleanly (1013) instead of OOM/silent drop
+  fakeWs.socket.writableLength = 9 * 1024 * 1024;
+  hub.publish('session:s-a', 'turn.completed', { turnId: 'ta' });
+  assert.equal(closedCode, 1013);
+  assert.equal(hub.clients.has(client.id), false);
+  hub.dispose();
+
+  // 3. GatewayAdapter.resolvePeer skips an aborted browserPeer and falls back to live operatorPeer
+  const abortedCtrl = new AbortController();
+  abortedCtrl.abort();
+  const liveCtrl = new AbortController();
+  const livePeer = { id: 'op-live', signal: liveCtrl.signal };
+  const gw = new GatewayAdapter({
+    get: (k) => ({
+      typertGateway: { operatorPeer: () => livePeer },
+      typert: { local: { list: () => [], get: () => null } },
+      connection: { admit: () => ({ peer: livePeer }) },
+    })[k],
+    logger: { warn: () => {} },
+  });
+  gw.browserPeer = { id: 'browser-dead', signal: abortedCtrl.signal };
+  assert.equal(gw.resolvePeer(), livePeer);
+});

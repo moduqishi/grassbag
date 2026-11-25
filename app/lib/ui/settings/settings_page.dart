@@ -65,8 +65,8 @@ const Map<SettingsSection, String> kSettingsSearchAliases = {
   SettingsSection.agentRuntime: '子代理 子智能体 并发 循环 终端 沙箱 subagent sandbox bash loop',
   SettingsSection.mcp: 'mcp 工具 服务器 协议 stdio sse http server',
   SettingsSection.plugins: '插件 市场 扩展 模块 cordis plugin market',
-  SettingsSection.hosts: '主机 远程 本机 容器 引擎 局域网 代理 proxy 备份 backup token 证书 桌面端 ubuntu dsh proot tawcroot',
-  SettingsSection.local: '本机 容器 更新 备份 代理 缓存 槽位 分区 ubuntu dsh proot tawcroot backup proxy',
+  SettingsSection.hosts: '主机 远程 本机 容器 引擎 局域网 代理 proxy 镜像 下载源 mirror 备份 backup token 证书 桌面端 ubuntu dsh proot tawcroot',
+  SettingsSection.local: '本机 容器 更新 备份 代理 镜像 下载源 mirror 缓存 槽位 分区 ubuntu dsh proot tawcroot backup proxy',
   SettingsSection.appearance: '外观 主题 深色 浅色 夜间 液态 玻璃 配色 字体 dark light glass theme accent',
   SettingsSection.permissions: '权限 无障碍 受限设置 电池 保活 悬浮窗 存储 sdcard 麦克风 通知 shizuku accessibility battery overlay storage',
   SettingsSection.phone: '操控 手机 自动化 安全护栏 急停 无障碍 safetygate phone control accessibility',
@@ -1140,15 +1140,9 @@ class _SettingsDetailBody extends ConsumerWidget {
                 s.recentErrors,
                 s.nativeRuntimeStatus,
               ),
-            SettingsSection.about => (
-                s.appVersion,
-                s.appBuildNumber,
-                s.appUpdateInfo,
-                s.checkingAppUpdate,
-                s.appUpdateError,
-                s.appUpdateDownloading,
-                s.appUpdateDownloadProgress,
-              ),
+            // `AppAboutAndUpdateView` self-watches its own granular update/progress slice,
+            // so watching it here would rebuild the entire settings detail shell at 8Hz during APK download!
+            SettingsSection.about => null,
             _ => null,
           },
         ),
@@ -1728,7 +1722,9 @@ class _SettingsDetailBody extends ConsumerWidget {
             GrassBagGroupedSection(
               header: '本机环境（容器与 DSH 引擎）',
               footer: isAndroidLocal
-                  ? '本机内置 Ubuntu 容器初始化、启动器模式、A/B 更新、备份与运行日志已统一收敛到此处管理。'
+                  ? (rt.hasBundledRuntimePayloads
+                      ? '本机内置 Ubuntu 容器初始化、启动器模式、A/B 更新、备份与运行日志已统一收敛到此处管理。'
+                      : '本机 Ubuntu + Node 24 + DSH 运行环境支持按需在线下载、多镜像加速与断点续传，可在详情页切换下载源。')
                   : null,
               dividerIndent: 62,
               children: [
@@ -1818,9 +1814,19 @@ class _SettingsDetailBody extends ConsumerWidget {
                             Expanded(
                               child: GrassBagPrimaryGlassButton(
                                 label: !rt.initialized
-                                    ? (isDeploying ? '正在初始化 ${state.runtimeProgressPct}%…' : '一键初始化并启动本机容器')
+                                    ? (isDeploying
+                                        ? (state.runtimeProgressCanCancel
+                                            ? '正在下载 ${state.runtimeProgressPct}%…'
+                                            : '正在部署 ${state.runtimeProgressPct}%…')
+                                        : (!rt.hasBundledRuntimePayloads
+                                            ? (rt.hasPartialDownload
+                                                ? '继续下载并部署（剩余 ${rt.formattedDownloadSize}）'
+                                                : '下载并部署本机环境（约 ${rt.formattedDownloadSize}）')
+                                            : '一键初始化并启动本机容器'))
                                     : (rt.engineState == 'starting' ? '正在启动引擎…' : '启动本机 DSH 引擎'),
-                                icon: CupertinoIcons.bolt_fill,
+                                icon: !rt.initialized && !rt.hasBundledRuntimePayloads
+                                    ? CupertinoIcons.cloud_download_fill
+                                    : CupertinoIcons.bolt_fill,
                                 height: 38,
                                 tier: state.glassTier,
                                 insideGlass: true,
@@ -1828,19 +1834,29 @@ class _SettingsDetailBody extends ConsumerWidget {
                                 onTap: (isDeploying || rt.engineState == 'starting')
                                     ? null
                                     : () => !rt.initialized
-                                        ? ctrl.bootstrapLocalRuntime()
+                                        ? triggerLocalRuntimeBootstrapWithGuard(context, ref)
                                         : ctrl.restartLocalEngine(),
                               ),
                             ),
                             const SizedBox(width: 8),
-                            GrassBagSecondaryGlassButton(
-                              label: '详细管理',
-                              height: 38,
-                              padding: const EdgeInsets.symmetric(horizontal: 12),
-                              tier: state.glassTier,
-                              insideGlass: true,
-                              onTap: () => onSelectHostDetail(local.id),
-                            ),
+                            if (isDeploying && state.runtimeProgressCanCancel)
+                              GrassBagSecondaryGlassButton(
+                                label: '暂停',
+                                height: 38,
+                                padding: const EdgeInsets.symmetric(horizontal: 12),
+                                tier: state.glassTier,
+                                insideGlass: true,
+                                onTap: () => unawaited(ctrl.cancelLocalRuntimeBootstrap()),
+                              )
+                            else
+                              GrassBagSecondaryGlassButton(
+                                label: '详细管理',
+                                height: 38,
+                                padding: const EdgeInsets.symmetric(horizontal: 12),
+                                tier: state.glassTier,
+                                insideGlass: true,
+                                onTap: () => onSelectHostDetail(local.id),
+                              ),
                           ],
                         ),
                       ],
@@ -2229,6 +2245,7 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
             dshNamespaces: s.dshNamespaces,
             runtimeProgressPct: s.runtimeProgressPct,
             runtimeProgressMsg: s.runtimeProgressMsg,
+            runtimeProgressCanCancel: s.runtimeProgressCanCancel,
             containerToolkits: s.containerToolkits,
             useSystemProxy: s.useSystemProxy,
           ),
@@ -2249,7 +2266,11 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
               'running' => '本机 DSH 引擎运行中',
               'starting' => '本机 DSH 引擎启动中…',
               'error' => '本机引擎启动异常',
-              _ => rt.initialized ? '本机容器已就绪（点击启动）' : '本机引擎未初始化',
+              _ => rt.initialized
+                  ? '本机容器已就绪（点击启动）'
+                  : (!rt.hasBundledRuntimePayloads
+                      ? (rt.hasPartialDownload ? '本机运行环境待续传' : '本机运行环境尚未下载')
+                      : '本机引擎未初始化'),
             }
           : (isConnected ? '已连接到本机 DSH 主机' : '等待连接本机 DSH');
       final engineSub = host.lastError != null && host.lastError!.isNotEmpty
@@ -2300,15 +2321,29 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                 ),
                 const SizedBox(width: 8),
                 () {
+                  final isDeployingNow = isAndroidLocal &&
+                      appState.runtimeProgressPct > 0 &&
+                      appState.runtimeProgressPct < 100;
                   final isBusy = isAndroidLocal &&
-                      (rt.engineState == 'starting' ||
-                          (appState.runtimeProgressPct > 0 && appState.runtimeProgressPct < 100));
+                      (rt.engineState == 'starting' || isDeployingNow);
+                  if (isDeployingNow && appState.runtimeProgressCanCancel) {
+                    return GrassBagSecondaryGlassButton(
+                      label: '暂停',
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      tier: tier,
+                      insideGlass: true,
+                      onTap: () => unawaited(ctrl.cancelLocalRuntimeBootstrap()),
+                    );
+                  }
                   final primaryBtn = GrassBagSecondaryGlassButton(
                     label: isAndroidLocal
                         ? (!rt.initialized
-                            ? (appState.runtimeProgressPct > 0 && appState.runtimeProgressPct < 100
+                            ? (isDeployingNow
                                 ? '${appState.runtimeProgressPct}%'
-                                : '一键部署')
+                                : (!rt.hasBundledRuntimePayloads
+                                    ? (rt.hasPartialDownload ? '继续下载' : '下载部署')
+                                    : '一键部署'))
                             : (rt.engineRunning
                                 ? '重启'
                                 : (rt.engineState == 'starting' ? '启动中…' : '启动')))
@@ -2322,7 +2357,7 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                         ? null
                         : () => isAndroidLocal
                             ? (!rt.initialized
-                                ? ctrl.bootstrapLocalRuntime()
+                                ? triggerLocalRuntimeBootstrapWithGuard(context, ref)
                                 : ctrl.restartLocalEngine())
                             : ctrl.probeAndRefreshHost(host.id),
                   );
@@ -2617,6 +2652,39 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                 ),
                 GrassBagListTile(
                   leading: GrassBagSquircleIcon(
+                    icon: CupertinoIcons.cloud_download_fill,
+                    color: t.primary,
+                    size: 34,
+                    iconSize: 16,
+                  ),
+                  title: const Text('运行环境下载源'),
+                  subtitle: Text(
+                    rt.hasBundledRuntimePayloads
+                        ? '当前安装包已内置离线环境；也可配置自定义镜像备用'
+                        : '版本 ${rt.runtimeReleaseTag.isNotEmpty ? rt.runtimeReleaseTag : 'runtime-arm64-r2'} · 自动多镜像容灾与断点续传',
+                  ),
+                  trailing: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 148),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            rt.runtimeMirrorDisplayLabel,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 12.5, color: t.text3),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(CupertinoIcons.chevron_right, size: 13.5, color: t.text3),
+                      ],
+                    ),
+                  ),
+                  onTap: () => showRuntimeMirrorSheet(context, ref),
+                ),
+                GrassBagListTile(
+                  leading: GrassBagSquircleIcon(
                     icon: CupertinoIcons.folder_fill,
                     color: t.ok,
                     size: 34,
@@ -2654,16 +2722,26 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                     size: 34,
                     iconSize: 16,
                   ),
-                  title: Text(rt.initialized ? '校验 / 修复本机容器' : '一键初始化本机容器'),
+                  title: Text(
+                    rt.initialized
+                        ? '校验 / 修复本机容器'
+                        : (!rt.hasBundledRuntimePayloads
+                            ? (rt.hasPartialDownload ? '继续下载并部署本机容器' : '下载并部署本机容器')
+                            : '一键初始化本机容器'),
+                  ),
                   subtitle: Text(
-                    '系统分区 ${rt.activeSlot} · ${rt.initialized ? '容器已解压，点击可原地校验完整性' : '离线解压 Ubuntu 24.04.5 + Node 24 + DSH'}',
+                    '系统分区 ${rt.activeSlot} · ${rt.initialized ? '容器已就绪，点击可原地校验完整性' : (!rt.hasBundledRuntimePayloads ? '按需在线下载 Ubuntu 24.04.5 + Node 24 + DSH（约 ${rt.formattedDownloadSize}）' : '离线解压 Ubuntu 24.04.5 + Node 24 + DSH')}',
                   ),
                   trailing: _SmallPill(
-                    label: rt.initialized ? '已就绪' : '待部署',
+                    label: rt.initialized
+                        ? '已就绪'
+                        : (!rt.hasBundledRuntimePayloads
+                            ? (rt.hasPartialDownload ? '待续传' : '待下载')
+                            : '待部署'),
                     bg: rt.initialized ? t.okSoft : t.primarySoft,
                     fg: rt.initialized ? t.ok : t.primary,
                   ),
-                  onTap: () => unawaited(ctrl.bootstrapLocalRuntime()),
+                  onTap: () => unawaited(triggerLocalRuntimeBootstrapWithGuard(context, ref)),
                 ),
                 GrassBagListTile(
                   leading: GrassBagSquircleIcon(
@@ -2685,13 +2763,19 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                     iconSize: 16,
                   ),
                   title: const Text('保留 /root 重建容器'),
-                  subtitle: const Text('重新解压干净 Ubuntu + Node 24 镜像，代码与对话零丢失'),
+                  subtitle: Text(
+                    rt.hasBundledRuntimePayloads
+                        ? '重新解压干净 Ubuntu + Node 24 镜像，代码与对话零丢失'
+                        : '重新拉取干净 Ubuntu + Node 24 基础镜像（约 72 MB），代码与对话零丢失',
+                  ),
                   showChevron: true,
                   onTap: () async {
                     final ok = await showGrassBagConfirmDialog(
                       context,
                       title: '保留 /root 重建容器？',
-                      message: '将停止当前引擎并重新部署干净 Linux 根文件系统，/root 中的项目、密钥与历史对话均完好保留。',
+                      message: rt.hasBundledRuntimePayloads
+                          ? '将停止当前引擎并重新部署干净 Linux 根文件系统，/root 中的项目、密钥与历史对话均完好保留。'
+                          : '将停止当前引擎并重新在线下载约 72 MB 的 Ubuntu 根文件系统（已安装的 DSH 引擎分区保留），/root 中的项目、密钥与历史对话均完好保留。',
                       confirmLabel: '开始重建',
                     );
                     if (ok) unawaited(ctrl.rebuildLocalContainer());

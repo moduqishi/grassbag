@@ -879,6 +879,8 @@ class GrassBagAppState {
     this.nativePermissions = const NativePermissionsStatus(),
     this.runtimeProgressPct = 0,
     this.runtimeProgressMsg = '',
+    this.runtimeProgressStage = '',
+    this.runtimeProgressCanCancel = false,
     this.connectionPhase = ConnectionPhase.disconnected,
     this.discoveredLanHosts = const [],
     this.scanningLan = false,
@@ -1028,6 +1030,8 @@ class GrassBagAppState {
   final NativePermissionsStatus nativePermissions;
   final int runtimeProgressPct;
   final String runtimeProgressMsg;
+  final String runtimeProgressStage;
+  final bool runtimeProgressCanCancel;
   final ConnectionPhase connectionPhase;
   final List<DiscoveredLanHost> discoveredLanHosts;
   final bool scanningLan;
@@ -1275,9 +1279,18 @@ class GrassBagAppState {
     if (host.isLocal && !kIsWeb && GrassBagNativeBridge.instance.isAndroidNative) {
       final rt = nativeRuntimeStatus;
       if (runtimeProgressPct > 0 && runtimeProgressPct < 100) {
-        return '正在部署容器 $runtimeProgressPct%…';
+        return runtimeProgressCanCancel
+            ? '正在下载运行环境 $runtimeProgressPct%…'
+            : '正在部署容器 $runtimeProgressPct%…';
       }
-      if (!rt.initialized) return '容器未初始化 · 待部署';
+      if (!rt.initialized) {
+        if (!rt.hasBundledRuntimePayloads) {
+          return rt.hasPartialDownload
+              ? '待继续下载 · 剩余 ${rt.formattedDownloadSize}'
+              : '未下载环境 · 约 ${rt.formattedDownloadSize}';
+        }
+        return '容器未初始化 · 待部署';
+      }
       if (rt.engineState == 'starting') return '正在启动本机 DSH 引擎…';
       if (rt.engineState == 'error') return '启动异常 · 点击查看日志';
       if (rt.engineRunning && host.bridged) return 'DSH ${host.dshVersion} · 运行中';
@@ -1303,8 +1316,14 @@ class GrassBagAppState {
   String hostStatusBadge(ManagedHost host) {
     if (host.isLocal && !kIsWeb && GrassBagNativeBridge.instance.isAndroidNative) {
       final rt = nativeRuntimeStatus;
-      if (runtimeProgressPct > 0 && runtimeProgressPct < 100) return '部署中 $runtimeProgressPct%';
-      if (!rt.initialized) return '未初始化';
+      if (runtimeProgressPct > 0 && runtimeProgressPct < 100) {
+        return runtimeProgressCanCancel ? '下载中 $runtimeProgressPct%' : '部署中 $runtimeProgressPct%';
+      }
+      if (!rt.initialized) {
+        return !rt.hasBundledRuntimePayloads
+            ? (rt.hasPartialDownload ? '待续传' : '待下载')
+            : '未初始化';
+      }
       if (rt.engineState == 'starting') return '启动中';
       if (rt.engineState == 'error') return '启动异常';
       if (rt.engineRunning) return host.bridged ? '运行中' : '接入中';
@@ -1528,6 +1547,8 @@ class GrassBagAppState {
     NativePermissionsStatus? nativePermissions,
     int? runtimeProgressPct,
     String? runtimeProgressMsg,
+    String? runtimeProgressStage,
+    bool? runtimeProgressCanCancel,
     ConnectionPhase? connectionPhase,
     List<DiscoveredLanHost>? discoveredLanHosts,
     bool? scanningLan,
@@ -1698,6 +1719,8 @@ class GrassBagAppState {
       nativePermissions: nativePermissions ?? this.nativePermissions,
       runtimeProgressPct: runtimeProgressPct ?? this.runtimeProgressPct,
       runtimeProgressMsg: runtimeProgressMsg ?? this.runtimeProgressMsg,
+      runtimeProgressStage: runtimeProgressStage ?? this.runtimeProgressStage,
+      runtimeProgressCanCancel: runtimeProgressCanCancel ?? this.runtimeProgressCanCancel,
       connectionPhase: connectionPhase ?? this.connectionPhase,
       discoveredLanHosts: discoveredLanHosts ?? this.discoveredLanHosts,
       scanningLan: scanningLan ?? this.scanningLan,
@@ -1881,6 +1904,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   DateTime? _lastBackgroundedAt;
   Future<void>? _inFlightPermissionsRefresh;
   Future<void>? _inFlightNativeStatus;
+  int _nativeStatusSeq = 0;
+  int _dshUpdateCheckSeq = 0;
+  static const String _disconnectedSaveError = '主机连接已断开或切换，本次保存未完成，请重连后重试';
 
   static const int _maxCachedSessionsTurns = 10;
   static const int _maxToolCacheEntries = 50;
@@ -1995,8 +2021,13 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool markUserNavigated = false,
   }) {
     final scope = _draftScopeKey(sessionId);
-    final entry = _hostContexts.putIfAbsent(hostId, () => <String, dynamic>{});
-    final existingDrafts = entry['sessionDrafts'];
+    final existingEntry = _hostContexts[hostId];
+    final existingDrafts = existingEntry?['sessionDrafts'];
+    final currentVal = existingDrafts is Map
+        ? (existingDrafts[scope]?.toString() ?? '')
+        : (scope == '__new__' ? (existingEntry?['composerDraft']?.toString() ?? '') : '');
+    if (currentVal == text) return;
+    final entry = existingEntry ?? _hostContexts.putIfAbsent(hostId, () => <String, dynamic>{});
     final Map<String, dynamic> drafts;
     if (existingDrafts is Map<String, dynamic>) {
       drafts = existingDrafts;
@@ -2006,7 +2037,6 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     } else {
       drafts = <String, dynamic>{};
     }
-    if ((drafts[scope]?.toString() ?? '') == text) return;
     if (text.isEmpty) {
       drafts.remove(scope);
       if (scope == '__new__') entry.remove('composerDraft');
@@ -2207,7 +2237,28 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (!mounted) return;
     if (savedContexts != null && savedContexts.isNotEmpty) {
       for (final entry in savedContexts.entries) {
-        _hostContexts.putIfAbsent(entry.key, () => Map<String, dynamic>.from(entry.value));
+        final existing = _hostContexts[entry.key];
+        if (existing == null) {
+          _hostContexts[entry.key] = Map<String, dynamic>.from(entry.value);
+        } else {
+          // Deep-merge persisted context under any in-memory cold-start edits so
+          // early typing never wipes remembered `lastSessionId` / `lastWorkspace` / sibling drafts.
+          for (final kv in entry.value.entries) {
+            if (kv.key == 'sessionDrafts' && kv.value is Map) {
+              final memDrafts = existing['sessionDrafts'] is Map
+                  ? Map<String, dynamic>.from(existing['sessionDrafts'] as Map)
+                  : <String, dynamic>{};
+              for (final d in (kv.value as Map).entries) {
+                memDrafts.putIfAbsent(d.key.toString(), () => d.value);
+              }
+              if (memDrafts.isNotEmpty) {
+                existing['sessionDrafts'] = memDrafts;
+              }
+            } else {
+              existing.putIfAbsent(kv.key, () => kv.value);
+            }
+          }
+        }
       }
     }
 
@@ -2381,10 +2432,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           if (evt.type == 'runtime_progress') {
             final nextPct = (evt.data['percent'] as num?)?.toInt() ?? 0;
             final nextMsg = evt.data['message']?.toString() ?? '';
-            if (nextPct != state.runtimeProgressPct || nextMsg != state.runtimeProgressMsg) {
+            final nextStage = evt.data['stage']?.toString() ?? '';
+            final nextCanCancel =
+                nextPct > 0 && nextPct < 100 && evt.data['canCancel'] == true;
+            if (nextPct != state.runtimeProgressPct ||
+                nextMsg != state.runtimeProgressMsg ||
+                nextStage != state.runtimeProgressStage ||
+                nextCanCancel != state.runtimeProgressCanCancel) {
               state = state.copyWith(
                 runtimeProgressPct: nextPct,
                 runtimeProgressMsg: nextMsg,
+                runtimeProgressStage: nextPct <= 0 || nextPct >= 100 ? '' : nextStage,
+                runtimeProgressCanCancel: nextCanCancel,
               );
             }
           } else if (evt.type == 'engine_log') {
@@ -2443,12 +2502,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
               }
             }
           } else if (evt.type == 'engine_web_url') {
-            unawaited(refreshNativeStatus(skipAutoConnect: true));
+            unawaited(refreshNativeStatus(skipAutoConnect: true, forceFresh: true));
           } else if (evt.type == 'engine_ready') {
             final sock = evt.data['bridgeSocketPath']?.toString() ?? '';
             final httpUrl = evt.data['bridgeHttpUrl']?.toString() ?? 'http://127.0.0.1:13080';
             final token = evt.data['bridgeToken']?.toString() ?? '';
-            unawaited(refreshNativeStatus(skipAutoConnect: true));
+            unawaited(refreshNativeStatus(skipAutoConnect: true, forceFresh: true));
             if (state.activeHost.isLocal && token.isNotEmpty) {
               unawaited(_connectLocalAndroidEngine(sock, httpUrl, token, gen: _hostConnectGen));
             }
@@ -2700,7 +2759,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return false;
     }
     final res = await native.requestRuntimePermission(target);
-    await refreshNativeStatus(skipAutoConnect: true);
+    await refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
     if (!mounted) return false;
     final granted = res['granted'] == true;
     if (granted) {
@@ -2794,8 +2853,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _lastLiveTpsEmitAt = null;
   }
 
-  Future<void> refreshNativeStatus({int? connectGen, bool skipAutoConnect = false}) {
-    if (_inFlightNativeStatus != null && skipAutoConnect) {
+  Future<void> refreshNativeStatus({
+    int? connectGen,
+    bool skipAutoConnect = false,
+    bool forceFresh = false,
+  }) {
+    if (_inFlightNativeStatus != null && skipAutoConnect && !forceFresh) {
       return _inFlightNativeStatus!;
     }
     final fut = _refreshNativeStatusImpl(
@@ -2812,6 +2875,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   }
 
   Future<void> _refreshNativeStatusImpl({int? connectGen, bool skipAutoConnect = false}) async {
+    final seq = ++_nativeStatusSeq;
     final native = GrassBagNativeBridge.instance;
     final nativeRes = await Future.wait<Object?>([
       native.getRuntimeStatus(),
@@ -2821,7 +2885,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final rt = nativeRes[0] as NativeRuntimeStatus?;
     final perms = nativeRes[1] as NativePermissionsStatus?;
     final safety = nativeRes[2] as Map<String, dynamic>?;
-    if (!mounted) return;
+    if (!mounted || seq != _nativeStatusSeq) return;
     if (connectGen != null && connectGen != _hostConnectGen) return;
 
     var nextHosts = state.hosts;
@@ -3090,7 +3154,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
         GbridgeClient? client;
         try {
-          _detachLiveClientsSync();
+          _detachLiveClientsSync(preserveLocalConnectLock: true);
           if (!mounted || targetGen != _hostConnectGen || !state.activeHost.isLocal) return;
           client = GbridgeClient(
             HostEndpoint.http(baseUri: Uri.parse(httpUrl), token: token),
@@ -3136,30 +3200,85 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return;
     }
     if (_bootstrappingLocal) {
-      showToast('本机容器正在部署中，请稍候…', tone: ToastTone.info);
+      showToast('本机运行环境正在准备中，请稍候…', tone: ToastTone.info);
       return;
     }
     _bootstrappingLocal = true;
+    final isRemote = !state.nativeRuntimeStatus.hasBundledRuntimePayloads;
     try {
-      state = state.copyWith(runtimeProgressPct: 8, runtimeProgressMsg: '准备初始化本机运行环境…');
+      state = state.copyWith(
+        runtimeProgressPct: 2,
+        runtimeProgressMsg: isRemote ? '准备下载并部署本机运行环境…' : '准备初始化本机运行环境…',
+        runtimeProgressStage: 'layout',
+        runtimeProgressCanCancel: isRemote,
+      );
       final res = await native.bootstrapRuntime();
-      await refreshNativeStatus();
+      if (!mounted) return;
+      if (res['cancelled'] == true) {
+        state = state.copyWith(
+          runtimeProgressPct: 0,
+          runtimeProgressMsg: '',
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
+        await refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
+        if (!mounted) return;
+        showToast('已暂停下载，下次点击可断点续传', tone: ToastTone.info);
+        return;
+      }
+      await refreshNativeStatus(forceFresh: true);
       if (!mounted) return;
       if (res['ok'] == true) {
+        state = state.copyWith(
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
         await native.startKeepaliveService();
         showToast('本机 Linux 容器与零侵入桥已就绪');
       } else {
-        state = state.copyWith(runtimeProgressPct: 0, runtimeProgressMsg: '');
-        showError('初始化本机运行环境失败', error: res['error'] ?? '容器部署未完成，请检查存储空间后重试');
+        state = state.copyWith(
+          runtimeProgressPct: 0,
+          runtimeProgressMsg: '',
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
+        showError('初始化本机运行环境失败', error: res['error'] ?? '容器部署未完成，请检查网络或存储空间后重试');
       }
     } catch (e) {
       if (mounted) {
-        state = state.copyWith(runtimeProgressPct: 0, runtimeProgressMsg: '');
+        state = state.copyWith(
+          runtimeProgressPct: 0,
+          runtimeProgressMsg: '',
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
         showError('初始化本机运行环境失败', error: e);
       }
     } finally {
       _bootstrappingLocal = false;
     }
+  }
+
+  Future<void> cancelLocalRuntimeBootstrap() async {
+    final native = GrassBagNativeBridge.instance;
+    if (!native.isAndroidNative) return;
+    await native.cancelRuntimeBootstrap();
+    if (!mounted) return;
+    showToast('正在暂停下载，将保留断点进度…', tone: ToastTone.info);
+  }
+
+  Future<String?> setLocalRuntimeMirrorUrl(String url) async {
+    final native = GrassBagNativeBridge.instance;
+    if (!native.isAndroidNative) return '仅 Android 本机环境支持配置下载源';
+    final res = await native.setRuntimeMirrorUrl(url);
+    await refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
+    if (!mounted) return null;
+    if (res['ok'] == true) {
+      final cleaned = res['customRuntimeMirrorUrl']?.toString().trim() ?? '';
+      showToast(cleaned.isEmpty ? '已恢复自动择优下载源' : '已保存自定义运行环境下载源');
+      return null;
+    }
+    return res['error']?.toString() ?? '保存下载源失败，请检查地址格式';
   }
 
   Future<void> stopLocalEngine() async {
@@ -6633,7 +6752,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       showToast('已创建定时任务：$cleanName');
       return null;
     } catch (e) {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       showError('创建定时任务失败', error: e);
       return '创建定时任务失败：$e';
     }
@@ -6673,7 +6792,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       showToast('已更新定时任务：$cleanName');
       return null;
     } catch (e) {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       showError('更新定时任务失败', error: e);
       return '更新定时任务失败：$e';
     }
@@ -6924,13 +7043,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       showToast('请先连接到运行中的 DSH 主机后再启动后台任务', tone: ToastTone.warn);
       return false;
     }
-    showToast('已通过当前对话委派后台命令，可返回对话查看或稍后刷新', tone: ToastTone.info);
-    unawaited(
-      sendPrompt(
-        '请在后台启动并运行以下命令，并汇报任务状态：\n```bash\n$clean\n```',
-        includePendingAttachments: false,
-      ),
+    if (!state.hasAvailableModels) {
+      showToast('请先在设置中配置可用模型后再启动后台任务', tone: ToastTone.warn);
+      return false;
+    }
+    final ok = await sendPrompt(
+      '请在后台启动并运行以下命令，并汇报任务状态：\n```bash\n$clean\n```',
+      includePendingAttachments: false,
     );
+    if (!ok || !mounted) return false;
+    showToast('已通过当前对话委派后台命令，可返回对话查看或稍后刷新', tone: ToastTone.info);
     Future<void>.delayed(const Duration(seconds: 2), () {
       if (mounted && _liveClient != null) {
         unawaited(refreshJobs(silent: true));
@@ -7324,7 +7446,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (ops.isEmpty) return null;
     final queueKey = '${state.activeHostId}:$ns';
     return _serializeNamespaceWrite<String?>(queueKey, () async {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       if (shouldProceed != null && !shouldProceed()) return null;
 
       var currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
@@ -7351,13 +7473,13 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         int? retryExpectedRev;
         const maxAttempts = 4;
         for (var attempt = 0; attempt < maxAttempts; attempt++) {
-          if (!_isStillLive(client)) return null;
+          if (!_isStillLive(client)) return _disconnectedSaveError;
           if (shouldProceed != null && !shouldProceed()) return null;
           try {
             res = await sendMutate(retryExpectedRev);
             break;
           } catch (err) {
-            if (!_isStillLive(client)) return null;
+            if (!_isStillLive(client)) return _disconnectedSaveError;
             if (shouldProceed != null && !shouldProceed()) return null;
             if (!_isRevisionConflictError(err) || attempt == maxAttempts - 1) {
               rethrow;
@@ -7365,7 +7487,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             // Refresh live revision (bypassing any read cache) and recover cleanly.
             final actualFromErr = _extractActualRevisionFromConflict(err);
             final freshRev = await _fetchFreshNamespaceRevision(client, ns, forceFresh: true);
-            if (!_isStillLive(client)) return null;
+            if (!_isStillLive(client)) return _disconnectedSaveError;
             if (shouldProceed != null && !shouldProceed()) return null;
             // On retry for path-addressed mutate, omit expectedRevision when possible so
             // back-to-back async saves (e.g. DSH `saveSelection`) cannot re-trigger 409;
@@ -7384,7 +7506,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             }
           }
         }
-        if (res == null || !_isStillLive(client)) return null;
+        if (res == null || !_isStillLive(client)) return _disconnectedSaveError;
         final resultObj = res['result'];
         if (resultObj is Map && resultObj['revision'] is num) {
           nextRev = (resultObj['revision'] as num).toInt();
@@ -7395,7 +7517,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             ..addAll(Map<String, dynamic>.from(resultObj['value'] as Map));
         }
       } catch (err) {
-        if (!_isStillLive(client)) return null;
+        if (!_isStillLive(client)) return _disconnectedSaveError;
         if (shouldProceed != null && !shouldProceed()) return null;
         final readable = formatReadableError(err);
         if (_isRevisionConflictError(err)) {
@@ -7494,7 +7616,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool suppressErrorToast = false,
     Map<String, dynamic> Function(Map<String, dynamic> freshSection)? mergeOnConflict,
   }) async {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       var currentList = List<DshSettingsNamespace>.of(state.dshNamespaces);
       var idx = currentList.indexWhere((e) => e.ns == ns);
       final existing = idx >= 0 ? currentList[idx] : null;
@@ -7531,18 +7653,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         int? expectedRev = replace ? existing?.revision : null;
         const maxAttempts = 4;
         for (var attempt = 0; attempt < maxAttempts; attempt++) {
-          if (!_isStillLive(client)) return null;
+          if (!_isStillLive(client)) return _disconnectedSaveError;
           try {
             res = await sendPatch(expectedRev);
             break;
           } catch (err) {
-            if (!_isStillLive(client)) return null;
+            if (!_isStillLive(client)) return _disconnectedSaveError;
             if (!_isRevisionConflictError(err) || attempt == maxAttempts - 1) {
               rethrow;
             }
             final actualFromErr = _extractActualRevisionFromConflict(err);
             final freshRev = await _fetchFreshNamespaceRevision(client, ns, forceFresh: true);
-            if (!_isStillLive(client)) return null;
+            if (!_isStillLive(client)) return _disconnectedSaveError;
             if (replace && mergeOnConflict != null) {
               final freshNs = state.dshNamespaces.where((e) => e.ns == ns).firstOrNull;
               if (freshNs != null) {
@@ -7558,7 +7680,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             }
           }
         }
-        if (res == null || !_isStillLive(client)) return null;
+        if (res == null || !_isStillLive(client)) return _disconnectedSaveError;
         final resultObj = res['result'];
         if (resultObj is Map && resultObj['revision'] is num) {
           nextRev = (resultObj['revision'] as num).toInt();
@@ -7569,7 +7691,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             ..addAll(Map<String, dynamic>.from(resultObj['value'] as Map));
         }
       } catch (err) {
-        if (!_isStillLive(client)) return null;
+        if (!_isStillLive(client)) return _disconnectedSaveError;
         // Roll back ONLY the failed `ns` entry so concurrent writes to sibling namespaces are preserved!
         if (!replace && existing != null) {
           final rolledBack = List<DshSettingsNamespace>.of(state.dshNamespaces);
@@ -7690,9 +7812,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (cleanSecret.isNotEmpty && cleanEnv.isNotEmpty) {
       try {
         await client.setCredential({'ref': cleanEnv, 'value': cleanSecret});
-        if (!_isStillLive(client)) return null;
+        if (!_isStillLive(client)) return _disconnectedSaveError;
       } catch (e) {
-        if (!_isStillLive(client)) return null;
+        if (!_isStillLive(client)) return _disconnectedSaveError;
         final readable = formatReadableError(e);
         showError('保存密钥 $cleanEnv 失败', error: e);
         return readable;
@@ -7709,7 +7831,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         if (cleanEnv.isNotEmpty) {'op': 'set', 'path': ['apiKeyEnv'], 'value': cleanEnv},
       ];
       final err = await mutateDshNamespace('llm-deepseek', ops, silent: true, skipHydrate: true, clientOverride: client);
-      if (err != null || !_isStillLive(client)) return err;
+      if (err != null) return err;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
     } else if (settingsNs == 'llm-commandcode') {
       final ops = <Map<String, dynamic>>[
         if (cleanUrl.isNotEmpty)
@@ -7719,7 +7842,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         if (cleanEnv.isNotEmpty) {'op': 'set', 'path': ['apiKeyEnv'], 'value': cleanEnv},
       ];
       final err = await mutateDshNamespace('llm-commandcode', ops, silent: true, skipHydrate: true, clientOverride: client);
-      if (err != null || !_isStillLive(client)) return err;
+      if (err != null) return err;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
     } else if (settingsNs == 'llm-pi-ai' && cleanId.isNotEmpty) {
       final queueKey = '${state.activeHostId}:llm-pi-ai';
       Map<String, dynamic> applyProviderDelta(Map<String, dynamic> baseSection) {
@@ -7757,7 +7881,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
 
       final err = await _serializeNamespaceWrite<String?>(queueKey, () async {
-        if (!_isStillLive(client)) return null;
+        if (!_isStillLive(client)) return _disconnectedSaveError;
         final ns = state.dshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
         final rootCopy = applyProviderDelta(ns?.value ?? const <String, dynamic>{});
 
@@ -7771,7 +7895,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           mergeOnConflict: applyProviderDelta,
         );
       });
-      if (err != null || !_isStillLive(client)) return err;
+      if (err != null) return err;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
     }
 
     // 3. Immediately refresh authoritative models, providers & credentials from DSH!
@@ -7855,7 +7980,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
     final queueKey = '${state.activeHostId}:llm-pi-ai';
     final err = await _serializeNamespaceWrite<String?>(queueKey, () async {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       final ns = state.dshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
       final rootCopy = Map<String, dynamic>.from(ns?.value ?? const <String, dynamic>{});
       final rawProviders = rootCopy['providers'];
@@ -7979,7 +8104,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         },
       );
     });
-    if (err != null || !_isStillLive(client)) return err;
+    if (err != null) return err;
+    if (!_isStillLive(client)) return _disconnectedSaveError;
 
     await _hydrateLiveDomains(client, skipAutoDefaultSync: true);
     if (!_isStillLive(client)) return null;
@@ -8019,7 +8145,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     var removedEnv = '';
     final queueKey = '${state.activeHostId}:llm-pi-ai';
     final err = await _serializeNamespaceWrite<String?>(queueKey, () async {
-      if (!_isStillLive(client)) return null;
+      if (!_isStillLive(client)) return _disconnectedSaveError;
       final ns = state.dshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
       if (ns == null) return null;
       final rootCopy = Map<String, dynamic>.from(ns.value);
@@ -8049,7 +8175,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         },
       );
     });
-    if (err != null || !_isStillLive(client)) return err;
+    if (err != null) return err;
+    if (!_isStillLive(client)) return _disconnectedSaveError;
     if (isCustom && removedEnv.isNotEmpty) {
       await client.unsetCredential({'ref': removedEnv}).catchError((_) => <String, dynamic>{});
       if (!_isStillLive(client)) return null;
@@ -8403,10 +8530,33 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         }
       }
       final res = await native.rebuildContainer();
-      await refreshNativeStatus(connectGen: gen);
+      if (!mounted) return;
+      if (res['cancelled'] == true) {
+        state = state.copyWith(
+          runtimeProgressPct: 0,
+          runtimeProgressMsg: '',
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
+        await refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
+        if (!mounted) return;
+        showToast('已暂停容器重建下载，下次可断点续传', tone: ToastTone.info);
+        return;
+      }
+      await refreshNativeStatus(connectGen: gen, forceFresh: true);
       if (!mounted) return;
       if (res['ok'] != true) {
-        state = state.copyWith(runtimeProgressPct: 0, runtimeProgressMsg: '');
+        state = state.copyWith(
+          runtimeProgressPct: 0,
+          runtimeProgressMsg: '',
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
+      } else {
+        state = state.copyWith(
+          runtimeProgressStage: '',
+          runtimeProgressCanCancel: false,
+        );
       }
       showToast(
         res['ok'] == true ? '容器已重建并重启引擎，/root 资料零丢失' : '容器重建失败：${res['error']}',
@@ -10243,6 +10393,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (interactionId == null) return false;
     final client = _liveClient;
     final backup = _pendingInteractionsById[interactionId];
+    _interactionMutationSeq++;
     _pendingInteractionsById.remove(interactionId);
     _recomputeVisibleInteractions();
     if (client != null) {
@@ -10252,6 +10403,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       } catch (e) {
         if (!_isStillLive(client)) return false;
         if (backup != null) {
+          _interactionMutationSeq++;
           _pendingInteractionsById[interactionId] = backup;
           _recomputeVisibleInteractions();
         }
@@ -10272,6 +10424,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (q == null) return false;
     final client = _liveClient;
     final backup = _pendingInteractionsById[q.interactionId];
+    _interactionMutationSeq++;
     _pendingInteractionsById.remove(q.interactionId);
     _recomputeVisibleInteractions();
     if (client != null) {
@@ -10281,6 +10434,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       } catch (e) {
         if (!_isStillLive(client)) return false;
         if (backup != null) {
+          _interactionMutationSeq++;
           _pendingInteractionsById[q.interactionId] = backup;
           _recomputeVisibleInteractions();
         }
@@ -10307,6 +10461,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         return false;
       }
     }
+    _interactionMutationSeq++;
     _pendingInteractionsById.remove(q.interactionId);
     _recomputeVisibleInteractions();
     if (!mounted) return true;
@@ -10319,6 +10474,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (req == null) return false;
     final client = _liveClient;
     final backup = _pendingInteractionsById[req.interactionId];
+    _interactionMutationSeq++;
     _pendingInteractionsById.remove(req.interactionId);
     _recomputeVisibleInteractions();
     if (client != null) {
@@ -10328,6 +10484,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       } catch (e) {
         if (!_isStillLive(client)) return false;
         if (backup != null) {
+          _interactionMutationSeq++;
           _pendingInteractionsById[req.interactionId] = backup;
           _recomputeVisibleInteractions();
         }
@@ -10565,8 +10722,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
   /// Synchronously detach the active live client & cancel EVERY host-scoped timer/buffer
   /// BEFORE committing a host switch so zero stale frames or delayed flushes can cross-contaminate.
-  void _detachLiveClientsSync() {
+  void _detachLiveClientsSync({bool preserveLocalConnectLock = false}) {
     _clearPendingStreamCoalesce();
+    _disarmStreamWatchdog();
     _hostSessionsRefreshTimer?.cancel();
     _hostSessionsRefreshTimer = null;
     _domainRefreshTimer?.cancel();
@@ -10575,6 +10733,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _domainRetryTimer = null;
     _reconnectGraceTimer?.cancel();
     _reconnectGraceTimer = null;
+    _reconnectStreamCheckTimer?.cancel();
+    _reconnectStreamCheckTimer = null;
     _hydrationGen++;
     _drawerSearchTimer?.cancel();
     _drawerSearchTimer = null;
@@ -10593,8 +10753,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _isSendingPrompt = false;
     _sendingPromptGen = -1;
     _sendingPromptSessionKey = null;
-    _connectingLocalAndroid = false;
-    _connectingLocalGen = null;
+    if (!preserveLocalConnectLock) {
+      _connectingLocalAndroid = false;
+      _connectingLocalGen = null;
+    }
     _sessionTurnsMemory.clear();
     _sessionPaginationMemory.clear();
     _toolDetailCache.clear();
@@ -10752,6 +10914,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       sessionTelemetry: const SessionTelemetry(),
       loadingSession: false,
       isStreaming: false,
+      isStopping: false,
+      streamStalled: false,
+      sendStage: SendStage.idle,
+      uploadDoneCount: 0,
+      uploadTotalCount: 0,
+      activePendingInteractionCount: 0,
       contextPct: 0,
       contextUsedK: 0,
       contextMaxK: 128,
@@ -10805,7 +10973,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   Future<bool> _connectUnixBridge(String socketPath, String token, {int? gen}) async {
     GbridgeClient? client;
     try {
-      _detachLiveClientsSync();
+      _detachLiveClientsSync(preserveLocalConnectLock: true);
       if (!mounted || (gen != null && gen != _hostConnectGen)) return false;
       client = GbridgeClient(
         HostEndpoint.unix(socketPath: socketPath, token: token),
@@ -12552,18 +12720,23 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       // never wipe interactions that arrived over WS while Stage 2 was in flight!
       final isDirectClient = client.isVanillaDirect;
       if (!isDirectClient && !pendingFailed) {
+        // Only apply Stage-2 HTTP interaction snapshot if no local resolve/WS interaction
+        // mutation happened while Stage 2 was in flight — otherwise the stale HTTP snapshot
+        // would resurrect an approval/question the user already resolved!
         if (_interactionMutationSeq == stage2InteractionSeq) {
           _pendingInteractionsById.clear();
+          for (final item in pending) {
+            _pendingInteractionsById[item.id] = item;
+          }
+          _recomputeVisibleInteractions();
         }
-        for (final item in pending) {
-          _pendingInteractionsById[item.id] = item;
-        }
-        _recomputeVisibleInteractions();
       } else if (isDirectClient && pending.isNotEmpty) {
-        for (final item in pending) {
-          _pendingInteractionsById.putIfAbsent(item.id, () => item);
+        if (_interactionMutationSeq == stage2InteractionSeq) {
+          for (final item in pending) {
+            _pendingInteractionsById.putIfAbsent(item.id, () => item);
+          }
+          _recomputeVisibleInteractions();
         }
-        _recomputeVisibleInteractions();
       }
 
       if (!skipAutoDefaultSync &&
@@ -14072,6 +14245,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return;
     }
     final targetHostId = state.activeHostId;
+    final checkSeq = ++_dshUpdateCheckSeq;
     state = state.copyWith(checkingUpdate: true);
     try {
       final resp = await client.checkSystemUpdate();
@@ -14110,6 +14284,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!_isStillLive(client)) return;
       state = state.copyWith(checkingUpdate: false);
       if (!silent) showError('检查更新失败', error: e);
+    } finally {
+      if (mounted && checkSeq == _dshUpdateCheckSeq && state.checkingUpdate) {
+        state = state.copyWith(checkingUpdate: false);
+      }
     }
   }
 

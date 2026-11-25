@@ -25,6 +25,15 @@ class NativeRuntimeStatus {
     this.hasTawcroot = false,
     this.hasProot = false,
     this.hasBundledAssets = false,
+    this.hasBundledRuntimePayloads = false,
+    this.runtimeDelivery = 'remote',
+    this.runtimeReleaseTag = '',
+    this.runtimeTotalBytes = 0,
+    this.runtimeDownloadBytes = 0,
+    this.hasPartialDownload = false,
+    this.isMeteredNetwork = false,
+    this.customRuntimeMirrorUrl = '',
+    this.bootstrapActive = false,
     this.homePath = '/root',
     this.homeSizeKb = 0,
     this.bridgeSocketPath = '',
@@ -67,6 +76,16 @@ class NativeRuntimeStatus {
       hasTawcroot: m['hasTawcroot'] == true,
       hasProot: m['hasProot'] == true,
       hasBundledAssets: m['hasBundledAssets'] == true,
+      hasBundledRuntimePayloads: m['hasBundledRuntimePayloads'] == true,
+      runtimeDelivery: m['runtimeDelivery']?.toString() ??
+          (m['hasBundledRuntimePayloads'] == true ? 'bundled' : 'remote'),
+      runtimeReleaseTag: m['runtimeReleaseTag']?.toString() ?? '',
+      runtimeTotalBytes: (m['runtimeTotalBytes'] as num?)?.toInt() ?? 0,
+      runtimeDownloadBytes: (m['runtimeDownloadBytes'] as num?)?.toInt() ?? 0,
+      hasPartialDownload: m['hasPartialDownload'] == true,
+      isMeteredNetwork: m['isMeteredNetwork'] == true,
+      customRuntimeMirrorUrl: m['customRuntimeMirrorUrl']?.toString() ?? '',
+      bootstrapActive: m['bootstrapActive'] == true,
       homePath: m['homePath']?.toString() ?? '/root',
       homeSizeKb: (m['homeSizeKb'] as num?)?.toInt() ?? 0,
       bridgeSocketPath: m['bridgeSocketPath']?.toString() ?? '',
@@ -105,6 +124,15 @@ class NativeRuntimeStatus {
   final bool hasTawcroot;
   final bool hasProot;
   final bool hasBundledAssets;
+  final bool hasBundledRuntimePayloads;
+  final String runtimeDelivery;
+  final String runtimeReleaseTag;
+  final int runtimeTotalBytes;
+  final int runtimeDownloadBytes;
+  final bool hasPartialDownload;
+  final bool isMeteredNetwork;
+  final String customRuntimeMirrorUrl;
+  final bool bootstrapActive;
   final String homePath;
   final int homeSizeKb;
   final String bridgeSocketPath;
@@ -121,8 +149,32 @@ class NativeRuntimeStatus {
   final String deviceAbi;
   final int sdkInt;
 
+  /// True when the thin APK requires downloading container/DSH bundles online.
+  bool get requiresOnlineDownload => !hasBundledRuntimePayloads && runtimeDownloadBytes > 0;
+
+  /// Human-readable pending download size (e.g. `188 MB`), falling back to total or `188 MB`.
+  String get formattedDownloadSize {
+    final bytes = runtimeDownloadBytes > 0
+        ? runtimeDownloadBytes
+        : (runtimeTotalBytes > 0 ? runtimeTotalBytes : 197125416);
+    final mb = bytes / (1024.0 * 1024.0);
+    if (mb < 1.0) return '< 1 MB';
+    if (mb < 10.0) return '${mb.toStringAsFixed(1)} MB';
+    return '${mb.round()} MB';
+  }
+
+  /// Short display label for the configured download mirror setting.
+  String get runtimeMirrorDisplayLabel {
+    final raw = customRuntimeMirrorUrl.trim();
+    if (raw.isEmpty) return '自动择优';
+    final uri = Uri.tryParse(raw);
+    if (uri != null && uri.host.isNotEmpty) return uri.host;
+    return raw;
+  }
+
   NativeRuntimeStatus copyWith({
     String? configuredExecutorMode,
+    String? customRuntimeMirrorUrl,
   }) {
     return NativeRuntimeStatus(
       initialized: initialized,
@@ -143,6 +195,15 @@ class NativeRuntimeStatus {
       hasTawcroot: hasTawcroot,
       hasProot: hasProot,
       hasBundledAssets: hasBundledAssets,
+      hasBundledRuntimePayloads: hasBundledRuntimePayloads,
+      runtimeDelivery: runtimeDelivery,
+      runtimeReleaseTag: runtimeReleaseTag,
+      runtimeTotalBytes: runtimeTotalBytes,
+      runtimeDownloadBytes: runtimeDownloadBytes,
+      hasPartialDownload: hasPartialDownload,
+      isMeteredNetwork: isMeteredNetwork,
+      customRuntimeMirrorUrl: customRuntimeMirrorUrl ?? this.customRuntimeMirrorUrl,
+      bootstrapActive: bootstrapActive,
       homePath: homePath,
       homeSizeKb: homeSizeKb,
       bridgeSocketPath: bridgeSocketPath,
@@ -183,6 +244,15 @@ class NativeRuntimeStatus {
         other.hasTawcroot == hasTawcroot &&
         other.hasProot == hasProot &&
         other.hasBundledAssets == hasBundledAssets &&
+        other.hasBundledRuntimePayloads == hasBundledRuntimePayloads &&
+        other.runtimeDelivery == runtimeDelivery &&
+        other.runtimeReleaseTag == runtimeReleaseTag &&
+        other.runtimeTotalBytes == runtimeTotalBytes &&
+        other.runtimeDownloadBytes == runtimeDownloadBytes &&
+        other.hasPartialDownload == hasPartialDownload &&
+        other.isMeteredNetwork == isMeteredNetwork &&
+        other.customRuntimeMirrorUrl == customRuntimeMirrorUrl &&
+        other.bootstrapActive == bootstrapActive &&
         other.homePath == homePath &&
         other.homeSizeKb == homeSizeKb &&
         other.bridgeSocketPath == bridgeSocketPath &&
@@ -220,6 +290,15 @@ class NativeRuntimeStatus {
         hasTawcroot,
         hasProot,
         hasBundledAssets,
+        hasBundledRuntimePayloads,
+        runtimeDelivery,
+        runtimeReleaseTag,
+        runtimeTotalBytes,
+        runtimeDownloadBytes,
+        hasPartialDownload,
+        isMeteredNetwork,
+        customRuntimeMirrorUrl,
+        bootstrapActive,
         homePath,
         homeSizeKb,
         bridgeSocketPath,
@@ -487,6 +566,11 @@ class GrassBagNativeBridge {
   }
 
   Future<Map<String, dynamic>> bootstrapRuntime() => _safeInvokeMap('runtime.bootstrap');
+
+  Future<Map<String, dynamic>> cancelRuntimeBootstrap() => _safeInvokeMap('runtime.cancelBootstrap');
+
+  Future<Map<String, dynamic>> setRuntimeMirrorUrl(String url) =>
+      _safeInvokeMap('runtime.setRuntimeMirror', {'url': url});
 
   Future<Map<String, dynamic>> startLocalEngine() => _safeInvokeMap('runtime.startEngine');
 

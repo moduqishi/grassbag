@@ -33,14 +33,36 @@ class GbridgeHttpTransport {
   }
 
   Future<GbridgeRawWebSocket> openRawWebSocket(String path) async {
-    var wsUri = endpoint.resolveWsUri(path);
     final token = endpoint.token;
+    var cookieReady = false;
     if (token != null && token.isNotEmpty) {
+      final exchanged = await exchangeAuthToken();
+      final baseOrigin = endpoint.baseUri?.origin;
+      final pageOrigin = (() {
+        try {
+          final loc = globalContext.getProperty<JSObject?>('location'.toJS);
+          final orig = loc?.getProperty<JSAny?>('origin'.toJS);
+          return (orig != null && orig.isA<JSString>()) ? (orig as JSString).toDart : null;
+        } catch (_) {
+          return null;
+        }
+      })();
+      cookieReady = exchanged && baseOrigin != null && pageOrigin != null && baseOrigin == pageOrigin;
+    }
+    var wsUri = endpoint.resolveWsUri(path);
+    if (!cookieReady && token != null && token.isNotEmpty) {
       wsUri = wsUri.replace(queryParameters: {...wsUri.queryParameters, 'token': token});
     }
     final ctor = globalContext.getProperty<JSFunction>('WebSocket'.toJS);
     final ws = ctor.callAsConstructor<JSObject>(wsUri.toString().toJS);
     final openCompleter = Completer<void>();
+    void clearHandshakeHandlers() {
+      try {
+        ws.setProperty('onopen'.toJS, null);
+        ws.setProperty('onerror'.toJS, null);
+        ws.setProperty('onclose'.toJS, null);
+      } catch (_) {}
+    }
     ws.setProperty(
       'onopen'.toJS,
       ((JSAny? _) {
@@ -59,9 +81,26 @@ class GbridgeHttpTransport {
         }
       }).toJS,
     );
+    ws.setProperty(
+      'onclose'.toJS,
+      ((JSObject? ev) {
+        if (!openCompleter.isCompleted) {
+          final codeAny = ev?.getProperty<JSAny?>('code'.toJS);
+          final code = (codeAny != null && codeAny.isA<JSNumber>()) ? (codeAny as JSNumber).toDartInt : null;
+          final authErr = code == 4001 || code == 1008;
+          openCompleter.completeError(GbridgeException(
+            status: authErr ? 401 : 0,
+            code: authErr ? 'gbridge/unauthorized' : 'gbridge/ws_closed',
+            message: authErr ? 'WebSocket authorization rejected' : 'WebSocket closed during handshake',
+          ));
+        }
+      }).toJS,
+    );
     try {
       await openCompleter.future.timeout(timeout);
+      clearHandshakeHandlers();
     } catch (_) {
+      clearHandshakeHandlers();
       try {
         ws.callMethod('close'.toJS);
       } catch (_) {}
@@ -70,7 +109,13 @@ class GbridgeHttpTransport {
     return _WebRawWebSocket(ws);
   }
 
-  Future<JSObject> _fetchWithAbort(Uri uri, JSObject init) async {
+  Future<({JSObject response, JSObject? abortCtrl, DateTime deadline})> _fetchWithAbort(
+    Uri uri,
+    JSObject init, {
+    Duration? timeoutOverride,
+  }) async {
+    final budget = timeoutOverride ?? timeout;
+    final deadline = DateTime.now().add(budget);
     JSObject? abortCtrl;
     try {
       final ctor = globalContext.getProperty<JSAny?>('AbortController'.toJS);
@@ -80,16 +125,40 @@ class GbridgeHttpTransport {
       }
     } catch (_) {}
     try {
-      return await globalContext
+      final response = await globalContext
           .callMethod<JSPromise<JSObject>>('fetch'.toJS, uri.toString().toJS, init)
           .toDart
-          .timeout(timeout);
+          .timeout(budget);
+      return (response: response, abortCtrl: abortCtrl, deadline: deadline);
     } on TimeoutException {
       try {
         abortCtrl?.callMethod<JSAny?>('abort'.toJS);
       } catch (_) {}
       rethrow;
     }
+  }
+
+  static void _abortQuietly(JSObject? abortCtrl) {
+    try {
+      abortCtrl?.callMethod<JSAny?>('abort'.toJS);
+    } catch (_) {}
+  }
+
+  static Duration _remainingFor(DateTime deadline) {
+    final rem = deadline.difference(DateTime.now());
+    return rem > const Duration(milliseconds: 500) ? rem : const Duration(milliseconds: 500);
+  }
+
+  static bool _shouldRetry503Text(String text, String method) {
+    if (text.contains('gbridge/reloading')) return true;
+    final m = method.toUpperCase();
+    if (m != 'GET' && m != 'HEAD') return false;
+    if (text.contains('gbridge/web_unavailable') ||
+        text.contains('gbridge/auth_unconfigured') ||
+        text.contains('gbridge/gateway_unavailable')) {
+      return false;
+    }
+    return false;
   }
 
   Future<bool> exchangeAuthToken([String? tokenOverride]) async {
@@ -100,8 +169,9 @@ class GbridgeHttpTransport {
       final init = JSObject();
       init.setProperty('method'.toJS, 'GET'.toJS);
       init.setProperty('credentials'.toJS, 'include'.toJS);
-      final resp = await _fetchWithAbort(uri, init);
-      final status = (resp.getProperty<JSNumber>('status'.toJS)).toDartInt;
+      final fetched = await _fetchWithAbort(uri, init);
+      final status = (fetched.response.getProperty<JSNumber>('status'.toJS)).toDartInt;
+      _abortQuietly(fetched.abortCtrl);
       return status >= 200 && status < 400;
     } catch (_) {
       return false;
@@ -123,6 +193,7 @@ class GbridgeHttpTransport {
     Object? body,
     bool retryAuth = true,
     int reloadRetryAttempt = 0,
+    Duration? timeoutOverride,
   }) async {
     if (_closed) {
       throw const GbridgeException(
@@ -155,9 +226,41 @@ class GbridgeHttpTransport {
     }
     init.setProperty('headers'.toJS, headersObj);
 
-    final response = await _fetchWithAbort(uri, init);
+    final fetched = await _fetchWithAbort(uri, init, timeoutOverride: timeoutOverride);
+    final response = fetched.response;
     final status = (response.getProperty<JSNumber>('status'.toJS)).toDartInt;
-    if (status == 503 && reloadRetryAttempt < 4) {
+    if (status == 401 && retryAuth && (endpoint.token?.isNotEmpty ?? false)) {
+      _abortQuietly(fetched.abortCtrl);
+      final exchanged = await exchangeAuthToken();
+      if (exchanged) {
+        return requestJson(
+          method,
+          path,
+          query: query,
+          body: body,
+          retryAuth: false,
+          reloadRetryAttempt: reloadRetryAttempt,
+          timeoutOverride: timeoutOverride,
+        );
+      }
+      throw const GbridgeException(
+        status: 401,
+        code: 'gbridge/unauthorized',
+        message: 'HTTP 401',
+      );
+    }
+    String text;
+    try {
+      text = (await response
+              .callMethod<JSPromise<JSString>>('text'.toJS)
+              .toDart
+              .timeout(_remainingFor(fetched.deadline)))
+          .toDart;
+    } on TimeoutException {
+      _abortQuietly(fetched.abortCtrl);
+      rethrow;
+    }
+    if (status == 503 && reloadRetryAttempt < 4 && _shouldRetry503Text(text, method)) {
       const delaysMs = <int>[220, 420, 700, 1100];
       await Future<void>.delayed(Duration(milliseconds: delaysMs[reloadRetryAttempt]));
       if (!_closed) {
@@ -168,23 +271,10 @@ class GbridgeHttpTransport {
           body: body,
           retryAuth: retryAuth,
           reloadRetryAttempt: reloadRetryAttempt + 1,
+          timeoutOverride: timeoutOverride,
         );
       }
     }
-    if (status == 401 && retryAuth && (endpoint.token?.isNotEmpty ?? false)) {
-      final exchanged = await exchangeAuthToken();
-      if (exchanged) {
-        return requestJson(
-          method,
-          path,
-          query: query,
-          body: body,
-          retryAuth: false,
-          reloadRetryAttempt: reloadRetryAttempt,
-        );
-      }
-    }
-    final text = (await response.callMethod<JSPromise<JSString>>('text'.toJS).toDart.timeout(timeout)).toDart;
 
     if (status >= 400) {
       _throwTextError(status, text);
@@ -252,24 +342,11 @@ class GbridgeHttpTransport {
     }
     init.setProperty('headers'.toJS, headersObj);
 
-    final response = await _fetchWithAbort(uri, init);
+    final fetched = await _fetchWithAbort(uri, init);
+    final response = fetched.response;
     final status = (response.getProperty<JSNumber>('status'.toJS)).toDartInt;
-    if (status == 503 && reloadRetryAttempt < 4) {
-      const delaysMs = <int>[220, 420, 700, 1100];
-      await Future<void>.delayed(Duration(milliseconds: delaysMs[reloadRetryAttempt]));
-      if (!_closed) {
-        return requestBytes(
-          method,
-          path,
-          query: query,
-          bodyBytes: bodyBytes,
-          contentType: contentType,
-          retryAuth: retryAuth,
-          reloadRetryAttempt: reloadRetryAttempt + 1,
-        );
-      }
-    }
     if (status == 401 && retryAuth && (endpoint.token?.isNotEmpty ?? false)) {
+      _abortQuietly(fetched.abortCtrl);
       final exchanged = await exchangeAuthToken();
       if (exchanged) {
         return requestBytes(
@@ -282,13 +359,51 @@ class GbridgeHttpTransport {
           reloadRetryAttempt: reloadRetryAttempt,
         );
       }
+      throw const GbridgeException(
+        status: 401,
+        code: 'gbridge/unauthorized',
+        message: 'HTTP 401',
+      );
     }
     if (status >= 400) {
-      final text = (await response.callMethod<JSPromise<JSString>>('text'.toJS).toDart.timeout(timeout)).toDart;
+      String text;
+      try {
+        text = (await response
+                .callMethod<JSPromise<JSString>>('text'.toJS)
+                .toDart
+                .timeout(_remainingFor(fetched.deadline)))
+            .toDart;
+      } on TimeoutException {
+        _abortQuietly(fetched.abortCtrl);
+        rethrow;
+      }
+      if (status == 503 && reloadRetryAttempt < 4 && _shouldRetry503Text(text, method)) {
+        const delaysMs = <int>[220, 420, 700, 1100];
+        await Future<void>.delayed(Duration(milliseconds: delaysMs[reloadRetryAttempt]));
+        if (!_closed) {
+          return requestBytes(
+            method,
+            path,
+            query: query,
+            bodyBytes: bodyBytes,
+            contentType: contentType,
+            retryAuth: retryAuth,
+            reloadRetryAttempt: reloadRetryAttempt + 1,
+          );
+        }
+      }
       _throwTextError(status, text);
     }
-    final buf = await response.callMethod<JSPromise<JSArrayBuffer>>('arrayBuffer'.toJS).toDart.timeout(timeout);
-    return buf.toDart.asUint8List();
+    try {
+      final buf = await response
+          .callMethod<JSPromise<JSArrayBuffer>>('arrayBuffer'.toJS)
+          .toDart
+          .timeout(_remainingFor(fetched.deadline));
+      return buf.toDart.asUint8List();
+    } on TimeoutException {
+      _abortQuietly(fetched.abortCtrl);
+      rethrow;
+    }
   }
 
   Never _throwTextError(int status, String text) {
@@ -459,6 +574,12 @@ class GbridgeStreamClient {
     _ws = null;
     if (old != null) {
       try {
+        old.setProperty('onopen'.toJS, null);
+        old.setProperty('onmessage'.toJS, null);
+        old.setProperty('onerror'.toJS, null);
+        old.setProperty('onclose'.toJS, null);
+      } catch (_) {}
+      try {
         old.callMethod<JSAny?>('close'.toJS);
       } catch (_) {}
     }
@@ -598,6 +719,7 @@ class GbridgeStreamClient {
       return info;
     } catch (err) {
       if (epoch == _connEpoch) {
+        _connEpoch++;
         _pendingWelcome = null;
         _closeCurrentSocket();
         final isAuthRejected = err is GbridgeException &&
@@ -679,6 +801,7 @@ class GbridgeStreamClient {
       return;
     }
     if (_reconnectTimer != null ||
+        _phase == ConnectionPhase.reconnecting ||
         _phase == ConnectionPhase.disconnected ||
         _phase == ConnectionPhase.error) {
       _reconnectTimer?.cancel();
@@ -845,6 +968,7 @@ class GbridgeStreamClient {
       // If WS closed before welcome (browser hides HTTP 401/403 status), probe HTTP capabilities once
       // so invalid/expired credentials stop reconnecting and surface `needsAuth`.
       if (pending != null) {
+        _setPhase(ConnectionPhase.reconnecting);
         final probeEpoch = _connEpoch;
         unawaited(_probeAuthAfterPreWelcomeClose(probeEpoch));
         return;
@@ -858,7 +982,13 @@ class GbridgeStreamClient {
 
   Future<void> _probeAuthAfterPreWelcomeClose(int probeEpoch) async {
     try {
-      await _transport.requestJson('GET', '/gbridge/v1/capabilities', retryAuth: false);
+      await _transport.requestJson(
+        'GET',
+        '/gbridge/v1/capabilities',
+        retryAuth: false,
+        reloadRetryAttempt: 4,
+        timeoutOverride: const Duration(seconds: 4),
+      );
     } on GbridgeException catch (e) {
       if (probeEpoch != _connEpoch) return;
       if (e.status == 401 || e.status == 403) {

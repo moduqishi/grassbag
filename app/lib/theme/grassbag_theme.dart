@@ -648,7 +648,7 @@ class GrassBagTokens extends ThemeExtension<GrassBagTokens> {
       secondary: primary,
       onSecondary: onPrimary,
       error: err,
-      onError: Colors.white,
+      onError: isDark ? const Color(0xFF2A0B0A) : Colors.white,
       surface: bgSolid,
       onSurface: text,
       surfaceContainerHighest: cardSolid,

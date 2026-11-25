@@ -1,0 +1,134 @@
+name: Android Runtime Assets Release
+
+# 独立构建并发布不可变的 ARM64 运行时资产发行版（如 runtime-arm64-r2）：
+#   - base-arm64.gbag       (Ubuntu 24.04.5 ARM64 + Node.js v24.22.3 ARM64, ~72 MB)
+#   - engine-init.gbag      (@deepseek-ai/dsh Linux ARM64 + dsh-gbridge, ~116 MB)
+#   - runtime-manifest.json (含 SHA-256 与镜像下载链)
+#   - SHA256SUMS.txt
+# 仅在需要升级底层容器/Node/DSH 版本时手动触发；以 --latest=false 发布，绝不抢占 App 正式版 Latest 标签。
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_tag:
+        description: Immutable runtime release tag (e.g. runtime-arm64-r2)
+        required: true
+        default: 'runtime-arm64-r2'
+        type: string
+      ubuntu_release:
+        description: Ubuntu base release version
+        required: false
+        default: '24.04.5'
+        type: string
+      node_version:
+        description: Node.js ARM64 version
+        required: false
+        default: '24.22.3'
+        type: string
+      dsh_version:
+        description: "@deepseek-ai/dsh version"
+        required: false
+        default: '0.2.2-rc.5'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-runtime-release-${{ inputs.runtime_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build_and_publish_runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim unused runner disk space
+        run: bash scripts/free_runner_disk.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Cache upstream ARM64 downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            runtime/.staging/dl
+            runtime/.staging/dsh-linux-arm64
+          key: grassbag-runtime-v2-ubuntu-${{ inputs.ubuntu_release }}-node-${{ inputs.node_version }}-dsh-${{ inputs.dsh_version }}
+
+      - name: Build full ARM64 runtime bundles
+        env:
+          UBUNTU_RELEASE: ${{ inputs.ubuntu_release }}
+          NODE_VERSION: ${{ inputs.node_version }}
+          DSH_VERSION: ${{ inputs.dsh_version }}
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/runtime-release"
+          bash runtime/scripts/build-runtime-bundle.sh \
+            --full --fetch \
+            --runtime-tag "${{ inputs.runtime_tag }}" \
+            --github-repo "${{ github.repository }}" \
+            --out "${OUT_DIR}"
+
+          (
+            cd "${OUT_DIR}"
+            sha256sum base-arm64.gbag engine-init.gbag runtime-manifest.json > SHA256SUMS.txt
+          )
+          ls -lh "${OUT_DIR}"
+          cat "${OUT_DIR}/SHA256SUMS.txt"
+
+      - name: Publish immutable GitHub Runtime Release (never marked Latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RUNTIME_TAG: ${{ inputs.runtime_tag }}
+        run: |
+          OUT_DIR="${RUNNER_TEMP}/runtime-release"
+          NOTES="${RUNNER_TEMP}/runtime-notes.md"
+          cat > "${NOTES}" <<EOF
+          ## GrassBag Android ARM64 运行时资产包（\`${RUNTIME_TAG}\`）
+
+          供精简版 GrassBag Android APK 在首次启用本机模式时按需断点续传下载与 SHA-256 校验（**非 App 安装包**）：
+
+          - 容器底包：\`base-arm64.gbag\`（Ubuntu \`${{ inputs.ubuntu_release }}\` + Node \`${{ inputs.node_version }}\` ARM64）
+          - 引擎底包：\`engine-init.gbag\`（\`@deepseek-ai/dsh@${{ inputs.dsh_version }}\` Linux ARM64）
+          - 清单文件：\`runtime-manifest.json\`
+
+          ### SHA-256 校验值
+          \`\`\`text
+          $(cat "${OUT_DIR}/SHA256SUMS.txt")
+          \`\`\`
+          EOF
+
+          if gh release view "${RUNTIME_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            gh release edit "${RUNTIME_TAG}" \
+              --repo "${RELEASE_REPO}" \
+              --title "GrassBag Android Runtime (${RUNTIME_TAG})" \
+              --notes-file "${NOTES}" \
+              --latest=false
+            gh release upload "${RUNTIME_TAG}" \
+              "${OUT_DIR}/base-arm64.gbag" \
+              "${OUT_DIR}/engine-init.gbag" \
+              "${OUT_DIR}/runtime-manifest.json" \
+              "${OUT_DIR}/SHA256SUMS.txt" \
+              --repo "${RELEASE_REPO}" --clobber
+          else
+            gh release create "${RUNTIME_TAG}" \
+              "${OUT_DIR}/base-arm64.gbag" \
+              "${OUT_DIR}/engine-init.gbag" \
+              "${OUT_DIR}/runtime-manifest.json" \
+              "${OUT_DIR}/SHA256SUMS.txt" \
+              --repo "${RELEASE_REPO}" \
+              --title "GrassBag Android Runtime (${RUNTIME_TAG})" \
+              --notes-file "${NOTES}" \
+              --latest=false
+          fi

@@ -145,28 +145,45 @@ export class StreamHub {
     this._onTurnCompleted = typeof fn === 'function' ? fn : null;
   }
 
+  _scheduleHostEventReconnect(delayMs) {
+    if (this._disposed || !this.gateway?.ready) return;
+    if (this._eventsReconnectTimer) {
+      clearTimeout(this._eventsReconnectTimer);
+      this._eventsReconnectTimer = null;
+    }
+    this._eventsReconnectTimer = setTimeout(() => {
+      this._eventsReconnectTimer = null;
+      this.startHostEventPump();
+    }, delayMs);
+    this._eventsReconnectTimer.unref?.();
+  }
+
   /** Start background pump consuming DSH's official `$events` stream. */
   startHostEventPump() {
     if (this._disposed || this._eventsAbort) return;
     if (!this.gateway?.ready) return;
     const peer = this.gateway.resolvePeer();
     if (!peer) {
-      if (!this._eventsReconnectTimer && !this._disposed) {
-        this._eventsReconnectTimer = setTimeout(() => {
-          this._eventsReconnectTimer = null;
-          this.startHostEventPump();
-        }, 500);
-        this._eventsReconnectTimer.unref?.();
-      }
+      this._scheduleHostEventReconnect(500);
       return;
     }
     this._eventsPeer = peer;
     const abort = new AbortController();
     this._eventsAbort = abort;
-    const stream = this.gateway.openRemoteEvents(abort.signal, peer);
+    let stream = null;
+    try {
+      stream = this.gateway.openRemoteEvents(abort.signal, peer);
+    } catch (err) {
+      this.logger?.warn?.('[gbridge] openRemoteEvents failed:', err?.message || err);
+      this._eventsAbort = null;
+      this._eventsPeer = null;
+      this._scheduleHostEventReconnect(1500);
+      return;
+    }
     if (!stream) {
       this._eventsAbort = null;
       this._eventsPeer = null;
+      this._scheduleHostEventReconnect(1500);
       return;
     }
     const signal = abort.signal;
@@ -193,13 +210,7 @@ export class StreamHub {
             }
           }
         }
-        if (!this._disposed && this.gateway?.ready) {
-          this._eventsReconnectTimer = setTimeout(() => {
-            this._eventsReconnectTimer = null;
-            this.startHostEventPump();
-          }, 1500);
-          this._eventsReconnectTimer.unref?.();
-        }
+        this._scheduleHostEventReconnect(1500);
       }
     })();
   }
@@ -506,11 +517,17 @@ export class StreamHub {
     }
 
     const MAX_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024;
-    for (const client of this.clients.values()) {
+    const HARD_CLIENT_BUFFER_BYTES = 8 * 1024 * 1024;
+    for (const client of [...this.clients.values()]) {
       if (!client.welcomed || !client.channels.has(channel)) continue;
       const buffered = client.ws.socket?.writableLength ?? 0;
-      if (isDelta && buffered > MAX_CLIENT_BUFFER_BYTES) {
-        continue; // Drop non-durable delta on congested slow mobile link; client stays synced via durable events.
+      if (buffered > HARD_CLIENT_BUFFER_BYTES || (isDelta && buffered > MAX_CLIENT_BUFFER_BYTES)) {
+        // Disconnect congested slow consumer cleanly so it reconnects & resyncs instead of
+        // silently corrupting streaming text/terminal output or growing write buffers unboundedly!
+        try { client.ws.close(1013, 'slow consumer'); } catch {}
+        try { client.ws.terminate?.(); } catch {}
+        this._detachClient(client);
+        continue;
       }
       if (isDelta && client.coalesceMs > 0) {
         this._enqueueDelta(client, frame);
@@ -1100,13 +1117,22 @@ export class StreamHub {
   _enqueueDelta(client, frame) {
     const key = `${frame.channel}:${frame.type}`;
     const existing = client.pendingDeltas.get(key);
+    const chunkBytes = estimateDeltaBytes(frame);
     if (!existing) {
       client.pendingDeltas.set(key, { ...frame, batch: [frame.data] });
     } else {
+      // Re-insert so Map iteration order stays strictly ascending by latest `seq`!
+      client.pendingDeltas.delete(key);
       existing.seq = frame.seq;
       existing.ts = frame.ts;
       existing.batch.push(frame.data);
       existing.data = frame.data;
+      client.pendingDeltas.set(key, existing);
+    }
+    client.pendingDeltaBytes = (client.pendingDeltaBytes || 0) + chunkBytes;
+    if (client.pendingDeltaBytes >= 512 * 1024) {
+      this._flushClientDeltas(client);
+      return;
     }
     if (!client.coalesceTimer) {
       client.coalesceTimer = setTimeout(() => this._flushClientDeltas(client), client.coalesceMs);
@@ -1119,8 +1145,12 @@ export class StreamHub {
       clearTimeout(client.coalesceTimer);
       client.coalesceTimer = null;
     }
+    client.pendingDeltaBytes = 0;
     if (client.pendingDeltas.size === 0) return;
-    for (const merged of client.pendingDeltas.values()) {
+    const ordered = client.pendingDeltas.size > 1
+      ? [...client.pendingDeltas.values()].sort((a, b) => a.seq - b.seq)
+      : client.pendingDeltas.values();
+    for (const merged of ordered) {
       if (merged.batch.length === 1) {
         client.ws.sendJson({
           op: 'delta',

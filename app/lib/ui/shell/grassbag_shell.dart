@@ -74,6 +74,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   DateTime? _lastBackPressedAt;
 
   late final AnimationController _drawerCtrl;
+  final ValueNotifier<double> _topBannerStackHeight = ValueNotifier<double>(0.0);
+  final ValueNotifier<bool> _drawerOpenForBackNotifier = ValueNotifier<bool>(false);
+  late final Listenable _backScopeListenable;
   Ticker? _streamScrollTicker;
   Duration? _lastScrollTick;
   double _streamSettleRemainingMs = 0.0;
@@ -90,6 +93,13 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       <String, ({double pixels, bool scrolledAway, int prependedCount})>{};
   final Set<String> _animatedTurnIds = <String>{};
 
+  void _syncDrawerBackState() {
+    final open = _drawerCtrl.value > 0.05;
+    if (_drawerOpenForBackNotifier.value != open) {
+      _drawerOpenForBackNotifier.value = open;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -100,6 +110,14 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       lowerBound: 0.0,
       upperBound: 1.0,
     );
+    _drawerCtrl.addListener(_syncDrawerBackState);
+    _backScopeListenable = Listenable.merge([
+      _drawerOpenForBackNotifier,
+      _plusOpenNotifier,
+      _suggestionsOpenNotifier,
+      _editingContextNotifier,
+      _composerFocus,
+    ]);
     _composerFocus.addListener(_onComposerFocusChanged);
     final initialDraft = ref.read(appProvider.notifier).getComposerDraftForActiveHost();
     if (initialDraft.isNotEmpty) {
@@ -113,8 +131,10 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       // Flush composer text immediately before persisting host contexts so rapid backgrounding
-      // within the 400ms typing debounce window NEVER loses an unsent draft!
-      ref.read(appProvider.notifier).setComposerDraftForActiveHost(_composerCtrl.text);
+      // within the 400ms typing debounce window NEVER loses an unsent draft (and when editing an
+      // earlier turn, preserve the user's stashed draft instead of overwriting it with turn text!).
+      final draftToFlush = _editingContextNotifier.value?.stashedDraft ?? _composerCtrl.text;
+      ref.read(appProvider.notifier).setComposerDraftForActiveHost(draftToFlush);
       if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
         ref.read(appProvider.notifier).handleAppPaused();
       }
@@ -128,6 +148,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     WidgetsBinding.instance.removeObserver(this);
     _streamScrollTicker?.dispose();
     _composerFocus.removeListener(_onComposerFocusChanged);
+    _drawerCtrl.removeListener(_syncDrawerBackState);
     _composerFocus.dispose();
     _composerCtrl.dispose();
     _scrollCtrl.dispose();
@@ -139,6 +160,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     _hasNewBelowNotifier.dispose();
     _prependedOlderCountNotifier.dispose();
     _composerHeightNotifier.dispose();
+    _topBannerStackHeight.dispose();
+    _drawerOpenForBackNotifier.dispose();
     _drawerCtrl.dispose();
     super.dispose();
   }
@@ -734,8 +757,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         return;
       }
       if (!s.nativeRuntimeStatus.initialized) {
-        ctrl.showToast('正在一键部署本机运行环境…', tone: ToastTone.info);
-        ctrl.bootstrapLocalRuntime();
+        if (s.nativeRuntimeStatus.hasBundledRuntimePayloads) {
+          ctrl.showToast('正在一键部署本机运行环境…', tone: ToastTone.info);
+        }
+        unawaited(
+          triggerLocalRuntimeBootstrapWithGuard(
+            context,
+            ref,
+            requireConfirmForRemote: true,
+          ),
+        );
       } else {
         ctrl.showToast('正在启动本机 DSH 引擎，请稍候片刻…', tone: ToastTone.info);
         ctrl.restartLocalEngine();
@@ -1132,11 +1163,15 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             tabletSidebarOpen: s.tabletSidebarOpen,
             tabletWorkbenchOpen: s.tabletWorkbenchOpen,
             nativeInitialized: s.nativeRuntimeStatus.initialized,
+            nativeHasBundledPayloads: s.nativeRuntimeStatus.hasBundledRuntimePayloads,
+            nativeHasPartialDownload: s.nativeRuntimeStatus.hasPartialDownload,
+            nativeDownloadSize: s.nativeRuntimeStatus.formattedDownloadSize,
             nativeStatusHydrated: s.nativeStatusHydrated,
             nativeEngineState: s.nativeRuntimeStatus.engineState,
             nativeEngineError: s.nativeRuntimeStatus.engineError,
             runtimeProgressPct: s.runtimeProgressPct,
             runtimeProgressMsg: s.runtimeProgressMsg,
+            runtimeProgressCanCancel: s.runtimeProgressCanCancel,
             showAppUpdateBanner: s.showAppUpdateBanner,
             appUpdateVersionName: s.appUpdateInfo?.versionName ?? '',
             phoneLiveActive: s.phoneLiveActive,
@@ -1215,22 +1250,23 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         : (hostHasErr
             ? t.err
             : ((hostNeedsAuth || hostIsConnecting) ? t.primary : t.text3));
-    final showAppUpdatePill = shellSlice.showAppUpdateBanner &&
+    // Show the low-priority floating app-update pill ONLY on the Empty Chat home stage so it
+    // never clutters or overlaps user bubbles inside an active conversation (Settings badge &
+    // sidebar still surface available updates cleanly).
+    final showAppUpdatePill = shellSlice.isEmptyChat &&
+        shellSlice.showAppUpdateBanner &&
         shellSlice.appUpdateVersionName.isNotEmpty &&
         !shellSlice.phoneLiveActive &&
         !showRemoteBasicBanner &&
         !showLocalAndroidBanner &&
         !showLocalDesktopErrorBanner;
-    // Active chat list always reserves consistent top clearance below the floating title pill
-    // (never jumping 46px downward 4s after launch when the floating update pill appears!).
-    final hasExtraTopBanner =
-        showRemoteBasicBanner || showLocalAndroidBanner || showLocalDesktopErrorBanner;
-    final listTopPad = topPad +
-        76.0 +
-        (hasExtraTopBanner ? 70.0 : 0.0) +
-        (showAppUpdatePill ? 40.0 : 0.0) +
-        (shellSlice.phoneLiveActive ? 56.0 : 0.0);
-    _lastListTopPad = listTopPad;
+    final hasNonPhoneTopBanner = showAppUpdatePill ||
+        showRemoteBasicBanner ||
+        showLocalAndroidBanner ||
+        showLocalDesktopErrorBanner;
+    final baseListTopPad = topPad + 76.0;
+    final currentBannerH = _topBannerStackHeight.value;
+    _lastListTopPad = baseListTopPad + (currentBannerH > 0.5 ? currentBannerH + 12.0 : 0.0);
 
     final chatStage = Stack(
       children: [
@@ -1242,7 +1278,15 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             onTap: _dismissKeyboardAndPopovers,
             child: _ChatCanvasArea(
               scrollCtrl: _scrollCtrl,
-              listTopPad: listTopPad,
+              baseListTopPad: baseListTopPad,
+              topBannerHeightNotifier: _topBannerStackHeight,
+              onEffectiveTopPadChanged: (nextTopPad) {
+                final delta = nextTopPad - _lastListTopPad;
+                _lastListTopPad = nextTopPad;
+                if (delta > 0.5) {
+                  _lastMaxScrollExtent += delta;
+                }
+              },
               screenH: screenH,
               topPad: topPad,
               baseComposerBottom: baseComposerBottom,
@@ -1266,41 +1310,78 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           ),
         ),
 
+        // Left-edge swipe gesture zone on Phone placed BELOW floating Liquid Glass chrome
+        // so it never intercepts taps on header pills or composer buttons, while cleanly
+        // dismissing open `+` deck / `/` `@` popovers as soon as the user pulls the drawer!
+        if (!isTab)
+          Positioned(
+            top: topPad + 72,
+            bottom: baseComposerBottom + 110,
+            left: 0,
+            width: 18,
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onHorizontalDragUpdate: (d) {
+                final drawerW =
+                    math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
+                final next = (_drawerCtrl.value + d.delta.dx / drawerW).clamp(0.0, 1.0);
+                if (d.delta.dx > 0 && next > 0.02) {
+                  _dismissKeyboardAndPopovers();
+                }
+                _drawerCtrl.value = next;
+              },
+              onHorizontalDragEnd: (d) {
+                final drawerW =
+                    math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
+                final v = d.velocity.pixelsPerSecond.dx / drawerW;
+                if (v > 0.6 || (_drawerCtrl.value > 0.35 && v > -0.4)) {
+                  _animateDrawerTo(1.0, velocity: v);
+                } else {
+                  _animateDrawerTo(0.0, velocity: v);
+                }
+              },
+              onHorizontalDragCancel: () =>
+                  _animateDrawerTo(_drawerCtrl.value > 0.5 ? 1.0 : 0.0),
+            ),
+          ),
+
           // Floating Liquid Glass Chrome Layer wrapped in ONE GlassBackdropGroup
           Positioned.fill(
             child: GlassBackdropGroup(
               child: Stack(
                 children: [
-                  // Silky progressive top feather (`topPad + 72dp`):
-                  // Solid `t.bgTop` across the OS status bar (0% ghosting under clock/battery)
-                  // gently softening scrolled chat text behind the floating Liquid Glass header
-                  // pills so headlines & buttons stay razor-legible while preserving refraction!
+                  // Silky progressive top feather dynamically covering BOTH the floating header
+                  // AND any mounted top status/phone-control banner stack so scrolled chat text
+                  // never clashes visually behind translucent floating chrome!
                   Positioned(
                     top: 0,
                     left: 0,
                     right: 0,
-                    height: topPad + 86.0,
                     child: IgnorePointer(
-                      child: Builder(
-                        builder: (_) {
-                          final capH = topPad + 86.0;
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: _topBannerStackHeight,
+                        builder: (_, bannerH, __) {
+                          final capH = topPad + 86.0 + (bannerH > 0.5 ? bannerH + 14.0 : 0.0);
                           final solidStop = topPad > 0
-                              ? ((topPad + 10.0) / capH).clamp(0.22, 0.56)
-                              : 0.18;
-                          final midStop =
-                              ((topPad + 48.0) / capH).clamp(solidStop + 0.18, 0.84);
-                          return DecoratedBox(
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: [
-                                  t.bgTop,
-                                  t.bgTop,
-                                  t.bgTop.withValues(alpha: t.isDark ? 0.78 : 0.80),
-                                  t.bgTop.withValues(alpha: 0.0),
-                                ],
-                                stops: [0.0, solidStop, midStop, 1.0],
+                              ? ((topPad + 10.0) / capH).clamp(0.18, 0.56)
+                              : 0.14;
+                          final midStop = ((topPad + 48.0 + (bannerH > 0.5 ? bannerH : 0.0)) / capH)
+                              .clamp(solidStop + 0.16, 0.86);
+                          return SizedBox(
+                            height: capH,
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    t.bgTop,
+                                    t.bgTop,
+                                    t.bgTop.withValues(alpha: t.isDark ? 0.80 : 0.82),
+                                    t.bgTop.withValues(alpha: 0.0),
+                                  ],
+                                  stops: [0.0, solidStop, midStop, 1.0],
+                                ),
                               ),
                             ),
                           );
@@ -1533,117 +1614,127 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                     ),
                   ),
 
-                if (showAppUpdatePill)
-                  Positioned(
-                    top: topPad + 64,
-                    left: 12,
-                    right: 12,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 440),
-                        child: GlassBackdropGroup(
-                          enabled: false,
-                          child: GrassBagGlass(
-                            tier: shellSlice.glassTier,
-                            borderRadius: 999,
-                            elevated: true,
-                            padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Flexible(
-                                  child: GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () => unawaited(showAppUpdateSheet(context, ref)),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        Icon(
-                                          CupertinoIcons.arrow_down_circle_fill,
-                                          size: 16,
-                                          color: t.primary,
-                                        ),
-                                        const SizedBox(width: 7),
-                                        Flexible(
-                                          child: Text(
-                                            '发现 GrassBag v${shellSlice.appUpdateVersionName} · 点击更新',
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
-                                              fontSize: 12.5,
-                                              fontWeight: FontWeight.w600,
-                                              color: t.text,
-                                            ),
+                // Unified measured top banner stack: guarantees zero banner-on-banner overlap
+                // across any font scale and feeds exact real pixel height to the top feather
+                // scrim, chat ListView top padding, and composer max-height clearance!
+                Positioned(
+                  top: topPad + 64,
+                  left: 12,
+                  right: 12,
+                  child: _ReportedHeightBox(
+                    onHeightChanged: (h) {
+                      if (mounted && (_topBannerStackHeight.value - h).abs() > 0.5) {
+                        _topBannerStackHeight.value = h;
+                      }
+                    },
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (showAppUpdatePill)
+                          Center(
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 440),
+                              child: GlassBackdropGroup(
+                                enabled: false,
+                                child: GrassBagGlass(
+                                  tier: shellSlice.glassTier,
+                                  borderRadius: 999,
+                                  elevated: true,
+                                  padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Flexible(
+                                        child: GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onTap: () => unawaited(showAppUpdateSheet(context, ref)),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                CupertinoIcons.arrow_down_circle_fill,
+                                                size: 16,
+                                                color: t.primary,
+                                              ),
+                                              const SizedBox(width: 7),
+                                              Flexible(
+                                                child: Text(
+                                                  '发现 GrassBag v${shellSlice.appUpdateVersionName} · 点击更新',
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 12.5,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: t.text,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                         ),
-                                      ],
-                                    ),
+                                      ),
+                                      const SizedBox(width: 4),
+                                      GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTap: ctrl.dismissAppUpdateBanner,
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(4),
+                                          child: Icon(
+                                            CupertinoIcons.xmark,
+                                            size: 13,
+                                            color: t.text3,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
-                                const SizedBox(width: 4),
-                                GestureDetector(
-                                  behavior: HitTestBehavior.opaque,
-                                  onTap: ctrl.dismissAppUpdateBanner,
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(4),
-                                    child: Icon(
-                                      CupertinoIcons.xmark,
-                                      size: 13,
-                                      color: t.text3,
-                                    ),
-                                  ),
-                                ),
-                              ],
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                    ),
-                  ),
 
-                // In-App Live Phone-Control Floating Pill (only mounts when a phone automation turn is live!)
-                _LivePhoneControlOverlayPill(
-                  topOffset: topPad + (hasExtraTopBanner ? 132.0 : 64.0),
-                ),
-
-                // Android Local Container & DSH Boot Banner (physical-phone first-run & error recovery!)
-                if (showLocalAndroidBanner)
-                  Positioned(
-                    top: topPad + 64,
-                    left: 12,
-                    right: 12,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 680),
-                        child: GlassBackdropGroup(
-                          enabled: false,
-                          child: GrassBagGlass(
-                            tier: shellSlice.glassTier,
-                            borderRadius: 22,
-                            elevated: true,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                          child: () {
+                        // Android Local Container & DSH Boot Banner (physical-phone first-run & error recovery!)
+                        if (showLocalAndroidBanner)
+                          Center(
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 680),
+                              child: GlassBackdropGroup(
+                                enabled: false,
+                                child: GrassBagGlass(
+                                  tier: shellSlice.glassTier,
+                                  borderRadius: 22,
+                                  elevated: true,
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                                child: () {
                             final isBooting = shellSlice.nativeEngineState == 'starting';
                             final isExtracting = shellSlice.runtimeProgressPct > 0 &&
                                 shellSlice.runtimeProgressPct < 100;
+                            final isRemoteThin = !shellSlice.nativeHasBundledPayloads;
                             final isErr = shellSlice.nativeEngineState == 'error' ||
                                 shellSlice.connectionPhase == ConnectionPhase.error;
                             final isStopped = shellSlice.nativeInitialized &&
                                 shellSlice.nativeEngineState == 'stopped' &&
                                 !isErr;
                             final title = isExtracting
-                                ? '正在部署本机容器 (${shellSlice.runtimeProgressPct}%)'
+                                ? (shellSlice.runtimeProgressCanCancel
+                                    ? '正在下载本机环境 (${shellSlice.runtimeProgressPct}%)'
+                                    : '正在部署本机容器 (${shellSlice.runtimeProgressPct}%)')
                                 : isBooting
                                     ? '正在启动本机 DSH 核心…'
                                     : isErr
                                         ? '本机 DSH 引擎启动失败'
                                         : isStopped
                                             ? '本机 DSH 引擎已停止'
-                                            : '本机 Linux 容器尚未初始化';
+                                            : (isRemoteThin
+                                                ? '本机运行环境尚未下载'
+                                                : '本机 Linux 容器尚未初始化');
                             final sub = isExtracting
                                 ? (shellSlice.runtimeProgressMsg.isNotEmpty
                                     ? shellSlice.runtimeProgressMsg
-                                    : '首次解压仅需一次，完成后即可离线使用')
+                                    : (isRemoteThin
+                                        ? '支持镜像加速与断点续传，部署完成后可离线使用'
+                                        : '首次解压仅需一次，完成后即可离线使用'))
                                 : isBooting
                                     ? '高速模式加速冷启，通常仅需数秒'
                                     : isErr
@@ -1652,7 +1743,11 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                             : '请重试启动或查看容器运行诊断日志')
                                         : isStopped
                                             ? '点击启动引擎即可继续在本机容器内对话'
-                                            : '点击一键部署内置 Ubuntu + Node + DSH 引擎';
+                                            : (isRemoteThin
+                                                ? (shellSlice.nativeHasPartialDownload
+                                                    ? '上次下载已保留断点，点击可继续下载（剩余 ${shellSlice.nativeDownloadSize}）'
+                                                    : '按需下载 Ubuntu + Node + DSH（约 ${shellSlice.nativeDownloadSize}）')
+                                                : '点击一键部署内置 Ubuntu + Node + DSH 引擎');
                             return Row(
                               children: [
                                 GestureDetector(
@@ -1665,7 +1760,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                   child: GrassBagSquircleIcon(
                                     icon: isErr
                                         ? CupertinoIcons.exclamationmark_triangle_fill
-                                        : CupertinoIcons.cube_box_fill,
+                                        : (isRemoteThin && !shellSlice.nativeInitialized
+                                            ? CupertinoIcons.cloud_download_fill
+                                            : CupertinoIcons.cube_box_fill),
                                     color: isErr ? t.err : t.primary,
                                     size: 36,
                                     iconSize: 17,
@@ -1705,7 +1802,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                   ),
                                 ),
                                 const SizedBox(width: 8),
-                                if (isExtracting || isBooting)
+                                if (isExtracting && shellSlice.runtimeProgressCanCancel)
+                                  GrassBagSecondaryGlassButton(
+                                    label: '暂停',
+                                    height: 32,
+                                    padding: const EdgeInsets.symmetric(horizontal: 11),
+                                    tier: shellSlice.glassTier,
+                                    insideGlass: true,
+                                    onTap: () => ctrl.cancelLocalRuntimeBootstrap(),
+                                  )
+                                else if (isExtracting || isBooting)
                                   Padding(
                                     padding: const EdgeInsets.symmetric(horizontal: 6),
                                     child: CupertinoActivityIndicator(radius: 9, color: t.primary),
@@ -1713,14 +1819,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                 else
                                   GrassBagPrimaryGlassButton(
                                     label: !shellSlice.nativeInitialized
-                                        ? '一键部署'
+                                        ? (isRemoteThin
+                                            ? (shellSlice.nativeHasPartialDownload ? '继续下载' : '下载部署')
+                                            : '一键部署')
                                         : (isErr ? '重试启动' : '启动引擎'),
                                     height: 34,
                                     padding: const EdgeInsets.symmetric(horizontal: 13),
                                     tier: shellSlice.glassTier,
                                     insideGlass: true,
                                     onTap: () => !shellSlice.nativeInitialized
-                                        ? ctrl.bootstrapLocalRuntime()
+                                        ? triggerLocalRuntimeBootstrapWithGuard(context, ref)
                                         : ctrl.restartLocalEngine(),
                                   ),
                               ],
@@ -1730,67 +1838,61 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                       ),
                     ),
                   ),
-                ),
 
                 if (showLocalDesktopErrorBanner)
-                  Positioned(
-                    top: topPad + 64,
-                    left: 12,
-                    right: 12,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 680),
-                        child: GlassBackdropGroup(
-                          enabled: false,
-                          child: GrassBagGlass(
-                            tier: shellSlice.glassTier,
-                            borderRadius: 22,
-                            elevated: true,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                            child: Row(
-                              children: [
-                                GrassBagSquircleIcon(
-                                  icon: CupertinoIcons.wifi_exclamationmark,
-                                  color: t.warn,
-                                  size: 36,
-                                  iconSize: 17,
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Text(
-                                        '本机 DSH 服务暂未连通',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.text,
-                                        ),
+                  Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 680),
+                      child: GlassBackdropGroup(
+                        enabled: false,
+                        child: GrassBagGlass(
+                          tier: shellSlice.glassTier,
+                          borderRadius: 22,
+                          elevated: true,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          child: Row(
+                            children: [
+                              GrassBagSquircleIcon(
+                                icon: CupertinoIcons.wifi_exclamationmark,
+                                color: t.warn,
+                                size: 36,
+                                iconSize: 17,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      '本机 DSH 服务暂未连通',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.text,
                                       ),
-                                      Text(
-                                        '确认本机服务运行后点击重试，或前往主机设置切换设备',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(fontSize: 11.5, color: t.text2),
-                                      ),
-                                    ],
-                                  ),
+                                    ),
+                                    Text(
+                                      '确认本机服务运行后点击重试，或前往主机设置切换设备',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(fontSize: 11.5, color: t.text2),
+                                    ),
+                                  ],
                                 ),
-                                const SizedBox(width: 8),
-                                GrassBagPrimaryGlassButton(
-                                  label: '重试',
-                                  height: 34,
-                                  padding: const EdgeInsets.symmetric(horizontal: 13),
-                                  tier: shellSlice.glassTier,
-                                  insideGlass: true,
-                                  onTap: () => ctrl.probeAndRefreshHost(shellSlice.hostId),
-                                ),
-                              ],
-                            ),
+                              ),
+                              const SizedBox(width: 8),
+                              GrassBagPrimaryGlassButton(
+                                label: '重试',
+                                height: 34,
+                                padding: const EdgeInsets.symmetric(horizontal: 13),
+                                tier: shellSlice.glassTier,
+                                insideGlass: true,
+                                onTap: () => ctrl.probeAndRefreshHost(shellSlice.hostId),
+                              ),
+                            ],
                           ),
                         ),
                       ),
@@ -1800,21 +1902,17 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                 // Actionable Remote Host Issue Banner (ONLY shown when auth/TLS/network blocks connection;
                 // never shown when connected via zero-plugin Vanilla Direct Mode!)
                 if (showRemoteBasicBanner)
-                  Positioned(
-                    top: topPad + 64,
-                    left: 12,
-                    right: 12,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 680),
-                        child: GlassBackdropGroup(
-                          enabled: false,
-                          child: GrassBagGlass(
-                            tier: shellSlice.glassTier,
-                            borderRadius: 22,
-                            elevated: true,
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                          child: () {
+                  Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 680),
+                      child: GlassBackdropGroup(
+                        enabled: false,
+                        child: GrassBagGlass(
+                          tier: shellSlice.glassTier,
+                          borderRadius: 22,
+                          elevated: true,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        child: () {
                             final errCode = shellSlice.hostLastErrorCode ?? '';
                             final isHtmlProxy = errCode == 'html_proxy';
                             final isAuth = errCode == 'needs_auth' ||
@@ -1958,6 +2056,13 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                       ),
                     ),
                   ),
+
+                // In-App Live Phone-Control Floating Pill stacked cleanly inside the same
+                // measured Column so it NEVER overlaps another top status banner at any font scale!
+                _LivePhoneControlOverlayPill(hasSiblingBannerAbove: hasNonPhoneTopBanner),
+                      ],
+                    ),
+                  ),
                 ),
 
                 // Transparent outside-tap barrier ONLY when '+' deck is open (dismisses immediately!)
@@ -1985,6 +2090,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                   child: _KeyboardBottomInsetLift(
                     baseBottom: baseComposerBottom,
                     topClearance: topPad + 66.0,
+                    topBannerHeightNotifier: _topBannerStackHeight,
                     child: ChatComposerDock(
                       controller: _composerCtrl,
                       focusNode: _composerFocus,
@@ -2022,39 +2128,6 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             ),
             ),
           ),
-
-          // Left-edge swipe gesture zone on Phone to pull the drawer interactively
-          if (!isTab)
-            Positioned(
-              top: topPad + 72,
-              bottom: baseComposerBottom + 110,
-              left: 0,
-              width: 18,
-              child: GestureDetector(
-                behavior: HitTestBehavior.translucent,
-                onHorizontalDragUpdate: (d) {
-                  final drawerW =
-                      math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
-                  final next = (_drawerCtrl.value + d.delta.dx / drawerW).clamp(0.0, 1.0);
-                  if (d.delta.dx > 0 && next > 0.02 && _composerFocus.hasFocus) {
-                    _composerFocus.unfocus();
-                  }
-                  _drawerCtrl.value = next;
-                },
-                onHorizontalDragEnd: (d) {
-                  final drawerW =
-                      math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
-                  final v = d.velocity.pixelsPerSecond.dx / drawerW;
-                  if (v > 0.6 || (_drawerCtrl.value > 0.35 && v > -0.4)) {
-                    _animateDrawerTo(1.0, velocity: v);
-                  } else {
-                    _animateDrawerTo(0.0, velocity: v);
-                  }
-                },
-                onHorizontalDragCancel: () =>
-                    _animateDrawerTo(_drawerCtrl.value > 0.5 ? 1.0 : 0.0),
-              ),
-            ),
         ],
     );
 
@@ -2215,15 +2288,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           );
 
     return ListenableBuilder(
-      listenable: Listenable.merge([
-        _drawerCtrl,
-        _plusOpenNotifier,
-        _suggestionsOpenNotifier,
-        _editingContextNotifier,
-        _composerFocus,
-      ]),
+      listenable: _backScopeListenable,
       builder: (context, child) {
-        final hasOpenOverlay = (!isTab && _drawerCtrl.value > 0.05) ||
+        final hasOpenOverlay = (!isTab && _drawerOpenForBackNotifier.value) ||
             _plusOpenNotifier.value ||
             _suggestionsOpenNotifier.value ||
             _editingContextNotifier.value != null ||
@@ -2734,11 +2801,13 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
   const _KeyboardBottomInsetLift({
     required this.baseBottom,
     required this.topClearance,
+    required this.topBannerHeightNotifier,
     required this.child,
   });
 
   final double baseBottom;
   final double topClearance;
+  final ValueListenable<double> topBannerHeightNotifier;
   final Widget child;
 
   @override
@@ -2754,7 +2823,8 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
       ),
     );
 
-    Widget buildLift(double kbInset, double settledKbHeight) {
+    Widget buildLift(double kbInset, double settledKbHeight, double bannerH) {
+      final effectiveTopClearance = topClearance + (bannerH > 0.5 ? bannerH + 10.0 : 0.0);
       // Continuous max(...) avoids any 32px discontinuity snap when kbInset crosses 0 <-> 1px!
       final targetBottom = math.max(baseBottom, kbInset + 8.0);
       final lift = (targetBottom - baseBottom).clamp(0.0, double.infinity);
@@ -2768,9 +2838,9 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
         final effectiveBottom = kbInset > 24.0
             ? math.max(baseBottom, settledKbHeight + 8.0)
             : baseBottom;
-        maxDockHeight = (screenH - effectiveBottom - topClearance).clamp(160.0, screenH);
+        maxDockHeight = (screenH - effectiveBottom - effectiveTopClearance).clamp(160.0, screenH);
       } else {
-        final raw = (screenH - targetBottom - topClearance).clamp(160.0, screenH);
+        final raw = (screenH - targetBottom - effectiveTopClearance).clamp(160.0, screenH);
         maxDockHeight = kbInset > 0 ? ((raw / 64.0).floor() * 64.0).clamp(160.0, screenH) : raw;
       }
       // Always keep Transform.translate mounted (Offset.zero at rest is a zero-cost
@@ -2788,13 +2858,19 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
       );
     }
 
-    if (ime == null) {
-      final raw = MediaQuery.viewInsetsOf(context).bottom;
-      return buildLift(raw, raw);
-    }
     return ValueListenableBuilder<double>(
-      valueListenable: ime.insetNotifier,
-      builder: (_, kbInset, __) => buildLift(kbInset, ime.knownKeyboardHeightNotifier.value),
+      valueListenable: topBannerHeightNotifier,
+      builder: (_, bannerH, __) {
+        if (ime == null) {
+          final raw = MediaQuery.viewInsetsOf(context).bottom;
+          return buildLift(raw, raw, bannerH);
+        }
+        return ValueListenableBuilder<double>(
+          valueListenable: ime.insetNotifier,
+          builder: (_, kbInset, __) =>
+              buildLift(kbInset, ime.knownKeyboardHeightNotifier.value, bannerH),
+        );
+      },
     );
   }
 }
@@ -2931,7 +3007,9 @@ class _KeyboardScrollTailState extends State<_KeyboardScrollTail> {
 class _ChatCanvasArea extends ConsumerWidget {
   const _ChatCanvasArea({
     required this.scrollCtrl,
-    required this.listTopPad,
+    required this.baseListTopPad,
+    required this.topBannerHeightNotifier,
+    required this.onEffectiveTopPadChanged,
     required this.screenH,
     required this.topPad,
     required this.baseComposerBottom,
@@ -2953,7 +3031,9 @@ class _ChatCanvasArea extends ConsumerWidget {
   static const ValueKey<String> _centerSliverKey = ValueKey<String>('chat-center-sliver');
 
   final ScrollController scrollCtrl;
-  final double listTopPad;
+  final double baseListTopPad;
+  final ValueListenable<double> topBannerHeightNotifier;
+  final ValueChanged<double> onEffectiveTopPadChanged;
   final double screenH;
   final double topPad;
   final double baseComposerBottom;
@@ -3069,7 +3149,12 @@ class _ChatCanvasArea extends ConsumerWidget {
     // Never place `CustomScrollView(controller: scrollCtrl)` inside `AnimatedSwitcher`!
     // Otherwise fast session switches (< 140ms) keep an outgoing ScrollPosition attached
     // while mounting the incoming one -> `StateError: Too many elements`!
-    return Stack(
+    return ValueListenableBuilder<double>(
+      valueListenable: topBannerHeightNotifier,
+      builder: (context, bannerH, _) {
+        final listTopPad = baseListTopPad + (bannerH > 0.5 ? bannerH + 12.0 : 0.0);
+        onEffectiveTopPadChanged(listTopPad);
+        return Stack(
       fit: StackFit.expand,
       children: [
         if (showActiveList)
@@ -3240,8 +3325,13 @@ class _ChatCanvasArea extends ConsumerWidget {
               : showError
                   ? Center(
                       key: const ValueKey('error-chat-stage'),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 28),
+                      child: SingleChildScrollView(
+                        padding: EdgeInsets.fromLTRB(
+                          28,
+                          listTopPad + 8,
+                          28,
+                          baseComposerBottom + 104,
+                        ),
                         child: ConstrainedBox(
                           constraints: const BoxConstraints(maxWidth: 380),
                           child: GrassBagCard(
@@ -3330,6 +3420,8 @@ class _ChatCanvasArea extends ConsumerWidget {
                       : const SizedBox.shrink(key: ValueKey('stage-overlay-none')),
         ),
       ],
+    );
+      },
     );
   }
 }
@@ -3674,9 +3766,9 @@ class _AnimatedTabletPane extends StatelessWidget {
 /// Android phone-control task is actively running or paused, keeping pause/resume & emergency
 /// stop within 1 thumb tap even after returning to chat.
 class _LivePhoneControlOverlayPill extends ConsumerWidget {
-  const _LivePhoneControlOverlayPill({required this.topOffset});
+  const _LivePhoneControlOverlayPill({this.hasSiblingBannerAbove = false});
 
-  final double topOffset;
+  final bool hasSiblingBannerAbove;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -3705,10 +3797,8 @@ class _LivePhoneControlOverlayPill extends ConsumerWidget {
       if (slice.app.isNotEmpty) slice.app,
     ];
 
-    return Positioned(
-      top: topOffset,
-      left: 12,
-      right: 12,
+    return Padding(
+      padding: EdgeInsets.only(top: hasSiblingBannerAbove ? 8.0 : 0.0),
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 420),
@@ -3797,7 +3887,7 @@ class _LivePhoneControlOverlayPill extends ConsumerWidget {
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                       decoration: BoxDecoration(
-                        color: t.err,
+                        color: t.isDark ? const Color(0xFFD94444) : t.err,
                         borderRadius: BorderRadius.circular(999),
                       ),
                       child: const Text(
@@ -3817,5 +3907,45 @@ class _LivePhoneControlOverlayPill extends ConsumerWidget {
         ),
       ),
     );
+  }
+}
+
+/// Zero-overhead RenderProxyBox height reporter for the unified floating top banner stack
+/// so the progressive feather scrim, chat ListView top inset, and composer clearance always
+/// match exact measured banner height across any font scale or stacked banner combo.
+class _ReportedHeightBox extends SingleChildRenderObjectWidget {
+  const _ReportedHeightBox({
+    required this.onHeightChanged,
+    required super.child,
+  });
+
+  final ValueChanged<double> onHeightChanged;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderReportedHeightBox(onHeightChanged);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderReportedHeightBox renderObject) {
+    renderObject.onHeightChanged = onHeightChanged;
+  }
+}
+
+class _RenderReportedHeightBox extends RenderProxyBox {
+  _RenderReportedHeightBox(this.onHeightChanged);
+
+  ValueChanged<double> onHeightChanged;
+  double _lastHeight = -1.0;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final h = size.height;
+    if ((h - _lastHeight).abs() > 0.5) {
+      _lastHeight = h;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        onHeightChanged(h);
+      });
+    }
   }
 }

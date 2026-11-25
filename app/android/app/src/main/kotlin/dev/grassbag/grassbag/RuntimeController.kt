@@ -6,6 +6,7 @@ import android.net.LinkProperties
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
@@ -25,6 +26,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.Proxy
 import java.net.URL
+import java.security.MessageDigest
 import java.util.Collections
 import java.util.LinkedList
 import java.util.TimeZone
@@ -36,6 +38,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -51,10 +54,38 @@ class BundledApkAssetSource(private val ctx: Context) : RuntimeAssetSource {
     private var cachedManifestText: String? = null
     @Volatile
     private var manifestChecked = false
+    @Volatile
+    private var cachedHasPayloads: Boolean? = null
 
     fun hasBundledAssets(): Boolean {
         if (!manifestChecked) loadManifest()
         return cachedManifestText != null
+    }
+
+    fun hasAsset(relPath: String): Boolean {
+        if (relPath.isBlank()) return false
+        return runCatching {
+            ctx.assets.open(relPath).use { true }
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Returns true ONLY when heavy offline container + DSH payloads (`base-arm64.gbag` &
+     * `engine-init.gbag`) are physically bundled inside the APK. Lean online-download APKs
+     * bundle only `shims.gbag`, `gbridge.gbag`, and `runtime-manifest.json` (~260 KB).
+     */
+    fun hasBundledRuntimePayloads(): Boolean {
+        cachedHasPayloads?.let { return it }
+        val manifest = loadManifest()
+        val arts = manifest?.optJSONObject("artifacts")
+        val baseAsset = arts?.optJSONObject("baseRootfs")?.optString("asset", "") ?: ""
+        val engineAsset = arts?.optJSONObject("engineInit")?.optString("asset", "") ?: ""
+        val present = baseAsset.isNotBlank() &&
+            engineAsset.isNotBlank() &&
+            hasAsset(baseAsset) &&
+            hasAsset(engineAsset)
+        cachedHasPayloads = present
+        return present
     }
 
     override fun loadManifest(): JSONObject? {
@@ -113,6 +144,10 @@ class RuntimeController private constructor(
     }
     private val activeToolkitInstalls = java.util.concurrent.atomic.AtomicInteger(0)
     private val upgradeInProgress = AtomicBoolean(false)
+    private val bootstrapRunning = AtomicBoolean(false)
+    private val bootstrapCancelRequested = AtomicBoolean(false)
+    private val activeDownloadConn = AtomicReference<HttpURLConnection?>(null)
+    private class BootstrapCancelledException : RuntimeException("已暂停下载，断点进度已保留")
     private val nativeLibDirFile = File(ctx.applicationInfo.nativeLibraryDir)
     private val hasTawcrootBin: Boolean = File(nativeLibDirFile, "libtawcroot.so").exists()
     private val hasProotBin: Boolean = File(nativeLibDirFile, "libproot.so").exists()
@@ -171,6 +206,7 @@ class RuntimeController private constructor(
     val ubuntuRoot = File(containersRoot, "ubuntu-24.04.5")
     val shimsRoot = File(ctx.filesDir, "shims")
     val runRoot = File(ctx.filesDir, "run")
+    val runtimeDownloadsDir = File(ctx.filesDir, "runtime-downloads")
     val prootTmpDir = File(ctx.cacheDir, "proot-tmp")
     val tawcTmpDir = File(ctx.cacheDir, "tawc-tmp")
 
@@ -327,6 +363,7 @@ class RuntimeController private constructor(
             containersRoot,
             shimsRoot,
             runRoot,
+            runtimeDownloadsDir,
             prootTmpDir,
             tawcTmpDir
         ).forEach { it.mkdirs() }
@@ -963,9 +1000,424 @@ class RuntimeController private constructor(
         return updated
     }
 
+    private data class RemoteDownloadEstimate(
+        val totalBytes: Long,
+        val remainingBytes: Long,
+        val hasPartial: Boolean
+    )
+
+    private fun isMeteredNetwork(): Boolean {
+        return runCatching {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return@runCatching false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val net = cm.activeNetwork ?: return@runCatching false
+                val caps = cm.getNetworkCapabilities(net) ?: return@runCatching cm.isActiveNetworkMetered
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return@runCatching true
+                if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) return@runCatching false
+            }
+            cm.isActiveNetworkMetered
+        }.getOrDefault(false)
+    }
+
+    private fun estimatePendingRemoteDownload(
+        manifest: JSONObject?,
+        meta: JSONObject,
+        activeSlot: String,
+        containerOk: Boolean,
+        slotOk: Boolean
+    ): RemoteDownloadEstimate {
+        if (manifest == null) return RemoteDownloadEstimate(0L, 0L, false)
+        val arts = manifest.optJSONObject("artifacts") ?: return RemoteDownloadEstimate(0L, 0L, false)
+        val manifestDshVer = manifest.optString("dshVersion", "0.2.2-rc.5")
+        val baseArt = arts.optJSONObject("baseRootfs")
+        val engineArt = arts.optJSONObject("engineInit")
+
+        val needRootfs = baseArt != null && (
+            !containerOk ||
+                (baseArt.optString("sha256", "").isNotEmpty() &&
+                    baseArt.optString("sha256", "") != meta.optString("baseRootfsSha256", ""))
+            )
+        val engineSha = engineArt?.optString("sha256", "") ?: ""
+        val storedEngineSha = meta.optString("engineInitSha256", "")
+        val needEngine = engineArt != null && (
+            !slotOk ||
+                (!meta.optBoolean("userUpgradedAb", false) && (
+                    (manifestDshVer.isNotEmpty() &&
+                        meta.optString("bundledDshVersion", "").isNotEmpty() &&
+                        manifestDshVer != meta.optString("bundledDshVersion", "")) ||
+                        (engineSha.isNotEmpty() &&
+                            storedEngineSha.isNotEmpty() &&
+                            engineSha != storedEngineSha)
+                    ))
+            )
+
+        var total = 0L
+        var remaining = 0L
+        var hasPartial = false
+
+        fun accountArtifact(art: JSONObject?) {
+            if (art == null) return
+            val assetPath = art.optString("asset", "")
+            if (bundled.hasAsset(assetPath)) return // Offline bundled in APK: 0 remote bytes needed
+            val expectedBytes = art.optLong("bytes", 0L).coerceAtLeast(0L)
+            if (expectedBytes <= 0L) return
+            total += expectedBytes
+            val filename = art.optString("filename", "").ifBlank { File(assetPath).name }
+            val cached = File(runtimeDownloadsDir, filename)
+            val part = File(runtimeDownloadsDir, "$filename.part")
+            if (cached.isFile && cached.length() == expectedBytes) {
+                hasPartial = true
+                return
+            }
+            val partLen = if (part.isFile) part.length().coerceIn(0L, expectedBytes) else 0L
+            if (partLen > 0L) hasPartial = true
+            remaining += (expectedBytes - partLen).coerceAtLeast(0L)
+        }
+
+        if (needRootfs) accountArtifact(baseArt)
+        if (needEngine) accountArtifact(engineArt)
+        return RemoteDownloadEstimate(total, remaining, hasPartial)
+    }
+
+    fun setRuntimeMirrorUrl(rawUrl: String): Map<String, Any?> {
+        val clean = rawUrl.trim().trimEnd('/')
+        if (clean.isNotEmpty()) {
+            val lower = clean.lowercase()
+            if (!lower.startsWith("https://") && !lower.startsWith("http://")) {
+                return mapOf("ok" to false, "error" to "镜像地址必须以 http:// 或 https:// 开头", "status" to getStatus())
+            }
+            val parsed = runCatching { URL(clean) }.getOrNull()
+            if (parsed == null || parsed.host.isNullOrBlank()) {
+                return mapOf("ok" to false, "error" to "镜像地址格式无效，请检查后重试", "status" to getStatus())
+            }
+        }
+        updateMeta { it.put("customRuntimeMirrorUrl", clean) }
+        return mapOf("ok" to true, "customRuntimeMirrorUrl" to clean, "status" to getStatus())
+    }
+
+    fun cancelBootstrap(): Map<String, Any?> {
+        bootstrapCancelRequested.set(true)
+        runCatching { activeDownloadConn.getAndSet(null)?.disconnect() }
+        return mapOf("ok" to true, "cancelling" to bootstrapRunning.get())
+    }
+
+    private fun resolveArtifactDownloadUrls(
+        art: JSONObject,
+        manifest: JSONObject,
+        customMirror: String
+    ): List<String> {
+        val assetPath = art.optString("asset", "")
+        val filename = art.optString("filename", "").ifBlank { File(assetPath).name }
+        val repo = manifest.optString("githubRepo", "moduqishi/grassbag").ifBlank { "moduqishi/grassbag" }
+        val tag = manifest.optString("runtimeTag", "runtime-arm64-r2").ifBlank { "runtime-arm64-r2" }
+        val directUrl = "https://github.com/$repo/releases/download/$tag/$filename"
+        val out = LinkedHashSet<String>()
+
+        val cleanCustom = customMirror.trim().trimEnd('/')
+        if (cleanCustom.isNotEmpty()) {
+            val lower = cleanCustom.lowercase()
+            val looksLikeGhProxy = lower.contains("gh-proxy") ||
+                lower.contains("ghproxy") ||
+                lower.contains("ghfast") ||
+                lower.contains("ghp.")
+            if (looksLikeGhProxy) {
+                out.add("$cleanCustom/$directUrl")
+                out.add("$cleanCustom/$filename")
+            } else {
+                out.add("$cleanCustom/$filename")
+                out.add("$cleanCustom/$directUrl")
+            }
+        }
+
+        val manifestUrls = art.optJSONArray("urls")
+        if (manifestUrls != null) {
+            for (i in 0 until manifestUrls.length()) {
+                val u = manifestUrls.optString(i, "").trim()
+                if (u.startsWith("http://") || u.startsWith("https://")) {
+                    out.add(u)
+                }
+            }
+        }
+        out.add(directUrl)
+        return out.toList()
+    }
+
+    private fun computeFileSha256(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(131072)
+        FileInputStream(file).use { fis ->
+            while (true) {
+                val n = fis.read(buf)
+                if (n < 0) break
+                if (n > 0) md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun openHttpFollowingRedirects(rawUrl: String, rangeStart: Long): HttpURLConnection {
+        var current = rawUrl
+        for (hop in 0 until 8) {
+            if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+            val url = URL(current)
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 15_000
+                readTimeout = 30_000
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "GrassBag-Android/1.0")
+                setRequestProperty("Accept", "application/octet-stream, */*")
+                setRequestProperty("Accept-Encoding", "identity")
+                if (rangeStart > 0L) {
+                    setRequestProperty("Range", "bytes=$rangeStart-")
+                }
+            }
+            activeDownloadConn.set(conn)
+            val code = conn.responseCode
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val loc = conn.getHeaderField("Location")?.trim()
+                runCatching { conn.disconnect() }
+                activeDownloadConn.compareAndSet(conn, null)
+                if (loc.isNullOrEmpty()) {
+                    throw java.io.IOException("重定向缺少 Location 头 (HTTP $code)")
+                }
+                current = URL(url, loc).toString()
+                continue
+            }
+            return conn
+        }
+        throw java.io.IOException("下载重定向次数过多")
+    }
+
+    private fun shortSourceLabel(rawUrl: String): String {
+        val host = runCatching { URL(rawUrl).host }.getOrNull()?.lowercase() ?: return "在线源"
+        return when {
+            host.contains("gh-proxy") -> "国内镜像 1"
+            host.contains("ghfast") -> "国内镜像 2"
+            host.contains("github.com") -> "GitHub 直连"
+            else -> host
+        }
+    }
+
+    /**
+     * Downloads a remote runtime `.gbag` artifact into `runtimeDownloadsDir` with:
+     *  - Persistent `.part` HTTP Range resume (206 append / 200 restart / 416 verify-or-reset)
+     *  - Automatic mirror failover (custom mirror -> China mirrors -> GitHub direct)
+     *  - Immediate rejection of HTML error/proxy pages
+     *  - Exact byte-size + SHA-256 verification before atomic rename
+     *  - Instant cancellation preserving `.part` for future resume
+     */
+    private fun downloadArtifactResumable(
+        art: JSONObject,
+        manifest: JSONObject,
+        customMirror: String,
+        displayName: String,
+        pctStart: Int,
+        pctSpan: Int
+    ): File {
+        runtimeDownloadsDir.mkdirs()
+        val assetPath = art.optString("asset", "")
+        val filename = art.optString("filename", "").ifBlank { File(assetPath).name }
+        val wantSha = art.optString("sha256", "").trim().lowercase()
+        val expectedBytes = art.optLong("bytes", 0L).coerceAtLeast(0L)
+        val finalFile = File(runtimeDownloadsDir, filename)
+        val partFile = File(runtimeDownloadsDir, "$filename.part")
+
+        if (finalFile.isFile) {
+            val sizeOk = expectedBytes <= 0L || finalFile.length() == expectedBytes
+            if (sizeOk && (wantSha.isEmpty() || computeFileSha256(finalFile).equals(wantSha, ignoreCase = true))) {
+                sendProgress(
+                    "downloading",
+                    pctStart + pctSpan,
+                    "$displayName 已存在本地缓存，校验通过",
+                    mapOf("canCancel" to true)
+                )
+                return finalFile
+            }
+            runCatching { finalFile.delete() }
+        }
+
+        val candidates = resolveArtifactDownloadUrls(art, manifest, customMirror)
+        if (candidates.isEmpty()) error("清单中未配置 $filename 的下载地址")
+        val errors = mutableListOf<String>()
+
+        for ((idx, urlStr) in candidates.withIndex()) {
+            if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+            val label = shortSourceLabel(urlStr)
+            var conn: HttpURLConnection? = null
+            try {
+                if (partFile.isFile && expectedBytes > 0L && partFile.length() > expectedBytes) {
+                    runCatching { partFile.delete() }
+                }
+                if (partFile.isFile && expectedBytes > 0L && partFile.length() == expectedBytes) {
+                    if (wantSha.isEmpty() || computeFileSha256(partFile).equals(wantSha, ignoreCase = true)) {
+                        if (finalFile.exists()) finalFile.delete()
+                        if (!partFile.renameTo(finalFile)) {
+                            partFile.copyTo(finalFile, overwrite = true)
+                            partFile.delete()
+                        }
+                        return finalFile
+                    }
+                    runCatching { partFile.delete() }
+                }
+
+                var resumeFrom = if (partFile.isFile) partFile.length().coerceAtLeast(0L) else 0L
+                appendLog("[runtime] downloading $filename from $label ($urlStr, resume=$resumeFrom)")
+                sendProgress(
+                    "downloading",
+                    pctStart,
+                    if (resumeFrom > 0L) "正在从 $label 续传 $displayName…" else "正在连接 $label 下载 $displayName…",
+                    mapOf("canCancel" to true, "currentMirror" to label)
+                )
+
+                conn = openHttpFollowingRedirects(urlStr, resumeFrom)
+                var code = conn.responseCode
+                if (code == 416 && resumeFrom > 0L) {
+                    runCatching { conn.disconnect() }
+                    activeDownloadConn.compareAndSet(conn, null)
+                    runCatching { partFile.delete() }
+                    resumeFrom = 0L
+                    conn = openHttpFollowingRedirects(urlStr, 0L)
+                    code = conn.responseCode
+                }
+                if (code != 200 && code != 206) {
+                    throw java.io.IOException("HTTP $code")
+                }
+                val contentType = (conn.contentType ?: "").lowercase()
+                if (contentType.contains("text/html")) {
+                    throw java.io.IOException("下载源返回了 HTML 错误页")
+                }
+
+                val appendMode = if (code == 206 && resumeFrom > 0L) {
+                    val cr = conn.getHeaderField("Content-Range") ?: ""
+                    cr.isEmpty() || cr.startsWith("bytes $resumeFrom-")
+                } else {
+                    false
+                }
+                if (!appendMode && resumeFrom > 0L) {
+                    resumeFrom = 0L
+                }
+
+                val contentLen = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    conn.contentLengthLong
+                } else {
+                    conn.contentLength.toLong()
+                }
+                val totalBytes = when {
+                    expectedBytes > 0L -> expectedBytes
+                    contentLen > 0L -> resumeFrom + contentLen
+                    else -> 0L
+                }
+
+                var downloaded = resumeFrom
+                var speedBytesPerSec = 0.0
+                var windowBytes = 0L
+                var windowStartMs = SystemClock.elapsedRealtime()
+                val buf = ByteArray(65536)
+
+                conn.inputStream.use { ins ->
+                    FileOutputStream(partFile, appendMode).use { fos ->
+                        while (true) {
+                            if (bootstrapCancelRequested.get()) {
+                                fos.flush()
+                                throw BootstrapCancelledException()
+                            }
+                            val n = ins.read(buf)
+                            if (n < 0) break
+                            if (n > 0) {
+                                fos.write(buf, 0, n)
+                                downloaded += n
+                                windowBytes += n
+                                val nowMs = SystemClock.elapsedRealtime()
+                                val dtMs = nowMs - windowStartMs
+                                if (dtMs >= 350L) {
+                                    val inst = (windowBytes * 1000.0) / dtMs.coerceAtLeast(1L)
+                                    speedBytesPerSec = if (speedBytesPerSec <= 0.0) inst else (speedBytesPerSec * 0.65 + inst * 0.35)
+                                    windowBytes = 0L
+                                    windowStartMs = nowMs
+                                    val frac = if (totalBytes > 0L) {
+                                        (downloaded.toDouble() / totalBytes.toDouble()).coerceIn(0.0, 1.0)
+                                    } else 0.0
+                                    val pct = (pctStart + (frac * pctSpan).toInt()).coerceIn(pctStart, pctStart + pctSpan)
+                                    val doneMb = String.format("%.1f", downloaded / (1024.0 * 1024.0))
+                                    val totMb = if (totalBytes > 0L) String.format("%.1f", totalBytes / (1024.0 * 1024.0)) else "?"
+                                    val speedStr = if (speedBytesPerSec >= 1024.0 * 1024.0) {
+                                        String.format("%.1f MB/s", speedBytesPerSec / (1024.0 * 1024.0))
+                                    } else {
+                                        String.format("%.0f KB/s", speedBytesPerSec / 1024.0)
+                                    }
+                                    sendProgress(
+                                        "downloading",
+                                        pct,
+                                        "正在下载 $displayName（$doneMb / $totMb MB · $speedStr · $label）",
+                                        mapOf(
+                                            "canCancel" to true,
+                                            "downloadedBytes" to downloaded,
+                                            "totalBytes" to totalBytes,
+                                            "speedBytesPerSec" to speedBytesPerSec.toLong(),
+                                            "currentMirror" to label
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                        fos.flush()
+                    }
+                }
+
+                if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+                if (expectedBytes > 0L && partFile.length() != expectedBytes) {
+                    throw java.io.IOException("下载不完整（${partFile.length()} / $expectedBytes 字节）")
+                }
+                if (wantSha.isNotEmpty()) {
+                    sendProgress(
+                        "verifying",
+                        pctStart + pctSpan,
+                        "正在校验 $displayName SHA-256 完整性…",
+                        mapOf("canCancel" to false)
+                    )
+                    val actualSha = computeFileSha256(partFile)
+                    if (!actualSha.equals(wantSha, ignoreCase = true)) {
+                        runCatching { partFile.delete() }
+                        throw java.io.IOException("SHA-256 校验失败（已丢弃损坏分片）")
+                    }
+                }
+                if (finalFile.exists()) finalFile.delete()
+                if (!partFile.renameTo(finalFile)) {
+                    partFile.copyTo(finalFile, overwrite = true)
+                    partFile.delete()
+                }
+                appendLog("[runtime] verified $filename (${finalFile.length()} bytes) via $label")
+                return finalFile
+            } catch (c: BootstrapCancelledException) {
+                throw c
+            } catch (t: Throwable) {
+                if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+                val msg = "$label: ${t.message ?: t.javaClass.simpleName}"
+                errors.add(msg)
+                appendLog("[runtime] download mirror failed ($msg)")
+                if (idx < candidates.lastIndex) {
+                    sendProgress(
+                        "downloading",
+                        pctStart,
+                        "$label 连接失败，自动切换下一个镜像源…",
+                        mapOf("canCancel" to true)
+                    )
+                }
+            } finally {
+                val c = conn
+                if (c != null) {
+                    activeDownloadConn.compareAndSet(c, null)
+                    runCatching { c.disconnect() }
+                }
+            }
+        }
+        error("下载 $displayName 失败（已自动尝试全部下载源：${errors.joinToString("；")}）。请检查网络或前往「本机设置 -> 下载源」配置可用镜像后重试")
+    }
+
     fun getStatus(): Map<String, Any?> {
         val m = readMeta()
-        val libs = File(ctx.applicationInfo.nativeLibraryDir)
         refreshHomeSizeAsyncIfStale()
         val activeSlot = m.optString("activeSlot", "slot-a")
         val lkgSlot = m.optString("lkgSlot", "slot-a")
@@ -977,6 +1429,9 @@ class RuntimeController private constructor(
         val configuredExec = effectiveExecutorMode(m)
         val effectiveExec = activeExecutorUsed ?: configuredExec
         val canRollback = lkgSlot != activeSlot && isSlotExtracted(lkgSlot)
+        val manifest = bundled.loadManifest()
+        val hasPayloads = bundled.hasBundledRuntimePayloads()
+        val dlEstimate = estimatePendingRemoteDownload(manifest, m, activeSlot, containerOk, slotOk)
         return mapOf(
             "initialized" to (m.optBoolean("initialized", false) && extracted),
             "containerExtracted" to containerOk,
@@ -987,10 +1442,10 @@ class RuntimeController private constructor(
             "activeSlot" to activeSlot,
             "lkgSlot" to lkgSlot,
             "canRollback" to canRollback,
-            "dshVersion" to (lastCapabilitiesDshVersion ?: m.optString("dshVersion", "0.2.2-rc.5")),
+            "dshVersion" to (lastCapabilitiesDshVersion ?: m.optString("dshVersion", manifest?.optString("dshVersion", "0.2.2-rc.5") ?: "0.2.2-rc.5")),
             "dshPrevVersion" to (if (canRollback) m.optString("dshPrevVersion", "") else ""),
-            "bridgeVersion" to m.optString("bridgeVersion", "0.1.0"),
-            "containerVersion" to m.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3"),
+            "bridgeVersion" to m.optString("bridgeVersion", manifest?.optString("bridgeVersion", "0.2.0") ?: "0.2.0"),
+            "containerVersion" to m.optString("containerVersion", manifest?.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3") ?: "Ubuntu 24.04.5 · Node 24.22.3"),
             "executorMode" to effectiveExec,
             "configuredExecutorMode" to configuredExec,
             "sdcardMounted" to m.optBoolean("sdcardMounted", false),
@@ -999,6 +1454,15 @@ class RuntimeController private constructor(
             "hasTawcroot" to hasTawcrootBin,
             "hasProot" to hasProotBin,
             "hasBundledAssets" to bundled.hasBundledAssets(),
+            "hasBundledRuntimePayloads" to hasPayloads,
+            "runtimeDelivery" to (if (hasPayloads) "bundled" else "remote"),
+            "runtimeReleaseTag" to (manifest?.optString("runtimeTag", "") ?: ""),
+            "runtimeTotalBytes" to dlEstimate.totalBytes,
+            "runtimeDownloadBytes" to dlEstimate.remainingBytes,
+            "hasPartialDownload" to dlEstimate.hasPartial,
+            "isMeteredNetwork" to isMeteredNetwork(),
+            "customRuntimeMirrorUrl" to m.optString("customRuntimeMirrorUrl", ""),
+            "bootstrapActive" to bootstrapRunning.get(),
             "homePath" to homeDir.absolutePath,
             "homeSizeKb" to cachedHomeSizeKb,
             "bridgeSocketPath" to bridgeSocket.absolutePath,
@@ -1049,23 +1513,23 @@ class RuntimeController private constructor(
         emit("engine_log", mapOf("lines" to batch, "line" to batch.last()))
     }
 
-    private fun enqueueLocalTermData(tabId: String, chunk: String) {
-        var immediatePayload: String? = null
+    private fun enqueueLocalTermData(tabId: String, chunk: String, expectedSession: ShellSession? = null) {
         var shouldSchedule = false
         synchronized(termPendingLock) {
+            if (expectedSession != null && shells[tabId] !== expectedSession) return
             val sb = termPendingBuffers.getOrPut(tabId) { StringBuilder(chunk.length.coerceAtLeast(256)) }
             sb.append(chunk)
             if (sb.length >= 64 * 1024) {
-                immediatePayload = sb.toString()
+                val data = sb.toString()
                 sb.setLength(0)
                 termPendingBuffers.remove(tabId)
+                // Emit inside termPendingLock (Handler.post is non-blocking) so large bursts
+                // never overtake an earlier coalesced flush on mainHandler!
+                emit("local_term_data", mapOf("tabId" to tabId, "data" to data))
             } else if (!termFlushScheduled) {
                 termFlushScheduled = true
                 shouldSchedule = true
             }
-        }
-        immediatePayload?.let { data ->
-            emit("local_term_data", mapOf("tabId" to tabId, "data" to data))
         }
         if (shouldSchedule) {
             runCatching {
@@ -1074,370 +1538,463 @@ class RuntimeController private constructor(
         }
     }
 
-    private fun flushLocalTermDataFor(tabId: String) {
-        val data: String? = synchronized(termPendingLock) {
-            termPendingBuffers.remove(tabId)?.takeIf { it.isNotEmpty() }?.toString()
-        }
-        if (data != null) {
-            emit("local_term_data", mapOf("tabId" to tabId, "data" to data))
+    private fun flushLocalTermDataFor(tabId: String, expectedSession: ShellSession? = null, exitCode: Int? = null) {
+        synchronized(termPendingLock) {
+            val stillOwner = expectedSession == null || shells[tabId] === expectedSession
+            val data = if (stillOwner) {
+                termPendingBuffers.remove(tabId)?.takeIf { it.isNotEmpty() }?.toString()
+            } else {
+                null
+            }
+            if (data != null) {
+                emit("local_term_data", mapOf("tabId" to tabId, "data" to data))
+            }
+            if (exitCode != null && expectedSession != null && shells.remove(tabId, expectedSession)) {
+                emit("local_term_exit", mapOf("tabId" to tabId, "exitCode" to exitCode))
+            }
         }
     }
 
     private fun flushAllLocalTermData() {
-        val snapshot: List<Pair<String, String>> = synchronized(termPendingLock) {
+        synchronized(termPendingLock) {
             termFlushScheduled = false
             if (termPendingBuffers.isEmpty()) return
-            val out = ArrayList<Pair<String, String>>(termPendingBuffers.size)
             for ((tid, sb) in termPendingBuffers) {
-                if (sb.isNotEmpty()) out.add(tid to sb.toString())
+                if (sb.isNotEmpty() && shells.containsKey(tid)) {
+                    emit("local_term_data", mapOf("tabId" to tid, "data" to sb.toString()))
+                }
             }
             termPendingBuffers.clear()
-            out
-        }
-        for ((tid, data) in snapshot) {
-            emit("local_term_data", mapOf("tabId" to tid, "data" to data))
         }
     }
 
     fun bootstrapRuntime(done: (Map<String, Any?>) -> Unit) {
+        if (!bootstrapRunning.compareAndSet(false, true)) {
+            done(mapOf("ok" to false, "error" to "本机环境正在下载或部署中，请稍候…", "status" to getStatus()))
+            return
+        }
+        bootstrapCancelRequested.set(false)
         worker.execute {
             val extractedOk: Boolean
             var bootstrapErr: String? = null
+            var bootstrapCancelled = false
             var startedFgForBootstrap = false
-            synchronized(bootstrapLock) {
-                extractedOk = try {
-                    sendProgress("layout", 4, "检查设备架构与存储空间，准备物理四分离持久卷…")
-                    if (!Build.SUPPORTED_ABIS.any { it.equals("arm64-v8a", ignoreCase = true) }) {
-                        error("当前设备架构 (${Build.SUPPORTED_ABIS.joinToString(",")}) 不支持 ARM64 本机容器，请使用远程设备模式连接桌面端 DSH")
-                    }
-                    prepareLayout()
-
-                    val manifest = bundled.loadManifest()
-                        ?: error("APK 内未找到 runtime/runtime-manifest.json")
-                    val arts = manifest.optJSONObject("artifacts")
-                        ?: error("runtime-manifest.json 缺少 artifacts 字段")
-                    val st = readMeta()
-                    val activeSlot = st.optString("activeSlot", "slot-a")
-                    val targetSlotDir = if (activeSlot == "slot-b") slotB else slotA
-
-                    val manifestDshVer = manifest.optString("dshVersion", "0.2.2-rc.5")
-                    val baseArt = arts.optJSONObject("baseRootfs")
-                    val engineArt = arts.optJSONObject("engineInit")
-                    val needRootfsCheck = baseArt != null && (
-                        !isContainerExtracted() ||
-                            (baseArt.optString("sha256", "").isNotEmpty() &&
-                                baseArt.optString("sha256", "") != st.optString("baseRootfsSha256", ""))
-                        )
-                    val needEngineCheck = engineArt != null && (
-                        !isSlotExtracted(activeSlot) ||
-                            (manifestDshVer.isNotEmpty() &&
-                                st.optString("bundledDshVersion", "").isNotEmpty() &&
-                                manifestDshVer != st.optString("bundledDshVersion", "") &&
-                                !st.optBoolean("userUpgradedAb", false))
-                        )
-                    if (needRootfsCheck || needEngineCheck) {
-                        val availBytes = runCatching { StatFs(ctx.filesDir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
-                        // Account for reclaimable space when replacing an already-extracted rootfs or slot in-place.
-                        val rootfsMarginMb = if (needRootfsCheck) {
-                            if (ubuntuRoot.exists() && isContainerExtracted()) 150L else 350L
-                        } else 0L
-                        val engineMarginMb = if (needEngineCheck) {
-                            if (targetSlotDir.exists() && isSlotExtracted(activeSlot)) 220L else 750L
-                        } else 0L
-                        val requiredBytes = (rootfsMarginMb + engineMarginMb) * 1024L * 1024L
-                        if (availBytes < requiredBytes) {
-                            val availMb = availBytes / (1024L * 1024L)
-                            val reqMb = requiredBytes / (1024L * 1024L)
-                            error("手机可用存储空间不足（当前仅剩 ${availMb} MB，至少需要 ${reqMb} MB 用于部署 Ubuntu + DSH 运行环境）")
+            try {
+                synchronized(bootstrapLock) {
+                    extractedOk = try {
+                        sendProgress("layout", 2, "检查设备架构、网络与存储空间…", mapOf("canCancel" to true))
+                        if (!Build.SUPPORTED_ABIS.any { it.equals("arm64-v8a", ignoreCase = true) }) {
+                            error("当前设备架构 (${Build.SUPPORTED_ABIS.joinToString(",")}) 不支持 ARM64 本机容器，请使用远程设备模式连接桌面端 DSH")
                         }
-                    }
+                        prepareLayout()
 
-                    // Start foreground service + bounded WakeLock ONLY after preflight checks pass so early
-                    // errors never race startForegroundService() vs stop() on Android 10-16!
-                    GrassBagEngineService.startOrUpdate(
-                        ctx,
-                        "正在初始化 GrassBag 本机容器",
-                        "解压 Ubuntu + Node 24 + DSH 引擎，请保持应用运行…",
-                        wakeLockMs = 10 * 60 * 1000L
-                    )
-                    startedFgForBootstrap = true
+                        val manifest = bundled.loadManifest()
+                            ?: error("APK 内未找到 runtime/runtime-manifest.json")
+                        val arts = manifest.optJSONObject("artifacts")
+                            ?: error("runtime-manifest.json 缺少 artifacts 字段")
+                        val st = readMeta()
+                        val activeSlot = st.optString("activeSlot", "slot-a")
+                        val targetSlotDir = if (activeSlot == "slot-b") slotB else slotA
+                        val customMirror = st.optString("customRuntimeMirrorUrl", "")
 
-                    // 1. Shims & droid-* wrappers (always refresh when APK shims SHA-256 changes)
-                    arts.optJSONObject("shims")?.let { art ->
-                        val wantSha = art.optString("sha256", "")
-                        val prevSha = st.optString("shimsSha256", "")
-                        val needShims = !File(shimsRoot, "android-shim.mjs").exists() ||
-                            !File(shimsRoot, "pty-bridge.mjs").exists() ||
-                            (wantSha.isNotEmpty() && wantSha != prevSha)
-                        if (needShims) {
-                            sendProgress("shims", 10, "部署 android-shim、CA 证书与 droid-* 工具链…")
-                            TarGzExtractor.deleteTreeNoFollow(shimsRoot)
-                            shimsRoot.mkdirs()
-                            bundled.openStream(art.optString("asset"))?.use { ins ->
-                                TarGzExtractor.extractStream(
-                                    compressedStream = ins,
-                                    destDir = shimsRoot,
-                                    expectedSha256 = wantSha,
-                                    totalCompressedBytes = art.optLong("bytes", 0L),
-                                    freshDir = true
-                                )
-                            } ?: error("无法读取 ${art.optString("asset")}")
-                            if (wantSha.isNotEmpty()) st.put("shimsSha256", wantSha)
-                        } else {
-                            sendProgress("shims", 10, "android-shim 与 droid-* 工具链已是最新")
-                        }
-                    }
-
-                    // 2 & 3. Extract Ubuntu 24.04.5 + Node 24 rootfs and @deepseek-ai/dsh engine slot.
-                    // When both need extraction (fresh install), run them in parallel across 2 CPU cores
-                    // while preserving the foreground service & WakeLock (keepForegroundService = true)!
-                    if (needRootfsCheck || needEngineCheck) {
-                        stopEngineSync(keepForegroundService = true)
-                    }
-
-                    if (needRootfsCheck && needEngineCheck && baseArt != null && engineArt != null) {
-                        val rootfsTotal = baseArt.optLong("bytes", 75_000_000L).coerceAtLeast(1L)
-                        val engineTotal = engineArt.optLong("bytes", 112_000_000L).coerceAtLeast(1L)
-                        val combinedTotal = rootfsTotal + engineTotal
-                        val rootfsRead = AtomicLong(0L)
-                        val engineRead = AtomicLong(0L)
-                        val lastEmitMs = AtomicLong(0L)
-
-                        fun reportParallelProgress() {
-                            val now = System.currentTimeMillis()
-                            val prev = lastEmitMs.get()
-                            if (now - prev < 180L || !lastEmitMs.compareAndSet(prev, now)) return
-                            val doneBytes = rootfsRead.get() + engineRead.get()
-                            val pct = 14 + ((doneBytes * 70L) / combinedTotal).toInt().coerceIn(0, 70)
-                            sendProgress(
-                                "rootfs",
-                                pct,
-                                "并行解压 Ubuntu + Node 24 与 DSH $manifestDshVer (${doneBytes / (1024 * 1024)} / ${combinedTotal / (1024 * 1024)} MB)…"
+                        val manifestDshVer = manifest.optString("dshVersion", "0.2.2-rc.5")
+                        val baseArt = arts.optJSONObject("baseRootfs")
+                        val engineArt = arts.optJSONObject("engineInit")
+                        val needRootfsCheck = baseArt != null && (
+                            !isContainerExtracted() ||
+                                (baseArt.optString("sha256", "").isNotEmpty() &&
+                                    baseArt.optString("sha256", "") != st.optString("baseRootfsSha256", ""))
                             )
+                        val engineSha = engineArt?.optString("sha256", "") ?: ""
+                        val storedEngineSha = st.optString("engineInitSha256", "")
+                        val needEngineCheck = engineArt != null && (
+                            !isSlotExtracted(activeSlot) ||
+                                (!st.optBoolean("userUpgradedAb", false) && (
+                                    (manifestDshVer.isNotEmpty() &&
+                                        st.optString("bundledDshVersion", "").isNotEmpty() &&
+                                        manifestDshVer != st.optString("bundledDshVersion", "")) ||
+                                        (engineSha.isNotEmpty() &&
+                                            storedEngineSha.isNotEmpty() &&
+                                            engineSha != storedEngineSha)
+                                    ))
+                            )
+
+                        val rootfsIsBundled = baseArt != null && bundled.hasAsset(baseArt.optString("asset", ""))
+                        val engineIsBundled = engineArt != null && bundled.hasAsset(engineArt.optString("asset", ""))
+                        val needsRemoteDownload =
+                            (needRootfsCheck && !rootfsIsBundled) || (needEngineCheck && !engineIsBundled)
+
+                        if (needRootfsCheck || needEngineCheck) {
+                            val availBytes = runCatching { StatFs(ctx.filesDir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
+                            val rootfsMarginMb = if (needRootfsCheck) {
+                                if (ubuntuRoot.exists() && isContainerExtracted()) 180L else 360L
+                            } else 0L
+                            val engineMarginMb = if (needEngineCheck) {
+                                if (targetSlotDir.exists() && isSlotExtracted(activeSlot)) 260L else 760L
+                            } else 0L
+                            val downloadScratchMb = if (needsRemoteDownload) 130L else 0L
+                            val requiredBytes = (rootfsMarginMb + engineMarginMb + downloadScratchMb) * 1024L * 1024L
+                            if (availBytes < requiredBytes) {
+                                val availMb = availBytes / (1024L * 1024L)
+                                val reqMb = requiredBytes / (1024L * 1024L)
+                                error("手机可用存储空间不足（当前仅剩 ${availMb} MB，至少需要 ${reqMb} MB 用于下载并部署 Ubuntu + DSH 运行环境）")
+                            }
                         }
 
-                        sendProgress("rootfs", 14, "正在并行部署 Ubuntu + Node 24 与 DSH $manifestDshVer…")
-                        val fRootfs = worker.submit<Unit> {
-                            TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
-                            ubuntuRoot.mkdirs()
-                            val extractingFlag = File(ubuntuRoot, ".extracting").apply { writeText("1") }
-                            val wantSha = baseArt.optString("sha256", "")
-                            bundled.openStream(baseArt.optString("asset"))?.use { ins ->
-                                TarGzExtractor.extractStream(
-                                    compressedStream = ins,
-                                    destDir = ubuntuRoot,
-                                    expectedSha256 = wantSha,
-                                    totalCompressedBytes = rootfsTotal,
-                                    freshDir = true
-                                ) { read, _ ->
-                                    rootfsRead.set(read)
-                                    reportParallelProgress()
-                                }
-                            } ?: error("无法读取 ${baseArt.optString("asset")}")
-                            extractingFlag.delete()
-                            File(ubuntuRoot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                        }
-                        val fEngine = worker.submit<Unit> {
-                            TarGzExtractor.deleteTreeNoFollow(targetSlotDir)
-                            targetSlotDir.mkdirs()
-                            val extractingFlag = File(targetSlotDir, ".extracting").apply { writeText("1") }
-                            val wantSha = engineArt.optString("sha256", "")
-                            bundled.openStream(engineArt.optString("asset"))?.use { ins ->
-                                TarGzExtractor.extractStream(
-                                    compressedStream = ins,
-                                    destDir = targetSlotDir,
-                                    expectedSha256 = wantSha,
-                                    totalCompressedBytes = engineTotal,
-                                    freshDir = true
-                                ) { read, _ ->
-                                    engineRead.set(read)
-                                    reportParallelProgress()
-                                }
-                            } ?: error("无法读取 ${engineArt.optString("asset")}")
-                            extractingFlag.delete()
-                            File(targetSlotDir, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                        }
-                        // Wait for both and propagate any extraction exception cleanly.
-                        var firstErr: Throwable? = null
-                        runCatching { fRootfs.get() }.onFailure { firstErr = it.cause ?: it }
-                        runCatching { fEngine.get() }.onFailure { if (firstErr == null) firstErr = it.cause ?: it }
-                        firstErr?.let { throw it }
+                        if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
 
-                        etcPrepared = false
-                        ptySupportedCache = null
-                        val baseSha = baseArt.optString("sha256", "")
-                        val engSha = engineArt.optString("sha256", "")
-                        if (baseSha.isNotEmpty()) st.put("baseRootfsSha256", baseSha)
-                        if (engSha.isNotEmpty()) st.put("engineInitSha256", engSha)
-                        st.put("bundledDshVersion", manifestDshVer)
-                        st.put("dshVersion", manifestDshVer)
-                    } else {
-                        baseArt?.let { art ->
+                        GrassBagEngineService.startOrUpdate(
+                            ctx,
+                            if (needsRemoteDownload) "正在下载并部署 GrassBag 运行环境" else "正在初始化 GrassBag 本机容器",
+                            if (needsRemoteDownload) "断点续传下载 Ubuntu + Node 24 + DSH 引擎，请保持应用运行…" else "解压 Ubuntu + Node 24 + DSH 引擎，请保持应用运行…",
+                            wakeLockMs = 15 * 60 * 1000L
+                        )
+                        startedFgForBootstrap = true
+
+                        // 1. Shims & droid-* wrappers (always bundled ~156KB inside APK)
+                        arts.optJSONObject("shims")?.let { art ->
                             val wantSha = art.optString("sha256", "")
-                            if (needRootfsCheck) {
-                                val total = art.optLong("bytes", 75_000_000L)
-                                sendProgress("rootfs", 14, "清理旧容器并解压 Ubuntu 24.04.5 + Node 24.22.3 ARM64…")
+                            val prevSha = st.optString("shimsSha256", "")
+                            val needShims = !File(shimsRoot, "android-shim.mjs").exists() ||
+                                !File(shimsRoot, "pty-bridge.mjs").exists() ||
+                                (wantSha.isNotEmpty() && wantSha != prevSha)
+                            if (needShims) {
+                                sendProgress("shims", 5, "部署 android-shim、CA 证书与 droid-* 工具链…")
+                                TarGzExtractor.deleteTreeNoFollow(shimsRoot)
+                                shimsRoot.mkdirs()
+                                bundled.openStream(art.optString("asset"))?.use { ins ->
+                                    TarGzExtractor.extractStream(
+                                        compressedStream = ins,
+                                        destDir = shimsRoot,
+                                        expectedSha256 = wantSha,
+                                        totalCompressedBytes = art.optLong("bytes", 0L),
+                                        freshDir = true
+                                    )
+                                } ?: error("无法读取 ${art.optString("asset")}")
+                                if (wantSha.isNotEmpty()) {
+                                    st.put("shimsSha256", wantSha)
+                                    updateMeta { it.put("shimsSha256", wantSha) }
+                                }
+                            } else {
+                                sendProgress("shims", 5, "android-shim 与 droid-* 工具链已是最新")
+                            }
+                        }
+
+                        if (needRootfsCheck || needEngineCheck) {
+                            stopEngineSync(keepForegroundService = true)
+                        }
+
+                        // 2 & 3. Deploy Ubuntu + Node 24 rootfs and @deepseek-ai/dsh engine slot.
+                        // Fast path: when BOTH payloads are bundled offline in APK, extract in parallel across 2 CPU cores.
+                        // Lean APK path: sequentially download (resumable HTTP Range + mirror failover + SHA-256)
+                        // -> extract -> immediately delete archive to minimize peak storage and allow clean resume!
+                        if (needRootfsCheck && needEngineCheck && rootfsIsBundled && engineIsBundled && baseArt != null && engineArt != null) {
+                            val rootfsTotal = baseArt.optLong("bytes", 75_000_000L).coerceAtLeast(1L)
+                            val engineTotal = engineArt.optLong("bytes", 112_000_000L).coerceAtLeast(1L)
+                            val combinedTotal = rootfsTotal + engineTotal
+                            val rootfsRead = AtomicLong(0L)
+                            val engineRead = AtomicLong(0L)
+                            val lastEmitMs = AtomicLong(0L)
+
+                            fun reportParallelProgress() {
+                                val now = System.currentTimeMillis()
+                                val prev = lastEmitMs.get()
+                                if (now - prev < 180L || !lastEmitMs.compareAndSet(prev, now)) return
+                                val doneBytes = rootfsRead.get() + engineRead.get()
+                                val pct = 10 + ((doneBytes * 74L) / combinedTotal).toInt().coerceIn(0, 74)
+                                sendProgress(
+                                    "rootfs",
+                                    pct,
+                                    "并行解压 Ubuntu + Node 24 与 DSH $manifestDshVer (${doneBytes / (1024 * 1024)} / ${combinedTotal / (1024 * 1024)} MB)…"
+                                )
+                            }
+
+                            sendProgress("rootfs", 10, "正在并行部署 Ubuntu + Node 24 与 DSH $manifestDshVer…")
+                            val fRootfs = worker.submit<Unit> {
                                 TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
                                 ubuntuRoot.mkdirs()
                                 val extractingFlag = File(ubuntuRoot, ".extracting").apply { writeText("1") }
-                                bundled.openStream(art.optString("asset"))?.use { ins ->
+                                val wantSha = baseArt.optString("sha256", "")
+                                bundled.openStream(baseArt.optString("asset"))?.use { ins ->
                                     TarGzExtractor.extractStream(
                                         compressedStream = ins,
                                         destDir = ubuntuRoot,
                                         expectedSha256 = wantSha,
-                                        totalCompressedBytes = total,
+                                        totalCompressedBytes = rootfsTotal,
                                         freshDir = true
-                                    ) { read, tot ->
-                                        val pct = if (tot > 0) 14 + ((read * 36) / tot).toInt().coerceIn(0, 36) else 32
-                                        sendProgress("rootfs", pct, "正在解压 Ubuntu + Node 24 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                    ) { read, _ ->
+                                        rootfsRead.set(read)
+                                        reportParallelProgress()
                                     }
-                                } ?: error("无法读取 ${art.optString("asset")}")
+                                } ?: error("无法读取 ${baseArt.optString("asset")}")
                                 extractingFlag.delete()
                                 File(ubuntuRoot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                                etcPrepared = false
-                                ptySupportedCache = null
-                            } else {
-                                sendProgress("rootfs", 50, "Ubuntu 24.04.5 + Node 24 容器已存在，跳过解压")
                             }
-                            if (wantSha.isNotEmpty()) st.put("baseRootfsSha256", wantSha)
-                        }
-
-                        engineArt?.let { art ->
-                            val wantSha = art.optString("sha256", "")
-                            if (needEngineCheck) {
-                                val total = art.optLong("bytes", 112_000_000L)
-                                sendProgress("engine", 52, "清理旧槽位并部署真实 DSH $manifestDshVer…")
+                            val fEngine = worker.submit<Unit> {
                                 TarGzExtractor.deleteTreeNoFollow(targetSlotDir)
                                 targetSlotDir.mkdirs()
                                 val extractingFlag = File(targetSlotDir, ".extracting").apply { writeText("1") }
-                                bundled.openStream(art.optString("asset"))?.use { ins ->
+                                val wantSha = engineArt.optString("sha256", "")
+                                bundled.openStream(engineArt.optString("asset"))?.use { ins ->
                                     TarGzExtractor.extractStream(
                                         compressedStream = ins,
                                         destDir = targetSlotDir,
                                         expectedSha256 = wantSha,
-                                        totalCompressedBytes = total,
+                                        totalCompressedBytes = engineTotal,
                                         freshDir = true
-                                    ) { read, tot ->
-                                        val pct = if (tot > 0) 52 + ((read * 32) / tot).toInt().coerceIn(0, 32) else 72
-                                        sendProgress("engine", pct, "正在部署 DSH 引擎 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                    ) { read, _ ->
+                                        engineRead.set(read)
+                                        reportParallelProgress()
                                     }
-                                } ?: error("无法读取 ${art.optString("asset")}")
+                                } ?: error("无法读取 ${engineArt.optString("asset")}")
                                 extractingFlag.delete()
                                 File(targetSlotDir, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                                if (wantSha.isNotEmpty()) st.put("engineInitSha256", wantSha)
-                                st.put("bundledDshVersion", manifestDshVer)
-                                st.put("dshVersion", manifestDshVer)
-                            } else {
-                                sendProgress("engine", 84, "DSH 引擎槽位 $activeSlot 核心已就绪")
-                                if (st.optString("bundledDshVersion", "").isEmpty()) {
+                            }
+                            var firstErr: Throwable? = null
+                            runCatching { fRootfs.get() }.onFailure { firstErr = it.cause ?: it }
+                            runCatching { fEngine.get() }.onFailure { if (firstErr == null) firstErr = it.cause ?: it }
+                            firstErr?.let { throw it }
+
+                            etcPrepared = false
+                            ptySupportedCache = null
+                            val baseSha = baseArt.optString("sha256", "")
+                            val engSha = engineArt.optString("sha256", "")
+                            if (baseSha.isNotEmpty()) st.put("baseRootfsSha256", baseSha)
+                            if (engSha.isNotEmpty()) st.put("engineInitSha256", engSha)
+                            st.put("bundledDshVersion", manifestDshVer)
+                            st.put("dshVersion", manifestDshVer)
+                        } else {
+                            baseArt?.let { art ->
+                                val wantSha = art.optString("sha256", "")
+                                if (needRootfsCheck) {
+                                    val total = art.optLong("bytes", 75_000_000L).coerceAtLeast(1L)
+                                    var downloadedFile: File? = null
+                                    val openRootfsStream: () -> InputStream = if (rootfsIsBundled) {
+                                        { bundled.openStream(art.optString("asset")) ?: error("无法读取 ${art.optString("asset")}") }
+                                    } else {
+                                        val file = downloadArtifactResumable(
+                                            art = art,
+                                            manifest = manifest,
+                                            customMirror = customMirror,
+                                            displayName = "Ubuntu + Node 24 容器",
+                                            pctStart = 6,
+                                            pctSpan = 28
+                                        )
+                                        downloadedFile = file
+                                        { FileInputStream(file) }
+                                    }
+                                    if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+                                    val extractBase = if (rootfsIsBundled) 10 else 34
+                                    val extractSpan = if (rootfsIsBundled) 38 else 12
+                                    sendProgress("rootfs", extractBase, "正在解压 Ubuntu 24.04.5 + Node 24.22.3 ARM64…")
+                                    TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
+                                    ubuntuRoot.mkdirs()
+                                    val extractingFlag = File(ubuntuRoot, ".extracting").apply { writeText("1") }
+                                    openRootfsStream().use { ins ->
+                                        TarGzExtractor.extractStream(
+                                            compressedStream = ins,
+                                            destDir = ubuntuRoot,
+                                            expectedSha256 = wantSha,
+                                            totalCompressedBytes = total,
+                                            freshDir = true
+                                        ) { read, tot ->
+                                            val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
+                                            sendProgress("rootfs", pct, "正在解压 Ubuntu + Node 24 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                        }
+                                    }
+                                    extractingFlag.delete()
+                                    File(ubuntuRoot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
+                                    // Immediately reclaim compressed archive (~72MB) once extracted!
+                                    downloadedFile?.let { runCatching { it.delete() } }
+                                    etcPrepared = false
+                                    ptySupportedCache = null
+                                    if (wantSha.isNotEmpty()) {
+                                        st.put("baseRootfsSha256", wantSha)
+                                        updateMeta { it.put("baseRootfsSha256", wantSha) }
+                                    }
+                                } else {
+                                    sendProgress("rootfs", 46, "Ubuntu 24.04.5 + Node 24 容器已就绪，跳过下载")
+                                    if (wantSha.isNotEmpty()) st.put("baseRootfsSha256", wantSha)
+                                }
+                            }
+
+                            engineArt?.let { art ->
+                                val wantSha = art.optString("sha256", "")
+                                if (needEngineCheck) {
+                                    val total = art.optLong("bytes", 116_000_000L).coerceAtLeast(1L)
+                                    var downloadedFile: File? = null
+                                    val openEngineStream: () -> InputStream = if (engineIsBundled) {
+                                        { bundled.openStream(art.optString("asset")) ?: error("无法读取 ${art.optString("asset")}") }
+                                    } else {
+                                        val file = downloadArtifactResumable(
+                                            art = art,
+                                            manifest = manifest,
+                                            customMirror = customMirror,
+                                            displayName = "DSH $manifestDshVer 引擎",
+                                            pctStart = 46,
+                                            pctSpan = 34
+                                        )
+                                        downloadedFile = file
+                                        { FileInputStream(file) }
+                                    }
+                                    if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
+                                    val extractBase = if (engineIsBundled) 50 else 80
+                                    val extractSpan = if (engineIsBundled) 34 else 9
+                                    sendProgress("engine", extractBase, "正在解压并部署真实 DSH $manifestDshVer…")
+                                    TarGzExtractor.deleteTreeNoFollow(targetSlotDir)
+                                    targetSlotDir.mkdirs()
+                                    val extractingFlag = File(targetSlotDir, ".extracting").apply { writeText("1") }
+                                    openEngineStream().use { ins ->
+                                        TarGzExtractor.extractStream(
+                                            compressedStream = ins,
+                                            destDir = targetSlotDir,
+                                            expectedSha256 = wantSha,
+                                            totalCompressedBytes = total,
+                                            freshDir = true
+                                        ) { read, tot ->
+                                            val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
+                                            sendProgress("engine", pct, "正在部署 DSH 引擎 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                        }
+                                    }
+                                    extractingFlag.delete()
+                                    File(targetSlotDir, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
+                                    // Immediately reclaim compressed archive (~116MB) once extracted!
+                                    downloadedFile?.let { runCatching { it.delete() } }
+                                    if (wantSha.isNotEmpty()) {
+                                        st.put("engineInitSha256", wantSha)
+                                        updateMeta { it.put("engineInitSha256", wantSha) }
+                                    }
                                     st.put("bundledDshVersion", manifestDshVer)
+                                    st.put("dshVersion", manifestDshVer)
+                                } else {
+                                    sendProgress("engine", 88, "DSH 引擎槽位 $activeSlot 核心已就绪")
+                                    if (st.optString("bundledDshVersion", "").isEmpty()) {
+                                        st.put("bundledDshVersion", manifestDshVer)
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    updateRelativeSymlink(File(containersRoot, "current"), ubuntuRoot.name)
-                    ensureContainerEtcFiles(force = true)
+                        updateRelativeSymlink(File(containersRoot, "current"), ubuntuRoot.name)
+                        ensureContainerEtcFiles(force = true)
 
-                    // 3b. Fast ~100KB incremental dsh-gbridge overlay (MUST also re-apply whenever
-                    // engine-init.gbag was extracted so legacy v0.1.0 inside engine-init never survives!)
-                    arts.optJSONObject("gbridge")?.let { art ->
-                        val wantSha = art.optString("sha256", "")
-                        val prevSha = st.optString("gbridgeSha256_$activeSlot", st.optString("gbridgeSha256", ""))
-                        val bridgeDir = File(targetSlotDir, "dsh-gbridge")
-                        val needBridge = needEngineCheck ||
-                            !File(bridgeDir, "lib/index.js").exists() ||
-                            (wantSha.isNotEmpty() && wantSha != prevSha)
-                        if (needBridge) {
-                            sendProgress("gbridge", 86, "增量更新零侵入桥 dsh-gbridge…")
-                            TarGzExtractor.deleteTreeNoFollow(bridgeDir)
-                            bridgeDir.mkdirs()
-                            bundled.openStream(art.optString("asset"))?.use { ins ->
-                                TarGzExtractor.extractStream(ins, bridgeDir, wantSha, art.optLong("bytes", 0L), freshDir = true)
-                            } ?: error("无法读取 ${art.optString("asset")}")
-                            if (wantSha.isNotEmpty()) {
-                                st.put("gbridgeSha256", wantSha)
-                                st.put("gbridgeSha256_$activeSlot", wantSha)
+                        // 3b. Always apply tiny ~102KB APK-bundled dsh-gbridge overlay on top of target slot
+                        arts.optJSONObject("gbridge")?.let { art ->
+                            val wantSha = art.optString("sha256", "")
+                            val prevSha = st.optString("gbridgeSha256_$activeSlot", st.optString("gbridgeSha256", ""))
+                            val bridgeDir = File(targetSlotDir, "dsh-gbridge")
+                            val needBridge = needEngineCheck ||
+                                !File(bridgeDir, "lib/index.js").exists() ||
+                                (wantSha.isNotEmpty() && wantSha != prevSha)
+                            if (needBridge) {
+                                sendProgress("gbridge", 90, "增量更新零侵入桥 dsh-gbridge…")
+                                TarGzExtractor.deleteTreeNoFollow(bridgeDir)
+                                bridgeDir.mkdirs()
+                                bundled.openStream(art.optString("asset"))?.use { ins ->
+                                    TarGzExtractor.extractStream(ins, bridgeDir, wantSha, art.optLong("bytes", 0L), freshDir = true)
+                                } ?: error("无法读取 ${art.optString("asset")}")
+                                if (wantSha.isNotEmpty()) {
+                                    st.put("gbridgeSha256", wantSha)
+                                    st.put("gbridgeSha256_$activeSlot", wantSha)
+                                }
                             }
                         }
-                    }
 
-                    updateRelativeSymlink(File(slotsRoot, "current"), activeSlot)
-                    updateRelativeSymlink(File(slotsRoot, "lkg"), st.optString("lkgSlot", activeSlot))
+                        updateRelativeSymlink(File(slotsRoot, "current"), activeSlot)
+                        updateRelativeSymlink(File(slotsRoot, "lkg"), st.optString("lkgSlot", activeSlot))
 
-                    writeAndroidCordisPatch(File(targetSlotDir, "dsh-gbridge/cordis.patch.yml"))
+                        writeAndroidCordisPatch(File(targetSlotDir, "dsh-gbridge/cordis.patch.yml"))
 
-                    sendProgress("daemons", 88, "启动 0600 UDS 安全守护进程与本机 DSH 引擎…")
-                    phoneDaemon.start()
-                    droidDaemon.start()
+                        sendProgress("daemons", 91, "启动 0600 UDS 安全守护进程与本机 DSH 引擎…")
+                        phoneDaemon.start()
+                        droidDaemon.start()
 
-                    // Merge only bootstrap-owned keys atomically so concurrent user toggles (executor/proxy/sdcard)
-                    // made during long extraction are never clobbered!
-                    updateMeta { fresh ->
-                        fresh.put("initialized", true)
-                        fresh.put("activeSlot", activeSlot)
-                        fresh.put("lkgSlot", fresh.optString("lkgSlot", st.optString("lkgSlot", activeSlot)))
-                        fresh.put("containerVersion", manifest.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3"))
-                        val shimsSha = st.optString("shimsSha256", "")
-                        if (shimsSha.isNotEmpty()) fresh.put("shimsSha256", shimsSha)
-                        val baseSha = st.optString("baseRootfsSha256", "")
-                        if (baseSha.isNotEmpty()) fresh.put("baseRootfsSha256", baseSha)
-                        val engSha = st.optString("engineInitSha256", "")
-                        if (engSha.isNotEmpty()) fresh.put("engineInitSha256", engSha)
-                        val gbSha = st.optString("gbridgeSha256", "")
-                        if (gbSha.isNotEmpty()) fresh.put("gbridgeSha256", gbSha)
-                        val gbSlotSha = st.optString("gbridgeSha256_$activeSlot", "")
-                        if (gbSlotSha.isNotEmpty()) fresh.put("gbridgeSha256_$activeSlot", gbSlotSha)
-                        val bundledVer = st.optString("bundledDshVersion", "")
-                        if (bundledVer.isNotEmpty()) fresh.put("bundledDshVersion", bundledVer)
-                        val dshVer = st.optString("dshVersion", "")
-                        if (dshVer.isNotEmpty()) {
-                            fresh.put("dshVersion", dshVer)
-                        } else if (fresh.optString("dshVersion", "").isEmpty()) {
-                            fresh.put("dshVersion", manifestDshVer)
+                        updateMeta { fresh ->
+                            fresh.put("initialized", true)
+                            fresh.put("activeSlot", activeSlot)
+                            fresh.put("lkgSlot", fresh.optString("lkgSlot", st.optString("lkgSlot", activeSlot)))
+                            fresh.put("containerVersion", manifest.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3"))
+                            val shimsSha = st.optString("shimsSha256", "")
+                            if (shimsSha.isNotEmpty()) fresh.put("shimsSha256", shimsSha)
+                            val baseSha = st.optString("baseRootfsSha256", "")
+                            if (baseSha.isNotEmpty()) fresh.put("baseRootfsSha256", baseSha)
+                            val engSha = st.optString("engineInitSha256", "")
+                            if (engSha.isNotEmpty()) fresh.put("engineInitSha256", engSha)
+                            val gbSha = st.optString("gbridgeSha256", "")
+                            if (gbSha.isNotEmpty()) fresh.put("gbridgeSha256", gbSha)
+                            val gbSlotSha = st.optString("gbridgeSha256_$activeSlot", "")
+                            if (gbSlotSha.isNotEmpty()) fresh.put("gbridgeSha256_$activeSlot", gbSlotSha)
+                            val bundledVer = st.optString("bundledDshVersion", "")
+                            if (bundledVer.isNotEmpty()) fresh.put("bundledDshVersion", bundledVer)
+                            val dshVer = st.optString("dshVersion", "")
+                            if (dshVer.isNotEmpty()) {
+                                fresh.put("dshVersion", dshVer)
+                            } else if (fresh.optString("dshVersion", "").isEmpty()) {
+                                fresh.put("dshVersion", manifestDshVer)
+                            }
+                            fresh.put("bridgeVersion", manifest.optString("bridgeVersion", "0.2.0"))
+                            if (!fresh.optBoolean("executorModePinned", false)) {
+                                fresh.put("executorMode", detectExecutor())
+                            }
                         }
-                        fresh.put("bridgeVersion", manifest.optString("bridgeVersion", "0.1.0"))
-                        if (!fresh.optBoolean("executorModePinned", false)) {
-                            fresh.put("executorMode", detectExecutor())
+                        lastEngineError = null
+                        true
+                    } catch (c: BootstrapCancelledException) {
+                        bootstrapCancelled = true
+                        if (startedFgForBootstrap) {
+                            GrassBagEngineService.stop(ctx)
                         }
+                        sendProgress("cancelled", 0, c.message ?: "已暂停下载，断点进度已保留")
+                        false
+                    } catch (err: Throwable) {
+                        Log.e(TAG, "bootstrapRuntime failed", err)
+                        bootstrapErr = err.message ?: "bootstrap_failed"
+                        lastEngineError = bootstrapErr
+                        if (startedFgForBootstrap) {
+                            GrassBagEngineService.stop(ctx)
+                        }
+                        sendProgress("error", 0, "本机环境部署失败：${bootstrapErr}")
+                        false
                     }
-                    true
-                } catch (err: Throwable) {
-                    Log.e(TAG, "bootstrapRuntime failed", err)
-                    bootstrapErr = err.message ?: "bootstrap_failed"
-                    lastEngineError = bootstrapErr
-                    if (startedFgForBootstrap) {
+                }
+
+                if (!extractedOk) {
+                    done(
+                        if (bootstrapCancelled) {
+                            mapOf("ok" to false, "cancelled" to true, "status" to getStatus())
+                        } else {
+                            mapOf("ok" to false, "error" to (bootstrapErr ?: "bootstrap_failed"), "status" to getStatus())
+                        }
+                    )
+                    return@execute
+                }
+                cachedInstalledToolkits = null
+
+                // Release bootstrapLock BEFORE starting DSH engine so status/start calls never stall!
+                sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…")
+                val engineRes = try {
+                    startEngineSync()
+                } catch (t: Throwable) {
+                    mapOf("ok" to false, "error" to (t.message ?: t.javaClass.simpleName))
+                }
+                val ok = engineRes["ok"] == true
+                if (ok) {
+                    val bootMs = (engineRes["bootMs"] as? Number)?.toLong() ?: 0L
+                    val execTag = engineRes["executorMode"]?.toString() ?: "tawcroot"
+                    val sec = if (bootMs > 0) String.format("%.1fs", bootMs / 1000.0) else ""
+                    sendProgress("ready", 100, "本机 Ubuntu + Node 24 + DSH 引擎已就绪 ($execTag${if (sec.isNotEmpty()) " · $sec" else ""})")
+                    done(mapOf("ok" to true, "engineStarted" to true, "bootMs" to bootMs, "status" to getStatus()))
+                } else {
+                    val errStr = engineRes["error"]?.toString() ?: "engine_start_failed"
+                    if (startedFgForBootstrap && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
                         GrassBagEngineService.stop(ctx)
                     }
-                    // Always reset progress percentage so UI Start/Retry controls are never locked out!
-                    sendProgress("error", 0, "本机容器初始化失败：${bootstrapErr}")
-                    false
+                    sendProgress("error", 0, "容器已部署，但 DSH 启动失败：$errStr")
+                    done(mapOf("ok" to false, "engineStarted" to false, "error" to errStr, "status" to getStatus()))
                 }
-            }
-
-            if (!extractedOk) {
-                done(mapOf("ok" to false, "error" to (bootstrapErr ?: "bootstrap_failed"), "status" to getStatus()))
-                return@execute
-            }
-            cachedInstalledToolkits = null
-
-            // Release bootstrapLock BEFORE starting DSH engine so status/start calls never stall!
-            sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…")
-            val engineRes = startEngineSync()
-            val ok = engineRes["ok"] == true
-            if (ok) {
-                val bootMs = (engineRes["bootMs"] as? Number)?.toLong() ?: 0L
-                val execTag = engineRes["executorMode"]?.toString() ?: "tawcroot"
-                val sec = if (bootMs > 0) String.format("%.1fs", bootMs / 1000.0) else ""
-                sendProgress("ready", 100, "本机 Ubuntu + Node 24 + DSH 引擎已就绪 ($execTag${if (sec.isNotEmpty()) " · $sec" else ""})")
-                done(mapOf("ok" to true, "engineStarted" to true, "bootMs" to bootMs, "status" to getStatus()))
-            } else {
-                val errStr = engineRes["error"]?.toString() ?: "engine_start_failed"
-                if (startedFgForBootstrap && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
-                    GrassBagEngineService.stop(ctx)
-                }
-                sendProgress("error", 0, "容器已部署，但 DSH 启动失败：$errStr")
-                done(mapOf("ok" to false, "engineStarted" to false, "error" to errStr, "status" to getStatus()))
+            } finally {
+                bootstrapRunning.set(false)
+                bootstrapCancelRequested.set(false)
             }
         }
     }
@@ -1470,19 +2027,54 @@ class RuntimeController private constructor(
     }.getOrNull()
 
     private fun killProcessGroupSafe(pid: Int) {
-        if (!isValidEnginePid(pid)) return
+        if (pid <= 1 || pid == android.os.Process.myPid()) return
+        val stat = readProcStat(pid)
+        val isZombie = stat?.first == "Z" || stat?.first == "X"
+        if (!isZombie && !isValidEnginePid(pid)) return
         val myPgid = readProcStat(android.os.Process.myPid())?.second ?: -1
-        val targetPgid = readProcStat(pid)?.second ?: -1
+        val targetPgid = stat?.second ?: -1
         val canKillGroup = targetPgid > 1 && targetPgid != myPgid
         if (canKillGroup) {
             runCatching { Os.kill(-targetPgid, 15) } // SIGTERM whole container session/process group
         }
-        runCatching { Os.kill(pid, 15) }
+        if (!isZombie) {
+            runCatching { Os.kill(pid, 15) }
+        }
         runCatching { Thread.sleep(150) }
         if (canKillGroup) {
             runCatching { Os.kill(-targetPgid, 9) } // SIGKILL remaining children (bash/MCP/dev servers)
         }
-        runCatching { Os.kill(pid, 9) }
+        if (!isZombie) {
+            runCatching { Os.kill(pid, 9) }
+        }
+    }
+
+    /**
+     * Kills a spawned subprocess AND its entire process group (`-pgid`) so timed-out `npm`/`apt-get`
+     * runs or closed terminal tabs never leave orphan grandchild processes holding ports or pipe FDs.
+     */
+    private fun killSubprocessGroup(proc: Process, graceMs: Long = 200L) {
+        val pid = extractProcessPid(proc)
+        val myPgid = readProcStat(android.os.Process.myPid())?.second ?: -1
+        val targetPgid = if (pid != null && pid > 1) readProcStat(pid)?.second ?: -1 else -1
+        val canKillGroup = targetPgid > 1 && targetPgid != myPgid
+        if (canKillGroup) {
+            runCatching { Os.kill(-targetPgid, 15) }
+        }
+        runCatching { proc.destroy() }
+        if (graceMs > 0L) {
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    proc.waitFor(graceMs, TimeUnit.MILLISECONDS)
+                } else {
+                    Thread.sleep(graceMs)
+                }
+            }
+        }
+        if (canKillGroup) {
+            runCatching { Os.kill(-targetPgid, 9) }
+        }
+        runCatching { proc.destroyForcibly() }
     }
 
     private fun killRecordedEnginePid() {
@@ -1870,6 +2462,11 @@ class RuntimeController private constructor(
                 return mapOf("ok" to false, "error" to errMsg, "status" to getStatus())
             }
 
+            if (stopEpoch.get() != myStartEpoch) {
+                appendLog("[runtime] startup cancelled by stop request before launching FGS")
+                return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+            }
+
             // Keep Android 12-16 cached-app freezer & Doze from stalling cold V8 boot!
             GrassBagEngineService.startOrUpdate(
                 ctx,
@@ -1903,6 +2500,9 @@ class RuntimeController private constructor(
             for ((idx, attempt) in attempts.withIndex()) {
                 if (stopEpoch.get() != myStartEpoch) {
                     appendLog("[runtime] startup cancelled by stop request before attempt #${idx + 1}")
+                    if (!isEngineAlive() && activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
+                        GrassBagEngineService.stop(ctx)
+                    }
                     return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
                 }
                 val (forceProot, disableSeccomp) = attempt
@@ -1920,6 +2520,9 @@ class RuntimeController private constructor(
                 }
                 if (stopEpoch.get() != myStartEpoch) {
                     appendLog("[runtime] startup aborted by stop request")
+                    if (!isEngineAlive() && activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
+                        GrassBagEngineService.stop(ctx)
+                    }
                     return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
                 }
                 lastAttemptErr = res["error"]?.toString()
@@ -1948,11 +2551,24 @@ class RuntimeController private constructor(
                 engineState = "error"
                 lastEngineError = lastAttemptErr ?: "DSH startup failed"
             }
-            if (activeToolkitInstalls.get() <= 0) {
+            if (activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
                 GrassBagEngineService.stop(ctx)
             }
             emit("engine_state", mapOf("state" to "error", "error" to lastEngineError))
             return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
+        } catch (t: Throwable) {
+            val errMsg = t.message ?: t.javaClass.simpleName
+            Log.e(TAG, "startEngineSync crashed: $errMsg", t)
+            appendLog("[runtime] ERROR: startEngineSync exception: $errMsg")
+            synchronized(engineLock) {
+                engineState = "error"
+                lastEngineError = errMsg
+            }
+            if (!isEngineAlive() && activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
+                GrassBagEngineService.stop(ctx)
+            }
+            emit("engine_state", mapOf("state" to "error", "error" to errMsg))
+            return mapOf("ok" to false, "error" to errMsg, "status" to getStatus())
         } finally {
             synchronized(engineLock) {
                 if (engineState == "starting") {
@@ -2277,11 +2893,15 @@ class RuntimeController private constructor(
             dirs.add(prootTmpDir)
             dirs.add(tawcTmpDir)
         }
+        if (!bootstrapRunning.get()) {
+            dirs.add(runtimeDownloadsDir)
+        }
         dirs.forEach { dir ->
             if (dir.exists()) {
                 freedBytes += cleanDirFilesNoFollow(dir, compileCacheDir)
             }
         }
+        runtimeDownloadsDir.mkdirs()
         prootTmpDir.mkdirs()
         tawcTmpDir.mkdirs()
         lastHomeSizeAtMs = 0L
@@ -2291,13 +2911,18 @@ class RuntimeController private constructor(
     fun rebuildContainerPreserveHome(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
             try {
+                if (bootstrapRunning.get()) {
+                    done(mapOf("ok" to false, "error" to "当前已有运行环境下载或部署任务在进行中，请先等待完成或暂停后再重试", "status" to getStatus()))
+                    return@execute
+                }
                 if (activeToolkitInstalls.get() > 0) {
                     done(mapOf("ok" to false, "error" to "当前有工具包正在安装，请等待安装完成后再重建容器", "status" to getStatus()))
                     return@execute
                 }
                 synchronized(bootstrapLock) {
                     shells.keys.toList().forEach { closeLocalShell(it) }
-                    stopEngineSync()
+                    // Keep FGS alive while deleting ubuntuRoot so Android 12-16 won't reject FGS re-start if backgrounded.
+                    stopEngineSync(keepForegroundService = true)
                     sendProgress("rebuild", 15, "保留 /root 数据卷，清理旧容器根文件系统…")
                     TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
                     TarGzExtractor.deleteTreeNoFollow(File(containersRoot, "tawcroot"))
@@ -2308,6 +2933,9 @@ class RuntimeController private constructor(
                 }
                 bootstrapRuntime(done)
             } catch (e: Throwable) {
+                if (!isEngineAlive() && activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
+                    GrassBagEngineService.stop(ctx)
+                }
                 val msg = e.message ?: "rebuild_failed"
                 sendProgress("error", 0, "重建容器失败：$msg")
                 done(mapOf("ok" to false, "error" to msg, "status" to getStatus()))
@@ -2376,6 +3004,23 @@ class RuntimeController private constructor(
                         remote.openStream(art.optString("asset"))?.use { ins ->
                             TarGzExtractor.extractStream(ins, targetDir, art.optString("sha256"), art.optLong("bytes", 0L), freshDir = true)
                         } ?: error("无法下载远程引擎包")
+                        // Ensure dsh-gbridge exists inside standby slot BEFORE isSlotExtracted() runs in startEngineSync()!
+                        val standbyBridge = File(targetDir, "dsh-gbridge")
+                        if (!File(standbyBridge, "lib/index.js").exists()) {
+                            val curBridge = File(curDir, "dsh-gbridge")
+                            if (curBridge.exists()) {
+                                curBridge.copyRecursively(standbyBridge, overwrite = true)
+                            } else {
+                                val bundledBridge = bundled.loadManifest()?.optJSONObject("artifacts")?.optJSONObject("gbridge")
+                                if (bundledBridge != null) {
+                                    standbyBridge.mkdirs()
+                                    bundled.openStream(bundledBridge.optString("asset"))?.use { ins ->
+                                        TarGzExtractor.extractStream(ins, standbyBridge, bundledBridge.optString("sha256"), bundledBridge.optLong("bytes", 0L), freshDir = true)
+                                    }
+                                }
+                            }
+                            writeAndroidCordisPatch(File(standbyBridge, "cordis.patch.yml"))
+                        }
                     } else {
                         // Preserve our zero-patch dsh-gbridge into standby slot, then run REAL npm install!
                         val curBridge = File(curDir, "dsh-gbridge")
@@ -2421,7 +3066,7 @@ class RuntimeController private constructor(
                         }, "gb-upgrade-reader").apply { isDaemon = true; start() }
                         val exitedInTime = proc.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)
                         if (!exitedInTime) {
-                            runCatching { proc.destroyForcibly() }
+                            killSubprocessGroup(proc)
                             runCatching { proc.inputStream.close() }
                             runCatching { reader.join(1000) }
                             error("npm 安装 $pkgSpec 超时（超过 5 分钟），请检查网络连接后重试")
@@ -2508,8 +3153,19 @@ class RuntimeController private constructor(
                     }
                     stagedTargetDir?.let { runCatching { TarGzExtractor.deleteTreeNoFollow(it) } }
                 }
-                if (startedFg && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
-                    GrassBagEngineService.stop(ctx)
+                if (startedFg) {
+                    if (isEngineAlive() && engineState == "running") {
+                        val ver = lastCapabilitiesDshVersion ?: readMeta().optString("dshVersion", "0.2.2-rc.5")
+                        val exec = activeExecutorUsed ?: effectiveExecutorMode()
+                        GrassBagEngineService.startOrUpdate(
+                            ctx,
+                            "GrassBag 本机引擎运行中",
+                            "DSH $ver ($exec) · 后台保活中",
+                            releaseWakeLock = true
+                        )
+                    } else if (activeToolkitInstalls.get() <= 0) {
+                        GrassBagEngineService.stop(ctx)
+                    }
                 }
                 val msg = err.message ?: "upgrade_failed"
                 appendLog("[upgrade] ERROR: $msg")
@@ -2557,6 +3213,11 @@ class RuntimeController private constructor(
                     sendProgress("error", 0, "回滚后引擎启动失败：${res["error"]}")
                 }
                 done(mapOf("ok" to (res["ok"] == true), "error" to res["error"], "status" to getStatus()))
+            } catch (t: Throwable) {
+                val msg = t.message ?: "rollback_failed"
+                appendLog("[rollback] ERROR: $msg")
+                sendProgress("error", 0, "回滚失败：$msg")
+                done(mapOf("ok" to false, "error" to msg, "status" to getStatus()))
             } finally {
                 upgradeInProgress.set(false)
             }
@@ -2678,7 +3339,7 @@ class RuntimeController private constructor(
                     }, "gb-apt-reader").apply { isDaemon = true; start() }
                     val exitedInTime = proc.waitFor(12, java.util.concurrent.TimeUnit.MINUTES)
                     if (!exitedInTime) {
-                        runCatching { proc.destroyForcibly() }
+                        killSubprocessGroup(proc)
                         runCatching { proc.inputStream.close() }
                         runCatching { reader.join(1000) }
                         return Triple(-1, "apt-get 安装超时（超过 12 分钟），请检查网络连接后重试", execTag)
@@ -2732,7 +3393,7 @@ class RuntimeController private constructor(
                 done(mapOf("ok" to false, "error" to (err.message ?: "toolkit_install_failed"), "status" to getStatus()))
             } finally {
                 val remainingInstalls = activeToolkitInstalls.decrementAndGet()
-                if (startedFg && remainingInstalls <= 0) {
+                if (startedFg && remainingInstalls <= 0 && !upgradeInProgress.get()) {
                     if (isEngineAlive() && engineState == "running") {
                         val ver = lastCapabilitiesDshVersion ?: readMeta().optString("dshVersion", "0.2.2-rc.5")
                         val exec = activeExecutorUsed ?: effectiveExecutorMode()
@@ -2742,7 +3403,7 @@ class RuntimeController private constructor(
                             "DSH $ver ($exec) · 后台保活中",
                             releaseWakeLock = true
                         )
-                    } else {
+                    } else if (engineState != "starting") {
                         GrassBagEngineService.stop(ctx)
                     }
                 }
@@ -2911,20 +3572,18 @@ class RuntimeController private constructor(
                                 }
                             }
                             if (chunk.isNotEmpty()) {
-                                enqueueLocalTermData(tabId, chunk)
+                                enqueueLocalTermData(tabId, chunk, expectedSession = session)
                             }
                         }
                         if (pendingOsc.isNotEmpty()) {
-                            enqueueLocalTermData(tabId, pendingOsc.toString())
+                            enqueueLocalTermData(tabId, pendingOsc.toString(), expectedSession = session)
                             pendingOsc.clear()
                         }
                     }
                 }
-                flushLocalTermDataFor(tabId)
+                runCatching { proc.outputStream.close() }
                 val exit = runCatching { proc.waitFor() }.getOrDefault(0)
-                if (shells.remove(tabId, session)) {
-                    emit("local_term_exit", mapOf("tabId" to tabId, "exitCode" to exit))
-                }
+                flushLocalTermDataFor(tabId, expectedSession = session, exitCode = exit)
             }
             mapOf(
                 "ok" to true,
@@ -2974,19 +3633,15 @@ class RuntimeController private constructor(
 
     fun closeLocalShell(tabId: String) {
         shells.remove(tabId)?.let { session ->
-            // Close stdin & send SIGTERM first so pty-bridge.mjs can SIGHUP its bash process group
-            // cleanly instead of leaving orphaned shells behind!
+            synchronized(termPendingLock) {
+                termPendingBuffers.remove(tabId)
+            }
+            // Close stdin & signal the whole subprocess group so pty-bridge / bash / grandchildren
+            // exit cleanly without leaking orphan servers, pipe FDs, or blocked reader threads!
             runCatching { session.proc.outputStream.close() }
-            runCatching { session.proc.destroy() }
             worker.execute {
-                runCatching {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        session.proc.waitFor(280, TimeUnit.MILLISECONDS)
-                    } else {
-                        Thread.sleep(200)
-                    }
-                }
-                runCatching { session.proc.destroyForcibly() }
+                killSubprocessGroup(session.proc, graceMs = 280L)
+                runCatching { session.proc.inputStream.close() }
             }
         }
     }
@@ -3008,7 +3663,12 @@ class RuntimeController private constructor(
         droidDaemon.stop()
     }
 
-    private fun sendProgress(stage: String, percent: Int, message: String) {
+    private fun sendProgress(
+        stage: String,
+        percent: Int,
+        message: String,
+        extra: Map<String, Any?> = emptyMap()
+    ) {
         val now = System.currentTimeMillis()
         val shouldEmit = synchronized(progressLock) {
             val isEdge = percent <= 0 || percent >= 100 || stage != lastProgressStage
@@ -3023,7 +3683,12 @@ class RuntimeController private constructor(
             }
         }
         if (shouldEmit) {
-            emit("runtime_progress", mapOf("stage" to stage, "percent" to percent, "message" to message))
+            val payload = LinkedHashMap<String, Any?>(4 + extra.size)
+            payload["stage"] = stage
+            payload["percent"] = percent
+            payload["message"] = message
+            if (extra.isNotEmpty()) payload.putAll(extra)
+            emit("runtime_progress", payload)
         }
     }
 

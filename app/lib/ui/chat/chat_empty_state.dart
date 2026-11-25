@@ -89,6 +89,7 @@ class ChatEmptyState extends ConsumerWidget {
           nativeStatusHydrated: s.nativeStatusHydrated,
           runtimeProgressPct: s.runtimeProgressPct,
           runtimeProgressMsg: s.runtimeProgressMsg,
+          runtimeProgressCanCancel: s.runtimeProgressCanCancel,
         ),
       ),
     );
@@ -374,9 +375,11 @@ class ChatEmptyState extends ConsumerWidget {
                 rt: rt,
                 progressPct: state.runtimeProgressPct,
                 progressMsg: state.runtimeProgressMsg,
+                canCancel: state.runtimeProgressCanCancel,
                 hasConnectionError: state.connectionPhase == ConnectionPhase.error,
                 tier: state.glassTier,
-                onBootstrap: () => ctrl.bootstrapLocalRuntime(),
+                onBootstrap: () => triggerLocalRuntimeBootstrapWithGuard(context, ref),
+                onCancelBootstrap: () => ctrl.cancelLocalRuntimeBootstrap(),
                 onStartEngine: () => ctrl.restartLocalEngine(),
               ),
             ] else if (showRemoteStatusBanner) ...[
@@ -1008,18 +1011,22 @@ class _LocalRuntimeBanner extends StatelessWidget {
     required this.rt,
     required this.progressPct,
     required this.progressMsg,
+    this.canCancel = false,
     this.hasConnectionError = false,
     required this.tier,
     required this.onBootstrap,
+    this.onCancelBootstrap,
     required this.onStartEngine,
   });
 
   final NativeRuntimeStatus rt;
   final int progressPct;
   final String progressMsg;
+  final bool canCancel;
   final bool hasConnectionError;
   final GrassBagGlassTier tier;
   final VoidCallback onBootstrap;
+  final VoidCallback? onCancelBootstrap;
   final VoidCallback onStartEngine;
 
   @override
@@ -1028,19 +1035,29 @@ class _LocalRuntimeBanner extends StatelessWidget {
     final deploying = progressPct > 0 && progressPct < 100;
     final starting = rt.engineState == 'starting';
     final hasErr = rt.engineState == 'error' || hasConnectionError;
+    final isRemoteThin = !rt.hasBundledRuntimePayloads;
+    final sizeLabel = rt.formattedDownloadSize;
 
     final title = deploying
-        ? '正在部署本机 Ubuntu + DSH 容器 ($progressPct%)'
+        ? (canCancel
+            ? '正在下载本机运行环境 ($progressPct%)'
+            : '正在部署本机 Ubuntu + DSH 容器 ($progressPct%)')
         : (!rt.initialized
-            ? '本机 Linux + DSH 容器尚未部署'
+            ? (isRemoteThin ? '按需下载本机 Ubuntu + DSH 环境' : '本机 Linux + DSH 容器尚未部署')
             : (starting
                 ? '正在启动本机 Ubuntu + DSH 引擎…'
                 : (hasErr ? '本机 DSH 引擎启动异常' : '本机容器已就绪，引擎未启动')));
 
     final subtitle = deploying
-        ? (progressMsg.isNotEmpty ? progressMsg : '正在解压内置运行时与桥接组件…')
+        ? (progressMsg.isNotEmpty
+            ? progressMsg
+            : (isRemoteThin ? '正在拉取运行环境组件并校验完整性…' : '正在解压内置运行时与桥接组件…'))
         : (!rt.initialized
-            ? '内置 Ubuntu 24.04 + Node 24 + DSH，一键解压后即可离线对话与运行命令'
+            ? (isRemoteThin
+                ? (rt.hasPartialDownload
+                    ? '已保留上次下载断点（剩余约 $sizeLabel），点击可断点续传并自动部署'
+                    : '首次使用需按需下载 Ubuntu 24.04 + Node 24 + DSH（约 $sizeLabel），支持镜像加速与断点续传')
+                : '内置 Ubuntu 24.04 + Node 24 + DSH，一键解压后即可离线对话与运行命令')
             : (starting
                 ? '首次启动约需数秒，完成后将自动接入本机工作区'
                 : (hasErr
@@ -1058,7 +1075,9 @@ class _LocalRuntimeBanner extends StatelessWidget {
               GrassBagSquircleIcon(
                 icon: hasErr
                     ? CupertinoIcons.exclamationmark_triangle_fill
-                    : CupertinoIcons.cube_box_fill,
+                    : (isRemoteThin && !rt.initialized
+                        ? CupertinoIcons.cloud_download_fill
+                        : CupertinoIcons.cube_box_fill),
                 color: hasErr ? t.err : t.primary,
                 size: 34,
                 iconSize: 16,
@@ -1089,11 +1108,22 @@ class _LocalRuntimeBanner extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 8),
-              if (starting || deploying)
+              if (deploying && canCancel && onCancelBootstrap != null)
+                GrassBagSecondaryGlassButton(
+                  label: '暂停',
+                  height: 30,
+                  padding: const EdgeInsets.symmetric(horizontal: 11),
+                  tier: tier,
+                  insideGlass: true,
+                  onTap: onCancelBootstrap,
+                )
+              else if (starting || deploying)
                 CupertinoActivityIndicator(radius: 9, color: t.primary)
               else
                 GrassBagPrimaryGlassButton(
-                  label: !rt.initialized ? '一键部署' : (hasErr ? '重试' : '启动'),
+                  label: !rt.initialized
+                      ? (isRemoteThin ? (rt.hasPartialDownload ? '继续下载' : '下载部署') : '一键部署')
+                      : (hasErr ? '重试' : '启动'),
                   height: 32,
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   tier: tier,

@@ -316,6 +316,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
     final host = state.activeHost;
     final topPad = MediaQuery.viewPaddingOf(context).top;
     final botPad = MediaQuery.viewPaddingOf(context).bottom;
+    final tabletImeBot = widget.isTabletPane ? MediaQuery.viewInsetsOf(context).bottom : 0.0;
     final body = ListView(
       controller: _scrollCtrl,
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -324,7 +325,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         16,
         widget.isTabletPane ? 4 : topPad + 68,
         16,
-        36 + botPad,
+        36 + botPad + tabletImeBot,
       ),
       children: [
         RepaintBoundary(

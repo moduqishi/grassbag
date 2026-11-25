@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,6 +11,7 @@ import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import 'package:grassbag/services/app_update_service.dart';
 import 'package:grassbag/services/models_dev_service.dart';
+import 'package:grassbag/services/native_bridge.dart';
 import 'package:grassbag/state/app_state.dart';
 import 'package:grassbag/theme/grassbag_glass.dart';
 import 'package:grassbag/theme/grassbag_theme.dart';
@@ -2033,6 +2035,232 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('切换单行'), findsOneWidget);
         expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v35 regressions: nested LaTeX braces, display math trailing punctuation, streaming stabilizer, language-aware code highlighter, O(1) ModelsDev index, Dark onError WCAG AA, tight composer dock zero overflow',
+      (tester) async {
+        // 1. Balanced-brace LaTeX formatter handles nested superscripts/subscripts inside \frac & \sqrt
+        expect(
+          formatReadableLatexForTest(r'\frac{x^{2}+1}{y_{i}-1}'),
+          '(x²+1) / (yᵢ-1)',
+        );
+        expect(
+          formatReadableLatexForTest(r'\sqrt{a^{2}+b^{2}}'),
+          '√(a²+b²)',
+        );
+        expect(
+          formatReadableLatexForTest(r'\frac{\sqrt{x^{2}+1}}{2}'),
+          '(√(x²+1)) / (2)',
+        );
+
+        // 2. Multi-line display math ending with trailing punctuation `$$。` preserves following prose
+        final blocks = splitMarkdownBlocksSummaryForTest(
+          '\$\$\nx^{2} + y^{2} = z^{2}\n\$\$。\n下一段正文正常显示',
+        );
+        expect(blocks.length, 2);
+        expect(blocks[0], startsWith('math:'));
+        expect(blocks[1], contains('下一段正文正常显示'));
+
+        // 3. Single-pass streaming stabilizer ignores `**` inside inline code spans & closes multi-line bold
+        expect(
+          stabilizeStreamingMarkdownForTest('Use `a**b` in code'),
+          'Use `a**b` in code',
+        );
+        expect(
+          stabilizeStreamingMarkdownForTest('Line 1 **bold\nLine 2 still'),
+          'Line 1 **bold\nLine 2 still**',
+        );
+
+        // 4. Incremental code highlighter does NOT enter block comment on bash globs or quoted strings,
+        //    and does NOT treat CSS `#fff` as a comment!
+        final bashRes = highlightCodeLineForTest('rm -rf build/*\n', 'bash');
+        expect(bashRes.endInBlockComment, isFalse);
+        final dartGlobRes = highlightCodeLineForTest('final glob = "src/**/*.dart";\n', 'dart');
+        expect(dartGlobRes.endInBlockComment, isFalse);
+        final realOpenRes = highlightCodeLineForTest('/* real multi-line comment\n', 'dart');
+        expect(realOpenRes.endInBlockComment, isTrue);
+        final cssRes = highlightCodeLineForTest('color: #fff; background: #000;\n', 'css');
+        expect(cssRes.endInBlockComment, isFalse);
+        final cssSpan = cssRes.span as TextSpan;
+        final hashSpans = (cssSpan.children ?? const <InlineSpan>[])
+            .whereType<TextSpan>()
+            .where((s) => (s.text ?? '').contains('#fff'));
+        expect(
+          hashSpans.any((s) => s.style?.fontStyle == FontStyle.italic),
+          isFalse,
+        );
+
+        // 5. ModelsDevCatalogService O(1) exact index prefers primary provider
+        ModelsDevCatalogService.instance.seedForTest(const [
+          ModelsDevSpec(
+            id: 'deepseek-chat',
+            providerId: 'thirdparty',
+            providerName: 'Third Party',
+            name: 'DeepSeek Chat',
+            contextWindow: 64000,
+          ),
+          ModelsDevSpec(
+            id: 'deepseek-chat',
+            providerId: 'deepseek',
+            providerName: 'DeepSeek',
+            name: 'DeepSeek Chat',
+            contextWindow: 128000,
+          ),
+        ]);
+        final hit = await ModelsDevCatalogService.instance.lookupModel('deepseek-chat');
+        expect(hit?.providerId, 'deepseek');
+        expect(hit?.contextWindow, 128000);
+        ModelsDevCatalogService.instance.clearCache();
+
+        // 6. Dark ColorScheme.onError meets WCAG AA (>= 4.5:1) against ColorScheme.error
+        double contrastRatio(Color fg, Color bg) {
+          final l1 = fg.computeLuminance();
+          final l2 = bg.computeLuminance();
+          final hi = l1 > l2 ? l1 : l2;
+          final lo = l1 > l2 ? l2 : l1;
+          return (hi + 0.05) / (lo + 0.05);
+        }
+        final darkScheme = GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.dark)
+            .toMaterialTheme()
+            .colorScheme;
+        expect(
+          contrastRatio(darkScheme.onError, darkScheme.error),
+          greaterThanOrEqualTo(4.5),
+        );
+
+        // 7. ChatComposerDock under tight 190px maxHeight constraint has ZERO RenderFlex overflow!
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        final ctrl = TextEditingController(text: 'Line 1\nLine 2\nLine 3\nLine 4\nLine 5');
+        final focus = FocusNode();
+        addTearDown(() {
+          ctrl.dispose();
+          focus.dispose();
+        });
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 190, maxWidth: 420),
+                    child: ChatComposerDock(
+                      controller: ctrl,
+                      focusNode: focus,
+                      onOpenTerminal: () {},
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'online runtime delivery: runtime tag filter, NativeRuntimeStatus parsing & thin-APK empty banner',
+      (tester) async {
+        // 1. Runtime asset releases are strictly excluded from App APK update discovery
+        expect(AppReleaseInfo.isRuntimeAssetTag('runtime-arm64-r2'), isTrue);
+        expect(AppReleaseInfo.isRuntimeAssetTag('runtime/arm64-r3'), isTrue);
+        expect(AppReleaseInfo.isRuntimeAssetTag('v0.2.0'), isFalse);
+        expect(
+          AppReleaseInfo.fromGitHubReleaseJson({
+            'tag_name': 'runtime-arm64-r2',
+            'name': 'GrassBag Runtime Assets (runtime-arm64-r2)',
+            'assets': [
+              {
+                'name': 'base-arm64.gbag',
+                'browser_download_url':
+                    'https://github.com/moduqishi/grassbag/releases/download/runtime-arm64-r2/base-arm64.gbag',
+                'size': 75760669,
+              },
+            ],
+          }),
+          isNull,
+        );
+        final appRel = AppReleaseInfo.fromGitHubReleaseJson({
+          'tag_name': 'v0.3.0',
+          'name': 'GrassBag v0.3.0',
+          'assets': [
+            {
+              'name': 'grassbag-v0.3.0-arm64.apk',
+              'browser_download_url':
+                  'https://github.com/moduqishi/grassbag/releases/download/v0.3.0/grassbag-v0.3.0-arm64.apk',
+              'size': 30000000,
+            },
+          ],
+        });
+        expect(appRel, isNotNull);
+        expect(appRel!.versionName, '0.3.0');
+
+        // 2. NativeRuntimeStatus parses remote delivery metadata, metered flag, partial resume & mirror
+        final remoteStatus = NativeRuntimeStatus.fromMap({
+          'initialized': false,
+          'hasBundledAssets': true,
+          'hasBundledRuntimePayloads': false,
+          'runtimeDelivery': 'remote',
+          'runtimeReleaseTag': 'runtime-arm64-r2',
+          'runtimeTotalBytes': 197125416,
+          'runtimeDownloadBytes': 121364747,
+          'hasPartialDownload': true,
+          'isMeteredNetwork': true,
+          'customRuntimeMirrorUrl': 'https://gh-proxy.com',
+          'bootstrapActive': false,
+        });
+        expect(remoteStatus.hasBundledRuntimePayloads, isFalse);
+        expect(remoteStatus.runtimeDelivery, 'remote');
+        expect(remoteStatus.runtimeReleaseTag, 'runtime-arm64-r2');
+        expect(remoteStatus.requiresOnlineDownload, isTrue);
+        expect(remoteStatus.hasPartialDownload, isTrue);
+        expect(remoteStatus.isMeteredNetwork, isTrue);
+        expect(remoteStatus.formattedDownloadSize, '116 MB');
+        expect(remoteStatus.runtimeMirrorDisplayLabel, 'gh-proxy.com');
+
+        final autoMirrorStatus = remoteStatus.copyWith(customRuntimeMirrorUrl: '');
+        expect(autoMirrorStatus.runtimeMirrorDisplayLabel, '自动择优');
+
+        // 3. Thin-APK ChatEmptyState displays online resume CTA cleanly on Android without overflow
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        try {
+          final container = ProviderContainer();
+          addTearDown(container.dispose);
+          final ctrl = container.read(appProvider.notifier);
+          ctrl.state = ctrl.state.copyWith(
+            nativeStatusHydrated: true,
+            nativeRuntimeStatus: remoteStatus,
+          );
+          expect(ctrl.state.hostStatusBadge(ctrl.state.localHost), '待续传');
+          expect(ctrl.state.hostStatusLabel(ctrl.state.localHost), contains('116 MB'));
+
+          await tester.pumpWidget(
+            UncontrolledProviderScope(
+              container: container,
+              child: MaterialApp(
+                theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+                home: Scaffold(
+                  body: SingleChildScrollView(
+                    child: ChatEmptyState(onSuggestionTap: (_) {}),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('按需下载本机 Ubuntu + DSH 环境'), findsOneWidget);
+          expect(find.text('继续下载'), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
       },
     );
   });

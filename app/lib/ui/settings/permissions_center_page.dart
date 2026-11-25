@@ -55,7 +55,7 @@ class PermissionsCenterPage extends ConsumerWidget {
                   useOwnLayer: false,
                   onTap: () async {
                     final ctrl = ref.read(appProvider.notifier);
-                    await ctrl.refreshNativeStatus(skipAutoConnect: true);
+                    await ctrl.refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
                     ctrl.showToast('已刷新系统权限状态', tone: ToastTone.info);
                   },
                 ),

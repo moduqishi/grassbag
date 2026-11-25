@@ -86,9 +86,16 @@ function main() {
     lines.push(`- 对比基线：\`${previousTag}\``);
   }
   if (runtime) {
-    lines.push(
-      `- 内置运行时：\`${runtime.containerVersion || 'Ubuntu 24.04.5'}\` · \`Node ${runtime.nodeVersion || '24.22.3'}\` · \`DSH ${runtime.dshVersion || '0.2.2-rc.5'}\``,
-    );
+    const baseBytes = Number(runtime.artifacts?.baseRootfs?.bytes || 0);
+    const engineBytes = Number(runtime.artifacts?.engineInit?.bytes || 0);
+    const totalMb = Math.round((baseBytes + engineBytes) / (1024 * 1024));
+    const runtimeLabel = `\`${runtime.containerVersion || 'Ubuntu 24.04.5'}\` · \`Node ${runtime.nodeVersion || '24.22.3'}\` · \`DSH ${runtime.dshVersion || '0.2.2-rc.5'}\``;
+    if (runtime.delivery === 'remote') {
+      const tagSuffix = runtime.runtimeTag ? `（资产标签 \`${runtime.runtimeTag}\`，约 ${totalMb || 188} MB，支持镜像加速与断点续传）` : '';
+      lines.push(`- 本机运行时（按需在线下载）：${runtimeLabel}${tagSuffix}`);
+    } else {
+      lines.push(`- 内置运行时：${runtimeLabel}`);
+    }
   }
   if (apkName) {
     lines.push(`- Android 安装包：\`${apkName}\``);

@@ -66,6 +66,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
   Widget build(BuildContext context) {
     ref.listen<String>(appProvider.select((s) => s.activeHostId), (prev, next) {
       if (prev != null && prev != next && mounted) {
+        _filterTimer?.cancel();
         _searchTimer?.cancel();
         _marketSearchCtrl.clear();
         final connected = ref.read(appProvider).connectionPhase == ConnectionPhase.connected;
@@ -105,6 +106,8 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
           },
           glassTier: s.glassTier,
           connectionPhase: s.connectionPhase,
+          activeHostBridged: s.activeHost.bridged,
+          activeHostDirectMode: s.activeHost.directMode,
         ),
       ),
     );

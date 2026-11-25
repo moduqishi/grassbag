@@ -629,6 +629,11 @@ class TurnStreamReducer {
           eventSeq,
         );
         _finalizeOpenReasoningSteps(idx);
+        for (final step in _turns[idx].steps) {
+          if (step is ToolStep) {
+            _toolStartedAtMs.remove(step.callId);
+          }
+        }
         final cur = _turns[idx];
         final rawReason = rawData['reason'] ?? data['reason'] ?? data['status'] ?? 'completed';
         final reason = rawReason is Map<String, dynamic>
@@ -1000,6 +1005,15 @@ class TurnStreamReducer {
     });
   }
 
+  void _pruneFinishedToolStartTimes(List<NormalizedStep> steps) {
+    if (_toolStartedAtMs.isEmpty) return;
+    for (final s in steps) {
+      if (s is ToolStep && s.status != 'running') {
+        _toolStartedAtMs.remove(s.callId);
+      }
+    }
+  }
+
   bool _mergeNormalizedTurn(NormalizedTurn snap, int eventSeq) {
     final effSeq = eventSeq > 0 ? eventSeq : snap.seqEnd;
     final idx = _turns.indexWhere((t) => t.turnId == snap.turnId);
@@ -1008,6 +1022,7 @@ class TurnStreamReducer {
       final promotedNarration = _shouldClearPromotedNarration(cur, snap);
       final mergedSteps = List<NormalizedStep>.of(cur.steps);
       _mergeSteps(mergedSteps, snap.steps);
+      _pruneFinishedToolStartTimes(mergedSteps);
       final nextStatus = (snap.status == 'error' || snap.status == 'cancelled')
           ? snap.status
           : (cur.isStreaming ? 'streaming' : snap.status);
@@ -1033,39 +1048,50 @@ class TurnStreamReducer {
     }
     if (_turns.isNotEmpty && _turns.last.isStreaming) {
       final cur = _turns.last;
-      final promotedNarration = _shouldClearPromotedNarration(cur, snap);
-      final mergedSteps = List<NormalizedStep>.of(cur.steps);
-      _mergeSteps(mergedSteps, snap.steps);
-      final adoptedTurnId =
-          cur.turnId.startsWith('client-turn-') && snap.turnId.isNotEmpty
-              ? snap.turnId
-              : cur.turnId;
-      final nextStatus = (snap.status == 'error' || snap.status == 'cancelled')
-          ? snap.status
-          : 'streaming';
-      final nextAssistantText = promotedNarration
-          ? ''
-          : (snap.assistantText.isNotEmpty && snap.assistantText.length >= cur.assistantText.length
-              ? snap.assistantText
-              : cur.assistantText);
-      _turns[_turns.length - 1] = NormalizedTurn(
-        turnId: adoptedTurnId,
-        stableKey: cur.stableKey,
-        assistantMessageId: snap.assistantMessageId ?? cur.assistantMessageId,
-        seqStart: cur.seqStart > 0 ? cur.seqStart : snap.seqStart,
-        seqEnd: effSeq > cur.seqEnd ? effSeq : cur.seqEnd,
-        status: nextStatus,
-        userMessage: _mergeUserMessages(cur.userMessage, snap.userMessage),
-        steps: List.unmodifiable(mergedSteps),
-        assistantText: nextAssistantText,
-        deliverables: snap.deliverables.isNotEmpty ? snap.deliverables : cur.deliverables,
-        usage: snap.usage ?? cur.usage,
-        errorCode: snap.errorCode ?? cur.errorCode,
-        errorMessage: snap.errorMessage ?? cur.errorMessage,
-      );
-      _invalidateCache();
-      return true;
+      final canFoldIntoLast = cur.turnId.startsWith('client-turn-') || snap.turnId.isEmpty;
+      if (canFoldIntoLast) {
+        final promotedNarration = _shouldClearPromotedNarration(cur, snap);
+        final mergedSteps = List<NormalizedStep>.of(cur.steps);
+        _mergeSteps(mergedSteps, snap.steps);
+        _pruneFinishedToolStartTimes(mergedSteps);
+        final adoptedTurnId =
+            cur.turnId.startsWith('client-turn-') && snap.turnId.isNotEmpty
+                ? snap.turnId
+                : cur.turnId;
+        final nextStatus = (snap.status == 'error' || snap.status == 'cancelled')
+            ? snap.status
+            : 'streaming';
+        final nextAssistantText = promotedNarration
+            ? ''
+            : (snap.assistantText.isNotEmpty && snap.assistantText.length >= cur.assistantText.length
+                ? snap.assistantText
+                : cur.assistantText);
+        _turns[_turns.length - 1] = NormalizedTurn(
+          turnId: adoptedTurnId,
+          stableKey: cur.stableKey,
+          assistantMessageId: snap.assistantMessageId ?? cur.assistantMessageId,
+          seqStart: cur.seqStart > 0 ? cur.seqStart : snap.seqStart,
+          seqEnd: effSeq > cur.seqEnd ? effSeq : cur.seqEnd,
+          status: nextStatus,
+          userMessage: _mergeUserMessages(cur.userMessage, snap.userMessage),
+          steps: List.unmodifiable(mergedSteps),
+          assistantText: nextAssistantText,
+          deliverables: snap.deliverables.isNotEmpty ? snap.deliverables : cur.deliverables,
+          usage: snap.usage ?? cur.usage,
+          errorCode: snap.errorCode ?? cur.errorCode,
+          errorMessage: snap.errorMessage ?? cur.errorMessage,
+        );
+        _invalidateCache();
+        return true;
+      }
+      // A distinct new server turn arrived before the prior streaming turn's turn.completed!
+      // Settle the prior turn instead of overwriting Turn 1's user prompt with Turn 2's prompt.
+      if (snap.userMessage != null) {
+        _finalizeOpenReasoningSteps(_turns.length - 1);
+        _turns[_turns.length - 1] = cur.copyWith(status: 'completed');
+      }
     }
+    _pruneFinishedToolStartTimes(snap.steps);
     _turns.add(snap);
     _invalidateCache();
     return true;
@@ -1073,13 +1099,26 @@ class TurnStreamReducer {
 
   /// Merges local optimistic and server-normalized user messages so server-computed
   /// `maskedRanges` & `references` always enrich optimistic bubbles without dropping
-  /// local text, attachments, or timestamps.
+  /// local text, attachments, or timestamps — while never letting a mid-turn steer
+  /// `user/message` (with a distinct server ID) overwrite the turn's original prompt!
   static NormalizedUserMessage? _mergeUserMessages(
     NormalizedUserMessage? local,
     NormalizedUserMessage? server,
   ) {
     if (local == null) return server;
     if (server == null) return local;
+    final localIsConfirmedServerId = local.id.isNotEmpty &&
+        !local.id.startsWith('u-client') &&
+        !local.id.startsWith('client-') &&
+        !local.id.startsWith('local-') &&
+        !local.id.startsWith('opt-') &&
+        !local.id.startsWith('u-opt-');
+    if (localIsConfirmedServerId &&
+        server.id.isNotEmpty &&
+        server.id != local.id &&
+        local.text.trim() != server.text.trim()) {
+      return local;
+    }
     final mergedMasks = server.maskedRanges.isNotEmpty
         ? server.maskedRanges
         : local.maskedRanges;

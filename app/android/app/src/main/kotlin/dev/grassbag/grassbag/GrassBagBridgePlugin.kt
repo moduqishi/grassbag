@@ -23,6 +23,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.util.Base64
+import android.util.Log
 import android.webkit.CookieManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -90,7 +91,20 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             return
         }
         try {
-            bgPool.execute(block)
+            bgPool.execute {
+                try {
+                    block()
+                } catch (t: Throwable) {
+                    Log.e("GrassBagBridgePlugin", "Unhandled error in bgPool task: ${t.message}", t)
+                    result?.let { r ->
+                        runCatching {
+                            mainHandler.post {
+                                r.error("native_worker_error", t.message ?: t.javaClass.simpleName, null)
+                            }
+                        }
+                    }
+                }
+            }
         } catch (t: Throwable) {
             result?.let { r -> runCatching { mainHandler.post { r.error("executor_rejected", t.message ?: "Executor rejected task", null) } } }
         }
@@ -256,6 +270,17 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             }
             "runtime.bootstrap" -> withRuntime(result) { rt ->
                 rt.bootstrapRuntime { res ->
+                    mainHandler.post { result.success(res) }
+                }
+            }
+            "runtime.cancelBootstrap" -> withRuntime(result) { rt ->
+                val res = rt.cancelBootstrap()
+                mainHandler.post { result.success(res) }
+            }
+            "runtime.setRuntimeMirror" -> {
+                val url = call.argument<String>("url") ?: ""
+                withRuntime(result) { rt ->
+                    val res = rt.setRuntimeMirrorUrl(url)
                     mainHandler.post { result.success(res) }
                 }
             }

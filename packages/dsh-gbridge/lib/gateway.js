@@ -11,11 +11,11 @@ export class GatewayAdapter {
   }
 
   resolvePeer(peer) {
-    if (peer) return peer;
+    if (peer && !peer.signal?.aborted) return peer;
     const gw = this.gateway;
     if (typeof gw?.operatorPeer === 'function') {
       const p = gw.operatorPeer();
-      if (p) return p;
+      if (p && !p.signal?.aborted) return p;
     }
     const connection = this.ctx.get?.('connection');
     if (connection?.browserPeer && !connection.browserPeer.signal?.aborted) {
@@ -26,6 +26,7 @@ export class GatewayAdapter {
     }
     if (typeof connection?.createPeer === 'function') {
       if (!this._ownerPeerScope || this._ownerPeerScope.peer?.signal?.aborted) {
+        try { this._ownerPeerScope?.dispose?.(); } catch {}
         this._ownerPeerScope = connection.createPeer({ principal: { kind: 'owner' } });
       }
       return this._ownerPeerScope.peer ?? this._ownerPeerScope;

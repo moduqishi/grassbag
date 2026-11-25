@@ -191,9 +191,14 @@ class AppReleaseInfo {
       RegExp(r'v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+|[-_.]b)(\d+)', caseSensitive: false);
   static final RegExp _kBodyBuildRegex = RegExp(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*\((\d+)\)');
 
+  static bool isRuntimeAssetTag(String tag) {
+    final lower = tag.trim().toLowerCase();
+    return lower.startsWith('runtime-') || lower.startsWith('runtime/');
+  }
+
   static AppReleaseInfo? fromGitHubReleaseJson(Map<String, dynamic> json) {
     final tag = json['tag_name']?.toString().trim() ?? '';
-    if (tag.isEmpty) return null;
+    if (tag.isEmpty || isRuntimeAssetTag(tag)) return null;
 
     final parsedTag = parseAppVersion(tag);
     final versionName = parsedTag?.versionString ?? tag.replaceFirst(RegExp(r'^v'), '');
@@ -344,6 +349,24 @@ class AppUpdateService {
           final info = AppReleaseInfo.fromGitHubReleaseJson(decoded);
           if (info != null) {
             return AppReleaseCheckResult(release: info);
+          }
+          // If `/releases/latest` ever points to a non-app runtime asset release, fall back
+          // to scanning recent releases so app update checks never break.
+          final listUri = Uri.parse('https://api.github.com/repos/$cleanSlug/releases?per_page=10');
+          final listResp = await _fetcher(listUri, timeout: timeout);
+          if (listResp.statusCode == 200) {
+            final listDecoded = jsonDecode(listResp.body);
+            if (listDecoded is List) {
+              for (final item in listDecoded) {
+                if (item is! Map) continue;
+                final map = Map<String, dynamic>.from(item);
+                if (map['draft'] == true || map['prerelease'] == true) continue;
+                final fallbackInfo = AppReleaseInfo.fromGitHubReleaseJson(map);
+                if (fallbackInfo != null && fallbackInfo.apkDownloadUrl != null) {
+                  return AppReleaseCheckResult(release: fallbackInfo);
+                }
+              }
+            }
           }
         }
         return const AppReleaseCheckResult(error: '解析 GitHub Release 元数据失败');

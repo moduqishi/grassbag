@@ -238,31 +238,36 @@ class DroidBridgeDaemon(
                         if (tts == null) {
                             pendingTtsText = text
                             ttsReady = false
-                            tts = TextToSpeech(context) { status ->
+                            var createdTts: TextToSpeech? = null
+                            createdTts = TextToSpeech(context) { status ->
                                 mainHandler.post {
-                                    if (!running.get()) {
-                                        runCatching { tts?.shutdown() }
-                                        tts = null
-                                        ttsReady = false
-                                        pendingTtsText = null
+                                    val instance = createdTts
+                                    if (instance == null || tts !== instance || !running.get()) {
+                                        runCatching { instance?.shutdown() }
+                                        if (tts === instance) {
+                                            tts = null
+                                            ttsReady = false
+                                            pendingTtsText = null
+                                        }
                                         return@post
                                     }
                                     if (status == TextToSpeech.SUCCESS) {
                                         ttsReady = true
-                                        tts?.language = Locale.getDefault()
+                                        instance.language = Locale.getDefault()
                                         val queued = pendingTtsText
                                         pendingTtsText = null
                                         if (!queued.isNullOrEmpty()) {
-                                            tts?.speak(queued, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
+                                            instance.speak(queued, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
                                         }
                                     } else {
-                                        runCatching { tts?.shutdown() }
+                                        runCatching { instance.shutdown() }
                                         tts = null
                                         ttsReady = false
                                         pendingTtsText = null
                                     }
                                 }
                             }
+                            tts = createdTts
                         } else if (ttsReady) {
                             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
                         } else {

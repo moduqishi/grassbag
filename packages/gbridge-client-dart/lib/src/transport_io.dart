@@ -110,31 +110,58 @@ class GbridgeHttpTransport {
 
     Future<bool> run() async {
       final prevCookie = _cookieHeader;
-      Future<bool> attempt(String path, Map<String, String> query) async {
-        final uri = endpoint.resolveHttpUri(path, query);
-        final req = await _client.getUrl(uri).timeout(timeout);
-        req.followRedirects = false;
-        // Preserve any reverse-proxy / SSO cookies (e.g. Cloudflare Access, Authelia) during DSH token exchange.
-        if (_cookieHeader != null && _cookieHeader!.isNotEmpty) {
-          req.headers.set(HttpHeaders.cookieHeader, _cookieHeader!);
-        }
-        final res = await req.close().timeout(timeout);
-        await res.drain<void>().timeout(timeout);
-        if (res.statusCode < 200 || res.statusCode >= 400) return false;
-        final gotSetCookie = _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
-        return _cookieHeader != null && _cookieHeader!.isNotEmpty && gotSetCookie;
+      final deadline = DateTime.now().add(timeout);
+      var sawAuthRejection = false;
+
+      Duration remaining() {
+        final rem = deadline.difference(DateTime.now());
+        return rem > const Duration(milliseconds: 250) ? rem : const Duration(milliseconds: 250);
       }
 
-      try {
-        if (await attempt('/', {'token': token})) return true;
-        if (_cookieHeader != null && _cookieHeader!.isNotEmpty && _cookieHeader != prevCookie) {
+      Future<bool> attempt(String path, Map<String, String> query) async {
+        final uri = endpoint.resolveHttpUri(path, query);
+        HttpClientRequest? req;
+        try {
+          req = await _openUrlWithTimeout('GET', uri, remaining());
+          req.followRedirects = false;
+          // Preserve any reverse-proxy / SSO cookies (e.g. Cloudflare Access, Authelia) during DSH token exchange.
+          if (_cookieHeader != null && _cookieHeader!.isNotEmpty) {
+            req.headers.set(HttpHeaders.cookieHeader, _cookieHeader!);
+          }
+          final res = await req.close().timeout(remaining());
+          await _drainResponseWithTimeout(res, remaining());
+          if (res.statusCode == 401 || res.statusCode == 403) {
+            sawAuthRejection = true;
+            return false;
+          }
+          if (res.statusCode < 200 || res.statusCode >= 400) return false;
+          final gotSetCookie = _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
+          return _cookieHeader != null && _cookieHeader!.isNotEmpty && gotSetCookie;
+        } catch (_) {
+          try {
+            req?.abort();
+          } catch (_) {}
+          return false;
+        }
+      }
+
+      if (await attempt('/', {'token': token})) {
+        _lastAuthExchangeRejected = false;
+        return true;
+      }
+      if (_cookieHeader != null && _cookieHeader!.isNotEmpty && _cookieHeader != prevCookie) {
+        _lastAuthExchangeRejected = false;
+        return true;
+      }
+      if (DateTime.now().isBefore(deadline)) {
+        if (await attempt('/connect', {'token': token, 'interactions': 'answer'})) {
+          _lastAuthExchangeRejected = false;
           return true;
         }
-      } catch (_) {}
-      try {
-        if (await attempt('/connect', {'token': token, 'interactions': 'answer'})) return true;
-      } catch (_) {}
-      return _cookieHeader != null && _cookieHeader!.isNotEmpty && _cookieHeader != prevCookie;
+      }
+      final changed = _cookieHeader != null && _cookieHeader!.isNotEmpty && _cookieHeader != prevCookie;
+      _lastAuthExchangeRejected = !changed && sawAuthRejection;
+      return changed;
     }
 
     final future = run();
@@ -144,9 +171,125 @@ class GbridgeHttpTransport {
         if (identical(_authExchangeFuture, future)) {
           _authExchangeFuture = null;
         }
-      });
+      }).ignore();
     }
     return future;
+  }
+
+  bool _lastAuthExchangeRejected = false;
+
+  void _evictDshAuthCookies() {
+    final cur = _cookieHeader;
+    if (cur == null || cur.isEmpty) return;
+    final kept = <String>[];
+    for (final part in cur.split(';')) {
+      final trimmed = part.trim();
+      if (trimmed.isEmpty) continue;
+      final eq = trimmed.indexOf('=');
+      final name = (eq > 0 ? trimmed.substring(0, eq) : trimmed).trim().toLowerCase();
+      if (name.startsWith('dsh-auth') || name.startsWith('gbridge-lan-auth')) {
+        continue;
+      }
+      kept.add(trimmed);
+    }
+    final next = kept.join('; ');
+    _cookieHeader = next.isEmpty ? null : next;
+    onCookieUpdated?.call(next);
+  }
+
+  static bool _shouldRetry503(_RawHttpResponse res, String method) {
+    if (res.statusCode != 503) return false;
+    final bodyPreview = res.bytes.isEmpty
+        ? ''
+        : utf8.decode(res.bytes.length > 512 ? res.bytes.sublist(0, 512) : res.bytes, allowMalformed: true);
+    if (bodyPreview.contains('gbridge/reloading')) return true;
+    final m = method.toUpperCase();
+    final isIdempotent = m == 'GET' || m == 'HEAD';
+    if (!isIdempotent) return false;
+    if (bodyPreview.contains('gbridge/web_unavailable') ||
+        bodyPreview.contains('gbridge/auth_unconfigured') ||
+        bodyPreview.contains('gbridge/gateway_unavailable')) {
+      return false;
+    }
+    return res.retryAfter != null;
+  }
+
+  Future<HttpClientRequest> _openUrlWithTimeout(String method, Uri uri, Duration budget) {
+    final completer = Completer<HttpClientRequest>();
+    var timedOut = false;
+    final timer = Timer(budget, () {
+      timedOut = true;
+      if (!completer.isCompleted) {
+        completer.completeError(TimeoutException('HTTP openUrl timed out', budget));
+      }
+    });
+    _client.openUrl(method, uri).then(
+      (req) {
+        timer.cancel();
+        if (timedOut || _closed) {
+          try {
+            req.abort();
+          } catch (_) {}
+          return;
+        }
+        if (!completer.isCompleted) completer.complete(req);
+      },
+      onError: (Object err, StackTrace st) {
+        timer.cancel();
+        if (!completer.isCompleted) completer.completeError(err, st);
+      },
+    );
+    return completer.future;
+  }
+
+  Future<void> _drainResponseWithTimeout(HttpClientResponse res, Duration budget) {
+    final completer = Completer<void>();
+    late StreamSubscription<List<int>> sub;
+    final timer = Timer(budget, () {
+      if (!completer.isCompleted) {
+        completer.completeError(TimeoutException('HTTP drain timed out', budget));
+      }
+      unawaited(sub.cancel().catchError((_) {}));
+    });
+    sub = res.listen(
+      (_) {},
+      onError: (Object err, StackTrace st) {
+        timer.cancel();
+        if (!completer.isCompleted) completer.completeError(err, st);
+      },
+      onDone: () {
+        timer.cancel();
+        if (!completer.isCompleted) completer.complete();
+      },
+      cancelOnError: true,
+    );
+    return completer.future;
+  }
+
+  Future<WebSocket> _connectWsWithTimeout(Uri wsUri, Map<String, String> headers, Duration budget) {
+    final completer = Completer<WebSocket>();
+    var timedOut = false;
+    final timer = Timer(budget, () {
+      timedOut = true;
+      if (!completer.isCompleted) {
+        completer.completeError(TimeoutException('WebSocket connect timed out', budget));
+      }
+    });
+    WebSocket.connect(wsUri.toString(), headers: headers, customClient: _client).then(
+      (ws) {
+        timer.cancel();
+        if (timedOut || _closed) {
+          unawaited(ws.close().catchError((_) {}));
+          return;
+        }
+        if (!completer.isCompleted) completer.complete(ws);
+      },
+      onError: (Object err, StackTrace st) {
+        timer.cancel();
+        if (!completer.isCompleted) completer.completeError(err, st);
+      },
+    );
+    return completer.future;
   }
 
   /// Probe stock DSH's public unauthenticated SSE endpoint (`GET /plugins/events`)
@@ -157,7 +300,7 @@ class GbridgeHttpTransport {
     HttpClientRequest? req;
     try {
       final uri = endpoint.resolveHttpUri('/plugins/events');
-      req = await _client.getUrl(uri).timeout(timeout);
+      req = await _openUrlWithTimeout('GET', uri, timeout);
       req.headers.set(HttpHeaders.acceptHeader, 'text/event-stream');
       final res = await req.close().timeout(timeout);
       if (res.statusCode != 200) {
@@ -334,7 +477,7 @@ class GbridgeHttpTransport {
   }) async {
     final usedCookie = _cookieHeader;
     final res = await _send(method, path, query: query, jsonBody: body);
-    if (res.statusCode == 503 && reloadRetryAttempt < 4) {
+    if (_shouldRetry503(res, method) && reloadRetryAttempt < 4) {
       // Absorb transient post-boot Cordis profile hot-reloads (`503 gbridge/reloading`)
       // without failing initial model/session/workspace hydration!
       final retryAfterSec = int.tryParse(res.retryAfter ?? '');
@@ -368,9 +511,8 @@ class GbridgeHttpTransport {
           reloadRetryAttempt: reloadRetryAttempt,
         );
       }
-      if (_cookieHeader == usedCookie && _cookieHeader != null) {
-        _cookieHeader = null;
-        onCookieUpdated?.call('');
+      if (_lastAuthExchangeRejected && _cookieHeader == usedCookie && _cookieHeader != null) {
+        _evictDshAuthCookies();
       }
     }
     return _decodeJsonResponse(res);
@@ -393,7 +535,7 @@ class GbridgeHttpTransport {
       rawBody: bodyBytes,
       contentType: contentType,
     );
-    if (res.statusCode == 503 && reloadRetryAttempt < 4) {
+    if (_shouldRetry503(res, method) && reloadRetryAttempt < 4) {
       final retryAfterSec = int.tryParse(res.retryAfter ?? '');
       const delaysMs = <int>[220, 420, 700, 1100];
       final waitMs = retryAfterSec != null && retryAfterSec > 0
@@ -425,9 +567,8 @@ class GbridgeHttpTransport {
           reloadRetryAttempt: reloadRetryAttempt,
         );
       }
-      if (_cookieHeader == usedCookie && _cookieHeader != null) {
-        _cookieHeader = null;
-        onCookieUpdated?.call('');
+      if (_lastAuthExchangeRejected && _cookieHeader == usedCookie && _cookieHeader != null) {
+        _evictDshAuthCookies();
       }
     }
     if (res.statusCode >= 400) {
@@ -442,20 +583,12 @@ class GbridgeHttpTransport {
     }
     final wsUri = endpoint.resolveWsUri(path);
     try {
-      return await WebSocket.connect(
-        wsUri.toString(),
-        headers: buildAuthHeaders(),
-        customClient: _client,
-      ).timeout(timeout);
+      return await _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
     } on WebSocketException {
       if (!endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
         final exchanged = await exchangeAuthToken();
         if (exchanged) {
-          return WebSocket.connect(
-            wsUri.toString(),
-            headers: buildAuthHeaders(),
-            customClient: _client,
-          ).timeout(timeout);
+          return _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
         }
       }
       rethrow;
@@ -470,21 +603,45 @@ class GbridgeHttpTransport {
 
   static const int _maxResponseBytes = 64 * 1024 * 1024; // 64 MiB hard cap
 
-  Future<Uint8List> _readResponseBytes(HttpClientResponse res) async {
+  Future<Uint8List> _readResponseBytes(HttpClientResponse res, Duration budget) {
+    final completer = Completer<Uint8List>();
     final builder = BytesBuilder(copy: false);
     var total = 0;
-    await for (final chunk in res) {
-      total += chunk.length;
-      if (total > _maxResponseBytes) {
-        throw const GbridgeException(
-          status: 413,
-          code: 'gbridge/response_too_large',
-          message: 'HTTP response exceeds 64 MiB safety limit',
-        );
+    late StreamSubscription<List<int>> sub;
+    final timer = Timer(budget, () {
+      if (!completer.isCompleted) {
+        completer.completeError(TimeoutException('HTTP response read timed out', budget));
       }
-      builder.add(chunk);
-    }
-    return builder.takeBytes();
+      unawaited(sub.cancel().catchError((_) {}));
+    });
+    sub = res.listen(
+      (chunk) {
+        total += chunk.length;
+        if (total > _maxResponseBytes) {
+          timer.cancel();
+          unawaited(sub.cancel().catchError((_) {}));
+          if (!completer.isCompleted) {
+            completer.completeError(const GbridgeException(
+              status: 413,
+              code: 'gbridge/response_too_large',
+              message: 'HTTP response exceeds 64 MiB safety limit',
+            ));
+          }
+          return;
+        }
+        builder.add(chunk);
+      },
+      onError: (Object err, StackTrace st) {
+        timer.cancel();
+        if (!completer.isCompleted) completer.completeError(err, st);
+      },
+      onDone: () {
+        timer.cancel();
+        if (!completer.isCompleted) completer.complete(builder.takeBytes());
+      },
+      cancelOnError: true,
+    );
+    return completer.future;
   }
 
   Future<_RawHttpResponse> _send(
@@ -504,7 +661,7 @@ class GbridgeHttpTransport {
     }
     final uri = endpoint.resolveHttpUri(path, query);
     final deadline = DateTime.now().add(timeout);
-    final req = await _client.openUrl(method, uri).timeout(timeout);
+    final req = await _openUrlWithTimeout(method, uri, timeout);
     try {
       req.headers.set(HttpHeaders.acceptHeader, 'application/json, application/octet-stream');
       for (final entry in buildAuthHeaders().entries) {
@@ -529,7 +686,8 @@ class GbridgeHttpTransport {
       final res = await req.close().timeout(remClose > Duration.zero ? remClose : const Duration(milliseconds: 500));
       _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
       final remRead = deadline.difference(DateTime.now());
-      final bytes = await _readResponseBytes(res).timeout(
+      final bytes = await _readResponseBytes(
+        res,
         remRead > const Duration(seconds: 2) ? remRead : const Duration(seconds: 2),
       );
       return _RawHttpResponse(
@@ -871,6 +1029,9 @@ class GbridgeStreamClient {
       return info;
     } catch (err) {
       if (epoch == _connEpoch) {
+        // Advance epoch BEFORE closing the socket so async ws.done / onDone callbacks
+        // cannot clobber ConnectionPhase.needsAuth or ConnectionPhase.error!
+        _connEpoch++;
         _pendingWelcome = null;
         _closeCurrentSocket();
         final errText = err.toString().toLowerCase();

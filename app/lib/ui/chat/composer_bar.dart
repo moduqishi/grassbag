@@ -508,28 +508,31 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _wasImeComposing = nowComposing;
     final raw = val.text;
     // Debounce draft persistence sync (400ms) so fast typing never clones host draft maps
-    // or churns persistence timers on every single keystroke.
+    // or churns persistence timers on every single keystroke. Skip while editing an earlier
+    // turn so the user's stashed unsent draft is NEVER overwritten by the edited message!
     _draftSyncTimer?.cancel();
-    final snap = ref.read(appProvider);
-    final draftHostId = snap.activeHostId;
-    final draftSessionId = snap.activeSessionId;
-    final draftRenderGen = snap.sessionRenderGen;
-    _draftScopeHostId = draftHostId;
-    _draftScopeSessionId = draftSessionId;
-    _hasUnsyncedDraftEdit = true;
-    _draftSyncTimer = Timer(const Duration(milliseconds: 400), () {
-      if (!mounted) return;
-      final cur = ref.read(appProvider);
-      if (cur.activeHostId != draftHostId || cur.sessionRenderGen != draftRenderGen) {
-        return;
-      }
-      _hasUnsyncedDraftEdit = false;
-      final ctrl = ref.read(appProvider.notifier);
-      final latest = widget.controller.text;
-      if (ctrl.getComposerDraftForActiveHost() != latest) {
-        ctrl.setComposerDraftForActiveHost(latest);
-      }
-    });
+    if (widget.editingContextNotifier?.value == null) {
+      final snap = ref.read(appProvider);
+      final draftHostId = snap.activeHostId;
+      final draftSessionId = snap.activeSessionId;
+      final draftRenderGen = snap.sessionRenderGen;
+      _draftScopeHostId = draftHostId;
+      _draftScopeSessionId = draftSessionId;
+      _hasUnsyncedDraftEdit = true;
+      _draftSyncTimer = Timer(const Duration(milliseconds: 400), () {
+        if (!mounted || widget.editingContextNotifier?.value != null) return;
+        final cur = ref.read(appProvider);
+        if (cur.activeHostId != draftHostId || cur.sessionRenderGen != draftRenderGen) {
+          return;
+        }
+        _hasUnsyncedDraftEdit = false;
+        final ctrl = ref.read(appProvider.notifier);
+        final latest = widget.controller.text;
+        if (ctrl.getComposerDraftForActiveHost() != latest) {
+          ctrl.setComposerDraftForActiveHost(latest);
+        }
+      });
+    }
     final nextHasText = raw.trim().isNotEmpty;
     if (_dismissedMentionText != null && _dismissedMentionText != raw) {
       _dismissedMentionText = null;
@@ -770,8 +773,17 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         return;
       }
       if (!appSnapshot.nativeRuntimeStatus.initialized) {
-        ctrl.showToast('正在部署本机运行环境，已保留输入内容…', tone: ToastTone.info);
-        unawaited(ctrl.bootstrapLocalRuntime());
+        if (appSnapshot.nativeRuntimeStatus.hasBundledRuntimePayloads) {
+          ctrl.showToast('正在部署本机运行环境，已保留输入内容…', tone: ToastTone.info);
+        }
+        unawaited(
+          triggerLocalRuntimeBootstrapWithGuard(
+            context,
+            ref,
+            requireConfirmForRemote: true,
+            implicitContextHint: '已保留你的输入内容',
+          ),
+        );
         return;
       }
       ctrl.showToast('正在启动本机 DSH 引擎，已保留输入内容…', tone: ToastTone.info);
@@ -1178,9 +1190,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         child: LayoutBuilder(
           builder: (context, dockBox) {
             final maxDockH = dockBox.maxHeight.isFinite ? dockBox.maxHeight : 560.0;
+            final isTightDock = dockBox.maxHeight.isFinite && dockBox.maxHeight < 290.0;
+            final effectiveTextMaxLines =
+                maxDockH < 210.0 ? 2 : (maxDockH < 270.0 ? 3 : 5);
             final takeoverMaxH = math.min(
               560.0,
-              math.max(160.0, maxDockH - (hasStatusPills ? 48.0 : 0.0)),
+              math.max(140.0, maxDockH - (hasStatusPills ? 48.0 : 0.0)),
             );
             return Column(
               mainAxisSize: MainAxisSize.min,
@@ -1188,7 +1203,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               children: [
                 // Standalone floating "Scroll to latest" droplet when no status pill row is present.
                 // Kept OUTSIDE _ComposerHeightReporter so scrolling up never alters ListView tail height.
-                if (!hasStatusPills) scrollDropletWidget(),
+                if (!hasStatusPills && maxDockH >= 210.0) scrollDropletWidget(),
 
                 // Single Flexible slot shared by `/` & `@` suggestions and the `+` Deck (mutually exclusive)
                 // so the active overlay receives 100% of available height above the composer pill without
@@ -1631,7 +1646,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   n.value = h;
                 }
               },
-              child: Column(
+              child: () {
+                final dockBody = Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -2266,7 +2282,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               controller: widget.controller,
                                               focusNode: widget.focusNode,
                                               minLines: 1,
-                                              maxLines: 5,
+                                              maxLines: effectiveTextMaxLines,
                                               keyboardType: TextInputType.multiline,
                                               // Mobile uses TextInputAction.newline (matching ChatGPT/Claude) so users
                                               // can freely compose multi-line prompts without dismissing the soft IME;
@@ -2950,7 +2966,18 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                     ),
                   ),
                 ],
-              ),
+              );
+                if (isTightDock) {
+                  return ConstrainedBox(
+                    constraints: BoxConstraints(maxHeight: math.max(80.0, maxDockH)),
+                    child: SingleChildScrollView(
+                      physics: const ClampingScrollPhysics(),
+                      child: dockBody,
+                    ),
+                  );
+                }
+                return dockBody;
+              }(),
             ),
           ],
         );

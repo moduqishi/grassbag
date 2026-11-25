@@ -54,6 +54,64 @@ class _IndexedModelSpec {
   final int primaryBonus;
 }
 
+class _CatalogIndex {
+  _CatalogIndex(this.specs, this.indexed)
+      : byFullLower = <String, _IndexedModelSpec>{},
+        byIdLower = <String, _IndexedModelSpec>{},
+        byBareId = <String, _IndexedModelSpec>{},
+        byNormBareId = <String, _IndexedModelSpec>{},
+        byNameLower = <String, _IndexedModelSpec>{} {
+    void putBest(Map<String, _IndexedModelSpec> map, String key, _IndexedModelSpec item) {
+      if (key.isEmpty) return;
+      final prev = map[key];
+      if (prev == null || item.primaryBonus > prev.primaryBonus) {
+        map[key] = item;
+      }
+    }
+
+    for (final item in indexed) {
+      putBest(byFullLower, item.fullLower, item);
+      putBest(byIdLower, item.idLower, item);
+      putBest(byBareId, item.bareId, item);
+      putBest(byNormBareId, item.normBareId, item);
+      putBest(byNameLower, item.nameLower, item);
+    }
+  }
+
+  factory _CatalogIndex.fromSpecs(List<ModelsDevSpec> specs) {
+    final indexed = specs.map(_IndexedModelSpec.new).toList(growable: false);
+    return _CatalogIndex(specs, indexed);
+  }
+
+  final List<ModelsDevSpec> specs;
+  final List<_IndexedModelSpec> indexed;
+  final Map<String, _IndexedModelSpec> byFullLower;
+  final Map<String, _IndexedModelSpec> byIdLower;
+  final Map<String, _IndexedModelSpec> byBareId;
+  final Map<String, _IndexedModelSpec> byNormBareId;
+  final Map<String, _IndexedModelSpec> byNameLower;
+
+  /// O(1) exact-tier lookup covering scores >= 94 (strictly higher than any prefix/fuzzy match <= 90).
+  ModelsDevSpec? lookupExact(String qLower, String bareQ, String normBareQ) {
+    final fullHit = byFullLower[qLower];
+    final idHit = byIdLower[qLower];
+    if (fullHit != null || idHit != null) {
+      if (fullHit == null) return idHit!.spec;
+      if (idHit == null) return fullHit.spec;
+      return fullHit.primaryBonus >= idHit.primaryBonus ? fullHit.spec : idHit.spec;
+    }
+    final bareHit = byBareId[bareQ];
+    if (bareHit != null) return bareHit.spec;
+    if (normBareQ.isNotEmpty) {
+      final normHit = byNormBareId[normBareQ];
+      if (normHit != null) return normHit.spec;
+    }
+    final nameHit = byNameLower[qLower];
+    if (nameHit != null) return nameHit.spec;
+    return null;
+  }
+}
+
 /// Fetches, caches, and fuzzy-matches model metadata from `https://models.dev/api.json`
 /// so users typing any model ID (e.g. `deepseek-v4-flash`, `claude-sonnet-4-5`, `gpt-5`,
 /// `gemini-2.5-pro`) automatically get accurate context window, max output tokens,
@@ -78,7 +136,7 @@ class ModelsDevCatalogService {
   };
 
   List<ModelsDevSpec>? _cachedSpecs;
-  List<_IndexedModelSpec>? _indexedSpecs;
+  _CatalogIndex? _catalogIndex;
   DateTime? _fetchedAt;
   DateTime? _lastFailureAt;
   Future<List<ModelsDevSpec>>? _inFlight;
@@ -86,7 +144,7 @@ class ModelsDevCatalogService {
   @visibleForTesting
   void seedForTest(List<ModelsDevSpec> specs) {
     _cachedSpecs = specs;
-    _indexedSpecs = specs.map(_IndexedModelSpec.new).toList(growable: false);
+    _catalogIndex = _CatalogIndex.fromSpecs(specs);
     _fetchedAt = DateTime.now();
     _lastFailureAt = null;
   }
@@ -94,7 +152,7 @@ class ModelsDevCatalogService {
   @visibleForTesting
   void clearCache() {
     _cachedSpecs = null;
-    _indexedSpecs = null;
+    _catalogIndex = null;
     _fetchedAt = null;
     _lastFailureAt = null;
     _inFlight = null;
@@ -118,11 +176,12 @@ class ModelsDevCatalogService {
 
     final fetchFut = _fetchAndParse(fetcher: fetcher);
     final listFut = fetchFut.then((res) {
-      if (res.ok && res.specs.isNotEmpty) {
-        _cachedSpecs = res.specs;
-        _indexedSpecs = res.specs.map(_IndexedModelSpec.new).toList(growable: false);
+      if (res.ok && res.index != null && res.index!.specs.isNotEmpty) {
+        _cachedSpecs = res.index!.specs;
+        _catalogIndex = res.index;
         _fetchedAt = DateTime.now();
         _lastFailureAt = null;
+        return res.index!.specs;
       } else if (fetcher == null) {
         _lastFailureAt = DateTime.now();
       }
@@ -136,7 +195,11 @@ class ModelsDevCatalogService {
     }
   }
 
-  Future<({List<ModelsDevSpec> specs, bool ok})> _fetchAndParse({
+  static _CatalogIndex _parseAndIndexCatalog(String rawJson) {
+    return _CatalogIndex.fromSpecs(parseCatalogJson(rawJson));
+  }
+
+  Future<({List<ModelsDevSpec> specs, _CatalogIndex? index, bool ok})> _fetchAndParse({
     Future<String?> Function(Uri uri)? fetcher,
   }) async {
     try {
@@ -152,17 +215,17 @@ class ModelsDevCatalogService {
         body = resp.statusCode == 200 ? resp.body : null;
       }
       if (body == null || body.isEmpty) {
-        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
+        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], index: _catalogIndex, ok: false);
       }
-      final parsed = body.length > 64 * 1024
-          ? await compute(parseCatalogJson, body)
-          : parseCatalogJson(body);
-      if (parsed.isEmpty) {
-        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
+      final built = body.length > 64 * 1024
+          ? await compute(_parseAndIndexCatalog, body)
+          : _parseAndIndexCatalog(body);
+      if (built.specs.isEmpty) {
+        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], index: _catalogIndex, ok: false);
       }
-      return (specs: parsed, ok: true);
+      return (specs: built.specs, index: built, ok: true);
     } catch (_) {
-      return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
+      return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], index: _catalogIndex, ok: false);
     }
   }
 
@@ -260,7 +323,7 @@ class ModelsDevCatalogService {
     final qLower = q.toLowerCase();
     final bareQ = qLower.contains('/') ? qLower.split('/').last : qLower;
     final normBareQ = _normalize(bareQ);
-    final indexed = identical(specs, _cachedSpecs) ? _indexedSpecs : null;
+    final indexed = identical(specs, _cachedSpecs) ? _catalogIndex?.indexed : null;
     final bestById = <String, (int, ModelsDevSpec)>{};
     if (indexed != null) {
       for (final idx in indexed) {
@@ -291,7 +354,12 @@ class ModelsDevCatalogService {
     if (qLower.length < 2 || specs.isEmpty) return null;
     final bareQ = qLower.contains('/') ? qLower.split('/').last : qLower;
     final normBareQ = _normalize(bareQ);
-    final indexed = identical(specs, instance._cachedSpecs) ? instance._indexedSpecs : null;
+    final index = identical(specs, instance._cachedSpecs) ? instance._catalogIndex : null;
+    if (index != null) {
+      final exact = index.lookupExact(qLower, bareQ, normBareQ);
+      if (exact != null) return exact;
+    }
+    final indexed = index?.indexed;
     ModelsDevSpec? best;
     var bestScore = 0;
     if (indexed != null) {

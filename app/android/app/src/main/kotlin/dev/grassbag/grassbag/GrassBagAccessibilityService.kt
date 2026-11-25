@@ -154,39 +154,67 @@ class GrassBagAccessibilityService : AccessibilityService() {
     fun getCachedNode(nodeId: String): CachedScreenNode? = lastScreenNodes[nodeId]
 
     fun currentForegroundPackage(): String? {
-        val root = waitForActiveRoot(retries = 2)
-        val rootPkg = try {
-            root?.packageName?.toString()?.takeIf { it.isNotBlank() }
-        } finally {
-            recycleCompat(root)
-        }
-        if (rootPkg != null &&
-            rootPkg != "com.android.systemui" &&
-            !rootPkg.contains("inputmethod", ignoreCase = true)
-        ) {
-            return rootPkg
-        }
-        // Ignore transient SystemUI volume/notification popups or IME overlays by inspecting top application window.
-        val topAppPkg = runCatching {
+        // Inspect AccessibilityWindows by type so ALL IMEs (WeType, Baidu, Samsung Honeyboard, Gboard)
+        // and our own Accessibility overlays are excluded cleanly, while active interactive SystemUI
+        // surfaces (Notification Shade, Quick Settings, Lock Screen, SystemUI dialogs) ARE returned
+        // so SafetyGate.systemWriteBlockedPackages cannot be bypassed!
+        val activeFromWindows = runCatching {
             val allWindows = windows ?: return@runCatching null
+            var bestActivePkg: String? = null
+            var bestActiveLayer = Int.MIN_VALUE
+            var bestAppPkg: String? = null
+            var bestAppLayer = Int.MIN_VALUE
             for (win in allWindows) {
-                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val type = win.type
+                if (type == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+                    type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY
+                ) {
+                    continue
+                }
+                val isInteractive = win.isActive || win.isFocused
+                if (type == AccessibilityWindowInfo.TYPE_SYSTEM && !isInteractive) {
+                    // Ignore passive status bar / navigation bar windows.
+                    continue
+                }
                 val r = win.root ?: continue
-                try {
-                    val p = r.packageName?.toString()
-                    if (!p.isNullOrBlank() &&
-                        p != "com.android.systemui" &&
-                        !p.contains("inputmethod", ignoreCase = true)
-                    ) {
-                        return@runCatching p
-                    }
+                val p = try {
+                    r.packageName?.toString()?.takeIf { it.isNotBlank() }
                 } finally {
                     recycleCompat(r)
                 }
+                if (p == null || p.contains("inputmethod", ignoreCase = true)) continue
+                val layer = win.layer
+                if (isInteractive && layer >= bestActiveLayer) {
+                    bestActiveLayer = layer
+                    bestActivePkg = p
+                }
+                if (type == AccessibilityWindowInfo.TYPE_APPLICATION && layer >= bestAppLayer) {
+                    bestAppLayer = layer
+                    bestAppPkg = p
+                }
             }
-            null
+            bestActivePkg ?: bestAppPkg
         }.getOrNull()
-        return topAppPkg ?: lastForegroundPackage ?: rootPkg
+        if (activeFromWindows != null) {
+            return activeFromWindows
+        }
+
+        val root = waitForActiveRoot(retries = 2)
+        val rootPkg = try {
+            val winType = runCatching { root?.window?.type }.getOrNull()
+            if (winType == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+                winType == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY
+            ) {
+                null
+            } else {
+                root?.packageName?.toString()?.takeIf {
+                    it.isNotBlank() && !it.contains("inputmethod", ignoreCase = true)
+                }
+            }
+        } finally {
+            recycleCompat(root)
+        }
+        return rootPkg ?: lastForegroundPackage
     }
 
     fun resolveAppLabel(pkg: String?): String? {

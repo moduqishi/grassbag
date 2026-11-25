@@ -473,9 +473,13 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
     final kbInset = widget.includeKeyboardInset
         ? MediaQuery.viewInsetsOf(context).bottom
         : 0.0;
-    final viewBot = MediaQuery.viewPaddingOf(context).bottom;
+    final viewPad = MediaQuery.viewPaddingOf(context);
+    final viewBot = viewPad.bottom;
     final effectiveKb = kbInset > viewBot ? (kbInset - viewBot) : 0.0;
     final safeBottom = math.max(widget.bottomOffset, viewBot + 12.0);
+    final screenH = MediaQuery.sizeOf(context).height;
+    final maxLift = math.max(0.0, screenH - viewPad.top - 84.0 - safeBottom);
+    final clampedKb = effectiveKb.clamp(0.0, maxLift);
     final motionChild = SlideTransition(
       position: _slide,
       child: GrassBagMaterializeTransition(
@@ -492,7 +496,7 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
       right: 16,
       bottom: safeBottom,
       child: Transform.translate(
-        offset: Offset(0, -effectiveKb),
+        offset: Offset(0, -clampedKb),
         child: IgnorePointer(
           ignoring: !widget.visible,
           child: motionChild,
@@ -5238,6 +5242,240 @@ class _GrassBagImageLightboxState extends State<_GrassBagImageLightbox>
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Starts local Android Ubuntu + Node 24 + DSH bootstrap, prompting for explicit
+/// confirmation first when the thin APK needs an online download over a metered
+/// (cellular / hotspot) network, or always when triggered implicitly (e.g. tapping
+/// Send / a suggestion card before downloading).
+Future<void> triggerLocalRuntimeBootstrapWithGuard(
+  BuildContext context,
+  WidgetRef ref, {
+  bool requireConfirmForRemote = false,
+  String? implicitContextHint,
+}) async {
+  final native = GrassBagNativeBridge.instance;
+  final ctrl = ref.read(appProvider.notifier);
+  if (native.isAndroidNative) {
+    final fresh = await native.getRuntimeStatus();
+    final rt = fresh ?? ref.read(appProvider).nativeRuntimeStatus;
+    final needsRemote = !rt.hasBundledRuntimePayloads && rt.runtimeDownloadBytes > 0;
+    if (needsRemote && (rt.isMeteredNetwork || requireConfirmForRemote)) {
+      if (!context.mounted) return;
+      final sizeLabel = rt.hasPartialDownload
+          ? '剩余 ${rt.formattedDownloadSize}'
+          : '约 ${rt.formattedDownloadSize}';
+      final title = rt.isMeteredNetwork ? '正在使用移动数据网络' : '下载本机运行环境？';
+      final prefix = (implicitContextHint != null && implicitContextHint.isNotEmpty)
+          ? '$implicitContextHint。'
+          : '';
+      final netNotice = rt.isMeteredNetwork
+          ? '当前为移动数据网络，预计消耗 $sizeLabel 流量'
+          : '预计下载 $sizeLabel（支持国内镜像加速与断点续传，部署完成后可离线使用）';
+      final ok = await showGrassBagConfirmDialog(
+        context,
+        title: title,
+        message: '$prefix本机运行需先下载 Ubuntu + Node 24 + DSH 核心，$netNotice，确认开始下载吗？',
+        cancelLabel: '暂不下载',
+        confirmLabel: rt.hasPartialDownload ? '继续下载' : '下载并部署',
+      );
+      if (!ok) return;
+    }
+  }
+  await ctrl.bootstrapLocalRuntime();
+}
+
+/// Shows the Liquid Glass sheet for selecting or customizing the online runtime
+/// download source (mirror failover presets or custom HTTP/HTTPS base URL).
+void showRuntimeMirrorSheet(BuildContext context, WidgetRef ref) {
+  final rt = ref.read(appProvider).nativeRuntimeStatus;
+  final tagText = rt.runtimeReleaseTag.isNotEmpty ? rt.runtimeReleaseTag : 'runtime-arm64-r2';
+  showGrassBagSheet<void>(
+    context,
+    title: '运行环境下载源',
+    subtitle: '当前锁定版本 $tagText · 下载前自动校验 SHA-256 签名',
+    bodyBuilder: (sheetCtx) => _RuntimeMirrorSheetBody(
+      initialMirror: rt.customRuntimeMirrorUrl,
+      onClose: () => Navigator.of(sheetCtx).pop(),
+    ),
+  );
+}
+
+class _RuntimeMirrorSheetBody extends ConsumerStatefulWidget {
+  const _RuntimeMirrorSheetBody({
+    required this.initialMirror,
+    required this.onClose,
+  });
+
+  final String initialMirror;
+  final VoidCallback onClose;
+
+  @override
+  ConsumerState<_RuntimeMirrorSheetBody> createState() => _RuntimeMirrorSheetBodyState();
+}
+
+class _RuntimeMirrorSheetBodyState extends ConsumerState<_RuntimeMirrorSheetBody> {
+  late final TextEditingController _ctrl;
+  bool _saving = false;
+  String? _errorText;
+
+  static const _presets = <({String label, String sub, String url})>[
+    (
+      label: '自动择优（推荐）',
+      sub: '依次尝试 gh-proxy.com → ghfast.top → GitHub 官方源',
+      url: '',
+    ),
+    (
+      label: 'gh-proxy.com 国内加速',
+      sub: '优先通过 gh-proxy.com 代理拉取，失败自动回退',
+      url: 'https://gh-proxy.com',
+    ),
+    (
+      label: 'ghfast.top 国内加速',
+      sub: '优先通过 ghfast.top 代理拉取，失败自动回退',
+      url: 'https://ghfast.top',
+    ),
+    (
+      label: 'GitHub 官方直连',
+      sub: '直接访问 github.com Releases（适合海外或已开代理网络）',
+      url: 'https://github.com/moduqishi/grassbag/releases/download/runtime-arm64-r2',
+    ),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = TextEditingController(text: widget.initialMirror);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _applyMirror(String url) async {
+    if (_saving) return;
+    setState(() {
+      _saving = true;
+      _errorText = null;
+    });
+    final err = await ref.read(appProvider.notifier).setLocalRuntimeMirrorUrl(url);
+    if (!mounted) return;
+    if (err != null && err.isNotEmpty) {
+      setState(() {
+        _saving = false;
+        _errorText = err;
+      });
+      return;
+    }
+    widget.onClose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final tier = ref.watch(appProvider.select((s) => s.glassTier));
+    final currentClean = widget.initialMirror.trim().replaceAll(RegExp(r'/+$'), '');
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        GrassBagSheetSection(
+          dividerIndent: 50,
+          children: [
+            for (final preset in _presets)
+              GrassBagListTile(
+                leading: GrassBagSquircleIcon(
+                  icon: preset.url.isEmpty ? CupertinoIcons.sparkles : CupertinoIcons.cloud_download_fill,
+                  color: preset.url.isEmpty ? t.primary : t.ok,
+                  size: 30,
+                  iconSize: 15,
+                  filled: currentClean == preset.url,
+                ),
+                title: Text(preset.label),
+                subtitle: Text(preset.sub),
+                trailing: currentClean == preset.url
+                    ? Icon(CupertinoIcons.checkmark_circle_fill, size: 18, color: t.primary)
+                    : null,
+                onTap: _saving ? null : () => unawaited(_applyMirror(preset.url)),
+              ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        Text(
+          '自定义镜像前缀或局域网下载地址',
+          style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
+        ),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _ctrl,
+          keyboardType: TextInputType.url,
+          autocorrect: false,
+          contextMenuBuilder: buildGrassBagEditableContextMenu,
+          style: TextStyle(fontSize: 13.5, color: t.text),
+          decoration: InputDecoration(
+            hintText: '如 https://mirror.example.com 或 http://192.168.1.10:8000',
+            hintStyle: TextStyle(fontSize: 12.5, color: t.text3),
+            filled: true,
+            fillColor: t.fill1,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: BorderSide(color: t.sep, width: 0.7),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: BorderSide(color: t.sep, width: 0.7),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: BorderSide(color: t.primary, width: 1.1),
+            ),
+          ),
+        ),
+        if (_errorText != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            _errorText!,
+            style: TextStyle(fontSize: 12, color: t.err),
+          ),
+        ],
+        const SizedBox(height: 6),
+        Text(
+          '留空并保存即恢复自动择优；自定义地址支持直链目录或 GitHub 反代前缀，失败时仍自动回退至内置备用源。',
+          style: TextStyle(fontSize: 11.5, height: 1.4, color: t.text3),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '恢复自动',
+                height: 42,
+                tier: tier,
+                insideGlass: true,
+                enabled: !_saving,
+                onTap: () => unawaited(_applyMirror('')),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: GrassBagPrimaryGlassButton(
+                label: _saving ? '保存中…' : '保存下载源',
+                icon: CupertinoIcons.checkmark_alt,
+                height: 42,
+                tier: tier,
+                insideGlass: true,
+                enabled: !_saving,
+                onTap: () => unawaited(_applyMirror(_ctrl.text)),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

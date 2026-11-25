@@ -213,16 +213,8 @@ jobs:
           cache: true
           pub-cache-key: flutter-pub-:os:-:channel:-${{ env.FLUTTER_VERSION }}-:arch:-${{ hashFiles('app/pubspec.lock') }}
 
-      - name: Cache offline ARM64 runtime staging downloads
-        uses: actions/cache@v4
-        with:
-          path: |
-            runtime/.staging/dl
-            runtime/.staging/dsh-linux-arm64
-          key: grassbag-runtime-v1-ubuntu-${{ env.UBUNTU_RELEASE }}-node-${{ env.NODE_VERSION }}-dsh-${{ env.DSH_VERSION }}
-
-      - name: Build bundled Android ARM64 Linux + Node + DSH runtime assets
-        run: bash runtime/scripts/build-runtime-bundle.sh --fetch
+      - name: Build lean APK runtime overlays & remote manifest (~260KB)
+        run: bash runtime/scripts/build-runtime-bundle.sh --thin --github-repo "${{ github.repository }}"
 
       - name: Apply incremented version to app/pubspec.yaml
         run: |

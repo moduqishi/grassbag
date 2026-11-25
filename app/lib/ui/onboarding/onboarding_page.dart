@@ -144,7 +144,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     HapticFeedback.lightImpact();
     setState(() => _bootstrapping = true);
     try {
-      await ref.read(appProvider.notifier).bootstrapLocalRuntime();
+      await triggerLocalRuntimeBootstrapWithGuard(context, ref);
     } finally {
       if (mounted) setState(() => _bootstrapping = false);
     }
@@ -207,6 +207,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
           nativeRuntimeStatus: s.nativeRuntimeStatus,
           runtimeProgressPct: s.runtimeProgressPct,
           runtimeProgressMsg: s.runtimeProgressMsg,
+          runtimeProgressCanCancel: s.runtimeProgressCanCancel,
           connectionPhase: s.connectionPhase,
           routableCount: s.routableProviders.length,
           selectedModel: s.modelName,
@@ -385,6 +386,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                         rt,
                         slice.runtimeProgressPct,
                         slice.runtimeProgressMsg,
+                        slice.runtimeProgressCanCancel,
                         localReady,
                         remoteConnected,
                         slice.activeHost,
@@ -446,7 +448,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
         icon: CupertinoIcons.cube_box_fill,
         color: t.primary,
         title: '本机独立 Linux 运行环境',
-        desc: '内置 Ubuntu 与 DeepSeek Harness 核心，随时离线写代码、跑工具链。',
+        desc: '按需下载 Ubuntu 与 DeepSeek Harness 核心，部署完成后可离线写代码、跑工具链。',
       ),
       (
         icon: CupertinoIcons.desktopcomputer,
@@ -615,6 +617,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     NativeRuntimeStatus rt,
     int runtimeProgressPct,
     String runtimeProgressMsg,
+    bool runtimeProgressCanCancel,
     bool localReady,
     bool remoteConnected,
     ManagedHost activeHost,
@@ -622,6 +625,8 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     final progress = (runtimeProgressPct / 100.0).clamp(0.0, 1.0);
     final isBootstrappingNow =
         _bootstrapping || (runtimeProgressPct > 0 && runtimeProgressPct < 100);
+    final isRemoteThin = _isAndroidDevice && !rt.hasBundledRuntimePayloads;
+    final downloadSizeLabel = rt.formattedDownloadSize;
     final localHasError = rt.engineState == 'error' && (rt.engineError?.isNotEmpty == true);
     final launcherDisplay =
         rt.executorMode.startsWith('proot') ? '标准兼容内核' : '高速原生内核';
@@ -669,7 +674,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                     child: _ModeChoiceCard(
                       icon: CupertinoIcons.device_phone_portrait,
                       title: '本机独立运行',
-                      subtitle: _isAndroidDevice ? '内置 Ubuntu · 离线可用' : '本地 DSH 服务',
+                      subtitle: _isAndroidDevice
+                          ? (localReady
+                              ? '已就绪 · 离线可用'
+                              : (isRemoteThin ? '按需下载 · 约 $downloadSizeLabel' : '内置 Ubuntu · 离线可用'))
+                          : '本地 DSH 服务',
                       badge: localReady ? '已就绪' : (_isAndroidDevice ? '推荐' : null),
                       badgeOk: localReady,
                       selected: _selectedMode == 0,
@@ -753,7 +762,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                               const SizedBox(height: 12),
                               Text(
                                 _isAndroidDevice
-                                    ? '首次部署会自动释放 ARM64 Linux 根文件系统与官方 DeepSeek Harness，并支持后续一键安装 Python、Git、Ripgrep 等工具链。'
+                                    ? (isRemoteThin
+                                        ? (rt.hasPartialDownload
+                                            ? '检测到上次未完成的下载断点（剩余约 $downloadSizeLabel），点击下方按钮即可断点续传并完成 Ubuntu + DeepSeek Harness 部署。'
+                                            : '安装包已瘦身，首次部署将按需在线下载 ARM64 Ubuntu 与官方 DeepSeek Harness（约 $downloadSizeLabel），内置多国内镜像容灾、断点续传与 SHA-256 校验，部署完成后即可离线使用。')
+                                        : '首次部署会自动释放 ARM64 Linux 根文件系统与官方 DeepSeek Harness，并支持后续一键安装 Python、Git、Ripgrep 等工具链。')
                                     : '当前非 Android 设备，可直接连接本机运行的 `dsh web`，或切换至右侧接入局域网/服务器上的远程主机。',
                                 style: TextStyle(fontSize: 12.5, height: 1.5, color: t.text2),
                               ),
@@ -815,17 +828,76 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                               ],
                               if (_isAndroidDevice && !localReady) ...[
                                 const SizedBox(height: 14),
-                                GrassBagPrimaryGlassButton(
-                                  label: isBootstrappingNow
-                                      ? '正在部署本机环境…'
-                                      : (localHasError ? '重试部署本机环境' : '一键部署本机容器'),
-                                  icon: CupertinoIcons.rocket_fill,
-                                  height: 44,
-                                  tier: tier,
-                                  insideGlass: true,
-                                  enabled: !isBootstrappingNow,
-                                  onTap: isBootstrappingNow ? null : _startLocalBootstrap,
-                                ),
+                                if (isBootstrappingNow && runtimeProgressCanCancel)
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: GrassBagPrimaryGlassButton(
+                                          label: '正在下载环境（$runtimeProgressPct%）…',
+                                          icon: CupertinoIcons.cloud_download_fill,
+                                          height: 44,
+                                          tier: tier,
+                                          insideGlass: true,
+                                          enabled: false,
+                                          onTap: null,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      GrassBagSecondaryGlassButton(
+                                        label: '暂停',
+                                        icon: CupertinoIcons.pause_fill,
+                                        height: 44,
+                                        padding: const EdgeInsets.symmetric(horizontal: 14),
+                                        tier: tier,
+                                        insideGlass: true,
+                                        onTap: () => unawaited(
+                                          ref.read(appProvider.notifier).cancelLocalRuntimeBootstrap(),
+                                        ),
+                                      ),
+                                    ],
+                                  )
+                                else
+                                  GrassBagPrimaryGlassButton(
+                                    label: isBootstrappingNow
+                                        ? '正在部署本机环境…'
+                                        : (localHasError
+                                            ? '重试部署本机环境'
+                                            : (isRemoteThin
+                                                ? (rt.hasPartialDownload
+                                                    ? '继续下载并部署（剩余 $downloadSizeLabel）'
+                                                    : '下载并部署（约 $downloadSizeLabel）')
+                                                : '一键部署本机容器')),
+                                    icon: isRemoteThin
+                                        ? CupertinoIcons.cloud_download_fill
+                                        : CupertinoIcons.rocket_fill,
+                                    height: 44,
+                                    tier: tier,
+                                    insideGlass: true,
+                                    enabled: !isBootstrappingNow,
+                                    onTap: isBootstrappingNow ? null : _startLocalBootstrap,
+                                  ),
+                                if (isRemoteThin && !isBootstrappingNow) ...[
+                                  const SizedBox(height: 8),
+                                  Center(
+                                    child: GrassBagSpringTap(
+                                      onTap: () => showRuntimeMirrorSheet(context, ref),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(CupertinoIcons.globe, size: 12.5, color: t.text3),
+                                            const SizedBox(width: 5),
+                                            Text(
+                                              '下载源：${rt.runtimeMirrorDisplayLabel} · 切换镜像',
+                                              style: TextStyle(fontSize: 11.5, color: t.text3),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ] else if (localStopped) ...[
                                 const SizedBox(height: 14),
                                 GrassBagPrimaryGlassButton(

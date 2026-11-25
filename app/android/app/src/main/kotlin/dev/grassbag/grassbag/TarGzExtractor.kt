@@ -106,22 +106,21 @@ object TarGzExtractor {
                     val rawLink = readTarString(header, 157, 100)
                     val mode = parseOctal(header, 100, 8).toInt()
                     val rawSize = parseOctal(header, 124, 12)
-                    val size = paxSize ?: rawSize
 
                     when (typeFlag) {
                         'L' -> {
-                            pendingLongName = readPayloadString(tar, size)
-                            skipPadding(tar, size)
+                            pendingLongName = readPayloadString(tar, rawSize)
+                            skipPadding(tar, rawSize)
                             continue
                         }
                         'K' -> {
-                            pendingLongLink = readPayloadString(tar, size)
-                            skipPadding(tar, size)
+                            pendingLongLink = readPayloadString(tar, rawSize)
+                            skipPadding(tar, rawSize)
                             continue
                         }
                         'x', 'g' -> {
-                            val pax = parsePaxHeaders(readPayloadBytes(tar, size))
-                            skipPadding(tar, size)
+                            val pax = parsePaxHeaders(readPayloadBytes(tar, rawSize))
+                            skipPadding(tar, rawSize)
                             if (typeFlag == 'x') {
                                 pax["path"]?.let { paxPath = it }
                                 pax["linkpath"]?.let { paxLinkPath = it }
@@ -130,6 +129,8 @@ object TarGzExtractor {
                             continue
                         }
                     }
+
+                    val size = paxSize ?: rawSize
 
                     val effectiveName = sanitizeRelativePath(paxPath ?: pendingLongName ?: baseName)
                     val effectiveLink = paxLinkPath ?: pendingLongLink ?: rawLink
@@ -246,7 +247,9 @@ object TarGzExtractor {
                     }
                     skipPadding(tar, size, ioBuf)
                 }
-                // Drain any trailing gzip trailer bytes so SHA-256 covers the full archive
+                // Drain remaining tar stream through GZIPInputStream first so GZIP trailer CRC32/ISIZE
+                // is verified even when expectedSha256 is blank, then drain any remaining compressed bytes.
+                while (tar.read(ioBuf) > 0) { /* verify gzip trailer */ }
                 while (counting.read(ioBuf) > 0) { /* drain */ }
             }
 
@@ -292,6 +295,9 @@ object TarGzExtractor {
         val st = runCatching { Os.lstat(target.absolutePath) }.getOrNull() ?: return
         val isDir = OsConstants.S_ISDIR(st.st_mode)
         if (isDir) {
+            if ((st.st_mode and 0x1C0) != 0x1C0) {
+                runCatching { Os.chmod(target.absolutePath, (st.st_mode and 0xFFF) or 0x1C0) }
+            }
             val children = target.listFiles()
             if (children != null) {
                 for (child in children) {

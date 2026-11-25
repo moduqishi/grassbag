@@ -62,7 +62,7 @@ class VanillaDshAdapter {
       if (identical(_inFlightReads[key], future)) {
         _inFlightReads.remove(key);
       }
-    });
+    }).ignore();
     return future.then((v) => v as T);
   }
 

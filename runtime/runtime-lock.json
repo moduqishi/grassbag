@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 4,
+  "arch": "arm64",
+  "runtimeTag": "runtime-arm64-r2",
+  "githubRepo": "moduqishi/grassbag",
+  "containerVersion": "Ubuntu 24.04.5 · r2",
+  "nodeVersion": "24.22.3",
+  "dshVersion": "0.2.2-rc.5",
+  "dshSpec": "@deepseek-ai/dsh@0.2.2-rc.5",
+  "mirrorPrefixes": [
+    "https://gh-proxy.com/",
+    "https://ghfast.top/"
+  ],
+  "artifacts": {
+    "baseRootfs": {
+      "filename": "base-arm64.gbag",
+      "sha256": "a5f04016b71e3fc56aba6154a17873d437f726450afde137a113d0574a5e09a5",
+      "bytes": 75760669
+    },
+    "engineInit": {
+      "filename": "engine-init.gbag",
+      "sha256": "6e0e562b22207c5a665216ff99be9b61063dd2e8baf905f7f2b24a1a020f3c7d",
+      "bytes": 121364747
+    }
+  }
+}

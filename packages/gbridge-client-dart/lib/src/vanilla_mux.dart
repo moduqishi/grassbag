@@ -68,6 +68,7 @@ class VanillaDshMuxEngine {
   bool _disposed = false;
   bool _manualDisconnect = false;
   final Map<String, Set<String>> _sessionAlwaysAllowed = <String, Set<String>>{};
+  Timer? _idleWatchdogTimer;
 
   static String _approvalToolKey(Map<String, dynamic> payload) {
     final raw = (payload['tool'] ??
@@ -85,7 +86,12 @@ class VanillaDshMuxEngine {
     final sid = sessionId?.trim() ?? '';
     final key = _approvalToolKey(payload);
     if (sid.isEmpty || key.isEmpty || key.startsWith('phone_')) return;
-    _sessionAlwaysAllowed.putIfAbsent(sid, () => <String>{}).add(key);
+    final existing = _sessionAlwaysAllowed.remove(sid) ?? <String>{};
+    existing.add(key);
+    _sessionAlwaysAllowed[sid] = existing;
+    while (_sessionAlwaysAllowed.length > 256) {
+      _sessionAlwaysAllowed.remove(_sessionAlwaysAllowed.keys.first);
+    }
   }
 
   bool _isSessionAlwaysAllowed(String? sessionId, Map<String, dynamic> payload) {
@@ -204,6 +210,7 @@ class VanillaDshMuxEngine {
       if (epoch != _connEpoch) return info;
       _reconnectAttempt = 0;
       _lastInboundAtMs = DateTime.now().millisecondsSinceEpoch;
+      _startIdleWatchdog(epoch);
 
       // 3) Re-open every subscribed channel not already opened by handshake listeners.
       for (final ch in _channels) {
@@ -214,6 +221,8 @@ class VanillaDshMuxEngine {
       return info;
     } catch (err) {
       if (epoch == _connEpoch) {
+        // Advance epoch BEFORE closing the socket so ws.done microtasks cannot clobber phase!
+        _connEpoch++;
         _pendingWelcome = null;
         _closeCurrentSocket();
         final errText = err.toString().toLowerCase();
@@ -631,6 +640,10 @@ class VanillaDshMuxEngine {
     } else if (type == 'end') {
       _activeChannelStreams.remove(channel);
       _streamIdToChannel.remove(streamId);
+      if (sub.prefix == 'session') {
+        _activeTurns.remove(sub.targetId);
+        normalizer.clearSessionStat(sub.targetId);
+      }
       _publish(channel, '${sub.prefix}.stream_end', {'id': sub.targetId});
     } else if (type == 'error') {
       final err = msg['error'];
@@ -644,6 +657,10 @@ class VanillaDshMuxEngine {
       }
       _activeChannelStreams.remove(channel);
       _streamIdToChannel.remove(streamId);
+      if (sub.prefix == 'session') {
+        _activeTurns.remove(sub.targetId);
+        normalizer.clearSessionStat(sub.targetId);
+      }
       final errMsg = (err is Map ? err['message']?.toString() : err?.toString()) ?? 'stream error';
       _publish(channel, '${sub.prefix}.stream_error', {'id': sub.targetId, 'message': errMsg});
     }
@@ -699,6 +716,15 @@ class VanillaDshMuxEngine {
           });
         }
         return;
+      }
+      if (ev == 'api-session/removed' || ev == 'api-session/archived') {
+        final raw = args.isNotEmpty ? args.first : null;
+        final sid = raw is Map
+            ? (raw['id'] ?? raw['sessionId'])?.toString()
+            : raw?.toString();
+        if (sid != null && sid.isNotEmpty) {
+          _sessionAlwaysAllowed.remove(sid);
+        }
       }
       final mapped = _mapHostEmitEvent(ev, args);
       _publish(mapped.channel, mapped.type, mapped.data);
@@ -1080,8 +1106,25 @@ class VanillaDshMuxEngine {
     } catch (_) {}
   }
 
+  void _startIdleWatchdog(int epoch) {
+    _idleWatchdogTimer?.cancel();
+    _idleWatchdogTimer = Timer.periodic(const Duration(seconds: 28), (_) {
+      if (_disposed || _manualDisconnect || epoch != _connEpoch || _phase != ConnectionPhase.connected) {
+        _idleWatchdogTimer?.cancel();
+        _idleWatchdogTimer = null;
+        return;
+      }
+      final idleMs = DateTime.now().millisecondsSinceEpoch - _lastInboundAtMs;
+      if (idleMs >= 25000) {
+        unawaited(checkLiveness(force: true));
+      }
+    });
+  }
+
   void _closeCurrentSocket() {
     _flushAllCoalescedDeltas();
+    _idleWatchdogTimer?.cancel();
+    _idleWatchdogTimer = null;
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
     _eventsReopenTimer?.cancel();
@@ -1093,6 +1136,10 @@ class VanillaDshMuxEngine {
     if (old != null) {
       unawaited(old.close().catchError((_) {}));
     }
+    for (final sid in _activeTurns.keys.toList(growable: false)) {
+      normalizer.clearSessionStat(sid);
+    }
+    _activeTurns.clear();
     _activeChannelStreams.clear();
     _streamIdToChannel.clear();
     _eventsClientId = null;
@@ -1188,6 +1235,7 @@ class VanillaDshMuxEngine {
     if (_disposed) return;
     _disposed = true;
     await disconnect();
+    _sessionAlwaysAllowed.clear();
     await _framesController.close();
     await _phaseController.close();
     await _welcomeController.close();

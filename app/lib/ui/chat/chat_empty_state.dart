@@ -542,107 +542,99 @@ class ChatEmptyState extends ConsumerWidget {
             () {
               final singleColTiles = [
                 for (var i = 0; i < suggestions.length; i++)
-                  RepaintBoundary(
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _SuggestionTile(
-                        icon: suggestions[i].$1,
-                        title: suggestions[i].$2,
-                        subtitle: suggestions[i].$3,
-                        accent: suggestions[i].$4,
-                        onTap: () => onSuggestionTap(suggestions[i].$5),
-                      ),
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: _SuggestionTile(
+                      icon: suggestions[i].$1,
+                      title: suggestions[i].$2,
+                      subtitle: suggestions[i].$3,
+                      accent: suggestions[i].$4,
+                      onTap: () => onSuggestionTap(suggestions[i].$5),
                     ),
                   ),
               ];
-              final twoColRow1 = RepaintBoundary(
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: _SuggestionTile(
-                        icon: suggestions[0].$1,
-                        title: suggestions[0].$2,
-                        subtitle: suggestions[0].$3,
-                        accent: suggestions[0].$4,
-                        onTap: () => onSuggestionTap(suggestions[0].$5),
-                      ),
+              final twoColRow1 = Row(
+                children: [
+                  Expanded(
+                    child: _SuggestionTile(
+                      icon: suggestions[0].$1,
+                      title: suggestions[0].$2,
+                      subtitle: suggestions[0].$3,
+                      accent: suggestions[0].$4,
+                      onTap: () => onSuggestionTap(suggestions[0].$5),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _SuggestionTile(
-                        icon: suggestions[1].$1,
-                        title: suggestions[1].$2,
-                        subtitle: suggestions[1].$3,
-                        accent: suggestions[1].$4,
-                        onTap: () => onSuggestionTap(suggestions[1].$5),
-                      ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _SuggestionTile(
+                      icon: suggestions[1].$1,
+                      title: suggestions[1].$2,
+                      subtitle: suggestions[1].$3,
+                      accent: suggestions[1].$4,
+                      onTap: () => onSuggestionTap(suggestions[1].$5),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               );
-              final twoColRow2 = RepaintBoundary(
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: _SuggestionTile(
-                        icon: suggestions[2].$1,
-                        title: suggestions[2].$2,
-                        subtitle: suggestions[2].$3,
-                        accent: suggestions[2].$4,
-                        onTap: () => onSuggestionTap(suggestions[2].$5),
-                      ),
+              final twoColRow2 = Row(
+                children: [
+                  Expanded(
+                    child: _SuggestionTile(
+                      icon: suggestions[2].$1,
+                      title: suggestions[2].$2,
+                      subtitle: suggestions[2].$3,
+                      accent: suggestions[2].$4,
+                      onTap: () => onSuggestionTap(suggestions[2].$5),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _SuggestionTile(
-                        icon: suggestions[3].$1,
-                        title: suggestions[3].$2,
-                        subtitle: suggestions[3].$3,
-                        accent: suggestions[3].$4,
-                        onTap: () => onSuggestionTap(suggestions[3].$5),
-                      ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _SuggestionTile(
+                      icon: suggestions[3].$1,
+                      title: suggestions[3].$2,
+                      subtitle: suggestions[3].$3,
+                      accent: suggestions[3].$4,
+                      onTap: () => onSuggestionTap(suggestions[3].$5),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               );
-              final tipRowContent = RepaintBoundary(
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 12),
-                  child: GrassBagSpringTap(
-                    onTap: ctrl.nextEmptyTip,
-                    pressedScale: 0.98,
-                    haptic: true,
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      child: Row(
-                        children: [
-                          Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 220),
-                              switchInCurve: Curves.linear,
-                              switchOutCurve: Curves.linear,
-                              transitionBuilder: (child, anim) => _TipSlideFadeTransition(
-                                animation: anim,
-                                child: child,
-                              ),
-                              child: Align(
-                                key: ValueKey(tip),
-                                alignment: Alignment.centerLeft,
-                                child: Text(
-                                  tip,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(fontSize: 12, height: 1.38, color: t.text3),
-                                ),
+              final tipRowContent = Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: GrassBagSpringTap(
+                  onTap: ctrl.nextEmptyTip,
+                  pressedScale: 0.98,
+                  haptic: true,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: Row(
+                      children: [
+                        Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 220),
+                            switchInCurve: Curves.linear,
+                            switchOutCurve: Curves.linear,
+                            transitionBuilder: (child, anim) => _TipSlideFadeTransition(
+                              animation: anim,
+                              child: child,
+                            ),
+                            child: Align(
+                              key: ValueKey(tip),
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                tip,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 12, height: 1.38, color: t.text3),
                               ),
                             ),
                           ),
-                          const SizedBox(width: 6),
-                          Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
-                        ],
-                      ),
+                        ),
+                        const SizedBox(width: 6),
+                        Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                      ],
                     ),
                   ),
                 ),
@@ -784,8 +776,8 @@ class _StaggeredDeckSlice extends StatelessWidget {
       maintainSize: true,
       maintainAnimation: true,
       maintainState: true,
-      child: FadeTransition(
-        opacity: AlwaysStoppedAnimation<double>(opacity),
+      child: GrassBagControlledOpacity(
+        opacity: opacity,
         child: Transform.translate(
           offset: Offset(0, dy * local),
           child: Transform.scale(
@@ -856,14 +848,20 @@ class _TipSlideFadeTransitionState extends State<_TipSlideFadeTransition> {
 
   @override
   Widget build(BuildContext context) {
-    final isReverse = widget.animation.status == AnimationStatus.reverse;
-    final begin = isReverse ? const Offset(0, -0.32) : const Offset(0, 0.32);
-    return FadeTransition(
-      opacity: _fadeCurve,
-      child: SlideTransition(
-        position: Tween<Offset>(begin: begin, end: Offset.zero).animate(_slideCurve),
-        child: widget.child,
-      ),
+    return AnimatedBuilder(
+      animation: widget.animation,
+      child: widget.child,
+      builder: (context, child) {
+        final isReverse = widget.animation.status == AnimationStatus.reverse;
+        final dy = (isReverse ? -0.32 : 0.32) * (1.0 - _slideCurve.value);
+        return GrassBagControlledOpacity(
+          opacity: _fadeCurve.value.clamp(0.0, 1.0),
+          child: FractionalTranslation(
+            translation: Offset(0, dy),
+            child: child,
+          ),
+        );
+      },
     );
   }
 }

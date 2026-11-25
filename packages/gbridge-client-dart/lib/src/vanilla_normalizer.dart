@@ -6,12 +6,23 @@ import 'dart:convert';
 /// and still render full structured turns, thinking steps, tool cards, secret masking,
 /// live Dock Stack telemetry, and lazy full tool outputs.
 class VanillaDshNormalizer {
-  VanillaDshNormalizer({this.maxCachedToolOutputs = 400});
+  VanillaDshNormalizer({
+    this.maxCachedToolOutputs = 400,
+    this.maxCacheBytes = 12 * 1024 * 1024,
+  });
+
+  static const int _maxSingleToolOutputChars = 512 * 1024;
 
   final int maxCachedToolOutputs;
-  final LinkedHashMap<String, Map<String, dynamic>> _toolOutputs =
-      LinkedHashMap<String, Map<String, dynamic>>();
+  final int maxCacheBytes;
+  final LinkedHashMap<String, ({Map<String, dynamic> record, int bytes})> _toolOutputs =
+      LinkedHashMap<String, ({Map<String, dynamic> record, int bytes})>();
+  int _toolOutputBytes = 0;
   final Map<String, _SessionStreamStat> _turnStats = <String, _SessionStreamStat>{};
+
+  static final RegExp _secretQuickTrigger = RegExp(
+    r'(?:sk-|gh[pousr]_|github_pat_|AKIA|AIza|-----BEGIN )',
+  );
 
   static final List<RegExp> _secretPatterns = <RegExp>[
     RegExp(r'\bsk-ant-[A-Za-z0-9_-]{16,}\b'),
@@ -24,7 +35,9 @@ class VanillaDshNormalizer {
   ];
 
   static List<Map<String, dynamic>> detectSecretRanges(String text) {
-    if (text.length < 16) return const <Map<String, dynamic>>[];
+    if (text.length < 16 || !_secretQuickTrigger.hasMatch(text)) {
+      return const <Map<String, dynamic>>[];
+    }
     final raw = <({int start, int end, int visiblePrefix})>[];
     for (final re in _secretPatterns) {
       for (final m in re.allMatches(text)) {
@@ -268,16 +281,21 @@ class VanillaDshNormalizer {
     Object? name,
     Object? args, [
     Object? output,
+    Map<String, dynamic>? preParsedOut,
+    bool hasPreParsedOut = false,
   ]) {
     final tool = (name?.toString().isNotEmpty == true) ? name.toString() : 'tool';
-    final outStr = output is String
-        ? output
-        : (output != null ? _safeJsonPreview(output, 400) : '');
-    final parsedOut = _tryParseJsonObject(output);
+    final parsedOut = hasPreParsedOut ? preParsedOut : _tryParseJsonObject(output);
+    final hasOutput = output is String ? output.isNotEmpty : output != null;
+    final outStr = parsedOut != null
+        ? ''
+        : output is String
+            ? output
+            : (hasOutput ? _safeJsonPreview(output, 400) : '');
     final target = _extractToolTarget(tool, args, parsedOut);
     final title = target.isNotEmpty ? '$tool · $target' : tool;
     final summary = _summarizeHumanToolOutput(tool, outStr, parsedOut);
-    return (title: title, summary: summary, hasFullOutput: outStr.isNotEmpty);
+    return (title: title, summary: summary, hasFullOutput: hasOutput);
   }
 
   static ({String? code, String message})? extractFailureInfo(
@@ -333,7 +351,11 @@ class VanillaDshNormalizer {
   void cacheToolOutput(String sessionId, String callId, Map<String, dynamic> record) {
     if (sessionId.isEmpty || callId.isEmpty) return;
     final key = '$sessionId:$callId';
-    final prev = _toolOutputs.remove(key);
+    final prevEntry = _toolOutputs.remove(key);
+    if (prevEntry != null) {
+      _toolOutputBytes -= prevEntry.bytes;
+    }
+    final prev = prevEntry?.record;
     final normalized = (prev != null &&
             record['output'] == null &&
             record['status'] == 'running' &&
@@ -343,14 +365,37 @@ class VanillaDshNormalizer {
             if (prev['args'] == null && record['args'] != null) 'args': record['args'],
           }
         : Map<String, dynamic>.from(record);
+    var bytes = 256;
     final out = normalized['output'];
-    if (out is String && out.length > 512 * 1024) {
-      normalized['output'] = '${out.substring(0, 512 * 1024)}\n…[已截断，原始长度 ${out.length} 字符]';
-      normalized['truncated'] = true;
+    if (out is String) {
+      if (out.length > _maxSingleToolOutputChars) {
+        normalized['output'] =
+            '${out.substring(0, _maxSingleToolOutputChars)}\n…[已截断，原始长度 ${out.length} 字符]';
+        normalized['truncated'] = true;
+      }
+      final finalOut = normalized['output'] as String;
+      bytes = finalOut.length * 2 < 128 ? 128 : finalOut.length * 2;
+    } else if (out != null) {
+      var jsonLen = 512;
+      try {
+        final encoded = jsonEncode(out);
+        jsonLen = encoded.length;
+        if (jsonLen > _maxSingleToolOutputChars) {
+          normalized['output'] =
+              '${encoded.substring(0, _maxSingleToolOutputChars)}\n…[已截断，原始长度 $jsonLen 字符]';
+          normalized['truncated'] = true;
+          jsonLen = (normalized['output'] as String).length;
+        }
+      } catch (_) {}
+      bytes = jsonLen * 2 < 256 ? 256 : jsonLen * 2;
     }
-    _toolOutputs[key] = normalized;
-    while (_toolOutputs.length > maxCachedToolOutputs) {
-      _toolOutputs.remove(_toolOutputs.keys.first);
+    _toolOutputs[key] = (record: normalized, bytes: bytes);
+    _toolOutputBytes += bytes;
+    while ((_toolOutputs.length > maxCachedToolOutputs || _toolOutputBytes > maxCacheBytes) &&
+        _toolOutputs.length > 1) {
+      final oldestKey = _toolOutputs.keys.first;
+      final oldest = _toolOutputs.remove(oldestKey);
+      if (oldest != null) _toolOutputBytes -= oldest.bytes;
     }
   }
 
@@ -359,7 +404,7 @@ class VanillaDshNormalizer {
     final hit = _toolOutputs.remove(key);
     if (hit == null) return null;
     _toolOutputs[key] = hit;
-    return hit;
+    return hit.record;
   }
 
   /// Normalize raw DSH session records/events into GrassBag `NormalizedTurn` JSON maps.
@@ -705,7 +750,7 @@ class VanillaDshNormalizer {
             prev?['name']?.toString() ??
             (msg['name'] ?? data['name'] ?? 'tool').toString();
         final effectiveArgs = prev?['args'] ?? data['arguments'] ?? const <String, dynamic>{};
-        final sum = summarizeTool(toolName, effectiveArgs, output);
+        final sum = summarizeTool(toolName, effectiveArgs, output, parsedOut, true);
         final effectiveHasFull =
             sum.hasFullOutput || (isError && output.toString().trim().isNotEmpty);
         if (existing != null) {

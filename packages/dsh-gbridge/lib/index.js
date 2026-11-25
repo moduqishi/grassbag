@@ -963,6 +963,7 @@ export function createPairingController(ctx, core, config = {}) {
     await nextHandle.ready;
   });
 
+  const qrCache = new Map();
   const buildEndpoints = (port, tokenForUrl) => {
     if (!port) return [];
     const rawHostLabel = (hostname() || 'DSH').trim();
@@ -984,10 +985,17 @@ export function createPairingController(ctx, core, config = {}) {
         if (tokenForUrl) compactQs.set('token', tokenForUrl);
         qrUrl = compactQs.toString() ? `${base}/?${compactQs.toString()}` : base;
       }
-      let qr = null;
-      try {
-        qr = buildQrPathData(encodeQrMatrix(qrUrl), 3);
-      } catch {}
+      let qr = qrCache.get(qrUrl) ?? null;
+      if (qr === null) {
+        try {
+          qr = buildQrPathData(encodeQrMatrix(qrUrl), 3);
+          if (qrCache.size >= 16) {
+            const oldestKey = qrCache.keys().next().value;
+            if (oldestKey !== undefined) qrCache.delete(oldestKey);
+          }
+          qrCache.set(qrUrl, qr);
+        } catch {}
+      }
       return {
         iface: item.iface,
         label: item.label,

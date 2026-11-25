@@ -357,39 +357,62 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                   ],
                 )
               else
-                Row(
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    if (canRunDemo) ...[
-                      Expanded(
-                        child: GrassBagPrimaryGlassButton(
-                          label: '实操试一试',
-                          icon: CupertinoIcons.play_fill,
-                          height: 38,
-                          tier: slice.glassTier,
-                          insideGlass: true,
-                          onTap: () {
-                            Navigator.of(context).popUntil((route) => route.isFirst);
-                            unawaited(
-                              ctrl.sendPrompt(
-                                '请用手机操控打开计算器或时钟确认屏幕画面，操作完成后告诉我结果',
-                              ),
-                            );
-                          },
+                    Row(
+                      children: [
+                        Expanded(
+                          child: GrassBagPrimaryGlassButton(
+                            label: '实操试一试',
+                            icon: CupertinoIcons.play_fill,
+                            height: 38,
+                            tier: slice.glassTier,
+                            insideGlass: true,
+                            onTap: () {
+                              if (!canRunDemo) {
+                                final hint = !slice.isLocalHost
+                                    ? '当前正在使用远程主机，切回「本机引擎」后即可一键实操'
+                                    : (!slice.isDshConnected
+                                        ? '本机 DSH 引擎连接中，请稍候引擎就绪后再试'
+                                        : '请先在「模型」设置页配置可用模型后再实操');
+                                ctrl.showToast(hint, tone: ToastTone.info);
+                                return;
+                              }
+                              Navigator.of(context).popUntil((route) => route.isFirst);
+                              unawaited(
+                                ctrl.sendPrompt(
+                                  '请用手机操控打开计算器或时钟确认屏幕画面，操作完成后告诉我结果',
+                                ),
+                              );
+                            },
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 9),
-                    ],
-                    Expanded(
-                      child: GrassBagSecondaryGlassButton(
-                        label: '预览悬浮岛',
-                        icon: CupertinoIcons.sparkles,
-                        height: 38,
-                        tier: slice.glassTier,
-                        insideGlass: true,
-                        accentForeground: true,
-                        onTap: () => unawaited(ctrl.previewPhoneOverlay(mode: 'interactive')),
-                      ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: GrassBagSecondaryGlassButton(
+                            label: '预览悬浮岛',
+                            icon: CupertinoIcons.sparkles,
+                            height: 38,
+                            tier: slice.glassTier,
+                            insideGlass: true,
+                            accentForeground: true,
+                            onTap: () => unawaited(ctrl.previewPhoneOverlay(mode: 'interactive')),
+                          ),
+                        ),
+                      ],
                     ),
+                    if (!canRunDemo) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        !slice.isLocalHost
+                            ? '提示：当前为远程主机，切回「本机引擎」即可直接体验自然语言实操。'
+                            : (!slice.isDshConnected
+                                ? '提示：等待本机 DSH 引擎连接就绪后即可直接发起实操。'
+                                : '提示：配置可用模型后即可发起自然语言手机实操。'),
+                        style: TextStyle(fontSize: 11.5, height: 1.35, color: t.text3),
+                      ),
+                    ],
                   ],
                 ),
             ],
@@ -531,34 +554,78 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                 onSelected: (i) => ctrl.setSafetyPolicy(policies[i]),
               ),
               const SizedBox(height: 8),
-              Text(
-                switch (polIdx) {
-                  0 => '每次点击或打开应用前在屏幕下方弹出液态玻璃确认卡，可单步放行或升级为「本轮允许」。',
-                  1 => '确认一次后本轮对话内流畅连续执行，但银行/支付/密码框与微信敏感操作仍强制拦截确认。',
-                  _ => '日常应用免弹窗流畅执行，硬件级安全隔离（银行/支付/系统设置/密码框）仍永久生效。',
-                },
-                style: TextStyle(fontSize: 11.5, height: 1.4, color: t.text3),
-              ),
+              if (polIdx == 2) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: t.warnSoft,
+                    borderRadius: BorderRadius.circular(11),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.only(top: 1.5),
+                        child: Icon(
+                          CupertinoIcons.exclamationmark_triangle_fill,
+                          size: 13.5,
+                          color: t.warn,
+                        ),
+                      ),
+                      const SizedBox(width: 7),
+                      Expanded(
+                        child: Text(
+                          '高自动化模式：日常应用将免弹窗直接执行；银行、支付、系统设置与密码框仍永久受硬安全隔离保护。',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            height: 1.38,
+                            fontWeight: FontWeight.w500,
+                            color: t.warn,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else
+                Text(
+                  switch (polIdx) {
+                    0 => '每次点击或打开应用前在屏幕下方弹出液态玻璃确认卡，可单步放行或升级为「本轮允许」。',
+                    _ => '确认一次后本轮对话内流畅连续执行，但银行/支付/密码框与微信敏感操作仍强制拦截确认。',
+                  },
+                  style: TextStyle(fontSize: 11.5, height: 1.4, color: t.text3),
+                ),
               const SizedBox(height: 10),
               GrassBagListTile(
                 contentPadding: EdgeInsets.zero,
-                title: const Text('跨应用悬浮确认卡保护'),
-                subtitle: const Text('工作区模式下在任意 App 上方弹出防劫持确认卡'),
+                title: const Text('跨应用高风险确认卡'),
+                subtitle: const Text('触发发送、删除、支付、卸载等高风险操作前弹出防劫持悬浮确认卡'),
                 trailing: GrassBagGlassSwitch(
                   value: slice.phoneConfirmHighRisk,
                   tier: slice.glassTier,
                   onChanged: (v) => ctrl.setPhoneSetting(confirmHighRisk: v),
                 ),
               ),
-              if (!slice.emergencyStopped) ...[
+              if (!slice.emergencyStopped && !slice.phoneLiveActive) ...[
                 const SizedBox(height: 8),
                 GrassBagSecondaryGlassButton(
-                  label: '紧急急停 · 立即中止',
+                  label: '紧急急停锁定',
                   icon: CupertinoIcons.stop_circle_fill,
                   tier: slice.glassTier,
                   insideGlass: true,
                   destructive: true,
-                  onTap: ctrl.triggerEmergencyStop,
+                  onTap: () async {
+                    final ok = await showGrassBagConfirmDialog(
+                      context,
+                      title: '锁定手机操控（紧急急停）？',
+                      message: '锁定后所有跨应用自动点击、滑动与输入操作都会被底层拦截，直到你手动解除锁定。不会中断当前普通对话生成。',
+                      confirmLabel: '确认锁定',
+                      isDestructive: true,
+                    );
+                    if (ok) {
+                      unawaited(ctrl.triggerEmergencyStop());
+                    }
+                  },
                 ),
               ],
             ],
@@ -667,13 +734,26 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
           ],
         ),
 
-        // 5. Readable Audit Timeline
-        if (slice.safetyAudit.isNotEmpty) ...[
-          const SizedBox(height: 14),
-          GrassBagGroupedSection(
-            header: '最近安全审计记录 (${slice.safetyAudit.length})',
-            dividerIndent: 52,
-            children: [
+        // 5. Readable Audit Timeline (always visible with clear empty state when no logs yet)
+        const SizedBox(height: 14),
+        GrassBagGroupedSection(
+          header: slice.safetyAudit.isEmpty
+              ? '最近安全审计记录'
+              : '最近安全审计记录 (${slice.safetyAudit.length})',
+          dividerIndent: 52,
+          children: [
+            if (slice.safetyAudit.isEmpty)
+              GrassBagListTile(
+                leading: GrassBagSquircleIcon(
+                  icon: CupertinoIcons.doc_text_search,
+                  color: t.text3,
+                  size: 30,
+                  iconSize: 14,
+                ),
+                title: const Text('暂无安全审计记录'),
+                subtitle: const Text('助手执行屏幕读取、点击或触发安全拦截后会在此自动留痕'),
+              )
+            else ...[
               for (final entry in visibleAudit) _AuditRowTile(entry: entry),
               if (slice.safetyAudit.length > 5)
                 GrassBagListTile(
@@ -688,8 +768,8 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                   onTap: () => setState(() => _showAllAudit = !_showAllAudit),
                 ),
             ],
-          ),
-        ],
+          ],
+        ),
       ],
     );
   }

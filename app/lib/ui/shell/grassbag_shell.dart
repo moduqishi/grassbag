@@ -83,9 +83,11 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   bool _isProgrammaticScroll = false;
   int _programmaticScrollGen = 0;
   double _lastMaxScrollExtent = 0.0;
+  double _lastListTopPad = 0.0;
   double _upwardScrollAccum = 0.0;
-  final Map<String, ({double pixels, bool scrolledAway})> _savedScrollOffsetBySession =
-      <String, ({double pixels, bool scrolledAway})>{};
+  final Map<String, ({double pixels, bool scrolledAway, int prependedCount})>
+      _savedScrollOffsetBySession =
+      <String, ({double pixels, bool scrolledAway, int prependedCount})>{};
   final Set<String> _animatedTurnIds = <String>{};
 
   @override
@@ -365,7 +367,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         });
       }
 
-      reanchor(3);
+      reanchor(6);
     }
   }
 
@@ -373,6 +375,10 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final startState = ref.read(appProvider);
     final targetSid = startState.activeSessionId;
     final prevLen = startState.turns.length;
+    final prevPrepended = _prependedOlderCountNotifier.value;
+    final prevPixels = (_scrollCtrl.hasClients && _scrollCtrl.positions.length == 1)
+        ? _scrollCtrl.position.pixels
+        : null;
     // Pause streaming auto-follow so loading older history NEVER yanks the user back to bottom!
     _userScrolledAway = true;
     _scrollCtrl.allowImeAnchor = false;
@@ -383,9 +389,27 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     if (afterState.activeSessionId != targetSid) return;
     final added = afterState.turns.length - prevLen;
     if (added > 0) {
-      // Shift newly prepended older turns into the upward-growing sliver above `_centerKey`
-      // so the current reading position stays mathematically anchored with ZERO jump!
-      _prependedOlderCountNotifier.value = _prependedOlderCountNotifier.value + added;
+      // Shift newly prepended older turns into the upward-growing sliver above `_centerSliverKey`.
+      // On the very first `0 -> N` transition, `listTopPad` moves from `_centerSliverKey` to the
+      // negative sliver; compensate scroll offset by exact `-_lastListTopPad` so the visible
+      // reading anchor stays invariant to the sub-pixel (zero ~130px jump!).
+      final topPadShift = prevPrepended == 0 ? _lastListTopPad : 0.0;
+      _prependedOlderCountNotifier.value = prevPrepended + added;
+      if (topPadShift > 0.0 && prevPixels != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_scrollCtrl.hasClients || _scrollCtrl.positions.length != 1) return;
+          final pos = _scrollCtrl.position;
+          final target = (prevPixels - topPadShift).clamp(pos.minScrollExtent, pos.maxScrollExtent);
+          if ((pos.pixels - target).abs() > 0.5) {
+            _isProgrammaticScroll = true;
+            try {
+              _scrollCtrl.jumpTo(target);
+            } finally {
+              _isProgrammaticScroll = false;
+            }
+          }
+        });
+      }
     }
   }
 
@@ -921,7 +945,11 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                   !_savedScrollOffsetBySession.containsKey(key)) {
                 _savedScrollOffsetBySession.remove(_savedScrollOffsetBySession.keys.first);
               }
-              _savedScrollOffsetBySession[key] = (pixels: pos.pixels, scrolledAway: true);
+              _savedScrollOffsetBySession[key] = (
+                pixels: pos.pixels,
+                scrolledAway: true,
+                prependedCount: _prependedOlderCountNotifier.value,
+              );
             } else {
               _savedScrollOffsetBySession.remove(key);
             }
@@ -986,9 +1014,12 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         final saved = s.activeSessionId == null
             ? null
             : _savedScrollOffsetBySession['${s.activeHostId}::${s.activeSessionId}'];
-        if (saved != null && saved.scrolledAway && saved.pixels > 0.0) {
+        if (saved != null && saved.scrolledAway) {
           _userScrolledAway = true;
           _scrollCtrl.allowImeAnchor = false;
+          if (saved.prependedCount > 0) {
+            _prependedOlderCountNotifier.value = saved.prependedCount.clamp(0, s.turns.length);
+          }
           _scheduleRestoreScrollOffset(saved.pixels);
         } else {
           _scheduleScrollToBottom(animated: false, settle: false);
@@ -1199,6 +1230,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         (hasExtraTopBanner ? 70.0 : 0.0) +
         (showAppUpdatePill ? 40.0 : 0.0) +
         (shellSlice.phoneLiveActive ? 56.0 : 0.0);
+    _lastListTopPad = listTopPad;
 
     final chatStage = Stack(
       children: [
@@ -2966,10 +2998,11 @@ class _ChatCanvasArea extends ConsumerWidget {
     final showActiveList = !showLoading && !showError && !showEmpty;
 
     Widget buildLoadOlderHeader() {
-      return Center(
+      return SizedBox(
         key: const ValueKey('load-older-header'),
-        child: Padding(
-          padding: const EdgeInsets.only(bottom: 16),
+        height: 44,
+        child: Align(
+          alignment: Alignment.topCenter,
           child: GrassBagSpringTap(
             onTap: () {
               if (!slice.loadingOlderTurns) {
@@ -2989,7 +3022,7 @@ class _ChatCanvasArea extends ConsumerWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   if (slice.loadingOlderTurns) ...[
-                    CupertinoActivityIndicator(radius: 6.5, color: t.primary),
+                    GrassBagActivityIndicator(radius: 6.5, color: t.primary),
                     const SizedBox(width: 7),
                     Text(
                       '正在加载更早消息…',
@@ -3124,23 +3157,26 @@ class _ChatCanvasArea extends ConsumerWidget {
                               if (prepended == 0) {
                                 return buildLoadOlderHeader();
                               }
-                              return Center(
+                              return SizedBox(
                                 key: const ValueKey('older-history-divider'),
-                                child: Padding(
-                                  padding: const EdgeInsets.only(bottom: 14),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
-                                      Padding(
-                                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                                        child: Text(
-                                          '以上为更早消息',
-                                          style: TextStyle(fontSize: 11, color: t.text3),
+                                height: 44,
+                                child: Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(bottom: 10),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                        Padding(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                                          child: Text(
+                                            '以上为更早消息',
+                                            style: TextStyle(fontSize: 11, color: t.text3),
+                                          ),
                                         ),
-                                      ),
-                                      SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
-                                    ],
+                                        SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               );

@@ -141,6 +141,8 @@ class _GrassBagToastOverlayState extends ConsumerState<GrassBagToastOverlay> {
   GrassBagToastMessage? _retainedToast;
   final Object _offsetToken = Object();
   _GlobalToastScope? _registeredScope;
+  double? _lastRegisteredBottomOffset;
+  bool? _lastRegisteredCurrent;
 
   @override
   void dispose() {
@@ -240,11 +242,19 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
       _registeredScope = globalScope;
       final isCurrentRoute = ModalRoute.of(context)?.isCurrent ?? true;
       if (isCurrentRoute) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
-            globalScope.registerOffset(_offsetToken, widget.bottomOffset);
-          }
-        });
+        if (_lastRegisteredCurrent != true ||
+            _lastRegisteredBottomOffset != widget.bottomOffset) {
+          _lastRegisteredCurrent = true;
+          _lastRegisteredBottomOffset = widget.bottomOffset;
+          final offset = widget.bottomOffset;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
+              globalScope.registerOffset(_offsetToken, offset);
+            }
+          });
+        }
+      } else {
+        _lastRegisteredCurrent = false;
       }
       // Must return Positioned (never a non-positioned SizedBox.shrink()) so pages whose
       // Stack contains only Positioned children + GrassBagToastOverlay don't collapse to 0x0!
@@ -577,7 +587,7 @@ Future<bool> showGrassBagConfirmDialog(
                               tier: tier,
                               insideGlass: true,
                               color: isDestructive
-                                  ? (t.isDark ? const Color(0xFFD94444) : t.err)
+                                  ? (t.isDark ? const Color(0xFFD94444) : const Color(0xFFC83232))
                                   : t.primary,
                               foregroundColor: isDestructive ? Colors.white : t.onPrimary,
                               onTap: () => Navigator.of(dialogCtx).pop(true),
@@ -651,6 +661,7 @@ Future<T?> showGrassBagSheet<T>(
         title: title,
         subtitle: subtitle,
         tier: tier,
+        expandable: expandable,
         bodyBuilder: bodyBuilder,
       );
     },
@@ -667,12 +678,14 @@ class _IntrinsicLiquidGlassSheet extends StatefulWidget {
     required this.subtitle,
     required this.tier,
     required this.bodyBuilder,
+    this.expandable = false,
   });
 
   final String title;
   final String? subtitle;
   final GrassBagGlassTier tier;
   final WidgetBuilder bodyBuilder;
+  final bool expandable;
 
   @override
   State<_IntrinsicLiquidGlassSheet> createState() => _IntrinsicLiquidGlassSheetState();
@@ -683,6 +696,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   late final SingleSpringController _dragSpring;
   bool _dragging = false;
   bool _dismissing = false;
+  bool _expanded = false;
 
   @override
   void initState() {
@@ -698,6 +712,12 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   void dispose() {
     _dragSpring.dispose();
     super.dispose();
+  }
+
+  void _toggleExpanded() {
+    if (!widget.expandable) return;
+    HapticFeedback.selectionClick();
+    setState(() => _expanded = !_expanded);
   }
 
   void _onDragStart(DragStartDetails _) {
@@ -721,6 +741,16 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
     if (!_dragging || _dismissing) return;
     _dragging = false;
     final vel = d.primaryVelocity ?? 0.0;
+    if (widget.expandable && !_expanded && (_dragSpring.value < -14.0 || vel < -420.0)) {
+      _dragSpring.animateTo(0.0, fromVelocity: vel);
+      _toggleExpanded();
+      return;
+    }
+    if (widget.expandable && _expanded && (_dragSpring.value > 56.0 || vel > 460.0)) {
+      _dragSpring.animateTo(0.0, fromVelocity: vel);
+      _toggleExpanded();
+      return;
+    }
     if (_dragSpring.value > 72.0 || vel > 520.0) {
       _dismissing = true;
       Navigator.of(context).pop();
@@ -767,26 +797,35 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   if (!isDesktopDialog) ...[
-                    Center(
-                      child: Container(
-                          width: 36,
-                          height: 4.5,
-                          decoration: BoxDecoration(
-                            color: t.isDark
-                                ? Colors.white.withValues(alpha: 0.24)
-                                : t.sepStrong,
-                            borderRadius: BorderRadius.circular(99),
+                    GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onDoubleTap: widget.expandable ? _toggleExpanded : null,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 2, bottom: 12),
+                        child: Center(
+                          child: Container(
+                            width: 36,
+                            height: 4.5,
+                            decoration: BoxDecoration(
+                              color: t.isDark
+                                  ? Colors.white.withValues(alpha: 0.24)
+                                  : t.sepStrong,
+                              borderRadius: BorderRadius.circular(99),
+                            ),
                           ),
                         ),
                       ),
-                      const SizedBox(height: 12),
-                    ],
-                    Padding(
-                      padding: const EdgeInsets.only(left: 4, bottom: 12),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
+                    ),
+                  ],
+                  Padding(
+                    padding: const EdgeInsets.only(left: 4, bottom: 12),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onDoubleTap: (!isDesktopDialog && widget.expandable) ? _toggleExpanded : null,
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
@@ -815,7 +854,53 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
                               ],
                             ),
                           ),
+                        ),
                           const SizedBox(width: 6),
+                          if (widget.expandable && !isDesktopDialog)
+                            GrassBagSpringTap(
+                              onTap: _toggleExpanded,
+                              pressedScale: 0.88,
+                              haptic: true,
+                              child: SizedBox(
+                                width: 40,
+                                height: 40,
+                                child: Center(
+                                  child: Container(
+                                    width: 30,
+                                    height: 30,
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: t.isDark
+                                            ? [
+                                                Colors.white.withValues(alpha: 0.16),
+                                                Colors.white.withValues(alpha: 0.08),
+                                              ]
+                                            : [
+                                                Colors.white.withValues(alpha: 0.78),
+                                                const Color(0x14162E42),
+                                              ],
+                                      ),
+                                      shape: BoxShape.circle,
+                                      border: Border.all(
+                                        color: t.isDark
+                                            ? Colors.white.withValues(alpha: 0.12)
+                                            : const Color(0x16162E42),
+                                        width: 0.55,
+                                      ),
+                                    ),
+                                    child: Icon(
+                                      _expanded
+                                          ? CupertinoIcons.arrow_down_right_arrow_up_left
+                                          : CupertinoIcons.arrow_up_left_arrow_down_right,
+                                      size: 13,
+                                      color: t.text2,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
                           GrassBagSpringTap(
                             onTap: () => Navigator.of(context).pop(),
                             pressedScale: 0.88,
@@ -882,6 +967,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
       size: size,
       viewPad: viewPad,
       isDesktopDialog: isDesktopDialog,
+      expanded: _expanded,
       child: ListenableBuilder(
         listenable: _dragSpring,
         builder: (context, child) => Transform.translate(
@@ -997,11 +1083,13 @@ class _SheetKeyboardFrame extends StatefulWidget {
     required this.viewPad,
     required this.isDesktopDialog,
     required this.child,
+    this.expanded = false,
   });
 
   final Size size;
   final EdgeInsets viewPad;
   final bool isDesktopDialog;
+  final bool expanded;
   final Widget child;
 
   @override
@@ -1013,6 +1101,7 @@ class _SheetKeyboardFrameState extends State<_SheetKeyboardFrame> {
   double? _settledMaxH;
   double _lastKbInset = -1.0;
   double _lastViewportH = -1.0;
+  bool _lastExpanded = false;
 
   @override
   void dispose() {
@@ -1035,15 +1124,18 @@ class _SheetKeyboardFrameState extends State<_SheetKeyboardFrame> {
     final rawAvailableH = widget.size.height > 88.0
         ? (widget.size.height - topMargin - targetBottom).clamp(88.0, widget.size.height)
         : 88.0;
-    final capH = widget.isDesktopDialog ? 700.0 : 660.0;
+    final capH = widget.expanded
+        ? math.max(660.0, widget.size.height - topMargin - baseMargin)
+        : (widget.isDesktopDialog ? 700.0 : 660.0);
     final unclampedMaxH = math.min(capH, rawAvailableH).clamp(88.0, capH);
     final viewportResized =
         _lastViewportH > 0 && (widget.size.height - _lastViewportH).abs() > 1.0;
+    final expandedChanged = _lastExpanded != widget.expanded;
 
     // Keep `maxHeight` rock-steady during 120Hz IME flight (eliminating both 64px stair-step
     // snaps and per-frame `toImageSync` glass rebakes!) and settle ONCE 90ms after keyboard stops,
-    // while immediately recomputing on rotation / split-screen viewport height changes.
-    if (_settledMaxH == null || kbInset <= 0.5 || viewportResized) {
+    // while immediately recomputing on rotation / split-screen viewport height or detent changes.
+    if (_settledMaxH == null || kbInset <= 0.5 || viewportResized || expandedChanged) {
       _settleTimer?.cancel();
       _settledMaxH = unclampedMaxH;
     } else if ((kbInset - _lastKbInset).abs() > 0.5) {
@@ -1057,32 +1149,86 @@ class _SheetKeyboardFrameState extends State<_SheetKeyboardFrame> {
     }
     _lastKbInset = kbInset;
     _lastViewportH = widget.size.height;
+    _lastExpanded = widget.expanded;
     final effectiveMaxH = math.min(_settledMaxH ?? unclampedMaxH, capH);
-    final desktopLiftY = widget.isDesktopDialog
-        ? math.min(liftY * 0.5, math.max(0.0, (widget.size.height - topMargin - targetBottom) > 0 ? liftY : 0.0))
-        : liftY;
 
-    return Align(
-      alignment: widget.isDesktopDialog ? Alignment.center : Alignment.bottomCenter,
-      child: Transform.translate(
-        offset: Offset(0, -desktopLiftY),
-        child: MediaQuery.removeViewInsets(
-          context: context,
-          removeBottom: true,
-          child: Padding(
-            padding: EdgeInsets.fromLTRB(16, topMargin, 16, baseMargin),
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                maxWidth: widget.isDesktopDialog ? 500 : 448,
-                maxHeight: effectiveMaxH,
-              ),
-              child: widget.child,
-            ),
-          ),
+    // CustomSingleChildLayout uses the ACTUAL intrinsic child height to clamp the sheet's
+    // top edge to `topMargin` — short sheets lift smoothly right above the keyboard, while
+    // tall sheets NEVER fly off the top of the screen during IME flight or before settling!
+    return MediaQuery.removeViewInsets(
+      context: context,
+      removeBottom: true,
+      child: CustomSingleChildLayout(
+        delegate: _SafeSheetKeyboardLayoutDelegate(
+          isDesktopDialog: widget.isDesktopDialog,
+          topMargin: topMargin,
+          baseMargin: baseMargin,
+          targetBottom: targetBottom,
+          liftY: liftY,
+          maxWidth: widget.isDesktopDialog ? 500.0 : 448.0,
+          maxHeight: effectiveMaxH,
         ),
+        child: widget.child,
       ),
     );
   }
+}
+
+class _SafeSheetKeyboardLayoutDelegate extends SingleChildLayoutDelegate {
+  const _SafeSheetKeyboardLayoutDelegate({
+    required this.isDesktopDialog,
+    required this.topMargin,
+    required this.baseMargin,
+    required this.targetBottom,
+    required this.liftY,
+    required this.maxWidth,
+    required this.maxHeight,
+  });
+
+  final bool isDesktopDialog;
+  final double topMargin;
+  final double baseMargin;
+  final double targetBottom;
+  final double liftY;
+  final double maxWidth;
+  final double maxHeight;
+
+  @override
+  BoxConstraints getConstraintsForChild(BoxConstraints constraints) {
+    final availW = math.max(0.0, constraints.maxWidth - 32.0);
+    final availH = math.max(88.0, constraints.maxHeight - topMargin - baseMargin);
+    return BoxConstraints(
+      maxWidth: math.min(availW, maxWidth),
+      maxHeight: math.min(availH, maxHeight),
+    );
+  }
+
+  @override
+  Offset getPositionForChild(Size size, Size childSize) {
+    final dx = ((size.width - childSize.width) / 2.0)
+        .clamp(16.0, math.max(16.0, size.width - 16.0))
+        .toDouble();
+    final double dy;
+    if (isDesktopDialog) {
+      final centered = (size.height - childSize.height) / 2.0 - liftY * 0.5;
+      final maxTop = math.max(topMargin, size.height - baseMargin - childSize.height);
+      dy = centered.clamp(topMargin, maxTop).toDouble();
+    } else {
+      final desired = size.height - targetBottom - childSize.height;
+      dy = math.max(topMargin, desired);
+    }
+    return Offset(dx, dy);
+  }
+
+  @override
+  bool shouldRelayout(_SafeSheetKeyboardLayoutDelegate old) =>
+      isDesktopDialog != old.isDesktopDialog ||
+      topMargin != old.topMargin ||
+      baseMargin != old.baseMargin ||
+      targetBottom != old.targetBottom ||
+      liftY != old.liftY ||
+      maxWidth != old.maxWidth ||
+      maxHeight != old.maxHeight;
 }
 
 /// Concentric translucent card nested inside a floating sheet/dialog.
@@ -1392,13 +1538,14 @@ class _WorkspacePickerSheetBodyState extends ConsumerState<_WorkspacePickerSheet
                                           behavior: HitTestBehavior.opaque,
                                           onTap: () => _openRenameWorkspaceSheet(context, w),
                                           child: SizedBox(
-                                            width: 32,
-                                            height: 36,
+                                            width: 40,
+                                            height: 40,
                                             child: Center(
-                                              child: Icon(CupertinoIcons.pencil, size: 15, color: t.text3),
+                                              child: Icon(CupertinoIcons.pencil, size: 15.5, color: t.text3),
                                             ),
                                           ),
                                         ),
+                                        const SizedBox(width: 6),
                                         GestureDetector(
                                           behavior: HitTestBehavior.opaque,
                                           onTap: () async {
@@ -1412,10 +1559,10 @@ class _WorkspacePickerSheetBodyState extends ConsumerState<_WorkspacePickerSheet
                                             if (ok) await ctrl.deleteWorkspaceItem(w);
                                           },
                                           child: SizedBox(
-                                            width: 32,
-                                            height: 36,
+                                            width: 40,
+                                            height: 40,
                                             child: Center(
-                                              child: Icon(CupertinoIcons.trash, size: 15, color: t.err),
+                                              child: Icon(CupertinoIcons.trash, size: 15.5, color: t.err),
                                             ),
                                           ),
                                         ),
@@ -1942,29 +2089,36 @@ class _WorkspaceDirectoryBrowserBodyState extends ConsumerState<_WorkspaceDirect
                         ),
                       ),
                     )
-                  : ListView(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  children: [
-                    if (_parentPath != null)
-                      GrassBagListTile(
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        leading: Icon(CupertinoIcons.arrow_turn_up_left, size: 15, color: t.primary),
-                        title: Text('.. (返回上级目录)', style: TextStyle(fontSize: 13, color: t.primary)),
-                        onTap: () => _loadDir(_parentPath),
-                      ),
-                    if (_entries.isEmpty)
-                      Padding(
-                        padding: const EdgeInsets.all(18),
-                        child: Center(
-                          child: Text(
-                            '此目录下没有子文件夹，可直接点击下方「挂载当前目录」',
-                            style: TextStyle(fontSize: 12.5, color: t.text3),
-                          ),
-                        ),
-                      )
-                    else
-                      for (final e in _entries)
-                        GrassBagListTile(
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      itemCount: (_parentPath != null ? 1 : 0) +
+                          (_entries.isEmpty ? 1 : _entries.length),
+                      itemBuilder: (_, idx) {
+                        var cursor = idx;
+                        if (_parentPath != null) {
+                          if (cursor == 0) {
+                            return GrassBagListTile(
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              leading: Icon(CupertinoIcons.arrow_turn_up_left, size: 15, color: t.primary),
+                              title: Text('.. (返回上级目录)', style: TextStyle(fontSize: 13, color: t.primary)),
+                              onTap: () => _loadDir(_parentPath),
+                            );
+                          }
+                          cursor -= 1;
+                        }
+                        if (_entries.isEmpty) {
+                          return Padding(
+                            padding: const EdgeInsets.all(18),
+                            child: Center(
+                              child: Text(
+                                '此目录下没有子文件夹，可直接点击下方「挂载当前目录」',
+                                style: TextStyle(fontSize: 12.5, color: t.text3),
+                              ),
+                            ),
+                          );
+                        }
+                        final e = _entries[cursor];
+                        return GrassBagListTile(
                           contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                           leading: Icon(CupertinoIcons.folder_fill, size: 16, color: t.primary),
                           title: Text(
@@ -1973,9 +2127,9 @@ class _WorkspaceDirectoryBrowserBodyState extends ConsumerState<_WorkspaceDirect
                           ),
                           showChevron: true,
                           onTap: () => _loadDir(e['path']?.toString()),
-                        ),
-                  ],
-                ),
+                        );
+                      },
+                    ),
         ),
         const SizedBox(height: 12),
         Row(
@@ -3838,81 +3992,97 @@ class _DiffSheetBodyState extends ConsumerState<_DiffSheetBody> {
                   child: LayoutBuilder(
                     builder: (context, box) {
                       final effectiveW = math.max(box.maxWidth, diffContentWidth);
+                      final maxDiffViewportH =
+                          (MediaQuery.sizeOf(context).height * 0.50).clamp(240.0, 520.0);
+                      const rowExtent = 24.0;
+                      Widget buildDiffRow(int idx) {
+                        final line = lines[idx];
+                        return Container(
+                          color: switch (line.$1) {
+                            '+' => const Color(0x261F9D63),
+                            '-' => const Color(0x2AD14E4E),
+                            '@' => const Color(0x243B82F6),
+                            _ => Colors.transparent,
+                          },
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3.5),
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 44,
+                                child: Text(
+                                  line.$2,
+                                  textAlign: TextAlign.right,
+                                  style: const TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 11,
+                                    fontFeatures: [FontFeature.tabularFigures()],
+                                    color: Color(0xFF8294AC),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              SizedBox(
+                                width: 14,
+                                child: Text(
+                                  line.$1 == '@' || line.$1 == '~' ? ' ' : line.$1,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: switch (line.$1) {
+                                      '+' => const Color(0xFF5DD199),
+                                      '-' => const Color(0xFFF08A84),
+                                      _ => const Color(0xFF8294AC),
+                                    },
+                                  ),
+                                ),
+                              ),
+                              Expanded(
+                                child: Text(
+                                  line.$3,
+                                  softWrap: false,
+                                  overflow: TextOverflow.visible,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 11.5,
+                                    height: 1.45,
+                                    color: line.$1 == '@'
+                                        ? const Color(0xFF93C5FD)
+                                        : (line.$1 == '~'
+                                            ? const Color(0xFF8294AC)
+                                            : t.codeFg),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }
+
+                      final useVirtualList = visibleCount > 36;
                       return SingleChildScrollView(
                         scrollDirection: Axis.horizontal,
                         child: SizedBox(
                           width: effectiveW,
+                          height: useVirtualList
+                              ? math.min(visibleCount * rowExtent + 8.0, maxDiffViewportH)
+                              : null,
                           child: SelectionArea(
                             contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                for (var idx = 0; idx < visibleCount; idx++)
-                                  () {
-                                    final line = lines[idx];
-                                    return Container(
-                                      color: switch (line.$1) {
-                                        '+' => const Color(0x261F9D63),
-                                        '-' => const Color(0x2AD14E4E),
-                                        '@' => const Color(0x243B82F6),
-                                        _ => Colors.transparent,
-                                      },
-                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3.5),
-                                      child: Row(
-                                        children: [
-                                          SizedBox(
-                                            width: 44,
-                                            child: Text(
-                                              line.$2,
-                                              textAlign: TextAlign.right,
-                                              style: const TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontSize: 11,
-                                                fontFeatures: [FontFeature.tabularFigures()],
-                                                color: Color(0xFF64748B),
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          SizedBox(
-                                            width: 14,
-                                            child: Text(
-                                              line.$1 == '@' || line.$1 == '~' ? ' ' : line.$1,
-                                              style: TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontSize: 11.5,
-                                                fontWeight: FontWeight.w700,
-                                                color: switch (line.$1) {
-                                                  '+' => const Color(0xFF5DD199),
-                                                  '-' => const Color(0xFFF08A84),
-                                                  _ => const Color(0xFF64748B),
-                                                },
-                                              ),
-                                            ),
-                                          ),
-                                          Expanded(
-                                            child: Text(
-                                              line.$3,
-                                              softWrap: false,
-                                              overflow: TextOverflow.visible,
-                                              style: TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontSize: 11.5,
-                                                height: 1.45,
-                                                color: line.$1 == '@'
-                                                    ? const Color(0xFF93C5FD)
-                                                    : (line.$1 == '~'
-                                                        ? const Color(0xFF64748B)
-                                                        : t.codeFg),
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    );
-                                  }(),
-                              ],
-                            ),
+                            child: useVirtualList
+                                ? ListView.builder(
+                                    itemCount: visibleCount,
+                                    itemExtent: rowExtent,
+                                    cacheExtent: 320,
+                                    itemBuilder: (_, idx) => buildDiffRow(idx),
+                                  )
+                                : Column(
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    children: [
+                                      for (var idx = 0; idx < visibleCount; idx++)
+                                        buildDiffRow(idx),
+                                    ],
+                                  ),
                           ),
                         ),
                       );
@@ -4971,6 +5141,11 @@ class _GrassBagImageLightboxState extends State<_GrassBagImageLightbox>
                       ? Image.memory(
                           widget.bytes!,
                           fit: BoxFit.contain,
+                          cacheWidth: (MediaQuery.sizeOf(context).width *
+                                  MediaQuery.devicePixelRatioOf(context) *
+                                  1.5)
+                              .round()
+                              .clamp(720, 2400),
                           errorBuilder: (_, __, ___) => const Padding(
                             padding: EdgeInsets.all(24),
                             child: Text(

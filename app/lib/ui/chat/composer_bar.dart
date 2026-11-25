@@ -103,7 +103,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   String _mentionQuery = '';
   int _mentionStartOffset = -1;
   String? _dismissedMentionText;
-  int _activeSuggestionIdx = 0;
+  final ValueNotifier<int> _activeSuggestionIdxNotifier = ValueNotifier<int>(0);
   bool _submitting = false;
   Timer? _refDebounceTimer;
   Timer? _draftSyncTimer;
@@ -179,14 +179,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         return KeyEventResult.handled;
       }
       if (count > 0 && event.logicalKey == LogicalKeyboardKey.arrowDown) {
-        _activeSuggestionIdx = (_activeSuggestionIdx + 1) % count;
-        _suggestionTickNotifier.value++;
+        _activeSuggestionIdxNotifier.value = (_activeSuggestionIdxNotifier.value + 1) % count;
         _scrollActiveSuggestionIntoView();
         return KeyEventResult.handled;
       }
       if (count > 0 && event.logicalKey == LogicalKeyboardKey.arrowUp) {
-        _activeSuggestionIdx = (_activeSuggestionIdx - 1 + count) % count;
-        _suggestionTickNotifier.value++;
+        _activeSuggestionIdxNotifier.value =
+            (_activeSuggestionIdxNotifier.value - 1 + count) % count;
         _scrollActiveSuggestionIntoView();
         return KeyEventResult.handled;
       }
@@ -204,7 +203,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           _insertNewlineAtCursor();
           return KeyEventResult.handled;
         }
-        final idx = _activeSuggestionIdx.clamp(0, count - 1);
+        final idx = _activeSuggestionIdxNotifier.value.clamp(0, count - 1);
         final isTab = event.logicalKey == LogicalKeyboardKey.tab;
         if (_mentionTrigger == '/') {
           final cmd = _latestCommands[idx];
@@ -366,6 +365,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     widget.suggestionsOpenNotifier?.removeListener(_onExternalSuggestionsChanged);
     _plusSpring.dispose();
     _suggestionTickNotifier.dispose();
+    _activeSuggestionIdxNotifier.dispose();
     _suggestionScrollCtrl.dispose();
     super.dispose();
   }
@@ -373,7 +373,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   void _scrollActiveSuggestionIntoView() {
     if (!_suggestionScrollCtrl.hasClients) return;
     const itemExtent = 38.0;
-    final targetTop = _activeSuggestionIdx * itemExtent;
+    final targetTop = _activeSuggestionIdxNotifier.value * itemExtent;
     final targetBottom = targetTop + itemExtent;
     final pos = _suggestionScrollCtrl.position;
     if (targetTop < pos.pixels) {
@@ -412,10 +412,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       _mentionTrigger = null;
       _mentionQuery = '';
       _mentionStartOffset = -1;
-      _activeSuggestionIdx = 0;
       _loadingRefs = false;
       _remoteRefs = const [];
     });
+    _activeSuggestionIdxNotifier.value = 0;
     _syncSuggestionsNotifier(false);
   }
 
@@ -600,11 +600,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final queryChanged = nextQuery != _mentionQuery;
     final startChanged = nextStart != _mentionStartOffset;
     if (nextHasText != _hasText || triggerVisibilityOrKindChanged) {
+      if (triggerVisibilityOrKindChanged || queryChanged) {
+        _activeSuggestionIdxNotifier.value = 0;
+      }
       setState(() {
         _hasText = nextHasText;
-        if (triggerVisibilityOrKindChanged || queryChanged) {
-          _activeSuggestionIdx = 0;
-        }
         _mentionTrigger = nextTrigger;
         _mentionQuery = nextQuery;
         _mentionStartOffset = nextStart;
@@ -615,7 +615,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       // Filtering inside an already-open `/` or `@` popover updates ONLY the popover leaf —
       // ZERO rebuilds of ChatComposerDock, TextField, or Liquid Glass composer chrome!
       if (queryChanged) {
-        _activeSuggestionIdx = 0;
+        _activeSuggestionIdxNotifier.value = 0;
       }
       _mentionQuery = nextQuery;
       _mentionStartOffset = nextStart;
@@ -695,9 +695,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       _mentionTrigger = null;
       _mentionQuery = '';
       _mentionStartOffset = -1;
-      _activeSuggestionIdx = 0;
       _remoteRefs = const [];
     });
+    _activeSuggestionIdxNotifier.value = 0;
     _syncSuggestionsNotifier(false);
   }
 
@@ -742,9 +742,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         _mentionTrigger = null;
         _mentionQuery = '';
         _mentionStartOffset = -1;
-        _activeSuggestionIdx = 0;
         _remoteRefs = const [];
       });
+      _activeSuggestionIdxNotifier.value = 0;
     }
     _syncSuggestionsNotifier(false);
   }
@@ -840,8 +840,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       _hasText = false;
       _mentionTrigger = null;
       _mentionQuery = '';
-      _activeSuggestionIdx = 0;
     });
+    _activeSuggestionIdxNotifier.value = 0;
     _syncSuggestionsNotifier(false);
     if (shouldForkBefore && editCtx.forkBeforeTurnId != null) {
       final forked = await ctrl.forkActiveSession(
@@ -958,8 +958,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
             contextPctHigh: s.contextPct >= 80 ? s.contextPct : 0,
             pendingAttachments: s.pendingAttachments,
             queuedMessages: s.queuedMessages,
-            slashCommands: s.slashCommands,
-            workspaceFiles: s.workspaceFiles,
             activeWorkspace: s.activeWorkspaceDisplayName,
             isEmptyChat: s.isEmptyChat,
             isStreaming: s.isStreaming,
@@ -1028,8 +1026,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           setState(() {
             _mentionTrigger = null;
             _mentionQuery = '';
-            _activeSuggestionIdx = 0;
           });
+          _activeSuggestionIdxNotifier.value = 0;
           _syncSuggestionsNotifier(false);
         }
       });
@@ -1215,315 +1213,345 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                 child: child,
               ),
               child: showSuggestions
-                  ? ValueListenableBuilder<int>(
+                  ? Consumer(
                       key: ValueKey('suggestions-$_mentionTrigger'),
-                      valueListenable: _suggestionTickNotifier,
-                      builder: (context, _, __) {
-                        final filteredCommands = _mentionTrigger == '/'
-                            ? state.slashCommands
-                                .where((c) =>
-                                    _mentionQuery.isEmpty ||
-                                    c.command.toLowerCase().contains(_mentionQuery) ||
-                                    c.title.toLowerCase().contains(_mentionQuery) ||
-                                    c.desc.toLowerCase().contains(_mentionQuery) ||
-                                    c.category.toLowerCase().contains(_mentionQuery))
-                                .take(24)
-                                .toList(growable: false)
+                      builder: (context, leafRef, _) {
+                        final leafSlashCommands = _mentionTrigger == '/'
+                            ? leafRef.watch(appProvider.select((s) => s.slashCommands))
                             : const <SlashCommandItem>[];
-                        final filteredRefs = _mentionTrigger == '@'
-                            ? () {
-                                final seen = <String>{};
-                                final list = <Map<String, String>>[];
-                                for (final r in _remoteRefs) {
-                                  final p = r['path'] ?? '';
-                                  final lbl = r['label'] ?? '';
-                                  final matchesQ = _mentionQuery.isEmpty ||
-                                      p.toLowerCase().contains(_mentionQuery) ||
-                                      lbl.toLowerCase().contains(_mentionQuery);
-                                  if (p.isNotEmpty && matchesQ && seen.add(p)) {
-                                    list.add(r);
-                                    if (list.length >= 24) break;
-                                  }
-                                }
-                                if (list.length < 24) {
-                                  for (final p in _getFlattenedFilePaths(state.workspaceFiles)) {
-                                    if (p.toLowerCase().contains(_mentionQuery) && seen.add(p)) {
-                                      list.add({'path': p, 'kind': 'file'});
-                                      if (list.length >= 24) break;
+                        final leafWorkspaceFiles = _mentionTrigger == '@'
+                            ? leafRef.watch(appProvider.select((s) => s.workspaceFiles))
+                            : const <WorkspaceFileNode>[];
+                        return ValueListenableBuilder<int>(
+                          valueListenable: _suggestionTickNotifier,
+                          builder: (context, _, __) {
+                            final filteredCommands = _mentionTrigger == '/'
+                                ? leafSlashCommands
+                                    .where((c) =>
+                                        _mentionQuery.isEmpty ||
+                                        c.command.toLowerCase().contains(_mentionQuery) ||
+                                        c.title.toLowerCase().contains(_mentionQuery) ||
+                                        c.desc.toLowerCase().contains(_mentionQuery) ||
+                                        c.category.toLowerCase().contains(_mentionQuery))
+                                    .take(24)
+                                    .toList(growable: false)
+                                : const <SlashCommandItem>[];
+                            final filteredRefs = _mentionTrigger == '@'
+                                ? () {
+                                    final seen = <String>{};
+                                    final candidates = <({Map<String, String> item, int rank})>[];
+                                    int rankFor(String path, String label) {
+                                      if (_mentionQuery.isEmpty) return 0;
+                                      final pLow = path.toLowerCase();
+                                      final lLow = label.toLowerCase();
+                                      final slash = pLow.lastIndexOf('/');
+                                      final base = slash >= 0 ? pLow.substring(slash + 1) : pLow;
+                                      if (base.startsWith(_mentionQuery) || lLow.startsWith(_mentionQuery)) {
+                                        return 0;
+                                      }
+                                      if (base.contains(_mentionQuery) || lLow.contains(_mentionQuery)) {
+                                        return 1;
+                                      }
+                                      return 2;
                                     }
-                                  }
-                                }
-                                return list;
-                              }()
-                            : const <Map<String, String>>[];
-                        _latestCommands = filteredCommands;
-                        _latestRefs = filteredRefs;
-                        return Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: GlassBackdropGroup(
-                            enabled: false,
-                            child: GrassBagGlass(
-                              tier: state.glassTier,
-                              borderRadius: 22,
-                              elevated: true,
-                              useSheetSettings: true,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  Padding(
-                                    padding: const EdgeInsets.fromLTRB(8, 0, 2, 4),
-                                    child: Row(
-                                      children: [
-                                        Text(
-                                          _mentionTrigger == '/'
-                                              ? '快捷指令${filteredCommands.isNotEmpty ? ' (${filteredCommands.length})' : ''}'
-                                              : '引用文件与会话${filteredRefs.isNotEmpty ? ' (${filteredRefs.length})' : ''}',
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w600,
-                                            color: t.text3,
-                                          ),
-                                        ),
-                                        if (_mentionTrigger == '@' && _loadingRefs) ...[
-                                          const SizedBox(width: 7),
-                                          CupertinoActivityIndicator(radius: 5.5, color: t.primary),
-                                        ],
-                                        const Spacer(),
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: _dismissSuggestions,
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(4),
-                                            child: Icon(
-                                              CupertinoIcons.xmark,
-                                              size: 13,
-                                              color: t.text3,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  Flexible(
-                                    fit: FlexFit.loose,
-                                    child: ConstrainedBox(
-                                      constraints: const BoxConstraints(maxHeight: 220),
-                                      child: SingleChildScrollView(
-                                        controller: _suggestionScrollCtrl,
-                                        physics: const BouncingScrollPhysics(),
-                                        child: Column(
-                                          mainAxisSize: MainAxisSize.min,
-                                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    for (final r in _remoteRefs) {
+                                      final p = r['path'] ?? '';
+                                      final lbl = r['label'] ?? '';
+                                      final matchesQ = _mentionQuery.isEmpty ||
+                                          p.toLowerCase().contains(_mentionQuery) ||
+                                          lbl.toLowerCase().contains(_mentionQuery);
+                                      if (p.isNotEmpty && matchesQ && seen.add(p)) {
+                                        candidates.add((item: r, rank: rankFor(p, lbl)));
+                                      }
+                                    }
+                                    for (final p in _getFlattenedFilePaths(leafWorkspaceFiles)) {
+                                      if ((_mentionQuery.isEmpty || p.toLowerCase().contains(_mentionQuery)) &&
+                                          seen.add(p)) {
+                                        candidates.add((item: {'path': p, 'kind': 'file'}, rank: rankFor(p, '')));
+                                      }
+                                    }
+                                    if (_mentionQuery.isNotEmpty && candidates.length > 1) {
+                                      candidates.sort((a, b) => a.rank.compareTo(b.rank));
+                                    }
+                                    return [
+                                      for (var i = 0; i < candidates.length && i < 24; i++)
+                                        candidates[i].item,
+                                    ];
+                                  }()
+                                : const <Map<String, String>>[];
+                            _latestCommands = filteredCommands;
+                            _latestRefs = filteredRefs;
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: GlassBackdropGroup(
+                                enabled: false,
+                                child: GrassBagGlass(
+                                  tier: state.glassTier,
+                                  borderRadius: 22,
+                                  elevated: true,
+                                  useSheetSettings: true,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    children: [
+                                      Padding(
+                                        padding: const EdgeInsets.fromLTRB(8, 0, 2, 4),
+                                        child: Row(
                                           children: [
-                                            if (_mentionTrigger == '/' && filteredCommands.isEmpty)
-                                              Padding(
-                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                                                child: Text(
-                                                  '未匹配到内置快捷指令，直接发送将交给 DSH 执行',
-                                                  style: TextStyle(fontSize: 12, color: t.text3),
+                                            Text(
+                                              _mentionTrigger == '/'
+                                                  ? '快捷指令${filteredCommands.isNotEmpty ? ' (${filteredCommands.length})' : ''}'
+                                                  : '引用文件与会话${filteredRefs.isNotEmpty ? ' (${filteredRefs.length})' : ''}',
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w600,
+                                                color: t.text3,
+                                              ),
+                                            ),
+                                            if (_mentionTrigger == '@' && _loadingRefs) ...[
+                                              const SizedBox(width: 7),
+                                              GrassBagActivityIndicator(radius: 5.5, color: t.primary),
+                                            ],
+                                            const Spacer(),
+                                            GestureDetector(
+                                              behavior: HitTestBehavior.opaque,
+                                              onTap: _dismissSuggestions,
+                                              child: Padding(
+                                                padding: const EdgeInsets.all(4),
+                                                child: Icon(
+                                                  CupertinoIcons.xmark,
+                                                  size: 13,
+                                                  color: t.text3,
                                                 ),
-                                              )
-                                            else if (_mentionTrigger == '/')
-                                              for (var ci = 0; ci < filteredCommands.length; ci++)
-                                                () {
-                                                  final cmd = filteredCommands[ci];
-                                                  final active = ci ==
-                                                      _activeSuggestionIdx.clamp(0, filteredCommands.length - 1);
-                                                  final isInstant = const {'/new', '/plan', '/status'}.contains(cmd.command) ||
-                                                      (!state.isEmptyChat &&
-                                                          const {'/fork', '/export'}.contains(cmd.command));
-                                                  final isSkill = cmd.command.startsWith('/skill:');
-                                                  final subtitle = cmd.desc.trim().isEmpty
-                                                      ? cmd.title
-                                                      : (cmd.title.trim().isEmpty
-                                                          ? cmd.desc
-                                                          : '${cmd.title} · ${cmd.desc}');
-                                                  return GrassBagSpringTap(
-                                                    onTap: () => _applySuggestion(
-                                                      cmd.command,
-                                                      executeImmediately: isInstant,
-                                                    ),
-                                                    child: Container(
-                                                      decoration: BoxDecoration(
-                                                        color: active ? t.fill1 : Colors.transparent,
-                                                        borderRadius: BorderRadius.circular(11),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      Flexible(
+                                        fit: FlexFit.loose,
+                                        child: ConstrainedBox(
+                                          constraints: const BoxConstraints(maxHeight: 220),
+                                          child: SingleChildScrollView(
+                                            controller: _suggestionScrollCtrl,
+                                            physics: const BouncingScrollPhysics(),
+                                            child: ValueListenableBuilder<int>(
+                                              valueListenable: _activeSuggestionIdxNotifier,
+                                              builder: (_, activeSuggestionIdx, __) => Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                                children: [
+                                                  if (_mentionTrigger == '/' && filteredCommands.isEmpty)
+                                                    Padding(
+                                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                                                      child: Text(
+                                                        '未匹配到内置快捷指令，直接发送将交给 DSH 执行',
+                                                        style: TextStyle(fontSize: 12, color: t.text3),
                                                       ),
-                                                      padding: const EdgeInsets.symmetric(
-                                                        horizontal: 8,
-                                                        vertical: 7,
-                                                      ),
+                                                    )
+                                                  else if (_mentionTrigger == '/')
+                                                    for (var ci = 0; ci < filteredCommands.length; ci++)
+                                                      () {
+                                                        final cmd = filteredCommands[ci];
+                                                        final active = ci ==
+                                                            activeSuggestionIdx.clamp(0, filteredCommands.length - 1);
+                                                        final isInstant = const {'/new', '/plan', '/status'}.contains(cmd.command) ||
+                                                            (!state.isEmptyChat &&
+                                                                const {'/fork', '/export'}.contains(cmd.command));
+                                                        final isSkill = cmd.command.startsWith('/skill:');
+                                                        final subtitle = cmd.desc.trim().isEmpty
+                                                            ? cmd.title
+                                                            : (cmd.title.trim().isEmpty
+                                                                ? cmd.desc
+                                                                : '${cmd.title} · ${cmd.desc}');
+                                                        return GrassBagSpringTap(
+                                                          onTap: () => _applySuggestion(
+                                                            cmd.command,
+                                                            executeImmediately: isInstant,
+                                                          ),
+                                                          child: Container(
+                                                            decoration: BoxDecoration(
+                                                              color: active ? t.fill1 : Colors.transparent,
+                                                              borderRadius: BorderRadius.circular(11),
+                                                            ),
+                                                            padding: const EdgeInsets.symmetric(
+                                                              horizontal: 8,
+                                                              vertical: 7,
+                                                            ),
+                                                            child: Row(
+                                                              children: [
+                                                                Container(
+                                                                  padding: const EdgeInsets.symmetric(
+                                                                    horizontal: 7,
+                                                                    vertical: 2,
+                                                                  ),
+                                                                  decoration: BoxDecoration(
+                                                                    color: isSkill ? t.okSoft : t.primarySoft,
+                                                                    borderRadius: BorderRadius.circular(7),
+                                                                  ),
+                                                                  child: Text(
+                                                                    cmd.command,
+                                                                    style: TextStyle(
+                                                                      fontFamily: 'monospace',
+                                                                      fontSize: 12,
+                                                                      fontWeight: FontWeight.w600,
+                                                                      color: isSkill ? t.ok : t.primary,
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                                const SizedBox(width: 9),
+                                                                Expanded(
+                                                                  child: Text(
+                                                                    subtitle,
+                                                                    maxLines: 1,
+                                                                    overflow: TextOverflow.ellipsis,
+                                                                    style: TextStyle(fontSize: 12.5, color: t.text2),
+                                                                  ),
+                                                                ),
+                                                                if (isInstant) ...[
+                                                                  const SizedBox(width: 6),
+                                                                  Container(
+                                                                    padding: const EdgeInsets.symmetric(
+                                                                      horizontal: 6,
+                                                                      vertical: 2,
+                                                                    ),
+                                                                    decoration: BoxDecoration(
+                                                                      color: t.fill2,
+                                                                      borderRadius: BorderRadius.circular(999),
+                                                                    ),
+                                                                    child: Text(
+                                                                      '直达',
+                                                                      style: TextStyle(
+                                                                        fontSize: 10,
+                                                                        fontWeight: FontWeight.w600,
+                                                                        color: t.text3,
+                                                                      ),
+                                                                    ),
+                                                                  ),
+                                                                ],
+                                                              ],
+                                                            ),
+                                                          ),
+                                                        );
+                                                      }()
+                                                  else if (filteredRefs.isEmpty)
+                                                    Padding(
+                                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
                                                       child: Row(
                                                         children: [
-                                                          Container(
-                                                            padding: const EdgeInsets.symmetric(
-                                                              horizontal: 7,
-                                                              vertical: 2,
+                                                          if (_loadingRefs) ...[
+                                                            GrassBagActivityIndicator(radius: 6.5, color: t.primary),
+                                                            const SizedBox(width: 8),
+                                                            Text(
+                                                              '正在搜索工作区文件与引用…',
+                                                              style: TextStyle(fontSize: 12, color: t.text3),
                                                             ),
-                                                            decoration: BoxDecoration(
-                                                              color: isSkill ? t.okSoft : t.primarySoft,
-                                                              borderRadius: BorderRadius.circular(7),
-                                                            ),
-                                                            child: Text(
-                                                              cmd.command,
-                                                              style: TextStyle(
-                                                                fontFamily: 'monospace',
-                                                                fontSize: 12,
-                                                                fontWeight: FontWeight.w600,
-                                                                color: isSkill ? t.ok : t.primary,
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(width: 9),
-                                                          Expanded(
-                                                            child: Text(
-                                                              subtitle,
-                                                              maxLines: 1,
-                                                              overflow: TextOverflow.ellipsis,
-                                                              style: TextStyle(fontSize: 12.5, color: t.text2),
-                                                            ),
-                                                          ),
-                                                          if (isInstant) ...[
-                                                            const SizedBox(width: 6),
-                                                            Container(
-                                                              padding: const EdgeInsets.symmetric(
-                                                                horizontal: 6,
-                                                                vertical: 2,
-                                                              ),
-                                                              decoration: BoxDecoration(
-                                                                color: t.fill2,
-                                                                borderRadius: BorderRadius.circular(999),
-                                                              ),
+                                                          ] else ...[
+                                                            Expanded(
                                                               child: Text(
-                                                                '直达',
-                                                                style: TextStyle(
-                                                                  fontSize: 10,
-                                                                  fontWeight: FontWeight.w600,
-                                                                  color: t.text3,
+                                                                state.activeWorkspace.isEmpty
+                                                                    ? '暂未选择工作区，选择后可用 @ 引用文件'
+                                                                    : '未找到匹配文件，可继续输入路径关键词',
+                                                                style: TextStyle(fontSize: 12, color: t.text3),
+                                                              ),
+                                                            ),
+                                                            if (state.activeWorkspace.isEmpty) ...[
+                                                              const SizedBox(width: 8),
+                                                              GrassBagSpringTap(
+                                                                onTap: () {
+                                                                  _dismissSuggestions();
+                                                                  showWorkspaceSheet(context, ref);
+                                                                },
+                                                                child: Container(
+                                                                  padding: const EdgeInsets.symmetric(
+                                                                    horizontal: 9,
+                                                                    vertical: 4,
+                                                                  ),
+                                                                  decoration: BoxDecoration(
+                                                                    color: t.primarySoft,
+                                                                    borderRadius: BorderRadius.circular(999),
+                                                                  ),
+                                                                  child: Text(
+                                                                    '选择工作区',
+                                                                    style: TextStyle(
+                                                                      fontSize: 11.5,
+                                                                      fontWeight: FontWeight.w600,
+                                                                      color: t.primary,
+                                                                    ),
+                                                                  ),
                                                                 ),
                                                               ),
-                                                            ),
+                                                            ],
                                                           ],
                                                         ],
                                                       ),
-                                                    ),
-                                                  );
-                                                }()
-                                            else if (filteredRefs.isEmpty)
-                                              Padding(
-                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                                                child: Row(
-                                                  children: [
-                                                    if (_loadingRefs) ...[
-                                                      CupertinoActivityIndicator(radius: 6.5, color: t.primary),
-                                                      const SizedBox(width: 8),
-                                                      Text(
-                                                        '正在搜索工作区文件与引用…',
-                                                        style: TextStyle(fontSize: 12, color: t.text3),
-                                                      ),
-                                                    ] else ...[
-                                                      Expanded(
-                                                        child: Text(
-                                                          state.activeWorkspace.isEmpty
-                                                              ? '暂未选择工作区，选择后可用 @ 引用文件'
-                                                              : '未找到匹配文件，可继续输入路径关键词',
-                                                          style: TextStyle(fontSize: 12, color: t.text3),
-                                                        ),
-                                                      ),
-                                                      if (state.activeWorkspace.isEmpty) ...[
-                                                        const SizedBox(width: 8),
-                                                        GrassBagSpringTap(
-                                                          onTap: () {
-                                                            _dismissSuggestions();
-                                                            showWorkspaceSheet(context, ref);
-                                                          },
+                                                    )
+                                                  else
+                                                    for (var ri = 0; ri < filteredRefs.length; ri++)
+                                                      () {
+                                                        final refItem = filteredRefs[ri];
+                                                        final active = ri ==
+                                                            activeSuggestionIdx.clamp(0, filteredRefs.length - 1);
+                                                        return GrassBagSpringTap(
+                                                          onTap: () => _applySuggestion(
+                                                            refItem['path'] ?? '',
+                                                            refItem: refItem,
+                                                          ),
                                                           child: Container(
-                                                            padding: const EdgeInsets.symmetric(
-                                                              horizontal: 9,
-                                                              vertical: 4,
-                                                            ),
                                                             decoration: BoxDecoration(
-                                                              color: t.primarySoft,
-                                                              borderRadius: BorderRadius.circular(999),
+                                                              color: active ? t.fill1 : Colors.transparent,
+                                                              borderRadius: BorderRadius.circular(11),
                                                             ),
-                                                            child: Text(
-                                                              '选择工作区',
-                                                              style: TextStyle(
-                                                                fontSize: 11.5,
-                                                                fontWeight: FontWeight.w600,
-                                                                color: t.primary,
-                                                              ),
+                                                            padding: const EdgeInsets.symmetric(
+                                                              horizontal: 8,
+                                                              vertical: 7,
                                                             ),
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ],
-                                                  ],
-                                                ),
-                                              )
-                                          else
-                                            for (var ri = 0; ri < filteredRefs.length; ri++)
-                                              () {
-                                                final refItem = filteredRefs[ri];
-                                                final active = ri ==
-                                                    _activeSuggestionIdx.clamp(0, filteredRefs.length - 1);
-                                                return GrassBagSpringTap(
-                                                  onTap: () => _applySuggestion(
-                                                    refItem['path'] ?? '',
-                                                    refItem: refItem,
-                                                  ),
-                                                  child: Container(
-                                                    decoration: BoxDecoration(
-                                                      color: active ? t.fill1 : Colors.transparent,
-                                                      borderRadius: BorderRadius.circular(11),
-                                                    ),
-                                                    padding: const EdgeInsets.symmetric(
-                                                      horizontal: 8,
-                                                      vertical: 7,
-                                                    ),
-                                                    child: Row(
-                                                      children: [
-                                                        Icon(
-                                                          refItem['kind'] == 'session'
-                                                              ? CupertinoIcons.chat_bubble_text_fill
-                                                              : CupertinoIcons.doc_text_fill,
-                                                          size: 14,
-                                                          color: refItem['kind'] == 'session'
-                                                              ? t.dusk
-                                                              : t.primary,
-                                                        ),
-                                                        const SizedBox(width: 8),
-                                                        Expanded(
-                                                          child: Text(
-                                                            refItem['label']?.isNotEmpty == true
-                                                                ? '${refItem['label']} (${refItem['path']})'
-                                                                : (refItem['path'] ?? ''),
-                                                            maxLines: 1,
-                                                            overflow: TextOverflow.ellipsis,
-                                                            style: TextStyle(
-                                                              fontFamily: refItem['kind'] == 'session'
-                                                                  ? null
-                                                                  : 'monospace',
-                                                              fontSize: 12.5,
-                                                              color: t.text,
+                                                            child: Row(
+                                                              children: [
+                                                                Icon(
+                                                                  refItem['kind'] == 'session'
+                                                                      ? CupertinoIcons.chat_bubble_text_fill
+                                                                      : CupertinoIcons.doc_text_fill,
+                                                                  size: 14,
+                                                                  color: refItem['kind'] == 'session'
+                                                                      ? t.dusk
+                                                                      : t.primary,
+                                                                ),
+                                                                const SizedBox(width: 8),
+                                                                Expanded(
+                                                                  child: Text(
+                                                                    refItem['label']?.isNotEmpty == true
+                                                                        ? '${refItem['label']} (${refItem['path']})'
+                                                                        : (refItem['path'] ?? ''),
+                                                                    maxLines: 1,
+                                                                    overflow: TextOverflow.ellipsis,
+                                                                    style: TextStyle(
+                                                                      fontFamily: refItem['kind'] == 'session'
+                                                                          ? null
+                                                                          : 'monospace',
+                                                                      fontSize: 12.5,
+                                                                      color: t.text,
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ],
                                                             ),
                                                           ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                );
-                                              }(),
-                                        ],
+                                                        );
+                                                      }(),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        ),
                                       ),
-                                    ),
+                                    ],
                                   ),
                                 ),
-                                ],
                               ),
-                            ),
-                          ),
+                            );
+                          },
                         );
                       },
                     )

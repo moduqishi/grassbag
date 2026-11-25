@@ -663,17 +663,17 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             behavior: HitTestBehavior.opaque,
                             onTap: () => ctrl.setSidebarWorkspaceFilter(null),
                             child: SizedBox(
-                              width: 26,
-                              height: 26,
+                              width: 34,
+                              height: 34,
                               child: Center(
                                 child: Container(
-                                  width: 16,
-                                  height: 16,
+                                  width: 18,
+                                  height: 18,
                                   decoration: BoxDecoration(
                                     color: t.primarySoft,
                                     shape: BoxShape.circle,
                                   ),
-                                  child: Icon(CupertinoIcons.xmark, size: 9.5, color: t.primary),
+                                  child: Icon(CupertinoIcons.xmark, size: 10, color: t.primary),
                                 ),
                               ),
                             ),
@@ -687,7 +687,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                   ),
                 ),
               ),
-              const SizedBox(width: 4),
+              const SizedBox(width: 2),
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -704,14 +704,14 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             : SessionGroupMode.workspace,
                       ),
                       child: SizedBox(
-                        width: 28,
-                        height: 28,
+                        width: 34,
+                        height: 38,
                         child: Center(
                           child: Icon(
                             state.sessionGroupMode == SessionGroupMode.workspace
                                 ? CupertinoIcons.folder
                                 : CupertinoIcons.clock,
-                            size: 14.5,
+                            size: 15,
                             color: t.primary,
                           ),
                         ),
@@ -728,14 +728,14 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                         _selectedIds.clear();
                       }),
                       child: SizedBox(
-                        width: 28,
-                        height: 28,
+                        width: 34,
+                        height: 38,
                         child: Center(
                           child: Icon(
                             _multiSelectMode
                                 ? CupertinoIcons.checkmark_circle_fill
                                 : CupertinoIcons.checkmark_circle,
-                            size: 14.5,
+                            size: 15,
                             color: _multiSelectMode ? t.primary : t.text2,
                           ),
                         ),
@@ -751,12 +751,12 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                         if (!state.loadingSessions) ctrl.refreshSessionsList();
                       },
                       child: SizedBox(
-                        width: 28,
-                        height: 28,
+                        width: 34,
+                        height: 38,
                         child: Center(
                           child: state.loadingSessions
-                              ? CupertinoActivityIndicator(radius: 6.5, color: t.primary)
-                              : Icon(CupertinoIcons.refresh, size: 14, color: t.text2),
+                              ? GrassBagActivityIndicator(radius: 6.5, color: t.primary)
+                              : Icon(CupertinoIcons.refresh, size: 14.5, color: t.text2),
                         ),
                       ),
                     ),
@@ -771,12 +771,12 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                         widget.onOpenTerminal();
                       },
                       child: SizedBox(
-                        width: 28,
-                        height: 28,
+                        width: 34,
+                        height: 38,
                         child: Center(
                           child: Icon(
                             CupertinoIcons.chevron_left_slash_chevron_right,
-                            size: 14,
+                            size: 14.5,
                             color: t.text2,
                           ),
                         ),
@@ -1289,12 +1289,12 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                                       widget.onCloseDrawer?.call();
                                     },
                                     child: SizedBox(
-                                      width: 32,
-                                      height: 28,
+                                      width: 38,
+                                      height: 36,
                                       child: Center(
                                         child: Icon(
                                           CupertinoIcons.plus,
-                                          size: 13.5,
+                                          size: 14,
                                           color: t.text3,
                                         ),
                                       ),
@@ -1563,8 +1563,29 @@ class _SessionListRow extends StatefulWidget {
 }
 
 class _SessionListRowState extends State<_SessionListRow> {
+  final ValueNotifier<bool> _pressed = ValueNotifier<bool>(false);
+  Timer? _pressDelay;
   bool _hovered = false;
-  bool _pressed = false;
+
+  void _schedulePress() {
+    _pressDelay?.cancel();
+    _pressDelay = Timer(const Duration(milliseconds: 60), () {
+      if (mounted && !_pressed.value) _pressed.value = true;
+    });
+  }
+
+  void _clearPress() {
+    _pressDelay?.cancel();
+    _pressDelay = null;
+    if (_pressed.value) _pressed.value = false;
+  }
+
+  @override
+  void dispose() {
+    _pressDelay?.cancel();
+    _pressed.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1607,6 +1628,111 @@ class _SessionListRowState extends State<_SessionListRow> {
 
     final statusBadge = buildStatusBadge();
 
+    final rowContent = Row(
+      children: [
+        if (widget.multiSelectMode) ...[
+          Icon(
+            widget.selected ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
+            size: 18,
+            color: widget.selected ? t.primary : t.text3,
+          ),
+          const SizedBox(width: 8),
+        ] else if (widget.active) ...[
+          Container(
+            width: 3,
+            height: 16,
+            margin: const EdgeInsets.only(right: 8),
+            decoration: BoxDecoration(
+              color: t.primary,
+              borderRadius: BorderRadius.circular(99),
+            ),
+          ),
+        ],
+        if (s.pinned) ...[
+          Icon(CupertinoIcons.pin_fill, size: 11.5, color: t.primary),
+          const SizedBox(width: 5),
+        ],
+        Expanded(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                s.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: widget.active ? FontWeight.w600 : FontWeight.w400,
+                  color: (widget.active || _hovered) ? t.text : t.text2,
+                ),
+              ),
+              if (showSnippet) ...[
+                const SizedBox(height: 2),
+                Text(
+                  cleanSnippet,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: t.text3,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        if (statusBadge != null) ...[
+          const SizedBox(width: 6),
+          statusBadge,
+        ],
+        if (!widget.multiSelectMode) ...[
+          const SizedBox(width: 2),
+          if (_hovered)
+            GrassBagSpringTap(
+              onTap: widget.onTogglePin,
+              pressedScale: 0.88,
+              haptic: true,
+              child: SizedBox(
+                width: 32,
+                height: 34,
+                child: Center(
+                  child: Icon(
+                    s.pinned ? CupertinoIcons.pin_slash : CupertinoIcons.pin,
+                    size: 13.5,
+                    color: t.text3,
+                  ),
+                ),
+              ),
+            ),
+          Builder(
+            builder: (btnCtx) => GrassBagSpringTap(
+              onTap: () {
+                final box = btnCtx.findRenderObject() as RenderBox?;
+                final anchor = box?.localToGlobal(box.size.center(Offset.zero));
+                widget.onMoreActions(anchor);
+              },
+              pressedScale: 0.88,
+              haptic: true,
+              child: SizedBox(
+                width: 38,
+                height: 40,
+                child: Center(
+                  child: Icon(
+                    CupertinoIcons.ellipsis,
+                    size: 15,
+                    color: (_hovered || widget.active)
+                        ? t.text2
+                        : t.text2.withValues(alpha: 0.88),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 1.5),
       child: MouseRegion(
@@ -1615,145 +1741,40 @@ class _SessionListRowState extends State<_SessionListRow> {
         onExit: (_) => setState(() => _hovered = false),
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTapDown: (_) {
-            if (!_pressed) setState(() => _pressed = true);
-          },
-          onTapUp: (_) {
-            if (_pressed) setState(() => _pressed = false);
-          },
-          onTapCancel: () {
-            if (_pressed) setState(() => _pressed = false);
-          },
+          onTapDown: (_) => _schedulePress(),
+          onTapUp: (_) => _clearPress(),
+          onTapCancel: _clearPress,
           onTap: widget.onTap,
           onLongPressStart: widget.multiSelectMode
               ? null
               : (d) {
-                  if (_pressed) setState(() => _pressed = false);
+                  _clearPress();
                   widget.onMoreActions(d.globalPosition);
                 },
           onSecondaryTapDown: widget.multiSelectMode
               ? null
               : (d) => widget.onMoreActions(d.globalPosition),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 110),
-            constraints: BoxConstraints(minHeight: showSnippet ? 54 : 44),
-            padding: EdgeInsets.symmetric(
-              horizontal: 11,
-              vertical: showSnippet ? 7 : 0,
-            ),
-            decoration: BoxDecoration(
-              color: highlighted
-                  ? t.primarySoft
-                  : (_pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent)),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: highlighted ? t.primary.withValues(alpha: 0.26) : Colors.transparent,
-                width: 0.6,
+          child: ValueListenableBuilder<bool>(
+            valueListenable: _pressed,
+            child: rowContent,
+            builder: (_, pressed, child) => AnimatedContainer(
+              duration: const Duration(milliseconds: 110),
+              constraints: BoxConstraints(minHeight: showSnippet ? 54 : 44),
+              padding: EdgeInsets.symmetric(
+                horizontal: 11,
+                vertical: showSnippet ? 7 : 0,
               ),
-            ),
-            child: Row(
-              children: [
-                if (widget.multiSelectMode) ...[
-                  Icon(
-                    widget.selected ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
-                    size: 18,
-                    color: widget.selected ? t.primary : t.text3,
-                  ),
-                  const SizedBox(width: 8),
-                ] else if (widget.active) ...[
-                  Container(
-                    width: 3,
-                    height: 16,
-                    margin: const EdgeInsets.only(right: 8),
-                    decoration: BoxDecoration(
-                      color: t.primary,
-                      borderRadius: BorderRadius.circular(99),
-                    ),
-                  ),
-                ],
-                if (s.pinned) ...[
-                  Icon(CupertinoIcons.pin_fill, size: 11.5, color: t.primary),
-                  const SizedBox(width: 5),
-                ],
-                Expanded(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        s.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13.5,
-                          fontWeight: widget.active ? FontWeight.w600 : FontWeight.w400,
-                          color: (widget.active || _hovered) ? t.text : t.text2,
-                        ),
-                      ),
-                      if (showSnippet) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          cleanSnippet,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: t.text3,
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
+              decoration: BoxDecoration(
+                color: highlighted
+                    ? t.primarySoft
+                    : (pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent)),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: highlighted ? t.primary.withValues(alpha: 0.26) : Colors.transparent,
+                  width: 0.6,
                 ),
-                if (statusBadge != null) ...[
-                  const SizedBox(width: 6),
-                  statusBadge,
-                ],
-                if (!widget.multiSelectMode) ...[
-                  const SizedBox(width: 2),
-                  if (_hovered)
-                    GrassBagSpringTap(
-                      onTap: widget.onTogglePin,
-                      pressedScale: 0.88,
-                      haptic: true,
-                      child: SizedBox(
-                        width: 32,
-                        height: 34,
-                        child: Center(
-                          child: Icon(
-                            s.pinned ? CupertinoIcons.pin_slash : CupertinoIcons.pin,
-                            size: 13.5,
-                            color: t.text3,
-                          ),
-                        ),
-                      ),
-                    ),
-                  Builder(
-                    builder: (btnCtx) => GrassBagSpringTap(
-                      onTap: () {
-                        final box = btnCtx.findRenderObject() as RenderBox?;
-                        final anchor = box?.localToGlobal(box.size.center(Offset.zero));
-                        widget.onMoreActions(anchor);
-                      },
-                      pressedScale: 0.88,
-                      haptic: true,
-                      child: SizedBox(
-                        width: 38,
-                        height: 40,
-                        child: Center(
-                          child: Icon(
-                            CupertinoIcons.ellipsis,
-                            size: 15,
-                            color: (_hovered || widget.active)
-                                ? t.text2
-                                : t.text2.withValues(alpha: 0.72),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ],
+              ),
+              child: child,
             ),
           ),
         ),

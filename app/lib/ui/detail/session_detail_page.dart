@@ -918,62 +918,70 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         ),
         for (final diff in state.workspaceDiffs) ...[
           RepaintBoundary(
-            child: GrassBagSpringTap(
-              pressedScale: 0.985,
-              haptic: true,
-              onTap: () => _openDiffRecordSheet(context, diff),
-              child: GrassBagCard(
+            child: GrassBagCard(
               padding: const EdgeInsets.all(13),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              diff.path,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                color: t.text,
+                  GrassBagSpringTap(
+                    pressedScale: 0.985,
+                    haptic: true,
+                    onTap: () => _openDiffRecordSheet(context, diff),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                diff.path,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.text,
+                                ),
                               ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(diff.summary, style: TextStyle(fontSize: 11.5, color: t.text3)),
-                          ],
+                              const SizedBox(height: 2),
+                              Text(diff.summary, style: TextStyle(fontSize: 11.5, color: t.text3)),
+                            ],
+                          ),
                         ),
-                      ),
-                      Text.rich(
-                        TextSpan(
-                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w600),
-                          children: [
-                            TextSpan(text: '+${diff.added} ', style: TextStyle(color: t.ok)),
-                            TextSpan(text: '-${diff.removed}', style: TextStyle(color: t.err)),
-                          ],
+                        Text.rich(
+                          TextSpan(
+                            style: const TextStyle(fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w600),
+                            children: [
+                              TextSpan(text: '+${diff.added} ', style: TextStyle(color: t.ok)),
+                              TextSpan(text: '-${diff.removed}', style: TextStyle(color: t.err)),
+                            ],
+                          ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                   const SizedBox(height: 9),
                   _UnifiedDiffCodeBox(diffText: diff.unifiedDiff, maxPreviewLines: 12),
                   const SizedBox(height: 8),
                   Align(
                     alignment: Alignment.centerRight,
-                    child: Text(
-                      '全屏查看补丁 ›',
-                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
+                    child: GrassBagSpringTap(
+                      pressedScale: 0.95,
+                      haptic: true,
+                      onTap: () => _openDiffRecordSheet(context, diff),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                        child: Text(
+                          '全屏查看补丁 ›',
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
+                        ),
+                      ),
                     ),
                   ),
                 ],
               ),
             ),
-          ),
           ),
           const SizedBox(height: 12),
         ],
@@ -2774,7 +2782,7 @@ class _StackedContextBar extends StatelessWidget {
   }
 }
 
-class _UnifiedDiffCodeBox extends StatelessWidget {
+class _UnifiedDiffCodeBox extends StatefulWidget {
   const _UnifiedDiffCodeBox({
     required this.diffText,
     this.maxPreviewLines,
@@ -2783,20 +2791,53 @@ class _UnifiedDiffCodeBox extends StatelessWidget {
   final int? maxPreviewLines;
 
   @override
-  Widget build(BuildContext context) {
-    final t = GrassBagTokens.of(context);
-    final allLines = diffText.split('\n');
-    final clipped = maxPreviewLines != null && allLines.length > maxPreviewLines!;
-    final lines = clipped ? allLines.sublist(0, maxPreviewLines!) : allLines;
+  State<_UnifiedDiffCodeBox> createState() => _UnifiedDiffCodeBoxState();
+}
+
+class _UnifiedDiffCodeBoxState extends State<_UnifiedDiffCodeBox> {
+  List<String> _lines = const [];
+  bool _clipped = false;
+  int _hiddenCount = 0;
+  double _contentWidth = 280.0;
+
+  void _rebuildCache() {
+    final allLines = widget.diffText.split('\n');
+    final maxLines = widget.maxPreviewLines;
+    _clipped = maxLines != null && allLines.length > maxLines;
+    _lines = _clipped ? allLines.sublist(0, maxLines) : allLines;
+    _hiddenCount = _clipped ? allLines.length - _lines.length : 0;
     var maxCols = 40;
-    for (final l in lines) {
+    for (final l in _lines) {
       var cols = 0;
       for (final cu in l.codeUnits) {
         cols += cu > 0xFF ? 2 : 1;
       }
       if (cols > maxCols) maxCols = cols;
     }
-    final contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
+    _contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _rebuildCache();
+  }
+
+  @override
+  void didUpdateWidget(covariant _UnifiedDiffCodeBox oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.diffText != widget.diffText ||
+        oldWidget.maxPreviewLines != widget.maxPreviewLines) {
+      _rebuildCache();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final lines = _lines;
+    final clipped = _clipped;
+    final contentWidth = _contentWidth;
 
     final horizontalView = LayoutBuilder(
       builder: (_, box) {
@@ -2839,10 +2880,10 @@ class _UnifiedDiffCodeBox extends StatelessWidget {
                   Padding(
                     padding: const EdgeInsets.only(left: 5, top: 4),
                     child: Text(
-                      '… 还有 ${allLines.length - lines.length} 行，点击下方全屏查看',
+                      '… 还有 $_hiddenCount 行，点击下方全屏查看',
                       style: const TextStyle(
                         fontSize: 11,
-                        color: Color(0xFF94A3B8),
+                        color: Color(0xFF8294AC),
                       ),
                     ),
                   ),

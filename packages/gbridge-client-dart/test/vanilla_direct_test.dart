@@ -1235,6 +1235,54 @@ void main() {
       expect(capturedCallbackOrigin, 'http://127.0.0.1:${srv.port}');
       expect((signInRes['result'] as Map)['authorizeUrl'], 'https://auth.example/oauth');
     });
+
+    test('v34 regression: TurnStreamReducer O(1) activeTurnHasOutput, VanillaDshNormalizer byte-capped object truncation & SessionSummary sanitization', () {
+      // 1. O(1) activeTurnHasOutput & isActiveTurnEmpty inspect buffered chunks without flushing
+      final reducer = TurnStreamReducer();
+      reducer.apply(StreamFrame(
+        op: 'event',
+        seq: 1,
+        channel: 'session:s-v34',
+        type: 'turn.start',
+        data: {'turnId': 't-v34', 'eventSeq': 1},
+      ));
+      expect(reducer.isActiveTurnEmpty, isTrue);
+      expect(reducer.activeTurnHasOutput, isFalse);
+
+      reducer.apply(StreamFrame(
+        op: 'delta',
+        seq: 2,
+        channel: 'session:s-v34',
+        type: 'text.delta',
+        data: {'turnId': 't-v34', 'delta': 'Hello', 'eventSeq': 2},
+      ));
+      expect(reducer.activeTurnHasOutput, isTrue);
+      expect(reducer.isActiveTurnEmpty, isFalse);
+      expect(reducer.turns.first.assistantText, 'Hello');
+
+      // 2. VanillaDshNormalizer truncates oversized map output (>512 KiB) & enforces byte cap
+      final norm = VanillaDshNormalizer(maxCacheBytes: 300 * 1024);
+      final hugeMap = {
+        'rows': List.generate(10000, (i) => 'line-$i-${'x' * 60}'),
+      };
+      norm.cacheToolOutput('s-v34', 'c-big', {
+        'tool': 'read',
+        'status': 'ok',
+        'output': hugeMap,
+      });
+      final cached = norm.getToolOutput('s-v34', 'c-big');
+      expect(cached?['truncated'], isTrue);
+      expect(cached?['output'], isA<String>());
+      expect((cached?['output'] as String).contains('已截断'), isTrue);
+
+      // 3. SessionSummary hoisted static regexes sanitize corrupt placeholder titles
+      final sum = SessionSummary.fromJson({
+        'id': 's-corrupt',
+        'title': '[object Object]',
+        'workingDirectory': '/Users/dev/grassbag',
+      });
+      expect(sum.title, isNot(contains('[object Object]')));
+    });
   });
 }
 

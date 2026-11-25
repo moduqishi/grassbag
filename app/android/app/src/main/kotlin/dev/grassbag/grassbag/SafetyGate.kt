@@ -241,13 +241,33 @@ object SafetyGate {
 
     fun getPolicy(): PolicyTier = policy.get()
 
+    private val pauseLock = Object()
+
     fun isPaused(): Boolean = paused.get()
 
     fun setPaused(value: Boolean) {
         val prev = paused.getAndSet(value)
+        synchronized(pauseLock) {
+            pauseLock.notifyAll()
+        }
         if (prev != value) {
             for (l in pauseListeners) {
                 runCatching { l(value) }
+            }
+        }
+    }
+
+    fun waitWhilePaused(deadlineMs: Long) {
+        synchronized(pauseLock) {
+            while (paused.get() && !emergencyStopped.get()) {
+                val remaining = deadlineMs - System.currentTimeMillis()
+                if (remaining <= 0L || Thread.currentThread().isInterrupted) break
+                try {
+                    pauseLock.wait(remaining.coerceAtMost(5_000L))
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
             }
         }
     }
@@ -304,6 +324,8 @@ object SafetyGate {
                 allowTurnSetAtMs = 0L
                 policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
             }
+        } else if (removed) {
+            synchronized(pauseLock) { pauseLock.notifyAll() }
         }
         return removed
     }
@@ -375,8 +397,18 @@ object SafetyGate {
 
     fun isSensitiveNode(isPassword: Boolean, text: String?, hint: String?, viewId: String?): Boolean {
         if (isPassword) return true
-        val combined = listOfNotNull(hint, viewId, text).joinToString(" ").lowercase()
-        if (combined.isBlank()) return false
+        if (hint.isNullOrBlank() && viewId.isNullOrBlank() && text.isNullOrBlank()) return false
+        val combined = buildString {
+            if (!hint.isNullOrBlank()) append(hint)
+            if (!viewId.isNullOrBlank()) {
+                if (isNotEmpty()) append(' ')
+                append(viewId)
+            }
+            if (!text.isNullOrBlank()) {
+                if (isNotEmpty()) append(' ')
+                append(text)
+            }
+        }.lowercase()
         return secretInputKeywords.any { combined.contains(it) } ||
             shortSecretTokenRe.containsMatchIn(combined)
     }

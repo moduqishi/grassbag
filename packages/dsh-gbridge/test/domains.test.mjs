@@ -978,3 +978,63 @@ test('v33 regression: StreamHub handles turn_end, bounds tornDownChannels & clea
   assert.equal(byCwd.status, 200);
   assert.equal(byCwd.json.results.length, 1);
 });
+
+test('v34 regression: slim session.event raw, durableRing byte cap & snapshot exclusion, oversized object tool cache truncation', async () => {
+  const norm = new SessionNormalizer();
+  const { StreamHub } = await import('../lib/stream-hub.js');
+  const hub = new StreamHub({
+    bootId: 'boot-v34',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: norm,
+    gateway: { has: () => false },
+    durableReplayMaxBytes: 1024,
+  });
+
+  // 1. durableRing skips giant snapshots and enforces byte cap via head-pointer compaction
+  hub.publish('session:s-v34', 'turn.snapshot', { huge: 'X'.repeat(5000) });
+  assert.equal(hub.durableRing.length - hub.durableRingHead, 0);
+  for (let i = 0; i < 12; i++) {
+    hub.publish('session:s-v34', 'turn.completed', { turnId: `t-${i}`, pad: 'A'.repeat(160) });
+  }
+  assert.ok(hub.durableRingBytes <= 1024, `expected durableRingBytes <= 1024, got ${hub.durableRingBytes}`);
+  assert.ok(hub.durableRing.length - hub.durableRingHead >= 1);
+
+  // 2. session.event strips redundant full raw when normalizedTurn is present, but preserves raw for todo/write
+  const published = [];
+  hub.publish = (channel, type, data) => {
+    published.push({ channel, type, data });
+    return { seq: published.length };
+  };
+  hub._forwardUpstreamStreamItem('session', 's-v34-slim', 'session:s-v34-slim', {
+    type: 'event',
+    event: {
+      seq: 1,
+      type: 'assistant/message',
+      turnId: 'tv34-1',
+      data: { text: '完整回复正文 '.repeat(50) },
+    },
+  });
+  hub._forwardUpstreamStreamItem('session', 's-v34-slim', 'session:s-v34-slim', {
+    type: 'event',
+    event: {
+      seq: 2,
+      type: 'todo/write',
+      turnId: 'tv34-1',
+      data: { todos: [{ id: '1', content: 'Verify v34', status: 'in_progress' }] },
+    },
+  });
+  const msgEv = published.find((e) => e.type === 'session.event' && e.data?.raw?.type === 'assistant/message');
+  assert.ok(msgEv?.data?.normalizedTurn, 'expected normalizedTurn on assistant/message');
+  assert.equal(msgEv?.data?.raw?.data, undefined, 'expected slim raw without duplicated payload data');
+  const todoEv = published.find((e) => e.type === 'session.event' && e.data?.raw?.type === 'todo/write');
+  assert.ok(Array.isArray(todoEv?.data?.raw?.data?.todos), 'expected full raw preserved for todo/write');
+  hub.dispose();
+
+  // 3. SessionNormalizer.cacheToolOutput truncates oversized object outputs accurately (>512 KiB)
+  const hugeObj = { items: Array.from({ length: 10000 }, (_, i) => ({ idx: i, body: 'payload-'.repeat(8) })) };
+  norm.cacheToolOutput('s-v34-cache', 'call-big', { tool: 'read', status: 'ok', output: hugeObj });
+  const cached = norm.getToolOutput('s-v34-cache', 'call-big');
+  assert.equal(cached?.truncated, true);
+  assert.equal(typeof cached?.output, 'string');
+  assert.ok(cached.output.includes('已截断'), 'expected truncated marker on oversized object output');
+});

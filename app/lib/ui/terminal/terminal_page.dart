@@ -1252,7 +1252,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                         ),
                 ),
                 SizedBox(
-                  height: 40,
+                  height: 42,
                   child: ListView.separated(
                     scrollDirection: Axis.horizontal,
                     padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -1266,8 +1266,8 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                             pressedScale: 0.90,
                             haptic: true,
                             child: Container(
-                              width: 38,
-                              height: 38,
+                              width: 36,
+                              height: 36,
                               decoration: BoxDecoration(
                                 color: t.fill1,
                                 shape: BoxShape.circle,
@@ -1298,12 +1298,14 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                           child: AnimatedContainer(
                             duration: const Duration(milliseconds: 180),
                             curve: Curves.easeOutCubic,
+                            height: 36,
                             padding: EdgeInsets.fromLTRB(
                               13,
-                              4,
+                              0,
                               canCloseInline ? 4 : 13,
-                              4,
+                              0,
                             ),
+                            alignment: Alignment.center,
                             decoration: BoxDecoration(
                               color: active ? t.primarySoft : t.fill1,
                               borderRadius: BorderRadius.circular(999),
@@ -1380,63 +1382,56 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                             Expanded(
                               child: Padding(
                                 padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
-                                child: RepaintBoundary(
-                                  // Aspect-isolated MediaQuery avoids subscribing to `viewInsets`
-                                  // (unlike `MediaQuery.removePadding`), eliminating 120Hz IME rebuild storms!
-                                  child: MediaQuery(
-                                    data: MediaQueryData(
-                                      size: MediaQuery.sizeOf(context),
-                                      devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
-                                      textScaler: MediaQuery.textScalerOf(context),
-                                      platformBrightness: MediaQuery.platformBrightnessOf(context),
-                                    ),
-                                    // Keep all open tabs mounted via IndexedStack so switching tabs
-                                    // preserves scrollback offset, text selection & soft-keyboard focus!
-                                    child: FadeTransition(
-                                      opacity: _tabPulseOpacity,
-                                      child: IndexedStack(
-                                        index: _activeIndex,
-                                      children: [
-                                        for (var idx = 0; idx < _tabs.length; idx++)
-                                          () {
-                                            final item = _tabs[idx];
-                                            return TickerMode(
-                                              key: ValueKey(item.id),
-                                              enabled: idx == _activeIndex,
-                                              child: RepaintBoundary(
-                                                child: TerminalView(
-                                                  item.terminal,
-                                                  controller: item.terminalController,
-                                                  scrollController: item.scrollController,
-                                                  focusNode: item.focusNode,
-                                                  onSecondaryTapDown: (details, _) {
-                                                    _openMoreSheet(anchor: details.globalPosition);
-                                                  },
-                                                  deleteDetection: !kIsWeb &&
-                                                      (defaultTargetPlatform == TargetPlatform.android ||
-                                                          defaultTargetPlatform == TargetPlatform.iOS),
-                                                  keyboardType: TextInputType.text,
-                                                  textStyle: TerminalStyle(
-                                                    fontSize: _fontSize,
-                                                    fontFamily: kIsWeb ? 'Menlo' : 'monospace',
-                                                    fontFamilyFallback: const [
-                                                      'SF Mono',
-                                                      'Monaco',
-                                                      'Consolas',
-                                                      'Liberation Mono',
-                                                      'Courier New',
-                                                      'monospace',
-                                                    ],
-                                                  ),
-                                                  theme: _resolveTerminalTheme(t),
-                                                  autofocus: false,
+                                // Keep all open tabs mounted via IndexedStack so switching tabs
+                                // preserves scrollback offset, text selection & soft-keyboard focus!
+                                // GrassBagControlledOpacity elides OpacityLayer completely at 1.0.
+                                child: AnimatedBuilder(
+                                  animation: _tabPulseOpacity,
+                                  builder: (_, child) => GrassBagControlledOpacity(
+                                    opacity: _tabPulseOpacity.value,
+                                    child: child,
+                                  ),
+                                  child: IndexedStack(
+                                    index: _activeIndex,
+                                    children: [
+                                      for (var idx = 0; idx < _tabs.length; idx++)
+                                        () {
+                                          final item = _tabs[idx];
+                                          return TickerMode(
+                                            key: ValueKey(item.id),
+                                            enabled: idx == _activeIndex,
+                                            child: RepaintBoundary(
+                                              child: TerminalView(
+                                                item.terminal,
+                                                controller: item.terminalController,
+                                                scrollController: item.scrollController,
+                                                focusNode: item.focusNode,
+                                                onSecondaryTapDown: (details, _) {
+                                                  _openMoreSheet(anchor: details.globalPosition);
+                                                },
+                                                deleteDetection: !kIsWeb &&
+                                                    (defaultTargetPlatform == TargetPlatform.android ||
+                                                        defaultTargetPlatform == TargetPlatform.iOS),
+                                                keyboardType: TextInputType.text,
+                                                textStyle: TerminalStyle(
+                                                  fontSize: _fontSize,
+                                                  fontFamily: kIsWeb ? 'Menlo' : 'monospace',
+                                                  fontFamilyFallback: const [
+                                                    'SF Mono',
+                                                    'Monaco',
+                                                    'Consolas',
+                                                    'Liberation Mono',
+                                                    'Courier New',
+                                                    'monospace',
+                                                  ],
                                                 ),
+                                                theme: _resolveTerminalTheme(t),
+                                                autofocus: false,
                                               ),
-                                            );
-                                          }(),
-                                      ],
-                                    ),
-                                    ),
+                                            ),
+                                          );
+                                        }(),
+                                    ],
                                   ),
                                 ),
                               ),
@@ -1448,7 +1443,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                   final extraKeys =
                                       buildExtraKeys(tab.terminalController.selection != null);
                                   return Container(
-                                    height: 46,
+                                    height: 52,
                                     decoration: BoxDecoration(
                                       color: t.codeBar,
                                       border: Border(
@@ -1465,7 +1460,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                             scrollDirection: Axis.horizontal,
                                             padding: const EdgeInsets.symmetric(
                                               horizontal: 10,
-                                              vertical: 6,
+                                              vertical: 7,
                                             ),
                                             itemCount: extraKeys.length,
                                             separatorBuilder: (_, __) => const SizedBox(width: 6),
@@ -1480,45 +1475,57 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                                 t.accent,
                                                 Brightness.dark,
                                               ).primaryHi;
+                                              final repeatable = k.$2 == 'left' ||
+                                                  k.$2 == 'up' ||
+                                                  k.$2 == 'down' ||
+                                                  k.$2 == 'right' ||
+                                                  k.$2 == 'tab';
+                                              final pill = Container(
+                                                constraints: const BoxConstraints(minWidth: 42),
+                                                padding: const EdgeInsets.symmetric(horizontal: 11),
+                                                alignment: Alignment.center,
+                                                decoration: ShapeDecoration(
+                                                  color: latch == _ModLatch.locked
+                                                      ? darkAccent.withValues(alpha: 0.36)
+                                                      : (isActive
+                                                          ? darkAccent.withValues(alpha: 0.22)
+                                                          : Colors.white.withValues(alpha: 0.085)),
+                                                  shape: RoundedSuperellipseBorder(
+                                                    borderRadius: BorderRadius.circular(10),
+                                                    side: latch == _ModLatch.locked
+                                                        ? BorderSide(color: darkAccent, width: 1.2)
+                                                        : (latch == _ModLatch.once
+                                                            ? BorderSide(
+                                                                color: darkAccent.withValues(alpha: 0.55),
+                                                                width: 0.8,
+                                                              )
+                                                            : BorderSide(
+                                                                color: Colors.white.withValues(alpha: 0.07),
+                                                                width: 0.5,
+                                                              )),
+                                                  ),
+                                                ),
+                                                child: Text(
+                                                  k.$1,
+                                                  style: TextStyle(
+                                                    fontFamily: 'monospace',
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: isActive ? darkAccent : t.codeFg,
+                                                  ),
+                                                ),
+                                              );
+                                              if (repeatable) {
+                                                return _RepeatableTerminalKey(
+                                                  onFire: () => _sendExtraKey(k.$2),
+                                                  child: pill,
+                                                );
+                                              }
                                               return GrassBagSpringTap(
                                                 onTap: () => _sendExtraKey(k.$2),
                                                 pressedScale: 0.90,
                                                 haptic: true,
-                                                child: Container(
-                                                  constraints: const BoxConstraints(minWidth: 40),
-                                                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                                                  alignment: Alignment.center,
-                                                  decoration: ShapeDecoration(
-                                                    color: latch == _ModLatch.locked
-                                                        ? darkAccent.withValues(alpha: 0.36)
-                                                        : (isActive
-                                                            ? darkAccent.withValues(alpha: 0.22)
-                                                            : Colors.white.withValues(alpha: 0.085)),
-                                                    shape: RoundedSuperellipseBorder(
-                                                      borderRadius: BorderRadius.circular(10),
-                                                      side: latch == _ModLatch.locked
-                                                          ? BorderSide(color: darkAccent, width: 1.2)
-                                                          : (latch == _ModLatch.once
-                                                              ? BorderSide(
-                                                                  color: darkAccent.withValues(alpha: 0.55),
-                                                                  width: 0.8,
-                                                                )
-                                                              : BorderSide(
-                                                                  color: Colors.white.withValues(alpha: 0.07),
-                                                                  width: 0.5,
-                                                                )),
-                                                    ),
-                                                  ),
-                                                  child: Text(
-                                                    k.$1,
-                                                    style: TextStyle(
-                                                      fontFamily: 'monospace',
-                                                      fontSize: 11.5,
-                                                      fontWeight: FontWeight.w600,
-                                                      color: isActive ? darkAccent : t.codeFg,
-                                                    ),
-                                                  ),
-                                                ),
+                                                child: pill,
                                               );
                                             },
                                           ),
@@ -1527,7 +1534,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                             (defaultTargetPlatform == TargetPlatform.android ||
                                                 defaultTargetPlatform == TargetPlatform.iOS))
                                           Padding(
-                                            padding: const EdgeInsets.fromLTRB(4, 6, 8, 6),
+                                            padding: const EdgeInsets.fromLTRB(4, 7, 8, 7),
                                             child: Tooltip(
                                               message: '收起键盘',
                                               child: GrassBagSpringTap(
@@ -1535,7 +1542,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                                 pressedScale: 0.90,
                                                 haptic: true,
                                                 child: Container(
-                                                  width: 38,
+                                                  width: 40,
                                                   alignment: Alignment.center,
                                                   decoration: ShapeDecoration(
                                                     color: Colors.white.withValues(alpha: 0.085),
@@ -1549,7 +1556,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                                                   ),
                                                   child: Icon(
                                                     CupertinoIcons.keyboard_chevron_compact_down,
-                                                    size: 16,
+                                                    size: 17,
                                                     color: t.codeFg,
                                                   ),
                                                 ),
@@ -1628,9 +1635,88 @@ class _LocalTermTab {
   }
 }
 
-/// Isolates `MediaQuery.viewInsetsOf` to a tiny bottom-margin leaf so 120Hz IME animations
-/// never rebuild `_TerminalPageState`, `GrassBagUnifiedHeader`, or `TerminalView`!
-class _TerminalKeyboardMargin extends StatelessWidget {
+/// Repeatable soft-key button for arrow/Tab keys: fires immediately on tap and auto-repeats
+/// at 65ms intervals after a 350ms hold, cancelling cleanly on lift, drag-away, or dispose.
+class _RepeatableTerminalKey extends StatefulWidget {
+  const _RepeatableTerminalKey({
+    required this.onFire,
+    required this.child,
+  });
+
+  final VoidCallback onFire;
+  final Widget child;
+
+  @override
+  State<_RepeatableTerminalKey> createState() => _RepeatableTerminalKeyState();
+}
+
+class _RepeatableTerminalKeyState extends State<_RepeatableTerminalKey> {
+  Timer? _holdTimer;
+  Timer? _repeatTimer;
+  bool _pressed = false;
+  bool _repeated = false;
+
+  void _cancelTimers() {
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _repeatTimer?.cancel();
+    _repeatTimer = null;
+  }
+
+  @override
+  void dispose() {
+    _cancelTimers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) {
+        _repeated = false;
+        if (!_pressed) setState(() => _pressed = true);
+        _cancelTimers();
+        _holdTimer = Timer(const Duration(milliseconds: 350), () {
+          if (!mounted) return;
+          _repeated = true;
+          HapticFeedback.selectionClick();
+          widget.onFire();
+          _repeatTimer = Timer.periodic(const Duration(milliseconds: 65), (_) {
+            if (!mounted) {
+              _cancelTimers();
+              return;
+            }
+            widget.onFire();
+          });
+        });
+      },
+      onTapUp: (_) {
+        _cancelTimers();
+        if (_pressed) setState(() => _pressed = false);
+        if (!_repeated) {
+          HapticFeedback.selectionClick();
+          widget.onFire();
+        }
+      },
+      onTapCancel: () {
+        _cancelTimers();
+        if (_pressed) setState(() => _pressed = false);
+      },
+      child: AnimatedScale(
+        scale: _pressed ? 0.90 : 1.0,
+        duration: const Duration(milliseconds: 90),
+        curve: Curves.easeOutCubic,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+/// Isolates `MediaQuery.viewInsetsOf` and settles the bottom padding 70ms after IME flight
+/// so `xterm`'s `TerminalView` runs `terminal.resize()` ONCE instead of 30x per keyboard open,
+/// while preserving all ambient MediaQuery accessibility & gesture settings!
+class _TerminalKeyboardMargin extends StatefulWidget {
   const _TerminalKeyboardMargin({
     required this.restingBottomMargin,
     required this.child,
@@ -1640,12 +1726,45 @@ class _TerminalKeyboardMargin extends StatelessWidget {
   final Widget child;
 
   @override
+  State<_TerminalKeyboardMargin> createState() => _TerminalKeyboardMarginState();
+}
+
+class _TerminalKeyboardMarginState extends State<_TerminalKeyboardMargin> {
+  Timer? _settleTimer;
+  double? _settledBottom;
+  double _lastKbInset = -1.0;
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final bottom = math.max(restingBottomMargin, kbInset + 6.0);
-    return Padding(
-      padding: EdgeInsets.fromLTRB(12, 0, 12, bottom),
-      child: child,
+    final targetBottom = math.max(widget.restingBottomMargin, kbInset + 6.0);
+    if (_settledBottom == null || kbInset <= 0.5) {
+      _settleTimer?.cancel();
+      _settledBottom = targetBottom;
+    } else if ((kbInset - _lastKbInset).abs() > 0.5) {
+      _settleTimer?.cancel();
+      final nextBottom = targetBottom;
+      _settleTimer = Timer(const Duration(milliseconds: 70), () {
+        if (mounted && _settledBottom != nextBottom) {
+          setState(() => _settledBottom = nextBottom);
+        }
+      });
+    }
+    _lastKbInset = kbInset;
+    final bottom = _settledBottom ?? targetBottom;
+    return MediaQuery.removeViewInsets(
+      context: context,
+      removeBottom: true,
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(12, 0, 12, bottom),
+        child: widget.child,
+      ),
     );
   }
 }

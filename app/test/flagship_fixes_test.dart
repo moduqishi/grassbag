@@ -249,10 +249,10 @@ void main() {
         find.ancestor(of: find.text('看看工作区'), matching: find.byType(Visibility)),
       );
       expect(cardVisibilities.any((v) => !v.visible), isTrue);
-      final fadeTransitions = tester.widgetList<FadeTransition>(
-        find.byType(FadeTransition),
+      final controlledOpacities = tester.widgetList<GrassBagControlledOpacity>(
+        find.byType(GrassBagControlledOpacity),
       );
-      expect(fadeTransitions.any((f) => f.opacity.value == 0.0), isTrue);
+      expect(controlledOpacities.any((c) => c.opacity == 0.0), isTrue);
       expect(tester.takeException(), isNull);
     });
 
@@ -1920,6 +1920,118 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('编辑排队消息'), findsNothing);
         await tester.pump(const Duration(milliseconds: 500));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v34 regression: readable LaTeX formatting, incremental block-comment code highlighting, WCAG AA accent contrast across all 12 themes, frosted tier budget & GrassBagControlledOpacity elision',
+      (tester) async {
+        // 1. LaTeX formatting handles nested \frac{\sqrt{x}}{2}, braced ^{2n}, \mathbb{R}, aligned envs
+        final fracSqrt = formatReadableLatexForTest(r'\frac{\sqrt{x}}{2}');
+        expect(fracSqrt, contains('√(x)'));
+        expect(fracSqrt, isNot(contains(r'\frac')));
+        expect(formatReadableLatexForTest(r'x^{2n} + y_{i+1}'), contains('²ⁿ'));
+        expect(formatReadableLatexForTest(r'x \in \mathbb{R}'), contains('ℝ'));
+        final aligned = formatReadableLatexForTest(r'\begin{aligned} a &= b \\ c &= d \end{aligned}');
+        expect(aligned, contains('\n'));
+        expect(aligned, isNot(contains(r'\begin')));
+
+        // 2. Frosted chrome tier uses standard quality (no shader oversampling)
+        expect(
+          GrassBagGlassConfig.chromeQualityFor(GrassBagGlassTier.frosted),
+          GlassQuality.standard,
+        );
+
+        // 3. WCAG AA contrast (>= 4.5:1) for primary over blended primarySoft on cardSolid across all 12 themes
+        double lum(Color c) => c.computeLuminance();
+        double contrastRatio(Color fg, Color bg) {
+          final l1 = lum(fg);
+          final l2 = lum(bg);
+          return (l1 > l2 ? l1 : l2) + 0.05 > 0
+              ? ((l1 > l2 ? l1 : l2) + 0.05) / ((l1 < l2 ? l1 : l2) + 0.05)
+              : 1.0;
+        }
+        for (final accent in GrassBagAccent.values) {
+          for (final brightness in Brightness.values) {
+            final t = GrassBagTokens.resolve(accent, brightness);
+            final blendedSoft = Color.alphaBlend(t.primarySoft, t.cardSolid);
+            final ratio = contrastRatio(t.primary, blendedSoft);
+            expect(
+              ratio,
+              greaterThanOrEqualTo(4.5),
+              reason: 'Accent $accent ($brightness) primary on primarySoft contrast=$ratio < 4.5',
+            );
+          }
+        }
+
+        // 4. GrassBagControlledOpacity elides OpacityLayer at 1.0 and enables compositing at 0.5
+        await tester.pumpWidget(
+          const Directionality(
+            textDirection: TextDirection.ltr,
+            child: Column(
+              children: [
+                GrassBagControlledOpacity(
+                  key: Key('op-full'),
+                  opacity: 1.0,
+                  child: Text('Full'),
+                ),
+                GrassBagControlledOpacity(
+                  key: Key('op-half'),
+                  opacity: 0.5,
+                  child: Text('Half'),
+                ),
+              ],
+            ),
+          ),
+        );
+        final fullRo = tester.renderObject(find.byKey(const Key('op-full')));
+        final halfRo = tester.renderObject(find.byKey(const Key('op-half')));
+        // ignore: invalid_use_of_protected_member
+        expect(fullRo.alwaysNeedsCompositing, isFalse);
+        // ignore: invalid_use_of_protected_member
+        expect(halfRo.alwaysNeedsCompositing, isTrue);
+
+        // 5. TurnView renders multi-line /* ... */ code block and opens fullscreen sheet with Soft-Wrap & Copy controls
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        final codeTurn = NormalizedTurn(
+          turnId: 'turn-v34-code',
+          status: 'completed',
+          userMessage: const NormalizedUserMessage(id: 'u-v34', text: '展示代码块'),
+          assistantText: '```dart\n'
+              '/* start comment\n'
+              'still inside comment\n'
+              'end comment */\n'
+              '${List.generate(12, (i) => 'final v$i = $i;').join('\n')}\n'
+              '```',
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: TurnView(
+                    turn: codeTurn,
+                    onOpenTerminal: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('still inside comment'), findsOneWidget);
+        expect(find.text('全屏'), findsOneWidget);
+        await tester.tap(find.text('全屏'));
+        await tester.pumpAndSettle();
+        expect(find.text('自动换行'), findsOneWidget);
+        expect(find.text('复制代码'), findsOneWidget);
+        await tester.tap(find.text('自动换行'));
+        await tester.pumpAndSettle();
+        expect(find.text('切换单行'), findsOneWidget);
         expect(tester.takeException(), isNull);
       },
     );

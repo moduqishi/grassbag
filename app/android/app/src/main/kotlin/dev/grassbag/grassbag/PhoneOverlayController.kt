@@ -3,12 +3,12 @@ package dev.grassbag.grassbag
 import android.accessibilityservice.AccessibilityService
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
+import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.ActivityOptions
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
@@ -42,6 +42,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -147,6 +148,9 @@ class PhoneOverlayController(private val appContext: Context) {
     private var hudCompletedAlreadyInApp = false
     private var hudTimerRunning = false
     private var pendingHideRunnable: Runnable? = null
+    private val completionGen = AtomicInteger(0)
+    private var lastHudBadgeKey: String? = null
+    private var hudBadgeDrawable: GradientDrawable? = null
     private val previewDemoActive = AtomicBoolean(false)
     private val previewDemoGen = AtomicInteger(0)
     private val hudSessionActiveAtomic = AtomicBoolean(false)
@@ -155,6 +159,7 @@ class PhoneOverlayController(private val appContext: Context) {
     private var activeConfirmContainer: FrameLayout? = null
     private var activeConfirmWm: WindowManager? = null
     private var activeConfirmTick: Runnable? = null
+    private var activeConfirmProgressAnim: ObjectAnimator? = null
     private val activeConfirmLatch = AtomicReference<CountDownLatch?>(null)
     private val activeConfirmResult = AtomicReference<Any?>(null)
 
@@ -231,22 +236,30 @@ class PhoneOverlayController(private val appContext: Context) {
         }
     }
 
-    fun hideForCapture(hidden: Boolean) {
+    fun hideForCapture(hidden: Boolean): Boolean {
         val count = if (hidden) {
             captureHideRefCount.incrementAndGet()
         } else {
             captureHideRefCount.updateAndGet { cur -> (cur - 1).coerceAtLeast(0) }
         }
         val shouldHide = count > 0
+        val wereAnyVisible = AtomicBoolean(false)
         runOnMainSyncOrPost(sync = shouldHide) {
+            if (shouldHide) {
+                val anyVis = (hudContainer?.visibility == View.VISIBLE) ||
+                    (fxCanvasView?.visibility == View.VISIBLE) ||
+                    (activeConfirmContainer?.visibility == View.VISIBLE)
+                wereAnyVisible.set(anyVis)
+            }
             val vis = if (shouldHide) View.INVISIBLE else View.VISIBLE
             hudContainer?.visibility = vis
             fxCanvasView?.visibility = vis
-            if (!shouldHide && SafetyGate.isShowEdgeAurora()) {
+            if (!shouldHide && (SafetyGate.isShowEdgeAurora() || fxCanvasView?.hasActiveFx() == true)) {
                 fxCanvasView?.startLoop()
             }
             activeConfirmContainer?.visibility = vis
         }
+        return wereAnyVisible.get()
     }
 
     fun refreshVisualPreferences() {
@@ -514,18 +527,24 @@ class PhoneOverlayController(private val appContext: Context) {
             }
 
             val finishDelayMs = if (willReturn) 680L else 1250L
+            val myCompletionGen = completionGen.incrementAndGet()
             val runnable = Runnable {
                 pendingHideRunnable = null
+                if (completionGen.get() != myCompletionGen) return@Runnable
                 if (willReturn) {
                     bringGrassBagToFrontNow(preferPendingIntent = false)
                     // Defer hideHud() past the 320ms retry so SYSTEM_ALERT_WINDOW BAL exemption remains active
                     // AND try PendingIntent fallback when direct startActivity was silently dropped by OEM BAL!
-                    mainHandler.postDelayed({
+                    val retryRunnable = Runnable {
+                        pendingHideRunnable = null
+                        if (completionGen.get() != myCompletionGen) return@Runnable
                         if (!MainActivity.isMainActivityResumed) {
                             bringGrassBagToFrontNow(preferPendingIntent = true)
                         }
                         hideHud()
-                    }, 320L)
+                    }
+                    pendingHideRunnable = retryRunnable
+                    mainHandler.postDelayed(retryRunnable, 320L)
                 } else {
                     hideHud()
                 }
@@ -984,7 +1003,7 @@ class PhoneOverlayController(private val appContext: Context) {
         }
 
         if (!runCatching { shownLatch.await(2000L, TimeUnit.MILLISECONDS) }.getOrDefault(false) || !shownOk.get()) {
-            return HandoffDecision.UNAVAILABLE
+            return resultBox.get() ?: HandoffDecision.UNAVAILABLE
         }
         val completed = runCatching { latch.await(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
         mainHandler.post { removeActiveConfirmView(animate = true, expectedView = cardRef.get()) }
@@ -1036,6 +1055,7 @@ class PhoneOverlayController(private val appContext: Context) {
     }
 
     private fun cancelPendingHide() {
+        completionGen.incrementAndGet()
         pendingHideRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingHideRunnable = null
     }
@@ -1045,6 +1065,8 @@ class PhoneOverlayController(private val appContext: Context) {
         hudTitleView = null
         hudSubView = null
         hudStatusBadge = null
+        lastHudBadgeKey = null
+        hudBadgeDrawable = null
         hudPauseBtn = null
         hudAutoReturnBtn = null
         hudTimelineContainer = null
@@ -2012,34 +2034,48 @@ class PhoneOverlayController(private val appContext: Context) {
         val badge = hudStatusBadge
         if (badge != null) {
             val dark = isDarkPalette()
-            val density = appContext.resources.displayMetrics.density
-            val (label, fg, bg) = when {
-                hudCompletedState -> Triple(
-                    "已完成",
-                    if (dark) Color.parseColor("#5CE0A4") else Color.parseColor("#188A56"),
-                    if (dark) Color.parseColor("#2A22C55E") else Color.parseColor("#1C188A56")
-                )
-                SafetyGate.isPaused() -> Triple(
-                    "已暂停",
-                    if (dark) Color.parseColor("#CBD5E1") else Color.parseColor("#475569"),
-                    if (dark) Color.parseColor("#2494A3B8") else Color.parseColor("#1864748B")
-                )
-                hudWaitingForUser -> Triple(
-                    "待确认",
-                    if (dark) Color.parseColor("#FBBF24") else Color.parseColor("#B45309"),
-                    if (dark) Color.parseColor("#2CF59E0B") else Color.parseColor("#1CE68A00")
-                )
-                else -> Triple(
-                    "操控中",
-                    if (dark) Color.parseColor("#7CC7FA") else Color.parseColor("#1E6DAE"),
-                    if (dark) Color.parseColor("#2638BDF8") else Color.parseColor("#1A2A78B5")
-                )
+            val statusState = when {
+                hudCompletedState -> "done"
+                SafetyGate.isPaused() -> "paused"
+                hudWaitingForUser -> "waiting"
+                else -> "active"
             }
-            badge.text = label
-            badge.setTextColor(fg)
-            badge.background = GradientDrawable().apply {
-                cornerRadius = 999f * density
-                setColor(bg)
+            val badgeKey = "$statusState:$dark"
+            if (badgeKey != lastHudBadgeKey) {
+                lastHudBadgeKey = badgeKey
+                val density = appContext.resources.displayMetrics.density
+                val (label, fg, bg) = when (statusState) {
+                    "done" -> Triple(
+                        "已完成",
+                        if (dark) Color.parseColor("#5CE0A4") else Color.parseColor("#188A56"),
+                        if (dark) Color.parseColor("#2A22C55E") else Color.parseColor("#1C188A56")
+                    )
+                    "paused" -> Triple(
+                        "已暂停",
+                        if (dark) Color.parseColor("#CBD5E1") else Color.parseColor("#475569"),
+                        if (dark) Color.parseColor("#2494A3B8") else Color.parseColor("#1864748B")
+                    )
+                    "waiting" -> Triple(
+                        "待确认",
+                        if (dark) Color.parseColor("#FBBF24") else Color.parseColor("#B45309"),
+                        if (dark) Color.parseColor("#2CF59E0B") else Color.parseColor("#1CE68A00")
+                    )
+                    else -> Triple(
+                        "操控中",
+                        if (dark) Color.parseColor("#7CC7FA") else Color.parseColor("#1E6DAE"),
+                        if (dark) Color.parseColor("#2638BDF8") else Color.parseColor("#1A2A78B5")
+                    )
+                }
+                badge.text = label
+                badge.setTextColor(fg)
+                val drawable = hudBadgeDrawable ?: GradientDrawable().also {
+                    it.cornerRadius = 999f * density
+                    hudBadgeDrawable = it
+                }
+                drawable.setColor(bg)
+                if (badge.background !== drawable) {
+                    badge.background = drawable
+                }
             }
         }
     }
@@ -2512,17 +2548,27 @@ class PhoneOverlayController(private val appContext: Context) {
             )
         )
 
+        progressFill.pivotX = 0f
+        activeConfirmProgressAnim?.cancel()
+        activeConfirmProgressAnim = ObjectAnimator.ofFloat(progressFill, View.SCALE_X, 1f, 0f).apply {
+            duration = totalMs.coerceAtLeast(1L)
+            interpolator = LinearInterpolator()
+            start()
+        }
+
         val tick = object : Runnable {
+            private var lastSec = -1
             override fun run() {
                 if (activeConfirmContainer !== wrapper) return
                 val remMs = (deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
                 val sec = ((remMs + 999L) / 1000L).toInt()
-                countdownPill.text = "${sec}s"
-                val frac = (remMs.toFloat() / totalMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
-                progressFill.scaleX = frac
-                progressFill.pivotX = 0f
+                if (sec != lastSec) {
+                    lastSec = sec
+                    countdownPill.text = "${sec}s"
+                }
                 if (remMs > 0L) {
-                    mainHandler.postDelayed(this, 100L)
+                    val nextDelay = ((remMs - 1L) % 1000L + 16L).coerceIn(100L, 1000L)
+                    mainHandler.postDelayed(this, nextDelay)
                 }
             }
         }
@@ -2552,6 +2598,8 @@ class PhoneOverlayController(private val appContext: Context) {
         if (expectedView != null && view !== expectedView) return
         activeConfirmTick?.let { mainHandler.removeCallbacks(it) }
         activeConfirmTick = null
+        activeConfirmProgressAnim?.cancel()
+        activeConfirmProgressAnim = null
         val wm = activeConfirmWm ?: return
         activeConfirmContainer = null
         activeConfirmWm = null
@@ -2559,6 +2607,8 @@ class PhoneOverlayController(private val appContext: Context) {
             runCatching { wm.removeViewImmediate(view) }
             return
         }
+        val entry = wm to (view as View)
+        fadingOverlayViews.add(entry)
         view.animate()
             .alpha(0f)
             .translationY(dp(appContext, 28).toFloat())
@@ -2568,7 +2618,8 @@ class PhoneOverlayController(private val appContext: Context) {
             .setInterpolator(DecelerateInterpolator())
             .setListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
-                    runCatching { wm.removeViewImmediate(view) }
+                    fadingOverlayViews.remove(entry)
+                    runCatching { if (view.isAttachedToWindow) wm.removeViewImmediate(view) }
                 }
             })
             .start()
@@ -2613,6 +2664,9 @@ class PhoneOverlayController(private val appContext: Context) {
         private val density = ctx.resources.displayMetrics.density
         private val clipPath = Path()
         private val boundsRect = RectF()
+        private val rimRect = RectF()
+        private val rimPath = Path()
+        private var cachedRimRadiusPx = 0f
         private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val tintWashPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val specularPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -2679,6 +2733,21 @@ class PhoneOverlayController(private val appContext: Context) {
                 if (dark) Color.parseColor("#1E9FC8F0") else Color.parseColor("#70FFFFFF"),
                 Shader.TileMode.CLAMP
             )
+
+            // Precompute rim geometry once per size change (zero allocations in draw())
+            val inset = 0.7f * density
+            val bezelBleed = 2.0f * density
+            rimRect.set(
+                boundsRect.left + if (dockedEdge < 0) -bezelBleed else inset,
+                boundsRect.top + inset,
+                boundsRect.right + if (dockedEdge > 0) bezelBleed else -inset,
+                boundsRect.bottom - inset
+            )
+            cachedRimRadiusPx = min(radiusDp * density, min(rimRect.width(), rimRect.height()) / 2f)
+            rimPath.reset()
+            if (customRadiiPx != null) {
+                rimPath.addRoundRect(rimRect, customRadiiPx, Path.Direction.CW)
+            }
         }
 
         override fun draw(canvas: Canvas) {
@@ -2690,24 +2759,14 @@ class PhoneOverlayController(private val appContext: Context) {
             canvas.drawRect(boundsRect, specularPaint)
             canvas.restore()
 
-            val inset = 0.7f * density
-            val bezelBleed = 2.0f * density
-            val rimRect = RectF(
-                boundsRect.left + if (dockedEdge < 0) -bezelBleed else inset,
-                boundsRect.top + inset,
-                boundsRect.right + if (dockedEdge > 0) bezelBleed else -inset,
-                boundsRect.bottom - inset
-            )
-            val rPx = min(radiusDp * density, min(rimRect.width(), rimRect.height()) / 2f)
             if (customRadiiPx != null) {
                 canvas.save()
                 canvas.clipRect(boundsRect)
-                val p = Path().apply { addRoundRect(rimRect, customRadiiPx, Path.Direction.CW) }
-                canvas.drawPath(p, rimPaint)
+                canvas.drawPath(rimPath, rimPaint)
                 canvas.restore()
             } else {
-                canvas.drawRoundRect(rimRect, rPx, rPx, rimPaint)
-                canvas.drawRoundRect(boundsRect, rPx, rPx, outerHairlinePaint)
+                canvas.drawRoundRect(rimRect, cachedRimRadiusPx, cachedRimRadiusPx, rimPaint)
+                canvas.drawRoundRect(boundsRect, cachedRimRadiusPx, cachedRimRadiusPx, outerHairlinePaint)
             }
         }
 
@@ -2771,6 +2830,10 @@ class PhoneOverlayController(private val appContext: Context) {
             color = Color.WHITE
         }
         private val donePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val waitingRingColor = Color.parseColor("#F59E0B")
+        private val pausedRingColor = if (dark) Color.parseColor("#64748B") else Color.parseColor("#94A3B8")
+        private val highlightColor = Color.parseColor("#88FFFFFF")
+
         private val checkPath = Path()
         private val scratchRect = RectF()
         private val sweepMatrix = Matrix()
@@ -2886,52 +2949,50 @@ class PhoneOverlayController(private val appContext: Context) {
                 Mode.WAITING -> {
                     val pulse = (0.55f + 0.45f * sin(Math.toRadians((phase * 2.0))).toFloat())
                     ringPaint.shader = null
-                    ringPaint.color = Color.parseColor("#F59E0B")
+                    ringPaint.color = waitingRingColor
                     ringPaint.alpha = (pulse * 225f).toInt()
                     canvas.drawCircle(cx, cy, ringRadius, ringPaint)
                 }
                 Mode.PAUSED -> {
                     ringPaint.shader = null
-                    ringPaint.color = if (dark) Color.parseColor("#64748B") else Color.parseColor("#94A3B8")
+                    ringPaint.color = pausedRingColor
                     ringPaint.alpha = 165
                     canvas.drawCircle(cx, cy, ringRadius, ringPaint)
                 }
                 Mode.COMPLETED -> Unit
             }
 
-            // GrassBag mascot silhouette
+            // GrassBag mascot silhouette (zero per-frame RectF allocations)
             val s = r * 0.56f
             canvas.save()
             canvas.rotate(-26f, cx - s * 0.18f, cy - s * 0.44f)
-            canvas.drawOval(RectF(cx - s * 0.36f, cy - s * 0.96f, cx - s * 0.02f, cy - s * 0.34f), pouchPaint)
+            scratchRect.set(cx - s * 0.36f, cy - s * 0.96f, cx - s * 0.02f, cy - s * 0.34f)
+            canvas.drawOval(scratchRect, pouchPaint)
             canvas.restore()
 
             canvas.save()
             canvas.rotate(26f, cx + s * 0.18f, cy - s * 0.44f)
-            canvas.drawOval(RectF(cx + s * 0.02f, cy - s * 0.96f, cx + s * 0.36f, cy - s * 0.34f), pouchPaint)
+            scratchRect.set(cx + s * 0.02f, cy - s * 0.96f, cx + s * 0.36f, cy - s * 0.34f)
+            canvas.drawOval(scratchRect, pouchPaint)
             canvas.restore()
 
-            val bodyRect = RectF(cx - s * 0.72f, cy - s * 0.42f, cx + s * 0.72f, cy + s * 0.78f)
-            canvas.drawRoundRect(bodyRect, s * 0.56f, s * 0.56f, pouchPaint)
+            scratchRect.set(cx - s * 0.72f, cy - s * 0.42f, cx + s * 0.72f, cy + s * 0.78f)
+            canvas.drawRoundRect(scratchRect, s * 0.56f, s * 0.56f, pouchPaint)
 
-            highlightPaint.color = Color.parseColor("#88FFFFFF")
+            highlightPaint.color = highlightColor
             highlightPaint.strokeWidth = s * 0.13f
-            val arcRect = RectF(cx - s * 0.50f, cy - s * 0.24f, cx + s * 0.50f, cy + s * 0.56f)
-            canvas.drawArc(arcRect, 200f, 65f, false, highlightPaint)
+            scratchRect.set(cx - s * 0.50f, cy - s * 0.24f, cx + s * 0.50f, cy + s * 0.56f)
+            canvas.drawArc(scratchRect, 200f, 65f, false, highlightPaint)
 
             // Playful micro-blink once per orbital cycle when active
             val blinkScale = if (mode == Mode.ACTIVE && phase in 336f..352f) 0.24f else 1f
             val eyeW = s * 0.15f
             val eyeH = s * 0.28f * blinkScale
             val eyeY = cy + s * 0.14f
-            canvas.drawRoundRect(
-                RectF(cx - s * 0.27f - eyeW / 2f, eyeY - eyeH / 2f, cx - s * 0.27f + eyeW / 2f, eyeY + eyeH / 2f),
-                eyeW, eyeW, eyePaint
-            )
-            canvas.drawRoundRect(
-                RectF(cx + s * 0.27f - eyeW / 2f, eyeY - eyeH / 2f, cx + s * 0.27f + eyeW / 2f, eyeY + eyeH / 2f),
-                eyeW, eyeW, eyePaint
-            )
+            scratchRect.set(cx - s * 0.27f - eyeW / 2f, eyeY - eyeH / 2f, cx - s * 0.27f + eyeW / 2f, eyeY + eyeH / 2f)
+            canvas.drawRoundRect(scratchRect, eyeW, eyeW, eyePaint)
+            scratchRect.set(cx + s * 0.27f - eyeW / 2f, eyeY - eyeH / 2f, cx + s * 0.27f + eyeW / 2f, eyeY + eyeH / 2f)
+            canvas.drawRoundRect(scratchRect, eyeW, eyeW, eyePaint)
         }
     }
 
@@ -2986,6 +3047,7 @@ class PhoneOverlayController(private val appContext: Context) {
         private var shutterAlpha = 0f
         private var running = false
         private var lastFrameMs = 0L
+        private var lastDrawNanos = 0L
         private var onFadedOut: (() -> Unit)? = null
 
         private val tapEffects = ArrayList<TapEffect>()
@@ -2993,12 +3055,15 @@ class PhoneOverlayController(private val appContext: Context) {
         private var activeTypeBadge: TypeBadgeEffect? = null
 
         private val density = context.resources.displayMetrics.density
-        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        // Multi-layer concentric halo strokes replace BlurMaskFilter so Skia/HWUI never runs a
+        // full-screen Gaussian blur pass at 60/120Hz while preserving the luminous edge aurora!
+        private val outerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 11f * density
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                maskFilter = BlurMaskFilter(10f * density, BlurMaskFilter.Blur.NORMAL)
-            }
+            strokeWidth = 20f * density
+        }
+        private val midGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 9.5f * density
         }
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -3015,6 +3080,17 @@ class PhoneOverlayController(private val appContext: Context) {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
+        private val trailMatrix = Matrix()
+        private var trailShader: LinearGradient? = null
+        private var trailShaderAccent: Int = 0
+        private val innerRippleColor = Color.parseColor("#20C997")
+        private val darkTagBgColor = Color.parseColor("#F21C2736")
+        private val lightTagBgColor = Color.parseColor("#F8FBFDFF")
+        private val darkTagRimColor = Color.parseColor("#9FC8F0")
+        private val lightTagRimColor = Color.parseColor("#132C44")
+        private val darkTagTextColor = Color.parseColor("#F4F8FD")
+        private val lightTagTextColor = Color.parseColor("#112131")
+        private val tagShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val tagBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val tagRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -3026,6 +3102,10 @@ class PhoneOverlayController(private val appContext: Context) {
             textAlign = Paint.Align.CENTER
         }
         private val tagMeasurePaint = TextPaint(tagTextPaint)
+        private var cachedTagRaw: String? = null
+        private var cachedTagWidth: Int = -1
+        private var cachedTagEllipsized: String = ""
+        private var cachedTagTextW: Float = 0f
         private val scratchRect = RectF()
         private val shutterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -3036,10 +3116,23 @@ class PhoneOverlayController(private val appContext: Context) {
         private val sweepMatrix = Matrix()
         private var sweepShader: SweepGradient? = null
 
+        fun hasActiveFx(): Boolean =
+            tapEffects.isNotEmpty() || swipeEffects.isNotEmpty() || activeTypeBadge != null || shutterAlpha > 0.01f
+
         private val frameCallback = object : Choreographer.FrameCallback {
             override fun doFrame(frameTimeNanos: Long) {
                 if (!running) return
                 val nowMs = SystemClock.elapsedRealtime()
+                val hasActiveFx = tapEffects.isNotEmpty() || swipeEffects.isNotEmpty() || activeTypeBadge != null || shutterAlpha > 0.01f
+                val ambientSettled = !hasActiveFx && kotlin.math.abs(targetFade - fade) <= 0.01f
+                // Throttle ambient-only edge aurora to ~33fps (28ms cadence) to cut GPU power by ~70% on 120Hz phones
+                // while keeping full native 60/120fps whenever gesture ripples, swipes, or fade transitions are active!
+                if (ambientSettled && lastDrawNanos != 0L && (frameTimeNanos - lastDrawNanos) < 28_000_000L) {
+                    Choreographer.getInstance().postFrameCallback(this)
+                    return
+                }
+                lastDrawNanos = frameTimeNanos
+
                 val dt = if (lastFrameMs == 0L) 16f else (nowMs - lastFrameMs).coerceIn(1L, 64L).toFloat()
                 lastFrameMs = nowMs
 
@@ -3065,23 +3158,27 @@ class PhoneOverlayController(private val appContext: Context) {
                 }
 
                 // Prune finished gesture FX
-                tapEffects.removeAll { nowMs - it.startMs >= it.totalMs }
-                swipeEffects.removeAll { nowMs - it.startMs >= it.totalMs }
+                if (tapEffects.isNotEmpty()) {
+                    tapEffects.removeAll { nowMs - it.startMs >= it.totalMs }
+                }
+                if (swipeEffects.isNotEmpty()) {
+                    swipeEffects.removeAll { nowMs - it.startMs >= it.totalMs }
+                }
                 activeTypeBadge?.let { if (nowMs - it.startMs >= it.totalMs) activeTypeBadge = null }
 
                 invalidate()
 
-                val hasActiveFx = tapEffects.isNotEmpty() || swipeEffects.isNotEmpty() || activeTypeBadge != null || shutterAlpha > 0.01f
-                if (targetFade == 0f && fade <= 0.01f && !hasActiveFx) {
+                val stillHasFx = tapEffects.isNotEmpty() || swipeEffects.isNotEmpty() || activeTypeBadge != null || shutterAlpha > 0.01f
+                if (targetFade == 0f && fade <= 0.01f && !stillHasFx) {
                     running = false
                     val cb = onFadedOut
                     onFadedOut = null
                     cb?.invoke()
                 } else if (visibility != View.VISIBLE ||
-                    (!showAurora && !hasActiveFx && targetFade > 0f && fade >= targetFade - 0.01f) ||
-                    (visualMode == VisualMode.PAUSED && !hasActiveFx && targetFade > 0f && fade >= targetFade - 0.01f)
+                    (!showAurora && !stillHasFx && targetFade > 0f && fade >= targetFade - 0.01f) ||
+                    (visualMode == VisualMode.PAUSED && !stillHasFx && targetFade > 0f && fade >= targetFade - 0.01f)
                 ) {
-                    // Halt 60/120Hz Choreographer loop when aurora is disabled, hidden, or paused with no active gesture FX.
+                    // Halt Choreographer loop when aurora is disabled, hidden, or paused with no active gesture FX.
                     running = false
                 } else {
                     Choreographer.getInstance().postFrameCallback(this)
@@ -3239,15 +3336,30 @@ class PhoneOverlayController(private val appContext: Context) {
                 )
             }
             sweepShader = SweepGradient(width / 2f, height / 2f, palette, null)
-            glowPaint.shader = sweepShader
+            outerGlowPaint.shader = sweepShader
+            midGlowPaint.shader = sweepShader
             rimPaint.shader = sweepShader
+        }
+
+        private fun ensureTrailShader(): LinearGradient {
+            val existing = trailShader
+            if (existing != null && trailShaderAccent == accentHi) return existing
+            val created = LinearGradient(
+                0f, 0f, 1f, 0f,
+                Color.argb(0, Color.red(accentHi), Color.green(accentHi), Color.blue(accentHi)),
+                Color.argb(255, Color.red(accentHi), Color.green(accentHi), Color.blue(accentHi)),
+                Shader.TileMode.CLAMP
+            )
+            trailShader = created
+            trailShaderAccent = accentHi
+            return created
         }
 
         override fun onDraw(canvas: Canvas) {
             if (width == 0 || height == 0) return
             val nowMs = SystemClock.elapsedRealtime()
 
-            // 1. Ambient Apple Intelligence Style Edge Aurora
+            // 1. Ambient Apple Intelligence Style Edge Aurora (3-layer soft halo, zero BlurMaskFilter)
             if (showAurora && fade > 0.01f) {
                 sweepShader?.let { s ->
                     sweepMatrix.setRotate(phaseDeg, width / 2f, height / 2f)
@@ -3260,10 +3372,13 @@ class PhoneOverlayController(private val appContext: Context) {
                 }
                 val boost = 1f + reactivePulse * 0.28f
                 val intensity = (fade * baseBreathe * boost).coerceIn(0f, 1.25f)
-                glowPaint.strokeWidth = (10.5f + reactivePulse * 4.5f) * density
-                glowPaint.alpha = (intensity * (if (dark) 136f else 104f)).toInt().coerceIn(0, 255)
+                outerGlowPaint.strokeWidth = (18f + reactivePulse * 7f) * density
+                outerGlowPaint.alpha = (intensity * (if (dark) 44f else 32f)).toInt().coerceIn(0, 255)
+                midGlowPaint.strokeWidth = (8.5f + reactivePulse * 3.5f) * density
+                midGlowPaint.alpha = (intensity * (if (dark) 92f else 72f)).toInt().coerceIn(0, 255)
                 rimPaint.alpha = (intensity * (if (dark) 225f else 185f)).toInt().coerceIn(0, 255)
-                canvas.drawPath(borderPath, glowPaint)
+                canvas.drawPath(borderPath, outerGlowPaint)
+                canvas.drawPath(borderPath, midGlowPaint)
                 canvas.drawPath(borderPath, rimPaint)
             }
 
@@ -3310,7 +3425,7 @@ class PhoneOverlayController(private val appContext: Context) {
                     val p2 = ((p - 0.14f) / 0.86f).coerceIn(0f, 1f)
                     if (p2 > 0f) {
                         val innerR = (8f + 24f * (1f - (1f - p2) * (1f - p2))) * density
-                        fxRingPaint.color = Color.parseColor("#20C997")
+                        fxRingPaint.color = innerRippleColor
                         fxRingPaint.strokeWidth = 2.0f * density
                         fxRingPaint.alpha = ((1f - p2) * 200f).toInt().coerceIn(0, 255)
                         canvas.drawCircle(fx.x, fx.y, innerR, fxRingPaint)
@@ -3359,17 +3474,24 @@ class PhoneOverlayController(private val appContext: Context) {
                 fxRingPaint.alpha = (fadeOut * 120f).toInt().coerceIn(0, 255)
                 canvas.drawCircle(sw.x1, sw.y1, 8f * density, fxRingPaint)
 
-                // Glowing directional ribbon
-                if (hypot((curX - tailX).toDouble(), (curY - tailY).toDouble()) > 2.0) {
-                    fxTrailPaint.shader = LinearGradient(
-                        tailX, tailY, curX, curY,
-                        Color.argb(0, Color.red(accentHi), Color.green(accentHi), Color.blue(accentHi)),
-                        Color.argb((fadeOut * 230f).toInt().coerceIn(0, 255), Color.red(accentHi), Color.green(accentHi), Color.blue(accentHi)),
-                        Shader.TileMode.CLAMP
-                    )
+                // Glowing directional ribbon (reused unit LinearGradient + Matrix — zero per-frame Shader allocations!)
+                val dx = curX - tailX
+                val dy = curY - tailY
+                val segLen = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                if (segLen > 2f) {
+                    val shader = ensureTrailShader()
+                    val deg = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat()
+                    trailMatrix.reset()
+                    trailMatrix.setScale(segLen, 1f)
+                    trailMatrix.postRotate(deg)
+                    trailMatrix.postTranslate(tailX, tailY)
+                    shader.setLocalMatrix(trailMatrix)
+                    fxTrailPaint.shader = shader
+                    fxTrailPaint.alpha = (fadeOut * 230f).toInt().coerceIn(0, 255)
                     fxTrailPaint.strokeWidth = 6.5f * density
                     canvas.drawLine(tailX, tailY, curX, curY, fxTrailPaint)
                     fxTrailPaint.shader = null
+                    fxTrailPaint.alpha = 255
                 }
 
                 // Glowing moving head orb + subtle directional chevron
@@ -3411,34 +3533,47 @@ class PhoneOverlayController(private val appContext: Context) {
             val padY = 6f * density
             val maxPillW = (width - 28f * density).coerceAtLeast(80f * density)
             val maxTextW = (maxPillW - padX * 2f).coerceAtLeast(32f * density)
-            val displayText = TextUtils.ellipsize(
-                text,
-                tagMeasurePaint,
-                maxTextW,
-                TextUtils.TruncateAt.END
-            ).toString()
-            val tw = tagTextPaint.measureText(displayText).coerceAtMost(maxTextW)
+            if (cachedTagRaw != text || cachedTagWidth != width) {
+                cachedTagRaw = text
+                cachedTagWidth = width
+                cachedTagEllipsized = TextUtils.ellipsize(
+                    text,
+                    tagMeasurePaint,
+                    maxTextW,
+                    TextUtils.TruncateAt.END
+                ).toString()
+                cachedTagTextW = tagTextPaint.measureText(cachedTagEllipsized).coerceAtMost(maxTextW)
+            }
+            val displayText = cachedTagEllipsized
+            val tw = cachedTagTextW
             val fm = tagTextPaint.fontMetrics
             val th = fm.descent - fm.ascent
             val halfW = tw / 2f + padX
             val minCx = halfW + 12f * density
             val maxCx = width - halfW - 12f * density
             val clampedCx = if (minCx >= maxCx) width / 2f else cx.coerceIn(minCx, maxCx)
+
+            // Soft cheap drop-shadow pill (replaces expensive per-frame setShadowLayer!)
+            val shadowOffY = 2f * density
+            val shadowPad = 1.5f * density
+            scratchRect.set(
+                clampedCx - halfW - shadowPad,
+                cy - th / 2f - padY + shadowOffY,
+                clampedCx + halfW + shadowPad,
+                cy + th / 2f + padY + shadowOffY + shadowPad
+            )
+            tagShadowPaint.color = if (dark) Color.BLACK else Color.rgb(15, 30, 48)
+            tagShadowPaint.alpha = (alphaFrac * (if (dark) 68f else 26f)).toInt().coerceIn(0, 255)
+            canvas.drawRoundRect(scratchRect, 999f, 999f, tagShadowPaint)
+
             scratchRect.set(clampedCx - halfW, cy - th / 2f - padY, clampedCx + halfW, cy + th / 2f + padY)
             val rect = scratchRect
 
-            tagBgPaint.color = if (dark) Color.parseColor("#F21C2736") else Color.parseColor("#F8FBFDFF")
+            tagBgPaint.color = if (dark) darkTagBgColor else lightTagBgColor
             tagBgPaint.alpha = (alphaFrac * 245f).toInt().coerceIn(0, 255)
-            tagBgPaint.setShadowLayer(
-                6f * density,
-                0f,
-                2f * density,
-                if (dark) Color.argb((alphaFrac * 130f).toInt().coerceIn(0, 255), 0, 0, 0)
-                else Color.argb((alphaFrac * 42f).toInt().coerceIn(0, 255), 15, 30, 48)
-            )
-            tagRimPaint.color = if (dark) Color.parseColor("#9FC8F0") else Color.parseColor("#132C44")
+            tagRimPaint.color = if (dark) darkTagRimColor else lightTagRimColor
             tagRimPaint.alpha = (alphaFrac * (if (dark) 110f else 72f)).toInt().coerceIn(0, 255)
-            tagTextPaint.color = if (dark) Color.parseColor("#F4F8FD") else Color.parseColor("#112131")
+            tagTextPaint.color = if (dark) darkTagTextColor else lightTagTextColor
             tagTextPaint.alpha = (alphaFrac * 255f).toInt().coerceIn(0, 255)
 
             canvas.drawRoundRect(rect, 999f, 999f, tagBgPaint)

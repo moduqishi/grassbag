@@ -363,9 +363,17 @@ class SessionSummary {
   final bool unread;
   final Map<String, dynamic> raw;
 
+  static final RegExp _trailingSlashesRe = RegExp(r'/+$');
+  static final RegExp _corruptObjRe = RegExp(r'\[object Object\]', caseSensitive: false);
+  static final RegExp _leadingPunctRe = RegExp(r'^[\s,，:：\-·]+');
+  static final RegExp _multiWhitespaceRe = RegExp(r'\s+');
+  static final RegExp _weNeedAnswerRe = RegExp(r'^We need answer\b', caseSensitive: false);
+  static final RegExp _quotedSnippetRe = RegExp(r'"([^"]{2,48})"');
+  static final RegExp _homeDirPathRe = RegExp(r'/(?:Users|home)/[^/\s]+/(?:[^/\s]+/)*([^/\s]+)');
+
   static String? _basenameFromCwd(String? cwd) {
     if (cwd == null) return null;
-    final trimmed = cwd.trim().replaceAll(RegExp(r'/+$'), '');
+    final trimmed = cwd.trim().replaceAll(_trailingSlashesRe, '');
     if (trimmed.isEmpty || trimmed == '/') return null;
     final parts = trimmed.split('/').where((p) => p.isNotEmpty).toList();
     return parts.isEmpty ? null : parts.last;
@@ -384,24 +392,24 @@ class SessionSummary {
       hadCorruptObject = true;
       if (rawTitle['text'] != null) str = rawTitle['text'].toString();
     }
-    if (RegExp(r'\[object Object\]', caseSensitive: false).hasMatch(str)) {
+    if (_corruptObjRe.hasMatch(str)) {
       hadCorruptObject = true;
       str = str
-          .replaceAll(RegExp(r'\[object Object\]', caseSensitive: false), ' ')
-          .replaceFirst(RegExp(r'^[\s,，:：\-·]+'), '');
+          .replaceAll(_corruptObjRe, ' ')
+          .replaceFirst(_leadingPunctRe, '');
     }
-    str = str.replaceAll(RegExp(r'\s+'), ' ').trim();
+    str = str.replaceAll(_multiWhitespaceRe, ' ').trim();
     if (str.isEmpty) {
       if (hadCorruptObject) return _basenameFromCwd(cwd) ?? '历史对话';
       return '新对话';
     }
-    if (RegExp(r'^We need answer\b', caseSensitive: false).hasMatch(str)) {
-      final m = RegExp(r'"([^"]{2,48})"').firstMatch(str);
+    if (_weNeedAnswerRe.hasMatch(str)) {
+      final m = _quotedSnippetRe.firstMatch(str);
       if (m != null && m.group(1) != null) return m.group(1)!.trim();
       return _basenameFromCwd(cwd) ?? '历史对话';
     }
     str = str.replaceAllMapped(
-      RegExp(r'/(?:Users|home)/[^/\s]+/(?:[^/\s]+/)*([^/\s]+)'),
+      _homeDirPathRe,
       (m) => m.group(1) ?? m.group(0)!,
     );
     return str.length > 72 ? '${str.substring(0, 71)}…' : str;

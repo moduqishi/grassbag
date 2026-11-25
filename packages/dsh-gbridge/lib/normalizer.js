@@ -4,6 +4,8 @@
  * `session-format` changes, and detects secret ranges for UI masking.
  */
 
+const SECRET_QUICK_TRIGGER = /(?:sk-|gh[pousr]_|github_pat_|AKIA|AIza|-----BEGIN )/;
+
 const SECRET_PATTERNS = [
   /\bsk-ant-[A-Za-z0-9_-]{16,}\b/g,
   /\bsk-(?!ant-)[A-Za-z0-9_-]{20,}\b/g,
@@ -16,9 +18,10 @@ const SECRET_PATTERNS = [
 
 export function detectSecretRanges(text) {
   if (typeof text !== 'string' || text.length < 16) return [];
+  if (!SECRET_QUICK_TRIGGER.test(text)) return [];
   const raw = [];
-  for (const baseRegex of SECRET_PATTERNS) {
-    const regex = new RegExp(baseRegex.source, baseRegex.flags);
+  for (const regex of SECRET_PATTERNS) {
+    regex.lastIndex = 0;
     let m;
     while ((m = regex.exec(text)) !== null) {
       const start = m.index;
@@ -43,9 +46,35 @@ export function detectSecretRanges(text) {
 }
 
 export function previewLine(text, maxChars = 160) {
-  if (typeof text !== 'string') return '';
-  const first = text.trim().split(/\r?\n/, 1)[0] || '';
-  return first.length > maxChars ? `${first.slice(0, maxChars - 1)}…` : first;
+  if (typeof text !== 'string' || text.length === 0) return '';
+  let start = 0;
+  const len = text.length;
+  while (start < len && text.charCodeAt(start) <= 32) start++;
+  if (start >= len) return '';
+  const scanLimit = Math.min(len, start + maxChars + 2);
+  let end = scanLimit;
+  for (let i = start; i < scanLimit; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 10 || c === 13) {
+      end = i;
+      break;
+    }
+  }
+  while (end > start && text.charCodeAt(end - 1) <= 32) end--;
+  const lineLen = end - start;
+  if (lineLen <= maxChars && end < len && (text.charCodeAt(end) === 10 || text.charCodeAt(end) === 13)) {
+    return text.slice(start, end);
+  }
+  if (lineLen > maxChars) {
+    return `${text.slice(start, start + maxChars - 1)}…`;
+  }
+  if (end === scanLimit && end < len) {
+    const nextC = text.charCodeAt(end);
+    if (nextC !== 10 && nextC !== 13) {
+      return `${text.slice(start, start + maxChars - 1)}…`;
+    }
+  }
+  return text.slice(start, end);
 }
 
 function tryParseJsonObject(val) {
@@ -205,18 +234,23 @@ function summarizeHumanToolOutput(tool, outStr, parsedOut) {
   return '';
 }
 
-export function summarizeTool(name, args, output) {
+export function summarizeTool(name, args, output, preParsedOut = undefined) {
   const tool = String(name || 'tool');
-  const outStr = typeof output === 'string'
-    ? output
-    : output !== undefined && output !== null
-      ? safeJsonPreview(output, 400)
-      : '';
-  const parsedOut = tryParseJsonObject(output);
+  const parsedOut = preParsedOut !== undefined ? preParsedOut : tryParseJsonObject(output);
+  const hasOutput = typeof output === 'string'
+    ? output.length > 0
+    : output !== undefined && output !== null;
+  const outStr = parsedOut
+    ? ''
+    : typeof output === 'string'
+      ? output
+      : hasOutput
+        ? safeJsonPreview(output, 400)
+        : '';
   const target = extractToolTarget(tool, args, parsedOut);
   const title = target ? `${tool} · ${target}` : tool;
   const summary = summarizeHumanToolOutput(tool, outStr, parsedOut);
-  return { title, summary, hasFullOutput: outStr.length > 0 };
+  return { title, summary, hasFullOutput: hasOutput };
 }
 
 /**
@@ -329,14 +363,32 @@ export class SessionNormalizer {
       this.toolOutputBytes -= prevEntry.bytes;
       this.toolOutputs.delete(key);
     }
-    if (normalizedRecord && typeof normalizedRecord.output === 'string' && normalizedRecord.output.length > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
-      normalizedRecord = {
-        ...normalizedRecord,
-        output: `${normalizedRecord.output.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${normalizedRecord.output.length} 字符]`,
-        truncated: true,
-      };
+    let bytes = 256;
+    if (normalizedRecord && typeof normalizedRecord.output === 'string') {
+      if (normalizedRecord.output.length > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
+        normalizedRecord = {
+          ...normalizedRecord,
+          output: `${normalizedRecord.output.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${normalizedRecord.output.length} 字符]`,
+          truncated: true,
+        };
+      }
+      bytes = Math.max(128, normalizedRecord.output.length * 2);
+    } else if (normalizedRecord && normalizedRecord.output != null) {
+      let jsonLen = 512;
+      try {
+        const encoded = JSON.stringify(normalizedRecord.output);
+        jsonLen = encoded ? encoded.length : 512;
+        if (jsonLen > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
+          normalizedRecord = {
+            ...normalizedRecord,
+            output: `${encoded.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${jsonLen} 字符]`,
+            truncated: true,
+          };
+          jsonLen = normalizedRecord.output.length;
+        }
+      } catch {}
+      bytes = Math.max(256, jsonLen * 2);
     }
-    const bytes = Math.max(128, (typeof normalizedRecord?.output === 'string' ? normalizedRecord.output.length * 2 : 512));
     this.toolOutputs.set(key, { record: normalizedRecord, bytes });
     this.toolOutputBytes += bytes;
     while (
@@ -660,7 +712,7 @@ export class SessionNormalizer {
         const existing = toolIndex.get(callId);
         const toolName = existing?.name || prev?.name || String(msg?.name || data?.name || 'tool');
         const effectiveArgs = prev?.args ?? data?.arguments ?? {};
-        const { title, summary, hasFullOutput } = summarizeTool(toolName, effectiveArgs, output);
+        const { title, summary, hasFullOutput } = summarizeTool(toolName, effectiveArgs, output, parsedOut);
         const effectiveHasFull = hasFullOutput || (isError && String(output || '').trim().length > 0);
         if (existing) {
           existing.status = isError ? 'error' : 'ok';
@@ -802,33 +854,6 @@ export class SessionNormalizer {
       stat.target = undefined;
       if (stat.phase === 'tool') stat.phase = 'thinking';
     }
-    const chunkText = () => {
-      if (Array.isArray(chunk?.texts)) return chunk.texts.map((s) => String(s ?? '')).join('');
-      return String(chunk?.text ?? chunk?.delta ?? '');
-    };
-    const estimateTokens = (text) => {
-      if (!text) return 0;
-      let cjk = 0;
-      let other = 0;
-      for (let i = 0; i < text.length; i++) {
-        if (text.charCodeAt(i) >= 0x2e80) cjk += 1;
-        else other += 1;
-      }
-      return cjk / 1.5 + other / 3.8;
-    };
-    const recordDecode = (text) => {
-      const tok = estimateTokens(text);
-      if (tok <= 0) return;
-      if (stat.lastDecodeAt > 0) {
-        const dt = now - stat.lastDecodeAt;
-        // Ignore multi-second pauses (e.g. tool execution or brief stall) so decode speed stays honest.
-        if (dt > 0 && dt <= 1500) {
-          stat.activeDecodeMs += Math.min(dt, 600);
-        }
-      }
-      stat.lastDecodeAt = now;
-      stat.estTokens += tok;
-    };
     if (ctype === 'reasoning-delta' || ctype === 'reasoning-chunks' || chunk?.kind === 'reasoning') {
       if (stat.phase === 'tool') {
         stat.activeDecodeMs = 0;
@@ -837,7 +862,7 @@ export class SessionNormalizer {
         stat.target = undefined;
       }
       stat.phase = 'thinking';
-      recordDecode(chunkText());
+      recordStreamDecode(stat, extractStreamChunkText(chunk), now);
     } else if (ctype === 'text-delta' || ctype === 'text-chunks' || chunk?.kind === 'text') {
       if (stat.phase === 'tool') {
         stat.activeDecodeMs = 0;
@@ -846,7 +871,7 @@ export class SessionNormalizer {
         stat.target = undefined;
       }
       stat.phase = 'streaming';
-      recordDecode(chunkText());
+      recordStreamDecode(stat, extractStreamChunkText(chunk), now);
     } else if (ctype === 'tool-call-delta' || ctype === 'tool-call-chunks' || chunk?.kind === 'tool-call') {
       stat.phase = 'tool';
       stat.lastDecodeAt = 0;
@@ -854,7 +879,7 @@ export class SessionNormalizer {
     }
     const elapsedMs = Math.max(1, now - stat.startedAt);
     const tps = (stat.phase !== 'tool' && stat.activeDecodeMs >= 200 && stat.estTokens >= 1)
-      ? Number(((stat.estTokens * 1000) / stat.activeDecodeMs).toFixed(1))
+      ? Math.round(((stat.estTokens * 1000) / stat.activeDecodeMs) * 10) / 10
       : undefined;
     return {
       phase: stat.phase,
@@ -867,6 +892,36 @@ export class SessionNormalizer {
   clearSessionStat(sessionId) {
     this.turnStats.delete(sessionId);
   }
+}
+
+function extractStreamChunkText(chunk) {
+  if (Array.isArray(chunk?.texts)) return chunk.texts.map((s) => String(s ?? '')).join('');
+  return String(chunk?.text ?? chunk?.delta ?? '');
+}
+
+function estimateStreamTokens(text) {
+  if (!text) return 0;
+  let cjk = 0;
+  let other = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) >= 0x2e80) cjk += 1;
+    else other += 1;
+  }
+  return cjk / 1.5 + other / 3.8;
+}
+
+function recordStreamDecode(stat, text, now) {
+  const tok = estimateStreamTokens(text);
+  if (tok <= 0) return;
+  if (stat.lastDecodeAt > 0) {
+    const dt = now - stat.lastDecodeAt;
+    // Ignore multi-second pauses (e.g. tool execution or brief stall) so decode speed stays honest.
+    if (dt > 0 && dt <= 1500) {
+      stat.activeDecodeMs += Math.min(dt, 600);
+    }
+  }
+  stat.lastDecodeAt = now;
+  stat.estTokens += tok;
 }
 
 function isHumanUserMessage(msg, data, text) {

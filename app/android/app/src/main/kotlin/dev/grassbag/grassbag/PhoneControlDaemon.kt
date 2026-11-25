@@ -32,11 +32,23 @@ class PhoneControlDaemon(
     val bearerToken: String,
     private val onEvent: (String, Map<String, Any?>) -> Unit
 ) {
+    private data class CachedApp(
+        val pkg: String,
+        val label: String,
+        val labelLower: String,
+        val pkgLower: String
+    )
+
     private val running = AtomicBoolean(false)
     @Volatile
     private var pool: java.util.concurrent.ExecutorService = Executors.newCachedThreadPool()
     private var boundSocket: LocalSocket? = null
     private var serverSocket: LocalServerSocket? = null
+    private val appsCacheLock = Any()
+    @Volatile
+    private var cachedApps: List<CachedApp>? = null
+    @Volatile
+    private var cachedAppsAtMs: Long = 0L
 
     fun start(): Boolean {
         if (running.getAndSet(true)) return true
@@ -150,20 +162,12 @@ class PhoneControlDaemon(
                         val turnId = if (caller == null || caller.isNull("turnId")) null else caller.optString("turnId").ifBlank { null }
                         val sessionId = if (caller == null || caller.isNull("sessionId")) null else caller.optString("sessionId").ifBlank { null }
 
-                        // If user tapped 暂停 on the floating HUD, wait smoothly (up to 3 min) until 继续 or 急停!
+                        // If user tapped 暂停 on the floating HUD, block on condition monitor (up to 3 min) until 继续 or 急停!
                         val wasPaused = SafetyGate.isPaused()
                         val hadActiveTurnBeforePause = wasPaused && SafetyGate.isTurnActiveForSession(sessionId, turnId)
-                        val pauseDeadlineMs = System.currentTimeMillis() + 180_000L
-                        while (SafetyGate.isPaused() && !SafetyGate.isEmergencyStopped()) {
-                            if (Thread.currentThread().isInterrupted || System.currentTimeMillis() >= pauseDeadlineMs) {
-                                break
-                            }
-                            try {
-                                Thread.sleep(150L)
-                            } catch (_: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                break
-                            }
+                        if (wasPaused) {
+                            val pauseDeadlineMs = System.currentTimeMillis() + 180_000L
+                            SafetyGate.waitWhilePaused(pauseDeadlineMs)
                         }
                         if (SafetyGate.isEmergencyStopped()) {
                             writeJson(
@@ -261,7 +265,8 @@ class PhoneControlDaemon(
         permissionPreset: String?,
         targetLabel: String? = null,
         isSensitiveTarget: Boolean = false,
-        userApproved: Boolean = false
+        userApproved: Boolean = false,
+        outShowedPrompt: AtomicBoolean? = null
     ): JSONObject? {
         val verdict = SafetyGate.evaluateAction(
             tool = tool,
@@ -294,6 +299,7 @@ class PhoneControlDaemon(
                 return null
             }
             is SafetyGate.ActionVerdict.NeedConfirm -> {
+                outShowedPrompt?.set(true)
                 SafetyGate.beginTurn(turnId, sessionId)
                 val resolvedApp = targetAppLabel ?: targetPackage
                 val decision = overlay.confirm(
@@ -382,6 +388,34 @@ class PhoneControlDaemon(
         )
     }
 
+    private fun getLaunchableAppsCached(forceRefresh: Boolean = false): List<CachedApp> {
+        val now = System.currentTimeMillis()
+        val existing = cachedApps
+        if (!forceRefresh && existing != null && (now - cachedAppsAtMs) < 60_000L) {
+            return existing
+        }
+        synchronized(appsCacheLock) {
+            val recheck = cachedApps
+            if (!forceRefresh && recheck != null && (System.currentTimeMillis() - cachedAppsAtMs) < 60_000L) {
+                return recheck
+            }
+            val pm = context.packageManager
+            val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val activities = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+            val seen = HashSet<String>(activities.size)
+            val list = ArrayList<CachedApp>(activities.size)
+            for (ri in activities) {
+                val pkg = ri.activityInfo?.packageName ?: continue
+                if (!seen.add(pkg)) continue
+                val label = runCatching { ri.loadLabel(pm)?.toString() }.getOrNull()?.trim().orEmpty().ifBlank { pkg }
+                list.add(CachedApp(pkg, label, label.lowercase(), pkg.lowercase()))
+            }
+            cachedApps = list
+            cachedAppsAtMs = System.currentTimeMillis()
+            return list
+        }
+    }
+
     private fun resolveAppByNameOrPackage(rawPkg: String, rawAppName: String): Pair<String, String>? {
         val pm = context.packageManager
         if (rawPkg.isNotBlank()) {
@@ -395,46 +429,35 @@ class PhoneControlDaemon(
         }
         val query = rawAppName.ifBlank { rawPkg }.trim().lowercase()
         if (query.isEmpty()) return null
-        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val apps = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+        val apps = getLaunchableAppsCached(forceRefresh = false)
         var exact: Pair<String, String>? = null
         var partial: Pair<String, String>? = null
-        for (ri in apps) {
-            val pkg = ri.activityInfo?.packageName ?: continue
-            val label = runCatching { ri.loadLabel(pm)?.toString() }.getOrNull()?.trim().orEmpty()
-            val labelLower = label.lowercase()
-            val pkgLower = pkg.lowercase()
-            if (labelLower == query || pkgLower == query) {
-                exact = pkg to label.ifBlank { pkg }
+        for (app in apps) {
+            if (app.labelLower == query || app.pkgLower == query) {
+                exact = app.pkg to app.label
                 break
             }
-            if (partial == null && (labelLower.contains(query) || query.contains(labelLower) && labelLower.length >= 2 || pkgLower.contains(query))) {
-                partial = pkg to label.ifBlank { pkg }
+            if (partial == null && (app.labelLower.contains(query) || (query.contains(app.labelLower) && app.labelLower.length >= 2) || app.pkgLower.contains(query))) {
+                partial = app.pkg to app.label
             }
         }
         return exact ?: partial
     }
 
-    private fun listLaunchableApps(query: String): JSONObject {
-        val pm = context.packageManager
-        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val activities = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+    private fun listLaunchableApps(query: String, forceRefresh: Boolean = false): JSONObject {
+        val apps = getLaunchableAppsCached(forceRefresh = forceRefresh)
         val q = query.trim().lowercase()
-        val seen = HashSet<String>()
         val arr = JSONArray()
-        for (ri in activities) {
-            val pkg = ri.activityInfo?.packageName ?: continue
-            if (!seen.add(pkg)) continue
-            if (pkg == "dev.grassbag.grassbag") continue
-            val label = runCatching { ri.loadLabel(pm)?.toString() }.getOrNull()?.trim().orEmpty()
-            if (q.isNotEmpty() && !label.lowercase().contains(q) && !pkg.lowercase().contains(q)) {
+        for (app in apps) {
+            if (app.pkg == "dev.grassbag.grassbag") continue
+            if (q.isNotEmpty() && !app.labelLower.contains(q) && !app.pkgLower.contains(q)) {
                 continue
             }
             arr.put(
                 JSONObject()
-                    .put("name", label.ifBlank { pkg })
-                    .put("package", pkg)
-                    .put("blocked", SafetyGate.isPackageBlocked(pkg))
+                    .put("name", app.label)
+                    .put("package", app.pkg)
+                    .put("blocked", SafetyGate.isPackageBlocked(app.pkg))
             )
             if (arr.length() >= 80) break
         }
@@ -453,6 +476,7 @@ class PhoneControlDaemon(
         return when (tool) {
             "phone_apps" -> {
                 val query = args.optString("query", "")
+                val refresh = args.optBoolean("refresh", false)
                 val denied = gateAndConfirm(
                     tool = tool,
                     targetPackage = "launcher",
@@ -465,7 +489,7 @@ class PhoneControlDaemon(
                     userApproved = userApproved
                 )
                 if (denied != null) return denied
-                listLaunchableApps(query)
+                listLaunchableApps(query, forceRefresh = refresh)
             }
             "phone_wait" -> {
                 val ms = args.optLong("ms", 1000L).coerceIn(100L, 10_000L)
@@ -545,6 +569,7 @@ class PhoneControlDaemon(
                 val isLong = tool == "phone_long_press"
                 val verb = if (isLong) "长按" else "点击"
                 val targetDesc = if (!elemLabel.isNullOrBlank()) "「$elemLabel」" else "位置 (${x.toInt()}, ${y.toInt()})"
+                val showedPrompt = AtomicBoolean(false)
                 val denied = gateAndConfirm(
                     tool = tool,
                     targetPackage = pkg,
@@ -556,14 +581,20 @@ class PhoneControlDaemon(
                     permissionPreset = permissionPreset,
                     targetLabel = gateLabel,
                     isSensitiveTarget = hitsSensitive || (cachedNode?.sensitive == true),
-                    userApproved = userApproved
+                    userApproved = userApproved,
+                    outShowedPrompt = showedPrompt
                 )
                 if (denied != null) return denied
-                val postPkg = svc.currentForegroundPackage()
-                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                if (SafetyGate.isEmergencyStopped()) {
                     return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
+                if (showedPrompt.get()) {
+                    val postPkg = svc.currentForegroundPackage()
+                    val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                        return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                    }
                 }
                 val dur = if (isLong) args.optLong("durationMs", 650L).coerceIn(400L, 1800L) else 65L
                 svc.executeTapGesture(x.toFloat(), y.toFloat(), dur, elemLabel).apply {
@@ -588,6 +619,7 @@ class PhoneControlDaemon(
                 }
                 val pkg = svc.currentForegroundPackage()
                 val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
+                val showedPrompt = AtomicBoolean(false)
                 val denied = gateAndConfirm(
                     tool = tool,
                     targetPackage = pkg,
@@ -597,14 +629,20 @@ class PhoneControlDaemon(
                     sessionId = sessionId,
                     turnId = turnId,
                     permissionPreset = permissionPreset,
-                    userApproved = userApproved
+                    userApproved = userApproved,
+                    outShowedPrompt = showedPrompt
                 )
                 if (denied != null) return denied
-                val postPkg = svc.currentForegroundPackage()
-                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                if (SafetyGate.isEmergencyStopped()) {
                     return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
+                if (showedPrompt.get()) {
+                    val postPkg = svc.currentForegroundPackage()
+                    val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                        return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                    }
                 }
                 svc.executeSwipeGesture(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur)
             }
@@ -648,6 +686,7 @@ class PhoneControlDaemon(
                 val (_, sensitive, fieldLabel) = svc.inspectFocusedInput()
                 val preview = if (text.length > 48) text.take(48) + "…" else text
                 val submit = args.optBoolean("submit", false)
+                val showedPrompt = AtomicBoolean(false)
                 val denied = gateAndConfirm(
                     tool = tool,
                     targetPackage = pkg,
@@ -659,14 +698,20 @@ class PhoneControlDaemon(
                     permissionPreset = permissionPreset,
                     targetLabel = fieldLabel,
                     isSensitiveTarget = sensitive,
-                    userApproved = userApproved
+                    userApproved = userApproved,
+                    outShowedPrompt = showedPrompt
                 )
                 if (denied != null) return denied
-                val postPkg = svc.currentForegroundPackage()
-                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                if (SafetyGate.isEmergencyStopped()) {
                     return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
+                if (showedPrompt.get()) {
+                    val postPkg = svc.currentForegroundPackage()
+                    val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                        return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                    }
                 }
                 overlay.showTypeFx(preview)
                 svc.executeType(text, submit = submit)

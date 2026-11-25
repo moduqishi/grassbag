@@ -22,16 +22,152 @@ import '../sdui/sdui_renderer.dart';
 import '../web/deepseek_signin_page.dart';
 import '../web/web_embed.dart';
 
-/// Bounded LRU cache for base64-decoded user image attachments so 42Hz streaming rebuilds
-/// never re-decode large payloads or allocate fresh Uint8Lists (which caused blank image flashes).
+/// Byte-budgeted true LRU cache (max 24 MiB / 48 items) for base64-decoded user image
+/// attachments so 42Hz streaming rebuilds never re-decode large payloads or OOM on photos.
 final Map<String, Uint8List> _decodedAttachmentBytesCache = <String, Uint8List>{};
+int _decodedAttachmentCacheBytes = 0;
+const int _kMaxAttachmentCacheEntries = 48;
+const int _kMaxAttachmentCacheBytes = 24 * 1024 * 1024;
+const int _kAsyncDecodeThresholdChars = 64 * 1024;
+
+Uint8List _decodeBase64Payload(String payload) {
+  try {
+    return base64Decode(payload);
+  } catch (_) {
+    return Uint8List(0);
+  }
+}
+
+Uint8List? _getCachedAttachmentBytes(String key) {
+  final hit = _decodedAttachmentBytesCache.remove(key);
+  if (hit == null) return null;
+  _decodedAttachmentBytesCache[key] = hit; // refresh LRU recency
+  return hit;
+}
+
+void _putCachedAttachmentBytes(String key, Uint8List bytes) {
+  final prev = _decodedAttachmentBytesCache.remove(key);
+  if (prev != null) _decodedAttachmentCacheBytes -= prev.lengthInBytes;
+  _decodedAttachmentBytesCache[key] = bytes;
+  _decodedAttachmentCacheBytes += bytes.lengthInBytes;
+  while ((_decodedAttachmentBytesCache.length > _kMaxAttachmentCacheEntries ||
+          _decodedAttachmentCacheBytes > _kMaxAttachmentCacheBytes) &&
+      _decodedAttachmentBytesCache.length > 1) {
+    final oldestKey = _decodedAttachmentBytesCache.keys.first;
+    final oldest = _decodedAttachmentBytesCache.remove(oldestKey);
+    if (oldest != null) _decodedAttachmentCacheBytes -= oldest.lengthInBytes;
+  }
+}
 
 /// Clears module-level decoded attachment bytes & typewriter reveal caches on host switch
 /// so cached images or turn offsets never bleed across hosts.
 void clearTurnProcessCaches() {
   _decodedAttachmentBytesCache.clear();
+  _decodedAttachmentCacheBytes = 0;
   _AssistantBodyState._revealedProgressByTurn.clear();
   _ToolStepRowState._kDetailCache.clear();
+}
+
+/// Decodes large (>64 KB) base64 image attachments off the UI thread via `compute`
+/// so opening history or streaming turns with pasted photos never drops a frame.
+class _AsyncAttachmentThumb extends StatefulWidget {
+  const _AsyncAttachmentThumb({
+    required this.cacheKey,
+    required this.payload,
+    required this.title,
+    required this.thumbCachePx,
+  });
+
+  final String cacheKey;
+  final String payload;
+  final String title;
+  final int thumbCachePx;
+
+  @override
+  State<_AsyncAttachmentThumb> createState() => _AsyncAttachmentThumbState();
+}
+
+class _AsyncAttachmentThumbState extends State<_AsyncAttachmentThumb> {
+  Uint8List? _bytes;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _AsyncAttachmentThumb oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.cacheKey != widget.cacheKey) {
+      _bytes = null;
+      _failed = false;
+      _load();
+    }
+  }
+
+  void _load() {
+    final hit = _getCachedAttachmentBytes(widget.cacheKey);
+    if (hit != null) {
+      _bytes = hit;
+      return;
+    }
+    final key = widget.cacheKey;
+    compute(_decodeBase64Payload, widget.payload).then((decoded) {
+      if (decoded.isNotEmpty) {
+        _putCachedAttachmentBytes(key, decoded);
+      }
+      if (!mounted || widget.cacheKey != key) return;
+      setState(() {
+        if (decoded.isEmpty) {
+          _failed = true;
+        } else {
+          _bytes = decoded;
+        }
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final bytes = _bytes;
+    return GestureDetector(
+      onTap: bytes != null
+          ? () => showImagePreviewDialog(
+                context,
+                bytes: bytes,
+                title: widget.title,
+              )
+          : null,
+      child: Container(
+        width: 76,
+        height: 76,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          color: t.fill1,
+          border: Border.all(color: t.sepStrong, width: 0.7),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: bytes != null
+            ? Image.memory(
+                bytes,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                cacheWidth: widget.thumbCachePx,
+                errorBuilder: (_, __, ___) => Center(
+                  child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                ),
+              )
+            : Center(
+                child: _failed
+                    ? Icon(CupertinoIcons.photo_fill, size: 20, color: t.text3)
+                    : GrassBagActivityIndicator(radius: 8, color: t.text3),
+              ),
+      ),
+    );
+  }
 }
 
 Map<String, dynamic>? _tryParseJsonMap(String raw) {
@@ -1201,11 +1337,15 @@ class _UserMessageContent extends StatelessWidget {
 
     if (!hasAttachments && !hasReferences) return buildTextWidget();
 
-    Uint8List? decodeAttBytes(Map<String, dynamic> att) {
+    ({Uint8List? bytes, String? payload, String? cacheKey}) resolveAttImage(
+      Map<String, dynamic> att,
+    ) {
       final rawBytes = att['bytes'];
-      if (rawBytes is Uint8List && rawBytes.isNotEmpty) return rawBytes;
+      if (rawBytes is Uint8List && rawBytes.isNotEmpty) {
+        return (bytes: rawBytes, payload: null, cacheKey: null);
+      }
       final b64 = (att['data'] ?? att['base64'])?.toString().trim() ?? '';
-      if (b64.isEmpty) return null;
+      if (b64.isEmpty) return (bytes: null, payload: null, cacheKey: null);
       final comma = b64.indexOf(',');
       final payload = (b64.startsWith('data:') && comma > 0) ? b64.substring(comma + 1) : b64;
       final payloadLen = payload.length;
@@ -1213,19 +1353,17 @@ class _UserMessageContent extends StatelessWidget {
       final tailStart = payloadLen > 24 ? payloadLen - 24 : 0;
       final cacheKey =
           '$payloadLen:${payload.substring(0, math.min(24, payloadLen))}:${payload.substring(midStart, math.min(midStart + 24, payloadLen))}:${payload.substring(tailStart)}';
-      final cached = _decodedAttachmentBytesCache[cacheKey];
-      if (cached != null) return cached;
-      try {
-        final decoded = base64Decode(payload);
-        if (decoded.isEmpty) return null;
-        if (_decodedAttachmentBytesCache.length >= 48) {
-          _decodedAttachmentBytesCache.remove(_decodedAttachmentBytesCache.keys.first);
-        }
-        _decodedAttachmentBytesCache[cacheKey] = decoded;
-        return decoded;
-      } catch (_) {
-        return null;
+      final cached = _getCachedAttachmentBytes(cacheKey);
+      if (cached != null) {
+        return (bytes: cached, payload: null, cacheKey: cacheKey);
       }
+      if (payloadLen <= _kAsyncDecodeThresholdChars) {
+        final decoded = _decodeBase64Payload(payload);
+        if (decoded.isEmpty) return (bytes: null, payload: null, cacheKey: null);
+        _putCachedAttachmentBytes(cacheKey, decoded);
+        return (bytes: decoded, payload: null, cacheKey: cacheKey);
+      }
+      return (bytes: null, payload: payload, cacheKey: cacheKey);
     }
 
     final thumbCachePx = (76 * MediaQuery.devicePixelRatioOf(context)).round();
@@ -1246,12 +1384,25 @@ class _UserMessageContent extends StatelessWidget {
                     final mime = att['mimeType']?.toString() ?? '';
                     final sizeStr = _formatBytes(att['size'] as num?);
                     final isImg = mime.startsWith('image/') || att['type']?.toString() == 'image';
-                    final imgBytes = isImg ? decodeAttBytes(att) : null;
+                    final resolved = isImg
+                        ? resolveAttImage(att)
+                        : (bytes: null, payload: null, cacheKey: null);
+                    final imgBytes = resolved.bytes;
+                    final imgPayload = resolved.payload;
+                    final imgCacheKey = resolved.cacheKey;
                     final imgUrl = isImg
                         ? (att['url'] ?? att['previewUrl'] ?? att['src'] ?? att['uri'])
                             ?.toString()
                             .trim()
                         : null;
+                    if (imgPayload != null && imgCacheKey != null) {
+                      return _AsyncAttachmentThumb(
+                        cacheKey: imgCacheKey,
+                        payload: imgPayload,
+                        title: name,
+                        thumbCachePx: thumbCachePx,
+                      );
+                    }
                     if (imgBytes != null ||
                         (imgUrl != null &&
                             (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')))) {
@@ -2215,18 +2366,33 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
             final showTranslateBtn = expanded &&
                 step.text.isNotEmpty &&
                 (effectiveTranslation != null || (widget.canTranslate && !_isStepMostlyChinese(step)));
-            final textNode = SelectionArea(
-              contextMenuBuilder: buildGrassBagSelectableContextMenu,
+            // When collapsed & actively streaming thinking, slice ONLY the trailing ~800 chars
+            // so TextPainter doesn't re-layout 10,000+ chars on every 42ms token flush!
+            String viewportText = bodyText;
+            if (showLiveViewport && bodyText.length > 820) {
+              var cut = bodyText.length - 800;
+              final nl = bodyText.indexOf('\n', cut);
+              if (nl >= 0 && nl < bodyText.length - 120) {
+                cut = nl + 1;
+              }
+              viewportText = '…${bodyText.substring(cut)}';
+            }
+            final rawTextWidget = Text(
+              viewportText,
               key: ValueKey('${step.id}-$translated'),
-              child: Text(
-                bodyText,
-                style: TextStyle(
-                  fontSize: showLiveViewport ? 12.0 : 12.5,
-                  height: 1.58,
-                  color: showLiveViewport ? t.text3 : t.text2,
-                ),
+              style: TextStyle(
+                fontSize: showLiveViewport ? 12.0 : 12.5,
+                height: 1.58,
+                color: showLiveViewport ? t.text3 : t.text2,
               ),
             );
+            final textNode = showLiveViewport
+                ? rawTextWidget
+                : SelectionArea(
+                    contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                    key: ValueKey('${step.id}-$translated'),
+                    child: rawTextWidget,
+                  );
             final scrollViewport = NotificationListener<ScrollNotification>(
               onNotification: (n) {
                 if (n is ScrollUpdateNotification && n.dragDetails != null) {
@@ -2246,6 +2412,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                       ),
               ),
             );
+            final fadeEdgeColor = Color.alphaBlend(t.fill1, t.bgSolid);
             return AnimatedContainer(
               duration: const Duration(milliseconds: 220),
               curve: Curves.easeOutCubic,
@@ -2267,20 +2434,50 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                     curve: Curves.easeOutCubic,
                     constraints: BoxConstraints(maxHeight: showLiveViewport ? 96 : 280),
                     child: showLiveViewport
-                        ? ShaderMask(
-                            blendMode: BlendMode.dstIn,
-                            shaderCallback: (bounds) => const LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                Colors.transparent,
-                                Colors.white,
-                                Colors.white,
-                                Colors.transparent,
-                              ],
-                              stops: [0.0, 0.12, 0.90, 1.0],
-                            ).createShader(bounds),
-                            child: scrollViewport,
+                        ? Stack(
+                            children: [
+                              scrollViewport,
+                              Positioned(
+                                left: 0,
+                                right: 0,
+                                top: 0,
+                                height: 14,
+                                child: IgnorePointer(
+                                  child: DecoratedBox(
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topCenter,
+                                        end: Alignment.bottomCenter,
+                                        colors: [
+                                          fadeEdgeColor,
+                                          fadeEdgeColor.withValues(alpha: 0.0),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              Positioned(
+                                left: 0,
+                                right: 0,
+                                bottom: 0,
+                                height: 12,
+                                child: IgnorePointer(
+                                  child: DecoratedBox(
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.bottomCenter,
+                                        end: Alignment.topCenter,
+                                        colors: [
+                                          fadeEdgeColor,
+                                          fadeEdgeColor.withValues(alpha: 0.0),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
                           )
                         : scrollViewport,
                   ),
@@ -2431,6 +2628,23 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
   String _memoSummaryPill = '';
   String? _memoFormattedSummaryRaw;
   String _memoFormattedSummary = '';
+  Map<String, dynamic>? _memoDiffDetail;
+  ({int added, int removed, String unified})? _memoSynthDiff;
+  TextSpan? _memoDiffSpan;
+
+  ({({int added, int removed, String unified})? diff, TextSpan? span}) _resolveMemoizedDiff(
+    bool isEdit,
+    Map argsMap,
+  ) {
+    if (!isEdit) return (diff: null, span: null);
+    if (identical(_memoDiffDetail, _detail) && _memoDiffDetail != null) {
+      return (diff: _memoSynthDiff, span: _memoDiffSpan);
+    }
+    _memoDiffDetail = _detail;
+    _memoSynthDiff = _synthesizeInlineDiffFromArgs(argsMap);
+    _memoDiffSpan = _memoSynthDiff != null ? _highlightDiffSpan(_memoSynthDiff!.unified) : null;
+    return (diff: _memoSynthDiff, span: _memoDiffSpan);
+  }
 
   String _formattedSummaryFor(String raw) {
     if (_memoFormattedSummaryRaw == raw) return _memoFormattedSummary;
@@ -3000,8 +3214,10 @@ child: Text(
                 : (isFileTool && rawDisplayTitle.isNotEmpty && !rawDisplayTitle.contains(' ')
                     ? rawDisplayTitle
                     : '');
-            // Synthesize real inline colored diff directly from edit/write/patch args!
-            final synthDiff = isEdit ? _synthesizeInlineDiffFromArgs(argsMap) : null;
+            // Synthesize real inline colored diff directly from edit/write/patch args (memoized by _detail identity!)
+            final resolvedDiff = _resolveMemoizedDiff(isEdit, argsMap);
+            final synthDiff = resolvedDiff.diff;
+            final synthDiffSpan = resolvedDiff.span;
             final synthDiffRecord = (synthDiff != null && resolvedFilePath.isNotEmpty)
                 ? WorkspaceDiffRecord(
                     path: resolvedFilePath,
@@ -3098,7 +3314,7 @@ child: Text(
                           child: SelectionArea(
                             contextMenuBuilder: buildGrassBagSelectableContextMenu,
                             child: Text.rich(
-                              _highlightDiffSpan(synthDiff.unified),
+                              synthDiffSpan ?? _highlightDiffSpan(synthDiff.unified),
                             ),
                           ),
                         ),
@@ -5123,6 +5339,7 @@ class _AssistantBodyState extends State<_AssistantBody>
           _streamedBlockIndices.add(idx);
         }
         return _FencedCodeBlock(
+          key: key,
           lang: blk.lang,
           code: blk.body,
           isStreaming: isStreamingBlock,
@@ -5256,6 +5473,7 @@ class _AssistantBodyState extends State<_AssistantBody>
             _splitTableRow(blk.tableLines[ri].trim()),
         ];
         return _MarkdownTableCard(
+          key: key,
           headers: headers,
           alignments: alignments,
           rows: rows,
@@ -5269,10 +5487,7 @@ class _AssistantBodyState extends State<_AssistantBody>
           ),
         );
       case _MdBlockKind.quote:
-        final calloutMatch = RegExp(
-          r'^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(?:\n|$)',
-          caseSensitive: false,
-        ).firstMatch(blk.body.trimLeft());
+        final calloutMatch = _mdCalloutRe.firstMatch(blk.body.trimLeft());
         final String? calloutKind = calloutMatch?.group(1)?.toUpperCase();
         final effectiveQuoteBody = calloutMatch != null
             ? blk.body.trimLeft().substring(calloutMatch.end).trim()
@@ -6063,6 +6278,7 @@ class _TableScrollMetrics {
 
 class _MarkdownTableCard extends StatefulWidget {
   const _MarkdownTableCard({
+    super.key,
     required this.headers,
     required this.alignments,
     required this.rows,
@@ -6834,145 +7050,195 @@ class _TableNudgeButton extends StatelessWidget {
   }
 }
 
+final RegExp _mdCalloutRe = RegExp(
+  r'^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(?:\n|$)',
+  caseSensitive: false,
+);
+final RegExp _latexEnvRe = RegExp(r'\\(?:begin|end)\{(?:aligned|align\*?|gather\*?|equation\*?|cases|split)\}');
+final RegExp _latexLineBreakRe = RegExp(r'\\\\(?:\[[^\]]*\])?');
+final RegExp _latexTextCmdRe = RegExp(r'\\(?:text|mathrm|mathbf|mathit|operatorname|boldsymbol)\{([^{}]+)\}');
+final RegExp _latexBbRe = RegExp(r'\\mathbb\{([RNZQC])\}');
+final RegExp _latexSqrtRe = RegExp(r'\\sqrt\{([^{}]+)\}');
+final RegExp _latexFracRe = RegExp(r'\\d?frac\{([^{}]+)\}\{([^{}]+)\}');
+final RegExp _latexSymbolRe = RegExp(r'\\[a-zA-Z]+|\\[,;!]');
+final RegExp _latexSupBracedRe = RegExp(r'\^\{([0-9+\-ni=()]+)\}');
+final RegExp _latexSubBracedRe = RegExp(r'_\{([0-9+\-ijknx=()]+)\}');
+final RegExp _latexSupSingleRe = RegExp(r'\^([0-9+\-ni])');
+final RegExp _latexSubSingleRe = RegExp(r'_([0-9+\-ijknx])');
+
+const Map<String, String> _latexBbMap = <String, String>{
+  'R': 'ℝ',
+  'N': 'ℕ',
+  'Z': 'ℤ',
+  'Q': 'ℚ',
+  'C': 'ℂ',
+};
+
+const Map<String, String> _latexSymbolMap = <String, String>{
+  r'\alpha': 'α',
+  r'\beta': 'β',
+  r'\gamma': 'γ',
+  r'\delta': 'δ',
+  r'\epsilon': 'ε',
+  r'\varepsilon': 'ε',
+  r'\theta': 'θ',
+  r'\lambda': 'λ',
+  r'\mu': 'μ',
+  r'\nu': 'ν',
+  r'\xi': 'ξ',
+  r'\pi': 'π',
+  r'\rho': 'ρ',
+  r'\sigma': 'σ',
+  r'\tau': 'τ',
+  r'\phi': 'φ',
+  r'\varphi': 'φ',
+  r'\chi': 'χ',
+  r'\psi': 'ψ',
+  r'\omega': 'ω',
+  r'\Gamma': 'Γ',
+  r'\Delta': 'Δ',
+  r'\Theta': 'Θ',
+  r'\Lambda': 'Λ',
+  r'\Pi': 'Π',
+  r'\Sigma': 'Σ',
+  r'\Phi': 'Φ',
+  r'\Psi': 'Ψ',
+  r'\Omega': 'Ω',
+  r'\infty': '∞',
+  r'\pm': '±',
+  r'\mp': '∓',
+  r'\times': '×',
+  r'\div': '÷',
+  r'\cdot': '·',
+  r'\dots': '…',
+  r'\cdots': '⋯',
+  r'\ldots': '…',
+  r'\leq': '≤',
+  r'\le': '≤',
+  r'\geq': '≥',
+  r'\ge': '≥',
+  r'\neq': '≠',
+  r'\ne': '≠',
+  r'\approx': '≈',
+  r'\equiv': '≡',
+  r'\sim': '∼',
+  r'\propto': '∝',
+  r'\rightarrow': '→',
+  r'\to': '→',
+  r'\leftarrow': '←',
+  r'\leftrightarrow': '↔',
+  r'\Rightarrow': '⇒',
+  r'\Leftarrow': '⇐',
+  r'\Leftrightarrow': '⇔',
+  r'\iff': '⇔',
+  r'\in': '∈',
+  r'\notin': '∉',
+  r'\subset': '⊂',
+  r'\subseteq': '⊆',
+  r'\cup': '∪',
+  r'\cap': '∩',
+  r'\emptyset': '∅',
+  r'\forall': '∀',
+  r'\exists': '∃',
+  r'\partial': '∂',
+  r'\nabla': '∇',
+  r'\sum': '∑',
+  r'\prod': '∏',
+  r'\int': '∫',
+  r'\degree': '°',
+  r'\quad': '  ',
+  r'\qquad': '   ',
+  r'\,': ' ',
+  r'\;': ' ',
+  r'\!': '',
+  r'\left': '',
+  r'\right': '',
+};
+
+const Map<String, String> _latexSupMap = <String, String>{
+  '0': '⁰',
+  '1': '¹',
+  '2': '²',
+  '3': '³',
+  '4': '⁴',
+  '5': '⁵',
+  '6': '⁶',
+  '7': '⁷',
+  '8': '⁸',
+  '9': '⁹',
+  '+': '⁺',
+  '-': '⁻',
+  '=': '⁼',
+  '(': '⁽',
+  ')': '⁾',
+  'n': 'ⁿ',
+  'i': 'ⁱ',
+};
+
+const Map<String, String> _latexSubMap = <String, String>{
+  '0': '₀',
+  '1': '₁',
+  '2': '₂',
+  '3': '₃',
+  '4': '₄',
+  '5': '₅',
+  '6': '₆',
+  '7': '₇',
+  '8': '₈',
+  '9': '₉',
+  '+': '₊',
+  '-': '₋',
+  '=': '₌',
+  '(': '₍',
+  ')': '₎',
+  'i': 'ᵢ',
+  'j': 'ⱼ',
+  'k': 'ₖ',
+  'n': 'ₙ',
+  'x': 'ₓ',
+};
+
+String _mapScriptChars(String raw, Map<String, String> table) {
+  final sb = StringBuffer();
+  for (var i = 0; i < raw.length; i++) {
+    final ch = raw[i];
+    sb.write(table[ch] ?? ch);
+  }
+  return sb.toString();
+}
+
 /// Lightweight, single-pass LaTeX -> Unicode math pretty-formatter for inline & display math.
 /// Preserves readability without external font bundles while display cards keep exact raw LaTeX on copy.
+@visibleForTesting
+String formatReadableLatexForTest(String tex) => _formatReadableLatex(tex);
+
 String _formatReadableLatex(String tex) {
   var s = tex.trim();
   if (s.isEmpty) return s;
-  // Simple `\frac{a}{b}` -> `(a)/(b)` (handles non-nested braces cleanly)
-  s = s.replaceAllMapped(
-    RegExp(r'\\d?frac\{([^{}]+)\}\{([^{}]+)\}'),
-    (m) => '(${m.group(1)!.trim()}) / (${m.group(2)!.trim()})',
-  );
-  s = s.replaceAllMapped(
-    RegExp(r'\\sqrt\{([^{}]+)\}'),
-    (m) => '√(${m.group(1)!.trim()})',
-  );
-  s = s.replaceAllMapped(
-    RegExp(r'\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]+)\}'),
-    (m) => m.group(1)!,
-  );
-  const symbolMap = <String, String>{
-    r'\alpha': 'α',
-    r'\beta': 'β',
-    r'\gamma': 'γ',
-    r'\delta': 'δ',
-    r'\epsilon': 'ε',
-    r'\varepsilon': 'ε',
-    r'\theta': 'θ',
-    r'\lambda': 'λ',
-    r'\mu': 'μ',
-    r'\nu': 'ν',
-    r'\xi': 'ξ',
-    r'\pi': 'π',
-    r'\rho': 'ρ',
-    r'\sigma': 'σ',
-    r'\tau': 'τ',
-    r'\phi': 'φ',
-    r'\varphi': 'φ',
-    r'\chi': 'χ',
-    r'\psi': 'ψ',
-    r'\omega': 'ω',
-    r'\Gamma': 'Γ',
-    r'\Delta': 'Δ',
-    r'\Theta': 'Θ',
-    r'\Lambda': 'Λ',
-    r'\Pi': 'Π',
-    r'\Sigma': 'Σ',
-    r'\Phi': 'Φ',
-    r'\Psi': 'Ψ',
-    r'\Omega': 'Ω',
-    r'\infty': '∞',
-    r'\pm': '±',
-    r'\mp': '∓',
-    r'\times': '×',
-    r'\div': '÷',
-    r'\cdot': '·',
-    r'\dots': '…',
-    r'\cdots': '⋯',
-    r'\ldots': '…',
-    r'\leq': '≤',
-    r'\le': '≤',
-    r'\geq': '≥',
-    r'\ge': '≥',
-    r'\neq': '≠',
-    r'\ne': '≠',
-    r'\approx': '≈',
-    r'\equiv': '≡',
-    r'\sim': '∼',
-    r'\propto': '∝',
-    r'\rightarrow': '→',
-    r'\to': '→',
-    r'\leftarrow': '←',
-    r'\leftrightarrow': '↔',
-    r'\Rightarrow': '⇒',
-    r'\Leftarrow': '⇐',
-    r'\Leftrightarrow': '⇔',
-    r'\iff': '⇔',
-    r'\in': '∈',
-    r'\notin': '∉',
-    r'\subset': '⊂',
-    r'\subseteq': '⊆',
-    r'\cup': '∪',
-    r'\cap': '∩',
-    r'\emptyset': '∅',
-    r'\forall': '∀',
-    r'\exists': '∃',
-    r'\partial': '∂',
-    r'\nabla': '∇',
-    r'\sum': '∑',
-    r'\prod': '∏',
-    r'\int': '∫',
-    r'\degree': '°',
-    r'\quad': '  ',
-    r'\qquad': '   ',
-    r'\,': ' ',
-    r'\;': ' ',
-    r'\left': '',
-    r'\right': '',
-  };
-  s = s.replaceAllMapped(RegExp(r'\\[a-zA-Z]+|\\[,;]'), (m) {
+  // Unwrap aligned/equation environments & line-break markers cleanly
+  s = s.replaceAll(_latexEnvRe, '').trim();
+  s = s.replaceAll(_latexLineBreakRe, '\n').replaceAll('&', ' ');
+  // Expand `\mathbb{R}` & inner `\text`/`\mathrm`/`\sqrt` BEFORE `\frac` so `\frac{\sqrt{x}}{2}` works!
+  s = s.replaceAllMapped(_latexBbRe, (m) => _latexBbMap[m.group(1)!] ?? m.group(0)!);
+  s = s.replaceAllMapped(_latexTextCmdRe, (m) => m.group(1)!);
+  for (var pass = 0; pass < 2; pass++) {
+    final prev = s;
+    s = s.replaceAllMapped(_latexSqrtRe, (m) => '√(${m.group(1)!.trim()})');
+    s = s.replaceAllMapped(
+      _latexFracRe,
+      (m) => '(${m.group(1)!.trim()}) / (${m.group(2)!.trim()})',
+    );
+    if (s == prev) break;
+  }
+  s = s.replaceAllMapped(_latexSymbolRe, (m) {
     final tok = m.group(0)!;
-    return symbolMap[tok] ?? tok;
+    return _latexSymbolMap[tok] ?? tok;
   });
-  const supMap = <String, String>{
-    '0': '⁰',
-    '1': '¹',
-    '2': '²',
-    '3': '³',
-    '4': '⁴',
-    '5': '⁵',
-    '6': '⁶',
-    '7': '⁷',
-    '8': '⁸',
-    '9': '⁹',
-    '+': '⁺',
-    '-': '⁻',
-    'n': 'ⁿ',
-    'i': 'ⁱ',
-  };
-  const subMap = <String, String>{
-    '0': '₀',
-    '1': '₁',
-    '2': '₂',
-    '3': '₃',
-    '4': '₄',
-    '5': '₅',
-    '6': '₆',
-    '7': '₇',
-    '8': '₈',
-    '9': '₉',
-    '+': '₊',
-    '-': '₋',
-    'i': 'ᵢ',
-    'j': 'ⱼ',
-    'k': 'ₖ',
-    'n': 'ₙ',
-    'x': 'ₓ',
-  };
-  s = s.replaceAllMapped(RegExp(r'\^([0-9+\-ni])'), (m) => supMap[m.group(1)!] ?? m.group(0)!);
-  s = s.replaceAllMapped(RegExp(r'_([0-9+\-ijknx])'), (m) => subMap[m.group(1)!] ?? m.group(0)!);
-  return s;
+  s = s.replaceAllMapped(_latexSupBracedRe, (m) => _mapScriptChars(m.group(1)!, _latexSupMap));
+  s = s.replaceAllMapped(_latexSubBracedRe, (m) => _mapScriptChars(m.group(1)!, _latexSubMap));
+  s = s.replaceAllMapped(_latexSupSingleRe, (m) => _latexSupMap[m.group(1)!] ?? m.group(0)!);
+  s = s.replaceAllMapped(_latexSubSingleRe, (m) => _latexSubMap[m.group(1)!] ?? m.group(0)!);
+  return s.trim();
 }
 
 class _DisplayMathCard extends StatefulWidget {
@@ -6991,6 +7257,15 @@ class _DisplayMathCard extends StatefulWidget {
 
 class _DisplayMathCardState extends State<_DisplayMathCard> {
   bool _copied = false;
+  String? _cachedRaw;
+  String _cachedFormatted = '';
+
+  String _formattedFor(String raw) {
+    if (_cachedRaw == raw) return _cachedFormatted;
+    _cachedRaw = raw;
+    _cachedFormatted = _formatReadableLatex(raw);
+    return _cachedFormatted;
+  }
 
   void _copyLatex() {
     Clipboard.setData(ClipboardData(text: widget.rawLatex));
@@ -7005,7 +7280,7 @@ class _DisplayMathCardState extends State<_DisplayMathCard> {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final formatted = _formatReadableLatex(widget.rawLatex);
+    final formatted = _formattedFor(widget.rawLatex);
     return Padding(
       padding: const EdgeInsets.only(top: 4, bottom: 10),
       child: Container(
@@ -7286,8 +7561,66 @@ TextSpan _highlightCodeSpan(String code, String rawLang) {
   return TextSpan(style: baseStyle, children: spans);
 }
 
+const TextStyle _kCodeCommentStyle = TextStyle(
+  color: Color(0xFF64748B),
+  fontStyle: FontStyle.italic,
+);
+
+/// Highlights a single line while propagating multi-line `/* ... */` block-comment state
+/// so streaming code blocks containing block comments still highlight incrementally in O(line)!
+({InlineSpan span, bool endInBlockComment}) _highlightLineIncremental(
+  String lineWithNl,
+  String rawLang,
+  bool startInBlockComment,
+) {
+  if (!startInBlockComment && !lineWithNl.contains('/*')) {
+    return (span: _highlightCodeSpan(lineWithNl, rawLang), endInBlockComment: false);
+  }
+  final spans = <InlineSpan>[];
+  var cursor = 0;
+  var inComment = startInBlockComment;
+  final len = lineWithNl.length;
+  while (cursor < len) {
+    if (inComment) {
+      final closeIdx = lineWithNl.indexOf('*/', cursor);
+      if (closeIdx < 0) {
+        spans.add(TextSpan(text: lineWithNl.substring(cursor), style: _kCodeCommentStyle));
+        return (span: TextSpan(children: spans), endInBlockComment: true);
+      }
+      spans.add(TextSpan(text: lineWithNl.substring(cursor, closeIdx + 2), style: _kCodeCommentStyle));
+      cursor = closeIdx + 2;
+      inComment = false;
+    } else {
+      final openIdx = lineWithNl.indexOf('/*', cursor);
+      if (openIdx < 0) {
+        spans.add(_highlightCodeSpan(lineWithNl.substring(cursor), rawLang));
+        return (span: TextSpan(children: spans), endInBlockComment: false);
+      }
+      // Check if an earlier `//` line comment or string swallows `/*`
+      final prefix = lineWithNl.substring(cursor, openIdx);
+      final lineCommentIdx = prefix.indexOf('//');
+      if (lineCommentIdx >= 0) {
+        spans.add(_highlightCodeSpan(lineWithNl.substring(cursor), rawLang));
+        return (span: TextSpan(children: spans), endInBlockComment: false);
+      }
+      if (prefix.isNotEmpty) {
+        spans.add(_highlightCodeSpan(prefix, rawLang));
+      }
+      final closeIdx = lineWithNl.indexOf('*/', openIdx + 2);
+      if (closeIdx < 0) {
+        spans.add(TextSpan(text: lineWithNl.substring(openIdx), style: _kCodeCommentStyle));
+        return (span: TextSpan(children: spans), endInBlockComment: true);
+      }
+      spans.add(TextSpan(text: lineWithNl.substring(openIdx, closeIdx + 2), style: _kCodeCommentStyle));
+      cursor = closeIdx + 2;
+    }
+  }
+  return (span: TextSpan(children: spans), endInBlockComment: inComment);
+}
+
 class _FencedCodeBlock extends StatefulWidget {
   const _FencedCodeBlock({
+    super.key,
     required this.lang,
     required this.code,
     this.isStreaming = false,
@@ -7311,12 +7644,18 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   bool _softWrap = false;
   bool _userToggled = false;
   late bool _expanded;
-  String? _cachedHighlightKey;
+  String? _cachedHighlightLang;
+  bool? _cachedHighlightStreaming;
+  String? _cachedHighlightText;
+  TextSpan? _cachedBaseSpan;
   TextSpan? _cachedHighlightSpan;
-  // Line-level incremental highlight cache so streaming a 300-line code block tokenizes
-  // ONLY the last active line in O(line) instead of re-running regex on char 0..N every 40ms!
+  String? _cachedLineCountCode;
+  int _cachedLineCount = 1;
+  // Line-level incremental highlight cache with block-comment state propagation so streaming
+  // even a 300-line block with `/* ... */` tokenizes ONLY the active tail line in O(line)!
   String _cachedLineLang = '';
   final List<String> _cachedLines = [];
+  final List<bool> _cachedLineEndInComment = [];
   final List<InlineSpan> _cachedLineSpans = [];
 
   @override
@@ -7339,12 +7678,17 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
     super.dispose();
   }
 
-  static int _countLines(String s) {
+  int _lineCountFor(String s) {
+    if (identical(_cachedLineCountCode, s) || _cachedLineCountCode == s) {
+      return _cachedLineCount;
+    }
     var count = 1;
     final len = s.length;
     for (var i = 0; i < len; i++) {
       if (s.codeUnitAt(i) == 0x0A /* '\n' */) count++;
     }
+    _cachedLineCountCode = s;
+    _cachedLineCount = count;
     return count;
   }
 
@@ -7361,51 +7705,69 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
     return s;
   }
 
-  Widget _buildCodeText(String displayText, GrassBagTokens t) {
-    final key = '${widget.lang}\u0000${widget.isStreaming}\u0000$displayText';
-    if (_cachedHighlightKey != key || _cachedHighlightSpan == null) {
-      _cachedHighlightKey = key;
-      final lang = widget.lang.trim().toLowerCase();
-      final canIncremental = displayText.length <= 24000 &&
-          lang != 'diff' &&
-          lang != 'patch' &&
-          !displayText.contains('/*');
-      TextSpan baseSpan;
-      if (canIncremental) {
-        if (_cachedLineLang != lang) {
-          _cachedLineLang = lang;
-          _cachedLines.clear();
-          _cachedLineSpans.clear();
-        }
-        final lines = displayText.split('\n');
-        var common = 0;
-        final limit = math.min(_cachedLines.length, lines.length);
-        // Completed lines before the final line hit O(1) string equality!
-        while (common < limit - 1 && _cachedLines[common] == lines[common]) {
-          common++;
-        }
-        if (common < _cachedLines.length) {
-          _cachedLines.removeRange(common, _cachedLines.length);
-          _cachedLineSpans.removeRange(common, _cachedLineSpans.length);
-        }
-        for (var i = common; i < lines.length; i++) {
-          final lineText = lines[i];
-          final lineWithNl = i == lines.length - 1 ? lineText : '$lineText\n';
-          _cachedLines.add(lineText);
-          _cachedLineSpans.add(_highlightCodeSpan(lineWithNl, widget.lang));
-        }
-        baseSpan = TextSpan(
-          style: const TextStyle(
-            fontFamily: 'monospace',
-            fontSize: 12,
-            height: 1.52,
-            color: Color(0xFFE2E8F0),
-          ),
-          children: List<InlineSpan>.of(_cachedLineSpans, growable: false),
-        );
-      } else {
-        baseSpan = _highlightCodeSpan(displayText, widget.lang);
+  TextSpan _ensureBaseSpan(String displayText) {
+    if (_cachedBaseSpan != null &&
+        _cachedHighlightLang == widget.lang &&
+        _cachedHighlightText == displayText) {
+      return _cachedBaseSpan!;
+    }
+    final lang = widget.lang.trim().toLowerCase();
+    final canIncremental = displayText.length <= 24000 && lang != 'diff' && lang != 'patch';
+    TextSpan baseSpan;
+    if (canIncremental) {
+      if (_cachedLineLang != lang) {
+        _cachedLineLang = lang;
+        _cachedLines.clear();
+        _cachedLineEndInComment.clear();
+        _cachedLineSpans.clear();
       }
+      final lines = displayText.split('\n');
+      var common = 0;
+      final limit = math.min(_cachedLines.length, lines.length);
+      // Completed lines before the final line hit O(1) string equality!
+      while (common < limit - 1 && _cachedLines[common] == lines[common]) {
+        common++;
+      }
+      if (common < _cachedLines.length) {
+        _cachedLines.removeRange(common, _cachedLines.length);
+        _cachedLineEndInComment.removeRange(common, _cachedLineEndInComment.length);
+        _cachedLineSpans.removeRange(common, _cachedLineSpans.length);
+      }
+      var inComment = common > 0 ? _cachedLineEndInComment[common - 1] : false;
+      for (var i = common; i < lines.length; i++) {
+        final lineText = lines[i];
+        final lineWithNl = i == lines.length - 1 ? lineText : '$lineText\n';
+        final res = _highlightLineIncremental(lineWithNl, widget.lang, inComment);
+        inComment = res.endInBlockComment;
+        _cachedLines.add(lineText);
+        _cachedLineEndInComment.add(inComment);
+        _cachedLineSpans.add(res.span);
+      }
+      baseSpan = TextSpan(
+        style: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 12,
+          height: 1.52,
+          color: Color(0xFFE2E8F0),
+        ),
+        children: List<InlineSpan>.of(_cachedLineSpans, growable: false),
+      );
+    } else {
+      baseSpan = _highlightCodeSpan(displayText, widget.lang);
+    }
+    _cachedBaseSpan = baseSpan;
+    return baseSpan;
+  }
+
+  Widget _buildCodeText(String displayText, GrassBagTokens t) {
+    if (_cachedHighlightSpan == null ||
+        _cachedHighlightLang != widget.lang ||
+        _cachedHighlightStreaming != widget.isStreaming ||
+        _cachedHighlightText != displayText) {
+      final baseSpan = _ensureBaseSpan(displayText);
+      _cachedHighlightLang = widget.lang;
+      _cachedHighlightStreaming = widget.isStreaming;
+      _cachedHighlightText = displayText;
       _cachedHighlightSpan = widget.isStreaming
           ? TextSpan(
               style: baseSpan.style,
@@ -7431,26 +7793,116 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   void _openFullscreenCode(BuildContext context, int lineCount) {
     final t = GrassBagTokens.of(context);
     final label = widget.lang.isEmpty ? '代码查看' : '${widget.lang} · $lineCount 行';
+    final fullSpan = (_cachedHighlightText == widget.code && _cachedBaseSpan != null)
+        ? _cachedBaseSpan!
+        : _highlightCodeSpan(widget.code, widget.lang);
+    var sheetSoftWrap = _softWrap;
+    var sheetCopied = false;
     showGrassBagSheet(
       context,
       title: label,
-      subtitle: '可横向滚动或局部划选复制',
-      preferredHeight: 480,
+      subtitle: '可横向滚动、切换自动换行或划选复制',
+      preferredHeight: 500,
       expandable: true,
-      bodyBuilder: (_) => Container(
-        decoration: BoxDecoration(
-          color: t.codeBg,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.1), width: 0.6),
-        ),
-        padding: const EdgeInsets.all(12),
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-            child: Text.rich(_highlightCodeSpan(widget.code, widget.lang)),
-          ),
-        ),
+      bodyBuilder: (_) => StatefulBuilder(
+        builder: (sheetCtx, setSheetState) {
+          final st = GrassBagTokens.of(sheetCtx);
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  GrassBagSpringTap(
+                    onTap: () => setSheetState(() => sheetSoftWrap = !sheetSoftWrap),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: sheetSoftWrap ? st.primarySoft : st.fill1,
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: sheetSoftWrap ? st.primary.withValues(alpha: 0.35) : st.sep,
+                          width: 0.7,
+                        ),
+                      ),
+                      child: Text(
+                        sheetSoftWrap ? '切换单行' : '自动换行',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: sheetSoftWrap ? (st.isDark ? st.primaryHi : st.primary) : st.text2,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  GrassBagSpringTap(
+                    onTap: () {
+                      Clipboard.setData(ClipboardData(text: widget.code));
+                      HapticFeedback.selectionClick();
+                      setSheetState(() => sheetCopied = true);
+                      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+                        if (sheetCtx.mounted) setSheetState(() => sheetCopied = false);
+                      });
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: sheetCopied ? st.okSoft : st.fill1,
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: sheetCopied ? st.ok.withValues(alpha: 0.35) : st.sep,
+                          width: 0.7,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            sheetCopied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                            size: 12.5,
+                            color: sheetCopied ? st.ok : st.text2,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            sheetCopied ? '已复制' : '复制代码',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: sheetCopied ? st.ok : st.text2,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Container(
+                decoration: BoxDecoration(
+                  color: t.codeBg,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: Colors.white.withValues(alpha: 0.1), width: 0.6),
+                ),
+                padding: const EdgeInsets.all(12),
+                child: sheetSoftWrap
+                    ? SelectionArea(
+                        contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                        child: Text.rich(fullSpan, softWrap: true),
+                      )
+                    : SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: SelectionArea(
+                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                          child: Text.rich(fullSpan, softWrap: false),
+                        ),
+                      ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -7458,7 +7910,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final lineCount = _countLines(widget.code);
+    final lineCount = _lineCountFor(widget.code);
     final isLong = !widget.isStreaming && lineCount > _collapseThreshold;
     final showFullscreenBtn = !widget.isStreaming && (lineCount > 12 || widget.code.length > 500);
     final displayText =
@@ -7618,15 +8070,39 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                         padding: const EdgeInsets.all(12),
                         child: _buildCodeText(displayText, t),
                       )
-                    : CupertinoScrollbar(
-                        controller: _hCtrl,
-                        thumbVisibility: false,
-                        child: SingleChildScrollView(
-                          controller: _hCtrl,
-                          scrollDirection: Axis.horizontal,
-                          padding: const EdgeInsets.all(12),
-                          child: _buildCodeText(displayText, t),
-                        ),
+                    : Stack(
+                        children: [
+                          CupertinoScrollbar(
+                            controller: _hCtrl,
+                            thumbVisibility: false,
+                            child: SingleChildScrollView(
+                              controller: _hCtrl,
+                              scrollDirection: Axis.horizontal,
+                              padding: const EdgeInsets.all(12),
+                              child: _buildCodeText(displayText, t),
+                            ),
+                          ),
+                          Positioned(
+                            top: 0,
+                            bottom: 0,
+                            right: 0,
+                            width: 18,
+                            child: IgnorePointer(
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.centerLeft,
+                                    end: Alignment.centerRight,
+                                    colors: [
+                                      t.codeBg.withValues(alpha: 0.0),
+                                      t.codeBg.withValues(alpha: 0.92),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
               ),
               if (isLong && !_expanded)

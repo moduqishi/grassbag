@@ -1810,6 +1810,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   final Set<String> _locallyCancelledTurnIds = {};
   int _cancelSuppressUntilMs = 0;
   int _lastStreamActivityMs = 0;
+  int _lastStage0HydrateMs = 0;
+  ({String wsId, int fetchedAtMs, List<String> files})? _refWorkspaceFilesCache;
   bool _stallProbeTriggered = false;
   Set<String> _deviceLocalIps = const {'127.0.0.1', '::1', '0.0.0.0'};
 
@@ -3899,6 +3901,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   Future<void> _syncLiveSessionBundle(
     String sessionId, {
     bool jumpToBottomOnLoad = false,
+    bool includeWorkbench = true,
   }) async {
     final client = _liveClient;
     if (client == null || sessionId.startsWith('pending-session-')) return;
@@ -3912,31 +3915,40 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final currentRelPath = state.workspaceCurrentPath;
     final currentDiffScope = state.activeDiffScope;
     try {
-      final results = await Future.wait([
-        client.getSessionTurns(sessionId, limit: 40),
-        client
-            .getWorkspaceFileTree(
-              fileScopeId,
-              path: currentRelPath.isEmpty ? '.' : currentRelPath,
-            )
-            .catchError((_) => const <String, dynamic>{}),
-        client
-            .getWorkspaceFileChanges(
-              fileScopeId,
-              sessionId: sessionId,
-              scope: currentDiffScope,
-            )
-            .catchError((_) => const <String, dynamic>{}),
-        client
-            .getSessionGoals(sessionId)
-            .catchError((_) => const <String, dynamic>{}),
-        client
-            .listCommands(sessionId: sessionId)
-            .catchError((_) => const <String, dynamic>{}),
-        client
-            .listJobs(sessionId: sessionId)
-            .catchError((_) => const <String, dynamic>{}),
-      ]);
+      final results = includeWorkbench
+          ? await Future.wait([
+              client.getSessionTurns(sessionId, limit: 40),
+              client
+                  .getWorkspaceFileTree(
+                    fileScopeId,
+                    path: currentRelPath.isEmpty ? '.' : currentRelPath,
+                  )
+                  .catchError((_) => const <String, dynamic>{}),
+              client
+                  .getWorkspaceFileChanges(
+                    fileScopeId,
+                    sessionId: sessionId,
+                    scope: currentDiffScope,
+                  )
+                  .catchError((_) => const <String, dynamic>{}),
+              client
+                  .getSessionGoals(sessionId)
+                  .catchError((_) => const <String, dynamic>{}),
+              client
+                  .listCommands(sessionId: sessionId)
+                  .catchError((_) => const <String, dynamic>{}),
+              client
+                  .listJobs(sessionId: sessionId)
+                  .catchError((_) => const <String, dynamic>{}),
+            ])
+          : <dynamic>[
+              await client.getSessionTurns(sessionId, limit: 40),
+              const <String, dynamic>{},
+              const <String, dynamic>{},
+              const <String, dynamic>{},
+              const <String, dynamic>{},
+              const <String, dynamic>{},
+            ];
       if (!mounted || !identical(_liveClient, client) || state.activeSessionId != sessionId) {
         return;
       }
@@ -4276,24 +4288,32 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             );
 
       // Parse real workspace files (preserve user's current directory inside Workbench!)
-      final parsedFiles = _parseFileTreeResponse(treeResp, basePath: currentRelPath);
+      final parsedFiles = includeWorkbench
+          ? _parseFileTreeResponse(treeResp, basePath: currentRelPath)
+          : state.workspaceFiles;
       // Parse real diffs
-      final parsedDiffs = _parseDiffsResponse(diffResp);
+      final parsedDiffs = includeWorkbench
+          ? _parseDiffsResponse(diffResp)
+          : state.workspaceDiffs;
       // Parse real goals (prefer goals/get, fall back to durable `projections.values.goal` on cold sessions!)
-      final parsedGoalsFromApi = _parseGoalsResponse(goalResp);
+      final parsedGoalsFromApi = includeWorkbench ? _parseGoalsResponse(goalResp) : const <SessionGoalRecord>[];
       final parsedGoals = parsedGoalsFromApi.isNotEmpty
           ? parsedGoalsFromApi
-          : (projValues is Map<String, dynamic>
+          : (projValues is Map<String, dynamic> && projValues.containsKey('goal')
               ? _parseGoalProjection(projValues['goal'])
-              : const <SessionGoalRecord>[]);
+              : (includeWorkbench ? const <SessionGoalRecord>[] : state.goals));
       // Sync authoritative DSH server inbox queue IDs when present in `projections.values.inbox`
       final parsedInbox = projValues is Map<String, dynamic>
           ? _parseInboxProjection(projValues['inbox'])
           : null;
       // Parse real slash commands if returned
-      final parsedCommands = _parseSlashCommandsResponse(cmdResp);
+      final parsedCommands = includeWorkbench
+          ? _parseSlashCommandsResponse(cmdResp)
+          : const <SlashCommandItem>[];
       // Parse real session background jobs
-      final parsedJobs = _parseJobsResponse(jobsResp, fallbackSessionId: sessionId);
+      final parsedJobs = includeWorkbench
+          ? _parseJobsResponse(jobsResp, fallbackSessionId: sessionId)
+          : const <BackgroundJobRecord>[];
 
       var sessionEntryChanged = false;
       for (final s in state.sessions) {
@@ -4603,26 +4623,42 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
                 : state.workspaces.first.path)
             : (activeWs.startsWith('/') ? activeWs : null);
         if (wsId != null && wsId.isNotEmpty) {
-          final tree = await client.getWorkspaceFileTree(wsId);
-          void collect(dynamic node) {
-            if (out.length >= 20) return;
-            if (node is List) {
-              for (final item in node) {
-                collect(item);
+          final nowMs = DateTime.now().millisecondsSinceEpoch;
+          List<String>? cachedPaths;
+          final cache = _refWorkspaceFilesCache;
+          if (cache != null && cache.wsId == wsId && (nowMs - cache.fetchedAtMs) < 30000) {
+            cachedPaths = cache.files;
+          } else {
+            final tree = await client.getWorkspaceFileTree(wsId);
+            final allFiles = <String>[];
+            void collectAll(dynamic node) {
+              if (allFiles.length >= 200) return;
+              if (node is List) {
+                for (final item in node) {
+                  collectAll(item);
+                }
+              } else if (node is Map) {
+                final kind = (node['kind'] ?? node['type'] ?? '').toString();
+                final p = (node['path'] ?? node['relativePath'] ?? node['name'])?.toString() ?? '';
+                final isDir = kind == 'directory' || kind == 'dir' || node['isDir'] == true;
+                if (!isDir && p.isNotEmpty) {
+                  allFiles.add(p);
+                }
+                if (node['children'] is List) collectAll(node['children']);
+                if (node['entries'] is List) collectAll(node['entries']);
+                if (node['files'] is List) collectAll(node['files']);
               }
-            } else if (node is Map) {
-              final kind = (node['kind'] ?? node['type'] ?? '').toString();
-              final p = (node['path'] ?? node['relativePath'] ?? node['name'])?.toString() ?? '';
-              final isDir = kind == 'directory' || kind == 'dir' || node['isDir'] == true;
-              if (!isDir && p.isNotEmpty && (q.isEmpty || p.toLowerCase().contains(q))) {
-                out.add({'path': p, 'kind': 'file'});
-              }
-              if (node['children'] is List) collect(node['children']);
-              if (node['entries'] is List) collect(node['entries']);
-              if (node['files'] is List) collect(node['files']);
+            }
+            collectAll(tree['entries'] ?? tree['children'] ?? tree['files'] ?? tree['tree']);
+            _refWorkspaceFilesCache = (wsId: wsId, fetchedAtMs: nowMs, files: allFiles);
+            cachedPaths = allFiles;
+          }
+          for (final p in cachedPaths) {
+            if (q.isEmpty || p.toLowerCase().contains(q)) {
+              out.add({'path': p, 'kind': 'file'});
+              if (out.length >= 20) break;
             }
           }
-          collect(tree['entries'] ?? tree['children'] ?? tree['files'] ?? tree['tree']);
         }
       } catch (_) {}
     }
@@ -5582,15 +5618,6 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
               _toolDetailCache.remove(_toolDetailCache.keys.first);
             }
           }
-          if (outStr.isNotEmpty && _isStillLive(client) && state.activeSessionId == sid) {
-            final updated = Map<String, String>.of(state.toolOutputCache)
-              ..remove(cacheKey)
-              ..[cacheKey] = outStr;
-            while (updated.length > _maxToolCacheEntries * 2) {
-              updated.remove(updated.keys.first);
-            }
-            state = state.copyWith(toolOutputCache: updated);
-          }
           return detail;
         }
       } catch (_) {
@@ -5604,8 +5631,11 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final hostId = state.activeHostId;
     final sid = state.activeSessionId;
     final cacheKey = (sid != null && sid.isNotEmpty) ? '$hostId:$sid:$callId' : '$hostId:__new__:$callId';
-    final existing = state.toolOutputCache[cacheKey];
-    if (existing != null) return existing;
+    final cachedDetail = _toolDetailCache[cacheKey];
+    final cachedOut = cachedDetail?['outputText']?.toString();
+    if (cachedOut != null && cachedOut.isNotEmpty && cachedDetail?['status'] != 'running') {
+      return cachedOut;
+    }
     final detail = await loadToolDetail(callId);
     final out = detail['outputText']?.toString() ?? '';
     if (out.isNotEmpty) return out;
@@ -11659,12 +11689,6 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
               : state.hosts,
         );
       }
-      if (phase == ConnectionPhase.connected &&
-          (prev == ConnectionPhase.reconnecting ||
-              prev == ConnectionPhase.disconnected ||
-              prev == ConnectionPhase.error)) {
-        unawaited(refreshSessionsList(silent: true));
-      }
     });
     _welcomeSub = client.stream.welcomes.listen((welcome) {
       if (!mounted || !identical(_liveClient, client)) return;
@@ -11685,27 +11709,29 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             state = state.copyWith(liveCapabilities: nextCaps);
           }).catchError((_) {}),
         );
+        // `_hydrateLiveDomains` Stage 0 already refreshes sessions/workspaces AND syncs `activeSessionId`.
         unawaited(_hydrateLiveDomains(client, allowEmptyModels: false));
-        if (state.activeSessionId != null && !state.activeSessionId!.startsWith('pending-session-')) {
-          unawaited(_syncLiveSessionBundle(state.activeSessionId!, jumpToBottomOnLoad: false));
+      } else if (isReconnect) {
+        if (DateTime.now().millisecondsSinceEpoch - _lastStage0HydrateMs > 2500) {
+          unawaited(refreshSessionsList(silent: true));
         }
-      } else if (isReconnect &&
-          state.isStreaming &&
-          state.activeSessionId != null &&
-          !state.activeSessionId!.startsWith('pending-session-')) {
-        // Even when `resumed == true`, schedule a lightweight safety check 1.5s later
-        // in case `turn.completed` arrived while upstream was briefly interrupted.
-        final checkSid = state.activeSessionId!;
-        final activityBefore = _lastStreamActivityMs;
-        _reconnectStreamCheckTimer?.cancel();
-        _reconnectStreamCheckTimer = Timer(const Duration(milliseconds: 1500), () {
-          if (!mounted || !identical(_liveClient, client)) return;
-          if (state.isStreaming &&
-              state.activeSessionId == checkSid &&
-              _lastStreamActivityMs == activityBefore) {
-            unawaited(_syncLiveSessionBundle(checkSid, jumpToBottomOnLoad: false));
-          }
-        });
+        if (state.isStreaming &&
+            state.activeSessionId != null &&
+            !state.activeSessionId!.startsWith('pending-session-')) {
+          // Even when `resumed == true`, schedule a lightweight safety check 1.5s later
+          // in case `turn.completed` arrived while upstream was briefly interrupted.
+          final checkSid = state.activeSessionId!;
+          final activityBefore = _lastStreamActivityMs;
+          _reconnectStreamCheckTimer?.cancel();
+          _reconnectStreamCheckTimer = Timer(const Duration(milliseconds: 1500), () {
+            if (!mounted || !identical(_liveClient, client)) return;
+            if (state.isStreaming &&
+                state.activeSessionId == checkSid &&
+                _lastStreamActivityMs == activityBefore) {
+              unawaited(_syncLiveSessionBundle(checkSid, jumpToBottomOnLoad: false));
+            }
+          });
+        }
       }
     });
     _streamSub = client.stream.frames.listen((frame) {
@@ -11859,6 +11885,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool allowEmptyModels = true,
   }) async {
     final myHydrateGen = ++_hydrationGen;
+    _lastStage0HydrateMs = DateTime.now().millisecondsSinceEpoch;
+    _refWorkspaceFilesCache = null;
     _domainRetryTimer?.cancel();
     _domainRetryTimer = null;
     try {
@@ -12965,9 +12993,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       streamTick: (reduced && streaming) ? state.streamTick + 1 : state.streamTick,
     );
     if (endedStreaming && sid != null && _liveClient != null) {
-      // Sync updated auto-generated session title, real context usage & workspace diffs
-      // WITHOUT forcing a scroll jump if the user scrolled up to read earlier messages!
-      unawaited(_syncLiveSessionBundle(sid, jumpToBottomOnLoad: false));
+      // Sync updated auto-generated session title & real context usage WITHOUT forcing a scroll jump;
+      // only fetch workspace file tree/diffs/jobs/commands/goals when the turn actually executed tools!
+      final completedTurn = updated.isNotEmpty ? updated.last : null;
+      final ranAnyTool = completedTurn != null &&
+          completedTurn.steps.any((s) => s is ToolStep);
+      unawaited(
+        _syncLiveSessionBundle(
+          sid,
+          jumpToBottomOnLoad: false,
+          includeWorkbench: ranAnyTool,
+        ),
+      );
     }
     if (endedStreaming &&
         state.activeHost.isLocal &&
@@ -13304,11 +13341,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         unawaited(_syncLiveSessionBundle(activeSid, jumpToBottomOnLoad: false));
       }
 
-      final hadNoOutputBefore = state.sendStage != SendStage.idle ||
-          (_turnReducer.turns.isNotEmpty &&
-              _turnReducer.turns.last.isStreaming &&
-              _turnReducer.turns.last.assistantText.isEmpty &&
-              _turnReducer.turns.last.steps.isEmpty);
+      final hadNoOutputBefore = state.sendStage != SendStage.idle || _turnReducer.isActiveTurnEmpty;
       final reduced = _turnReducer.apply(frame);
       final isTurnDone = (type == 'turn.completed' ||
               type == 'turn.end' ||
@@ -13415,8 +13448,11 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         if (sid != null && !sid.startsWith('pending-session-')) {
           unawaited(_syncLiveSessionBundle(sid, jumpToBottomOnLoad: false));
         }
-      } else if (type == 'host.ready' ||
-          type == 'session.added' ||
+      } else if (type == 'host.ready') {
+        if (DateTime.now().millisecondsSinceEpoch - _lastStage0HydrateMs > 2500) {
+          _scheduleHostSessionsRefresh();
+        }
+      } else if (type == 'session.added' ||
           type == 'session.created' ||
           type == 'session.updated' ||
           type == 'session.archived' ||
@@ -14315,7 +14351,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     showToast('SafetyGate 策略：$label');
   }
 
-  Future<void> triggerEmergencyStop() async {
+  Future<void> triggerEmergencyStop({bool cancelChatIfIdle = false}) async {
+    final wasPhoneActive = state.phoneLiveActive;
     await GrassBagNativeBridge.instance.triggerEmergencyStop();
     state = state.copyWith(
       emergencyStopped: true,
@@ -14325,9 +14362,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       phoneLiveApp: '',
       phoneLiveSteps: 0,
     );
-    cancelStreaming(announce: false);
+    if (wasPhoneActive || cancelChatIfIdle) {
+      cancelStreaming(announce: false);
+    }
     await refreshNativeStatus();
-    showToast('已触发紧急急停，所有操控与生成已立即中止', tone: ToastTone.warn);
+    showToast(
+      wasPhoneActive
+          ? '已触发紧急急停，所有操控与生成已立即中止'
+          : '已开启手机操控急停锁定（所有屏幕自动化已拦截）',
+      tone: ToastTone.warn,
+    );
   }
 
   Future<void> resetEmergencyStop() async {

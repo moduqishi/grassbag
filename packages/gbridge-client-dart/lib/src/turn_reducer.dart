@@ -27,6 +27,27 @@ class TurnStreamReducer {
   final Map<String, int> _reasoningStartedAtMs = <String, int>{};
   final Map<String, int> _toolStartedAtMs = <String, int>{};
 
+  /// Zero-flush O(1) check for whether the tail streaming turn already has buffered
+  /// or committed assistant text or steps (avoids triggering full `turns` flush per WS delta!).
+  bool get activeTurnHasOutput {
+    if (_turns.isEmpty) return false;
+    final lastIdx = _turns.length - 1;
+    final last = _turns[lastIdx];
+    if (!last.isStreaming) return false;
+    if (last.assistantText.isNotEmpty || last.steps.isNotEmpty) return true;
+    if (_activeTextBuf != null && _activeTextTurnIdx == lastIdx && _activeTextBuf!.isNotEmpty) {
+      return true;
+    }
+    if (_activeReasonBuf != null && _activeReasonTurnIdx == lastIdx && _activeReasonBuf!.isNotEmpty) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Zero-flush O(1) check matching `_turns.isNotEmpty && _turns.last.isStreaming && !activeTurnHasOutput`.
+  bool get isActiveTurnEmpty =>
+      _turns.isNotEmpty && _turns.last.isStreaming && !activeTurnHasOutput;
+
   List<NormalizedTurn> get turns {
     _flushBuffers(detach: false);
     return _cachedTurns ??= List.unmodifiable(_turns);
@@ -1102,7 +1123,10 @@ class TurnStreamReducer {
 
   int _ensureActiveTurnIndex(String? turnId, int seq) {
     if (turnId != null && turnId.isNotEmpty) {
-      final idx = _turns.indexWhere((t) => t.turnId == turnId);
+      if (_turns.isNotEmpty && _turns.last.turnId == turnId) {
+        return _turns.length - 1;
+      }
+      final idx = _turns.lastIndexWhere((t) => t.turnId == turnId);
       if (idx >= 0) return idx;
     }
     if (_turns.isNotEmpty && _turns.last.isStreaming) {

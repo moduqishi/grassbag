@@ -251,20 +251,25 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
   router.patch('/sessions/:id', async (req, res, { params, peer }) => {
     const body = await readJsonBody(req);
     const results = {};
+    const ops = [];
     if (typeof body.title === 'string') {
-      results.rename = await gateway.call('session/rename', { sessionId: params.id, title: body.title }, { peer });
+      ops.push(
+        gateway.call('session/rename', { sessionId: params.id, title: body.title }, { peer })
+          .then((r) => { results.rename = r; }),
+      );
     }
     if (typeof body.archived === 'boolean') {
       const ep = body.archived ? 'workspace/archiveSession' : 'workspace/unarchiveSession';
       const archiveArgs = body.archived && body.stopActivity !== undefined
         ? { sessionId: params.id, stopActivity: Boolean(body.stopActivity) }
         : { sessionId: params.id };
-      results.archive = await gateway.call(ep, archiveArgs, { peer });
+      ops.push(gateway.call(ep, archiveArgs, { peer }).then((r) => { results.archive = r; }));
     }
     if (typeof body.pinned === 'boolean') {
       const ep = body.pinned ? 'workspace/pinSession' : 'workspace/unpinSession';
-      results.pin = await gateway.call(ep, { sessionId: params.id }, { peer });
+      ops.push(gateway.call(ep, { sessionId: params.id }, { peer }).then((r) => { results.pin = r; }));
     }
+    if (ops.length > 0) await Promise.all(ops);
     sendJson(res, 200, { v: 1, sessionId: params.id, results });
   }, { domain: 'chat' });
 
@@ -281,15 +286,17 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
           ...(before && Number.isFinite(Number(before)) ? { beforeSeq: Number(before) } : {}),
         }
       : { sessionId: params.id, limit, ...(before ? { before } : {}) };
-    const page = await gateway.call('session/page', args, { peer });
+    const wantProj = searchParams.get('withProjections') !== 'false' && gateway.has('session/projections');
+    const [page, projections] = await Promise.all([
+      gateway.call('session/page', args, { peer }),
+      wantProj
+        ? gateway.call('session/projections', { sessionId: params.id }, { peer }).catch(() => null)
+        : Promise.resolve(null),
+    ]);
     const rawEvents = Array.isArray(page)
       ? page
       : (page?.records ?? page?.events ?? page?.items ?? []);
     const turns = normalizer.normalizeEvents(params.id, rawEvents);
-    let projections = null;
-    if (searchParams.get('withProjections') !== 'false' && gateway.has('session/projections')) {
-      projections = await gateway.call('session/projections', { sessionId: params.id }, { peer }).catch(() => null);
-    }
     const rawOldestSeq = (() => {
       for (const item of rawEvents) {
         const ev = item?.type === 'event' && item.event ? item.event : item;
@@ -835,10 +842,14 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       : { attachmentId: params.id, ...(sessionId ? { sessionId } : {}) };
     const result = await gateway.call('session/attachment', callArgs, { peer });
     let rawBuf = null;
-    if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
-      rawBuf = Buffer.from(result);
-    } else if (Buffer.isBuffer(result?.data) || result?.data instanceof Uint8Array) {
-      rawBuf = Buffer.from(result.data);
+    if (Buffer.isBuffer(result)) {
+      rawBuf = result;
+    } else if (result instanceof Uint8Array) {
+      rawBuf = Buffer.from(result.buffer, result.byteOffset, result.byteLength);
+    } else if (Buffer.isBuffer(result?.data)) {
+      rawBuf = result.data;
+    } else if (result?.data instanceof Uint8Array) {
+      rawBuf = Buffer.from(result.data.buffer, result.data.byteOffset, result.data.byteLength);
     } else if (typeof result?.data === 'string' && result.data.length > 0) {
       rawBuf = Buffer.from(result.data, 'base64');
     }

@@ -5,24 +5,33 @@ import { dirname, resolve } from 'node:path';
 import { GbridgeError, readJsonBody, sendJson } from '../http-util.js';
 
 const TICKET_TTL_MS = 60_000;
+let cachedDiscoveredDshVersion = null;
 
 export function detectDshVersion(ctx) {
   try {
     const envVer = process.env.DSH_VERSION?.trim();
     if (envVer) return envVer;
+    if (cachedDiscoveredDshVersion) return cachedDiscoveredDshVersion;
     if (process.argv[1]) {
       const realEntry = realpathSync(process.argv[1]);
       for (const rel of ['../package.json', '../../package.json']) {
         try {
           const pkg = JSON.parse(readFileSync(resolve(dirname(realEntry), rel), 'utf8'));
-          if (pkg?.name === '@deepseek-ai/dsh' && typeof pkg?.version === 'string') return pkg.version;
+          if (pkg?.name === '@deepseek-ai/dsh' && typeof pkg?.version === 'string') {
+            cachedDiscoveredDshVersion = pkg.version;
+            return pkg.version;
+          }
         } catch {}
       }
     }
     const loader = ctx.get?.('loader');
     for (const entry of loader?.entries?.() ?? []) {
       const pkg = entry?.options?.name;
-      if (pkg === '@deepseek-ai/dsh' && entry?.version) return String(entry.version);
+      if (pkg === '@deepseek-ai/dsh' && entry?.version) {
+        const ver = String(entry.version);
+        cachedDiscoveredDshVersion = ver;
+        return ver;
+      }
     }
   } catch {}
   return 'unknown';
@@ -171,13 +180,18 @@ export function registerMetaDomain(router, { ctx, gateway, hub, sdui, bridgeVers
 
   // Single-request aggregate for Settings OverviewCard & Drawer IdentityBar.
   router.get('/overview', async (_req, res, { peer }) => {
-    const caps = buildCapabilities({ ctx, gateway, bridgeVersion, bootId, phoneState, isLocalAndroid });
     const overview = {
       v: 1,
       bootId,
       bridgeVersion,
-      dshVersion: caps.dshVersion,
-      host: caps.host,
+      dshVersion: detectDshVersion(ctx),
+      host: {
+        name: hostname(),
+        platform: platform(),
+        arch: arch(),
+        isLocalAndroid: Boolean(isLocalAndroid),
+        homeDir: homedir(),
+      },
       pendingInteractionsCount: hub.pendingInteractions.size,
       activeStreamsCount: hub.upstreamStreams.size,
       account: null,

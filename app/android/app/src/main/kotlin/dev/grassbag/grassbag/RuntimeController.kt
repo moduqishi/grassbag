@@ -3,6 +3,8 @@ package dev.grassbag.grassbag
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.net.Network
 import android.os.Build
 import android.os.Environment
@@ -110,6 +112,12 @@ class RuntimeController private constructor(
         Thread(r, "grassbag-toolkit").apply { isDaemon = true }
     }
     private val activeToolkitInstalls = java.util.concurrent.atomic.AtomicInteger(0)
+    private val upgradeInProgress = AtomicBoolean(false)
+    private val nativeLibDirFile = File(ctx.applicationInfo.nativeLibraryDir)
+    private val hasTawcrootBin: Boolean = File(nativeLibDirFile, "libtawcroot.so").exists()
+    private val hasProotBin: Boolean = File(nativeLibDirFile, "libproot.so").exists()
+    @Volatile
+    private var cachedInstalledToolkits: List<String>? = null
     private val coalesceScheduler = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "grassbag-event-coalesce").apply { isDaemon = true }
     }
@@ -562,14 +570,14 @@ class RuntimeController private constructor(
             val groupFile = File(etcDir, "group")
             if (groupFile.exists()) {
                 val existingText = groupFile.readText()
-                val existingGids = Regex(""":x:(\d+):""").findAll(existingText).map { it.groupValues[1] }.toHashSet()
+                val existingGids = GROUP_GID_REGEX.findAll(existingText).map { it.groupValues[1] }.toHashSet()
                 val statusLine = runCatching {
                     File("/proc/self/status").readLines().firstOrNull { it.startsWith("Groups:") }
                 }.getOrNull()
                 val currentGids = mutableSetOf<String>()
                 runCatching { currentGids.add(Os.getgid().toString()) }
-                statusLine?.substringAfter("Groups:")?.trim()?.split(Regex("\\s+"))?.forEach { token ->
-                    if (token.matches(Regex("\\d+"))) currentGids.add(token)
+                statusLine?.substringAfter("Groups:")?.trim()?.split(WHITESPACE_REGEX)?.forEach { token ->
+                    if (token.matches(DIGITS_REGEX)) currentGids.add(token)
                 }
                 val toAppend = currentGids.filter { it != "0" && !existingGids.contains(it) }
                 if (toAppend.isNotEmpty()) {
@@ -736,38 +744,42 @@ class RuntimeController private constructor(
         return runCatching { Os.lstat(f.absolutePath) != null }.getOrDefault(false)
     }
 
-    fun detectInstalledToolkits(): List<String> {
+    fun detectInstalledToolkits(forceRefresh: Boolean = false): List<String> {
+        if (!forceRefresh) {
+            cachedInstalledToolkits?.let { return it }
+        }
         val found = mutableListOf<String>()
         if (isContainerExtracted()) found.add("core-node")
-        // Verify full toolkit readiness (never falsely report half-installed broken apt runs as installed!)
-        if (containerEntryExists("usr/bin/python3") &&
-            containerEntryExists("usr/bin/pip3")
-        ) {
+        // Read usr/bin directory listing once (detects both regular files and container-relative
+        // alternatives symlinks like /usr/bin/convert without throwing Os.lstat ErrnoExceptions!).
+        val binEntries = File(ubuntuRoot, "usr/bin").list()?.toHashSet() ?: emptySet()
+        if (binEntries.contains("python3") && binEntries.contains("pip3")) {
             found.add("python-uv")
         }
-        if (containerEntryExists("usr/bin/git") &&
-            containerEntryExists("usr/bin/rg") &&
-            containerEntryExists("usr/bin/jq") &&
-            containerEntryExists("usr/bin/sqlite3") &&
-            containerEntryExists("usr/bin/curl")
+        if (binEntries.contains("git") &&
+            binEntries.contains("rg") &&
+            binEntries.contains("jq") &&
+            binEntries.contains("sqlite3") &&
+            binEntries.contains("curl")
         ) {
             found.add("dev-git-cli")
         }
-        if (containerEntryExists("usr/bin/ffmpeg") &&
-            containerEntryExists("usr/bin/pandoc") &&
-            (containerEntryExists("usr/bin/convert") ||
-                containerEntryExists("usr/bin/convert-im6.q16") ||
-                containerEntryExists("usr/bin/magick"))
+        if (binEntries.contains("ffmpeg") &&
+            binEntries.contains("pandoc") &&
+            (binEntries.contains("convert") ||
+                binEntries.contains("convert-im6.q16") ||
+                binEntries.contains("magick"))
         ) {
             found.add("media-office")
         }
-        return found
+        val immutable = found.toList()
+        cachedInstalledToolkits = immutable
+        return immutable
     }
 
     fun effectiveExecutorMode(meta: JSONObject = readMeta()): String {
-        val libs = File(ctx.applicationInfo.nativeLibraryDir)
-        val hasTawc = File(libs, "libtawcroot.so").exists()
-        val hasProot = File(libs, "libproot.so").exists()
+        val hasTawc = hasTawcrootBin
+        val hasProot = hasProotBin
         val pinned = meta.optBoolean("executorModePinned", false)
         val stored = meta.optString("executorMode", "")
         val tawcUnsupportedFp = meta.optString("tawcUnsupportedFingerprint", "")
@@ -984,8 +996,8 @@ class RuntimeController private constructor(
             "sdcardMounted" to m.optBoolean("sdcardMounted", false),
             "useSystemProxy" to m.optBoolean("useSystemProxy", false),
             "installedToolkits" to detectInstalledToolkits(),
-            "hasTawcroot" to File(libs, "libtawcroot.so").exists(),
-            "hasProot" to File(libs, "libproot.so").exists(),
+            "hasTawcroot" to hasTawcrootBin,
+            "hasProot" to hasProotBin,
             "hasBundledAssets" to bundled.hasBundledAssets(),
             "homePath" to homeDir.absolutePath,
             "homeSizeKb" to cachedHomeSizeKb,
@@ -1407,6 +1419,7 @@ class RuntimeController private constructor(
                 done(mapOf("ok" to false, "error" to (bootstrapErr ?: "bootstrap_failed"), "status" to getStatus()))
                 return@execute
             }
+            cachedInstalledToolkits = null
 
             // Release bootstrapLock BEFORE starting DSH engine so status/start calls never stall!
             sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…")
@@ -1579,7 +1592,9 @@ class RuntimeController private constructor(
         prootTmpDir.mkdirs()
         tawcTmpDir.mkdirs()
         File(homeDir, ".cache/node-compile-cache").mkdirs()
-        ensureContainerEtcFiles(force = includeBridgeSecrets)
+        if (!etcPrepared) {
+            ensureContainerEtcFiles(force = false)
+        }
 
         // Never fall back to `homeDir` for `/root/shared` (that would bind `/root` recursively inside itself!).
         val extShared = ctx.getExternalFilesDir(null)
@@ -1791,13 +1806,21 @@ class RuntimeController private constructor(
                 return mapOf("ok" to false, "error" to "runtime_not_initialized", "status" to getStatus())
             }
 
-            // Adopt an already-healthy local DSH instance on our dedicated port ONLY when bundled overlays
-            // haven't changed (if the APK just upgraded dsh-gbridge/shims, restart cleanly so fixes take effect).
-            val existingCaps = probeLocalCapabilities()
+            // Adopt an already-healthy local DSH instance ONLY when a prior pid/socket exists
+            // (avoids cold HttpURLConnection/OkHttp classloading + ECONNREFUSED on clean cold launch).
+            val existingCaps = if (pidFile.exists() || bridgeSocket.exists()) {
+                probeLocalCapabilities()
+            } else {
+                null
+            }
             if (existingCaps != null) {
                 if (hasPendingFastOverlayUpdate(activeSlot)) {
                     appendLog("[runtime] APK overlays updated; restarting previously running DSH to apply updates...")
                     stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                    synchronized(engineLock) {
+                        engineState = "starting"
+                        lastEngineError = null
+                    }
                 } else {
                     synchronized(engineLock) {
                         adoptedRunning = true
@@ -1857,7 +1880,11 @@ class RuntimeController private constructor(
 
             updateRelativeSymlink(File(containersRoot, "current"), ubuntuRoot.name)
             updateRelativeSymlink(File(slotsRoot, "current"), activeSlot)
-            ensureContainerEtcFiles(force = true)
+            if (!etcPrepared) {
+                ensureContainerEtcFiles(force = true)
+            } else {
+                refreshContainerDns()
+            }
 
             // Try fast path first (`tawcroot`), automatically falling back to `proot` (seccomp) -> `proot-legacy` if needed.
             val freshMeta = readMeta()
@@ -2050,6 +2077,7 @@ class RuntimeController private constructor(
         }
         val deadline = t0 + timeoutMs
         var consecutive401AfterWebUrl = 0
+        var lastBlindTcpProbeAt = 0L
         while (SystemClock.elapsedRealtime() < deadline) {
             if (stopEpoch.get() != startEpoch) {
                 return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
@@ -2064,65 +2092,77 @@ class RuntimeController private constructor(
                 )
                 return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
             }
-            val elapsed = SystemClock.elapsedRealtime() - t0
-            if (dshWebUrl != null || bridgeSocket.exists() || elapsed >= 2000L) {
-                val probe = probeLocalCapabilitiesWithStatus()
-                val caps = probe.first
-                if (probe.second == 401 && dshWebUrl != null) {
-                    consecutive401AfterWebUrl++
-                    if (consecutive401AfterWebUrl == 1 || consecutive401AfterWebUrl == 10) {
-                        appendLog("[runtime] WARN: capabilities probe returned HTTP 401 after dshWebUrl appeared (token mismatch / legacy plugin)")
-                    }
+            val nowMs = SystemClock.elapsedRealtime()
+            val elapsed = nowMs - t0
+            val udsExists = bridgeSocket.exists()
+            var probe: Pair<JSONObject?, Int> = null to -1
+            var readyViaUds = false
+            if (udsExists) {
+                probe = probeUdsCapabilitiesWithStatus()
+                if (probe.first != null) {
+                    readyViaUds = true
                 }
-                if (caps != null) {
-                    // Wait briefly (up to 500ms) only for `bridge.sock` if not yet visible;
-                    // `dshWebUrl` arrives asynchronously via `engine_web_url` without stalling boot!
-                    for (i in 0 until 10) {
+            }
+            if (probe.first == null && (dshWebUrl != null || (elapsed >= 4000L && nowMs - lastBlindTcpProbeAt >= 1000L))) {
+                lastBlindTcpProbeAt = nowMs
+                probe = probeLocalCapabilitiesWithStatus()
+            }
+            val caps = probe.first
+            if (probe.second == 401 && dshWebUrl != null) {
+                consecutive401AfterWebUrl++
+                if (consecutive401AfterWebUrl == 1 || consecutive401AfterWebUrl == 10) {
+                    appendLog("[runtime] WARN: capabilities probe returned HTTP 401 after dshWebUrl appeared (token mismatch / legacy plugin)")
+                }
+            }
+            if (caps != null) {
+                if (!readyViaUds && !bridgeSocket.exists()) {
+                    // Brief grace (up to 250ms) only if TCP responded before bridge.sock appeared.
+                    for (i in 0 until 5) {
                         if (bridgeSocket.exists()) break
                         runCatching { Thread.sleep(50) }
                     }
-                    if (bridgeSocket.exists()) {
-                        runCatching { Os.chmod(bridgeSocket.absolutePath, 0x180) }
-                    }
-                    val stillValid = synchronized(engineLock) {
-                        if (dshProcess === proc && engineState == "starting") {
-                            lastCapabilitiesDshVersion = caps.optString("dshVersion", "0.2.2-rc.5")
-                            engineState = "running"
-                            lastEngineError = null
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    if (!stillValid) {
-                        return mapOf("ok" to false, "error" to "engine_stopped_during_startup", "status" to getStatus())
-                    }
-                    val bootMs = SystemClock.elapsedRealtime() - t0
-                    GrassBagEngineService.startOrUpdate(
-                        ctx,
-                        "GrassBag 本机引擎运行中",
-                        "DSH $lastCapabilitiesDshVersion ($executorTag) · 后台保活中",
-                        releaseWakeLock = activeToolkitInstalls.get() <= 0
-                    )
-                    appendLog("[runtime] DSH READY in ${bootMs}ms! executor=$executorTag version=$lastCapabilitiesDshVersion endpoints=${caps.optInt("endpointsCount")} uds=${bridgeSocket.exists()} webUrl=${dshWebUrl != null} port=$LOCAL_DSH_PORT")
-                    emit(
-                        "engine_ready",
-                        mapOf(
-                            "bridgeSocketPath" to bridgeSocket.absolutePath,
-                            "bridgeHttpUrl" to "http://127.0.0.1:$LOCAL_DSH_PORT",
-                            "dshWebUrl" to (dshWebUrl ?: "http://127.0.0.1:$LOCAL_DSH_PORT"),
-                            "bridgeToken" to bridgeToken,
-                            "dshVersion" to lastCapabilitiesDshVersion,
-                            "executorMode" to executorTag,
-                            "bootMs" to bootMs,
-                            "endpointsCount" to caps.optInt("endpointsCount", 0),
-                            "udsReady" to bridgeSocket.exists()
-                        )
-                    )
-                    return mapOf("ok" to true, "bootMs" to bootMs, "executorMode" to executorTag, "capabilities" to caps.toString(), "status" to getStatus())
                 }
+                if (bridgeSocket.exists()) {
+                    runCatching { Os.chmod(bridgeSocket.absolutePath, 0x180) }
+                }
+                val stillValid = synchronized(engineLock) {
+                    if (dshProcess === proc && engineState == "starting") {
+                        lastCapabilitiesDshVersion = caps.optString("dshVersion", "0.2.2-rc.5")
+                        engineState = "running"
+                        lastEngineError = null
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!stillValid) {
+                    return mapOf("ok" to false, "error" to "engine_stopped_during_startup", "status" to getStatus())
+                }
+                val bootMs = SystemClock.elapsedRealtime() - t0
+                GrassBagEngineService.startOrUpdate(
+                    ctx,
+                    "GrassBag 本机引擎运行中",
+                    "DSH $lastCapabilitiesDshVersion ($executorTag) · 后台保活中",
+                    releaseWakeLock = activeToolkitInstalls.get() <= 0
+                )
+                appendLog("[runtime] DSH READY in ${bootMs}ms! executor=$executorTag version=$lastCapabilitiesDshVersion endpoints=${caps.optInt("endpointsCount")} uds=${bridgeSocket.exists()} readyViaUds=$readyViaUds webUrl=${dshWebUrl != null} port=$LOCAL_DSH_PORT")
+                emit(
+                    "engine_ready",
+                    mapOf(
+                        "bridgeSocketPath" to bridgeSocket.absolutePath,
+                        "bridgeHttpUrl" to "http://127.0.0.1:$LOCAL_DSH_PORT",
+                        "dshWebUrl" to (dshWebUrl ?: "http://127.0.0.1:$LOCAL_DSH_PORT"),
+                        "bridgeToken" to bridgeToken,
+                        "dshVersion" to lastCapabilitiesDshVersion,
+                        "executorMode" to executorTag,
+                        "bootMs" to bootMs,
+                        "endpointsCount" to caps.optInt("endpointsCount", 0),
+                        "udsReady" to bridgeSocket.exists()
+                    )
+                )
+                return mapOf("ok" to true, "bootMs" to bootMs, "executorMode" to executorTag, "capabilities" to caps.toString(), "status" to getStatus())
             }
-            val waitMs = if (dshWebUrl != null || bridgeSocket.exists()) 160L else if (elapsed < 10_000L) 250L else 420L
+            val waitMs = if (dshWebUrl != null || udsExists) 150L else if (elapsed < 10_000L) 250L else 420L
             synchronized(readinessSignal) {
                 runCatching { readinessSignal.wait(waitMs) }
             }
@@ -2139,7 +2179,45 @@ class RuntimeController private constructor(
         )
     }
 
-    private fun probeLocalCapabilities(): JSONObject? = probeLocalCapabilitiesWithStatus().first
+    private fun probeLocalCapabilities(): JSONObject? {
+        if (bridgeSocket.exists()) {
+            probeUdsCapabilitiesWithStatus().first?.let { return it }
+        }
+        return probeLocalCapabilitiesWithStatus().first
+    }
+
+    private fun probeUdsCapabilitiesWithStatus(): Pair<JSONObject?, Int> = runCatching {
+        if (!bridgeSocket.exists()) return@runCatching null to -1
+        val sock = LocalSocket(LocalSocket.SOCKET_STREAM)
+        try {
+            sock.connect(LocalSocketAddress(bridgeSocket.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+            sock.soTimeout = 600
+            val req = "GET /gbridge/v1/capabilities HTTP/1.1\r\n" +
+                "Host: localhost\r\n" +
+                "Authorization: Bearer $bridgeToken\r\n" +
+                "Connection: close\r\n\r\n"
+            sock.outputStream.write(req.toByteArray(Charsets.UTF_8))
+            sock.outputStream.flush()
+            val raw = sock.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            val headerEnd = raw.indexOf("\r\n\r\n")
+            if (headerEnd < 0) return@runCatching null to -1
+            val statusLine = raw.substring(0, raw.indexOf("\r\n").coerceAtLeast(0))
+            val parts = statusLine.split(' ')
+            val code = parts.getOrNull(1)?.toIntOrNull() ?: -1
+            if (code !in 200..299) return@runCatching null to code
+            var body = raw.substring(headerEnd + 4)
+            if (raw.substring(0, headerEnd).contains("transfer-encoding: chunked", ignoreCase = true)) {
+                val jsonStart = body.indexOf('{')
+                val jsonEnd = body.lastIndexOf('}')
+                if (jsonStart in 0..jsonEnd) {
+                    body = body.substring(jsonStart, jsonEnd + 1)
+                }
+            }
+            JSONObject(body) to code
+        } finally {
+            runCatching { sock.close() }
+        }
+    }.getOrDefault(null to -1)
 
     private fun probeLocalCapabilitiesWithStatus(): Pair<JSONObject?, Int> = runCatching {
         val conn = (URL("http://127.0.0.1:$LOCAL_DSH_PORT/gbridge/v1/capabilities").openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
@@ -2226,6 +2304,7 @@ class RuntimeController private constructor(
                     ubuntuRoot.mkdirs()
                     etcPrepared = false
                     ptySupportedCache = null
+                    cachedInstalledToolkits = null
                 }
                 bootstrapRuntime(done)
             } catch (e: Throwable) {
@@ -2238,12 +2317,22 @@ class RuntimeController private constructor(
 
     fun performAbUpgrade(targetVersion: String, remoteBaseUrl: String?, done: (Map<String, Any?>) -> Unit) {
         worker.execute {
+            if (!upgradeInProgress.compareAndSet(false, true)) {
+                done(mapOf("ok" to false, "error" to "已有版本升级或回滚任务正在进行中，请稍候完成", "status" to getStatus()))
+                return@execute
+            }
             var stagedTargetDir: File? = null
             var startedFg = false
             var switchedMeta = false
             var revertMetaFn: (() -> Unit)? = null
-            synchronized(bootstrapLock) {
-                try {
+            var prevVersionForRollback = ""
+            var prevSlotForRollback = ""
+            var installedVer = targetVersion
+            var standbyName = ""
+            try {
+                // Hold bootstrapLock ONLY while preparing & atomically switching the standby slot;
+                // release BEFORE calling startEngineSync() to prevent AB-BA deadlock with syncFastOverlaysIfNeeded().
+                synchronized(bootstrapLock) {
                     val availBytes = runCatching { StatFs(ctx.filesDir.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
                     if (availBytes < 750L * 1024L * 1024L) {
                         error("手机可用存储空间不足（当前 ${availBytes / (1024L * 1024L)} MB，A/B 槽位升级至少需要 750 MB）")
@@ -2262,7 +2351,10 @@ class RuntimeController private constructor(
                     val curDir = if (cur == "slot-a") slotA else slotB
                     val targetDir = if (standby == "slot-a") slotA else slotB
                     stagedTargetDir = targetDir
+                    standbyName = standby
                     val prevVersion = lastCapabilitiesDshVersion ?: st.optString("dshVersion", "0.2.2-rc.5")
+                    prevVersionForRollback = prevVersion
+                    prevSlotForRollback = cur
                     val prevLkgSlot = st.optString("lkgSlot", cur)
                     val prevDshPrevVersion = st.optString("dshPrevVersion", "")
                     val prevUserUpgradedAb = st.optBoolean("userUpgradedAb", false)
@@ -2348,7 +2440,7 @@ class RuntimeController private constructor(
                     if (!dshBin.exists() || !dshPkg.exists()) {
                         error("备用槽位校验失败：未找到 @deepseek-ai/dsh/lib/bin.js")
                     }
-                    val installedVer = runCatching { JSONObject(dshPkg.readText()).optString("version", targetVersion) }
+                    installedVer = runCatching { JSONObject(dshPkg.readText()).optString("version", targetVersion) }
                         .getOrDefault(targetVersion)
                     runCatching { extractingFlag.delete() }
                     runCatching { File(targetDir, ".extract-complete").writeText(installedVer) }
@@ -2375,82 +2467,98 @@ class RuntimeController private constructor(
                         fresh.put("dshVersion", installedVer)
                         fresh.put("userUpgradedAb", true)
                         if (remoteBaseUrl.isNullOrBlank()) {
-                            // Local npm upgrade copied curDir/dsh-gbridge directly into standby.
                             val curBridgeSha = fresh.optString("gbridgeSha256_$cur", fresh.optString("gbridgeSha256", ""))
                             if (curBridgeSha.isNotEmpty()) fresh.put("gbridgeSha256_$standby", curBridgeSha)
                         } else {
-                            // Remote engineInit bundle may contain an older dsh-gbridge; clear standby SHA so
-                            // syncFastOverlaysIfNeeded() refreshes it from the bundled APK overlay on next start.
                             fresh.remove("gbridgeSha256_$standby")
                         }
                     }
                     updateRelativeSymlink(File(slotsRoot, "current"), standby)
                     updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
                     switchedMeta = true
+                }
 
-                    stopEngineSync(keepForegroundService = true)
-                    val res = startEngineSync()
-                    if (res["ok"] != true) {
-                        // Automatic LKG rollback on healthcheck failure: restore metadata + symlinks & remove broken slot!
-                        appendLog("[upgrade] 新版本启动失败，自动回滚至 LKG 槽位 $cur (v$prevVersion)…")
+                stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                val res = startEngineSync()
+                if (res["ok"] != true) {
+                    // Automatic LKG rollback on healthcheck failure: restore metadata + symlinks & remove broken slot!
+                    appendLog("[upgrade] 新版本启动失败，自动回滚至 LKG 槽位 $prevSlotForRollback (v$prevVersionForRollback)…")
+                    synchronized(bootstrapLock) {
                         revertMetaFn?.invoke()
                         switchedMeta = false
-                        stopEngineSync(keepForegroundService = true)
-                        runCatching { TarGzExtractor.deleteTreeNoFollow(targetDir) }
-                        startEngineSync()
-                        val errMsg = "v$installedVer 启动自检未通过，已自动回滚至 v$prevVersion：${res["error"]}"
-                        sendProgress("error", 0, errMsg)
-                        done(mapOf("ok" to false, "error" to errMsg, "status" to getStatus()))
-                        return@execute
+                        stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                        stagedTargetDir?.let { runCatching { TarGzExtractor.deleteTreeNoFollow(it) } }
+                        stagedTargetDir = null
                     }
-                    stagedTargetDir = null
-                    switchedMeta = false
-                    sendProgress("ready", 100, "已切换至 $standby (v$installedVer)")
-                    done(mapOf("ok" to true, "engineStarted" to true, "version" to installedVer, "status" to getStatus()))
-                } catch (err: Throwable) {
+                    startEngineSync()
+                    val errMsg = "v$installedVer 启动自检未通过，已自动回滚至 v$prevVersionForRollback：${res["error"]}"
+                    sendProgress("error", 0, errMsg)
+                    done(mapOf("ok" to false, "error" to errMsg, "status" to getStatus()))
+                    return@execute
+                }
+                stagedTargetDir = null
+                switchedMeta = false
+                sendProgress("ready", 100, "已切换至 $standbyName (v$installedVer)")
+                done(mapOf("ok" to true, "engineStarted" to true, "version" to installedVer, "status" to getStatus()))
+            } catch (err: Throwable) {
+                synchronized(bootstrapLock) {
                     if (switchedMeta) {
                         revertMetaFn?.invoke()
                         switchedMeta = false
                     }
                     stagedTargetDir?.let { runCatching { TarGzExtractor.deleteTreeNoFollow(it) } }
-                    if (startedFg && !isEngineAlive()) {
-                        GrassBagEngineService.stop(ctx)
-                    }
-                    val msg = err.message ?: "upgrade_failed"
-                    appendLog("[upgrade] ERROR: $msg")
-                    sendProgress("error", 0, "升级失败：$msg")
-                    done(mapOf("ok" to false, "error" to msg, "status" to getStatus()))
                 }
+                if (startedFg && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
+                    GrassBagEngineService.stop(ctx)
+                }
+                val msg = err.message ?: "upgrade_failed"
+                appendLog("[upgrade] ERROR: $msg")
+                sendProgress("error", 0, "升级失败：$msg")
+                done(mapOf("ok" to false, "error" to msg, "status" to getStatus()))
+            } finally {
+                upgradeInProgress.set(false)
             }
         }
     }
 
     fun rollbackLkg(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
-            synchronized(bootstrapLock) {
-                val st = readMeta()
-                val cur = st.optString("activeSlot", "slot-a")
-                val lkg = st.optString("lkgSlot", "slot-a")
-                if (lkg == cur || !isSlotExtracted(lkg)) {
-                    done(mapOf("ok" to false, "error" to "备用 LKG 槽位 ($lkg) 尚未写入历史版本，当前无需回滚", "status" to getStatus()))
-                    return@execute
+            if (!upgradeInProgress.compareAndSet(false, true)) {
+                done(mapOf("ok" to false, "error" to "已有版本升级或回滚任务正在进行中，请稍候完成", "status" to getStatus()))
+                return@execute
+            }
+            try {
+                val canProceed = synchronized(bootstrapLock) {
+                    val st = readMeta()
+                    val cur = st.optString("activeSlot", "slot-a")
+                    val lkg = st.optString("lkgSlot", "slot-a")
+                    if (lkg == cur || !isSlotExtracted(lkg)) {
+                        done(mapOf("ok" to false, "error" to "备用 LKG 槽位 ($lkg) 尚未写入历史版本，当前无需回滚", "status" to getStatus()))
+                        false
+                    } else {
+                        val prevVer = st.optString("dshPrevVersion", "")
+                        val curVer = st.optString("dshVersion", "0.2.2-rc.5")
+                        updateMeta { fresh ->
+                            fresh.put("activeSlot", lkg)
+                            fresh.put("lkgSlot", cur)
+                            if (prevVer.isNotEmpty()) fresh.put("dshVersion", prevVer)
+                            fresh.put("dshPrevVersion", curVer)
+                        }
+                        updateRelativeSymlink(File(slotsRoot, "current"), lkg)
+                        updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
+                        true
+                    }
                 }
-                val prevVer = st.optString("dshPrevVersion", "")
-                val curVer = st.optString("dshVersion", "0.2.2-rc.5")
-                updateMeta { fresh ->
-                    fresh.put("activeSlot", lkg)
-                    fresh.put("lkgSlot", cur)
-                    if (prevVer.isNotEmpty()) fresh.put("dshVersion", prevVer)
-                    fresh.put("dshPrevVersion", curVer)
-                }
-                updateRelativeSymlink(File(slotsRoot, "current"), lkg)
-                updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
-                stopEngineSync(keepForegroundService = true)
+                if (!canProceed) return@execute
+                // Release bootstrapLock BEFORE starting DSH engine to avoid AB-BA deadlock!
+                stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
                 val res = startEngineSync()
                 if (res["ok"] != true) {
                     sendProgress("error", 0, "回滚后引擎启动失败：${res["error"]}")
                 }
                 done(mapOf("ok" to (res["ok"] == true), "error" to res["error"], "status" to getStatus()))
+            } finally {
+                upgradeInProgress.set(false)
             }
         }
     }
@@ -2599,8 +2707,9 @@ class RuntimeController private constructor(
                 }
 
                 if (code != 0) {
+                    cachedInstalledToolkits = null
                     val errText = reason.ifBlank { "apt-get exited with code $code ($usedExec)" }
-                    done(mapOf("ok" to false, "error" to errText, "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
+                    done(mapOf("ok" to false, "error" to errText, "installedToolkits" to detectInstalledToolkits(forceRefresh = true), "status" to getStatus()))
                     return@execute
                 }
 
@@ -2615,8 +2724,9 @@ class RuntimeController private constructor(
                     aptFile.writeText(curJson.toString(2))
                 }
 
+                cachedInstalledToolkits = null
                 appendLog("[toolkit:$toolkitId] installed successfully ($usedExec): $pkgLine")
-                done(mapOf("ok" to true, "installedToolkits" to detectInstalledToolkits(), "status" to getStatus()))
+                done(mapOf("ok" to true, "installedToolkits" to detectInstalledToolkits(forceRefresh = true), "status" to getStatus()))
             } catch (err: Throwable) {
                 appendLog("[toolkit:$toolkitId] ERROR: ${err.message}")
                 done(mapOf("ok" to false, "error" to (err.message ?: "toolkit_install_failed"), "status" to getStatus()))
@@ -2922,6 +3032,9 @@ class RuntimeController private constructor(
         const val LOCAL_DSH_PORT = 13080
         private val DSH_WEB_URL_REGEX = Regex("""https?://127\.0\.0\.1:\d+/\?token=[^\s\u001b"'<>)]+""")
         private val TOKEN_QUERY_REGEX = Regex("""([?&]token=)[^\s&"'#]+""", RegexOption.IGNORE_CASE)
+        private val GROUP_GID_REGEX = Regex(""":x:(\d+):""")
+        private val WHITESPACE_REGEX = Regex("""\s+""")
+        private val DIGITS_REGEX = Regex("""\d+""")
 
         @Volatile
         private var instance: RuntimeController? = null

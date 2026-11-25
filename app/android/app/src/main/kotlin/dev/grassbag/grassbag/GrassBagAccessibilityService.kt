@@ -61,7 +61,12 @@ class GrassBagAccessibilityService : AccessibilityService() {
         Thread(r, "gb-a11y-shot").apply { isDaemon = true }
     }
     private val lastScreenNodes = ConcurrentHashMap<String, CachedScreenNode>()
+    private val appLabelCache = ConcurrentHashMap<String, String>()
     private var screenOffRegistered = false
+
+    private class ExposedByteArrayOutputStream(initialCapacity: Int) : ByteArrayOutputStream(initialCapacity) {
+        fun rawBuffer(): ByteArray = buf
+    }
 
     private val screenOffReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -163,29 +168,39 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
         // Ignore transient SystemUI volume/notification popups or IME overlays by inspecting top application window.
         val topAppPkg = runCatching {
-            windows?.firstOrNull { win ->
-                win.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
-                    win.root?.packageName?.toString()?.let { p ->
-                        p.isNotBlank() && p != "com.android.systemui" && !p.contains("inputmethod", ignoreCase = true)
-                    } == true
-            }?.let { win ->
-                val r = win.root
+            val allWindows = windows ?: return@runCatching null
+            for (win in allWindows) {
+                if (win.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val r = win.root ?: continue
                 try {
-                    r?.packageName?.toString()
+                    val p = r.packageName?.toString()
+                    if (!p.isNullOrBlank() &&
+                        p != "com.android.systemui" &&
+                        !p.contains("inputmethod", ignoreCase = true)
+                    ) {
+                        return@runCatching p
+                    }
                 } finally {
                     recycleCompat(r)
                 }
             }
+            null
         }.getOrNull()
         return topAppPkg ?: lastForegroundPackage ?: rootPkg
     }
 
     fun resolveAppLabel(pkg: String?): String? {
         if (pkg.isNullOrBlank()) return null
-        return runCatching {
+        appLabelCache[pkg]?.let { return it }
+        val resolved = runCatching {
             val ai = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(ai)?.toString()?.takeIf { it.isNotBlank() }
         }.getOrNull()
+        if (resolved != null) {
+            if (appLabelCache.size > 256) appLabelCache.clear()
+            appLabelCache[pkg] = resolved
+        }
+        return resolved
     }
 
     /**
@@ -414,6 +429,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
             }
 
             lastScreenNodes.clear()
+            val (sw, sh) = physicalScreenSize()
             val elements = JSONArray()
             if (root != null) {
                 val rect = Rect()
@@ -421,63 +437,82 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 var visited = 0
                 fun walk(node: AccessibilityNodeInfo?, depth: Int, parentSensitive: Boolean) {
                     if (node == null || count >= safeMax || depth > 48 || visited >= 1600) return
+                    val visible = runCatching { node.isVisibleToUser }.getOrDefault(false)
+                    if (depth > 0 && !visible) return
                     visited++
-                    val isPwd = runCatching { node.isPassword }.getOrDefault(false)
                     val editable = runCatching { node.isEditable }.getOrDefault(false)
+                    val clickable = runCatching { node.isClickable }.getOrDefault(false)
                     val text = runCatching { node.text?.toString() }.getOrNull()
                     val desc = runCatching { node.contentDescription?.toString() }.getOrNull()
                     val hint = runCatching { nodeHintCompat(node) }.getOrNull()
-                    val combinedHint = listOfNotNull(desc, hint).joinToString(" ").ifBlank { null }
                     val viewId = runCatching { node.viewIdResourceName }.getOrNull()
-                    val sensitive = parentSensitive ||
-                        isPwd ||
-                        SafetyGate.isSensitiveNode(false, if (editable) text else null, combinedHint, viewId)
-                    val visible = runCatching { node.isVisibleToUser }.getOrDefault(false)
-                    val clickable = runCatching { node.isClickable }.getOrDefault(false)
+                    val sensitive = if (parentSensitive) {
+                        true
+                    } else {
+                        val isPwd = runCatching { node.isPassword }.getOrDefault(false)
+                        if (isPwd) {
+                            true
+                        } else {
+                            val combinedHint = when {
+                                !desc.isNullOrBlank() && !hint.isNullOrBlank() -> "$desc $hint"
+                                !desc.isNullOrBlank() -> desc
+                                !hint.isNullOrBlank() -> hint
+                                else -> null
+                            }
+                            SafetyGate.isSensitiveNode(false, if (editable) text else null, combinedHint, viewId)
+                        }
+                    }
 
                     if (visible && (clickable || editable || !text.isNullOrBlank() || !desc.isNullOrBlank())) {
                         runCatching { node.getBoundsInScreen(rect) }
-                        val scrollable = runCatching { node.isScrollable }.getOrDefault(false)
-                        val checked = runCatching { node.isChecked }.getOrDefault(false)
-                        val focused = runCatching { node.isFocused }.getOrDefault(false)
-                        val nodeId = "n$count"
-                        val item = JSONObject()
-                            .put("id", nodeId)
-                            .put("class", runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "View")
-                            .put("clickable", clickable)
-                            .put("editable", editable)
-                            .put("sensitive", sensitive)
-                        if (scrollable) item.put("scrollable", true)
-                        if (checked) item.put("checked", true)
-                        if (focused) item.put("focused", true)
-                        if (sensitive) {
-                            item.put("text", "[REDACTED_BY_SAFETY_GATE]")
-                        } else {
-                            val cx = (rect.left + rect.right) / 2f
-                            val cy = (rect.top + rect.bottom) / 2f
-                            item.put("bounds", JSONArray().put(rect.left).put(rect.top).put(rect.right).put(rect.bottom))
-                            item.put("center", JSONArray().put(cx.toInt()).put(cy.toInt()))
-                            if (!text.isNullOrBlank()) item.put("text", text.take(160))
-                            if (!desc.isNullOrBlank()) item.put("desc", desc.take(160))
-                            val label = text?.trim()?.takeIf { it.isNotEmpty() }
-                                ?: desc?.trim()?.takeIf { it.isNotEmpty() }
-                                ?: hint?.trim()?.takeIf { it.isNotEmpty() }
-                                ?: (viewId?.substringAfterLast('/') ?: "元素")
-                            lastScreenNodes[nodeId] = CachedScreenNode(
-                                id = nodeId,
-                                label = label.take(40),
-                                cx = cx,
-                                cy = cy,
-                                editable = editable,
-                                sensitive = false,
-                                packageName = pkg
-                            )
+                        val onScreen = !rect.isEmpty &&
+                            rect.right > 0 &&
+                            rect.bottom > 0 &&
+                            rect.left < sw &&
+                            rect.top < sh
+                        if (onScreen) {
+                            val scrollable = runCatching { node.isScrollable }.getOrDefault(false)
+                            val checked = runCatching { node.isChecked }.getOrDefault(false)
+                            val focused = runCatching { node.isFocused }.getOrDefault(false)
+                            val nodeId = "n$count"
+                            val item = JSONObject()
+                                .put("id", nodeId)
+                                .put("class", runCatching { node.className?.toString()?.substringAfterLast('.') }.getOrNull() ?: "View")
+                                .put("clickable", clickable)
+                                .put("editable", editable)
+                                .put("sensitive", sensitive)
+                            if (scrollable) item.put("scrollable", true)
+                            if (checked) item.put("checked", true)
+                            if (focused) item.put("focused", true)
+                            if (sensitive) {
+                                item.put("text", "[REDACTED_BY_SAFETY_GATE]")
+                            } else {
+                                val cx = (rect.left + rect.right) / 2f
+                                val cy = (rect.top + rect.bottom) / 2f
+                                item.put("bounds", JSONArray().put(rect.left).put(rect.top).put(rect.right).put(rect.bottom))
+                                item.put("center", JSONArray().put(cx.toInt()).put(cy.toInt()))
+                                if (!text.isNullOrBlank()) item.put("text", text.take(160))
+                                if (!desc.isNullOrBlank()) item.put("desc", desc.take(160))
+                                val label = text?.trim()?.takeIf { it.isNotEmpty() }
+                                    ?: desc?.trim()?.takeIf { it.isNotEmpty() }
+                                    ?: hint?.trim()?.takeIf { it.isNotEmpty() }
+                                    ?: (viewId?.substringAfterLast('/') ?: "元素")
+                                lastScreenNodes[nodeId] = CachedScreenNode(
+                                    id = nodeId,
+                                    label = label.take(40),
+                                    cx = cx,
+                                    cy = cy,
+                                    editable = editable,
+                                    sensitive = false,
+                                    packageName = pkg
+                                )
+                            }
+                            if (!viewId.isNullOrBlank()) {
+                                item.put("viewId", viewId.substringAfterLast('/'))
+                            }
+                            elements.put(item)
+                            count++
                         }
-                        if (!viewId.isNullOrBlank()) {
-                            item.put("viewId", viewId.substringAfterLast('/'))
-                        }
-                        elements.put(item)
-                        count++
                     }
                     val childCount = runCatching { node.childCount }.getOrDefault(0)
                     for (i in 0 until childCount) {
@@ -493,7 +528,6 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 walk(root, 0, false)
             }
 
-            val (sw, sh) = physicalScreenSize()
             return JSONObject()
                 .put("ok", true)
                 .put("package", pkg)
@@ -529,10 +563,18 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 .apply { if (blockedMultiWin != null) put("blockedPackage", blockedMultiWin) }
         }
         val overlay = PhoneOverlayController.getInstance(applicationContext)
-        overlay.hideForCapture(true)
+        val hidVisibleOverlay = overlay.hideForCapture(true)
+        val overlayRestored = AtomicBoolean(false)
+        fun restoreOverlayOnce() {
+            if (overlayRestored.compareAndSet(false, true)) {
+                overlay.hideForCapture(false)
+            }
+        }
         var captureSucceeded = false
         try {
-            runCatching { Thread.sleep(60L) }
+            if (hidVisibleOverlay) {
+                runCatching { Thread.sleep(18L) }
+            }
             val latch = CountDownLatch(1)
             val resultRef = AtomicReference<JSONObject?>()
             takeScreenshot(
@@ -540,13 +582,17 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 screenshotExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
+                        // Frame buffer is already latched by SurfaceFlinger — restore overlay immediately
+                        // before CPU bitmap copy/scale/JPEG encoding to eliminate visible HUD flicker!
+                        restoreOverlayOnce()
                         try {
                             val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
                             if (hw == null) {
                                 resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_wrap_failed"))
                             } else {
                                 val soft = try {
-                                    hw.copy(Bitmap.Config.ARGB_8888, false)
+                                    hw.copy(Bitmap.Config.RGB_565, false)
+                                        ?: hw.copy(Bitmap.Config.ARGB_8888, false)
                                 } finally {
                                     hw.recycle()
                                 }
@@ -561,11 +607,11 @@ class GrassBagAccessibilityService : AccessibilityService() {
                                         } else {
                                             soft
                                         }
-                                        val baos = ByteArrayOutputStream()
+                                        val baos = ExposedByteArrayOutputStream(65536)
                                         val w = scaled.width
                                         val h = scaled.height
                                         scaled.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(30, 90), baos)
-                                        val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                                        val b64 = Base64.encodeToString(baos.rawBuffer(), 0, baos.size(), Base64.NO_WRAP)
                                         resultRef.set(
                                             JSONObject()
                                                 .put("ok", true)
@@ -595,6 +641,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     }
 
                     override fun onFailure(errorCode: Int) {
+                        restoreOverlayOnce()
                         resultRef.set(JSONObject().put("ok", false).put("reason", "screenshot_failed_code_$errorCode"))
                         latch.countDown()
                     }
@@ -605,7 +652,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
             captureSucceeded = result.optBoolean("ok", false)
             return result
         } finally {
-            overlay.hideForCapture(false)
+            restoreOverlayOnce()
             if (captureSucceeded) {
                 overlay.showScreenshotPulse()
             }

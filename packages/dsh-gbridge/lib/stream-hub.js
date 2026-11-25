@@ -4,9 +4,28 @@ import { extractFailureInfo } from './normalizer.js';
 
 const DEFAULT_REPLAY_CAPACITY = 2000;
 const DEFAULT_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
+const DEFAULT_DURABLE_REPLAY_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COALESCE_MS = 35;
 const HEARTBEAT_MS = 20000;
 const MAX_CHANNELS_PER_CLIENT = 64;
+
+function estimateDeltaBytes(data) {
+  if (!data || typeof data !== 'object') return 128;
+  let n = 128;
+  const ch = data.chunk;
+  if (typeof ch === 'string') {
+    n += ch.length * 2;
+  } else if (ch && typeof ch === 'object') {
+    if (typeof ch.text === 'string') n += ch.text.length * 2;
+    else if (typeof ch.delta === 'string') n += ch.delta.length * 2;
+    else if (Array.isArray(ch.texts)) {
+      for (const s of ch.texts) if (typeof s === 'string') n += s.length * 2;
+    } else {
+      n += 128;
+    }
+  }
+  return n;
+}
 
 function normalizeTurnEndReasonTag(rawReason, hasFailure = false) {
   if (hasFailure) return 'error';
@@ -79,22 +98,34 @@ function sessionFollowUsesAddress(gateway) {
 }
 
 export class StreamHub {
-  constructor({ bootId, gateway, normalizer, logger, replayCapacity = DEFAULT_REPLAY_CAPACITY } = {}) {
+  constructor({
+    bootId,
+    gateway,
+    normalizer,
+    logger,
+    replayCapacity = DEFAULT_REPLAY_CAPACITY,
+    durableReplayMaxBytes = DEFAULT_DURABLE_REPLAY_MAX_BYTES,
+  } = {}) {
     this.bootId = bootId || randomUUID();
     this.gateway = gateway;
     this.normalizer = normalizer;
     this.logger = logger;
     this.replayCapacity = replayCapacity;
+    this.durableReplayMaxBytes = durableReplayMaxBytes;
 
     this.seq = 0;
     this.ring = []; // { seq, bytes, frame }
-    this.durableRing = []; // { seq, frame } (bounded non-delta events protected from high-rate delta eviction)
+    this.ringHead = 0;
+    this.durableRing = []; // { seq, bytes, frame } (bounded non-delta events protected from high-rate delta eviction)
+    this.durableRingHead = 0;
     this.latestSnapshots = new Map(); // channel -> latest snapshot frame for late-joining subscribers
     this.ringBytes = 0;
+    this.durableRingBytes = 0;
 
     this.clients = new Map(); // clientId -> ClientState
     this.upstreamStreams = new Map(); // channel -> { subscribers: Set<clientId>, abort: AbortController }
     this.activeTurns = new Map(); // sessionId -> active server turnId (e.g. 'turn-1')
+    this.pendingTurnEndTimers = new Map(); // sessionId -> fallback timer handle
     this.tornDownChannels = new Set(); // channels whose upstream closed after idle grace (must force client resync)
     this.pendingInteractions = new Map(); // interactionId -> { id, kind, event, eventId, gatewayClientId, sessionId, payload, createdAt }
     this.sessionAlwaysAllowed = new Map(); // sessionId -> Set<toolKey> (honors 'always' approval within the session)
@@ -216,13 +247,16 @@ export class StreamHub {
       if (mapped.type === 'session.status' && Array.isArray(args) && args.length >= 2 && args[1] === false) {
         const finishedSid = args[0] != null ? String(args[0]) : null;
         if (finishedSid) {
+          this._clearPendingTurnEndTimer(finishedSid);
           // Defer fallback turn-end notification briefly so the authoritative `turn/end` event
           // (carrying error/abort/completed reason) wins first and is never overwritten as 'completed'.
           const fallbackTimer = setTimeout(() => {
+            this.pendingTurnEndTimers.delete(finishedSid);
             if (this._disposed) return;
             try { this._onTurnCompleted?.({ sessionId: finishedSid, reason: 'completed' }); } catch {}
           }, 250);
           fallbackTimer.unref?.();
+          this.pendingTurnEndTimers.set(finishedSid, fallbackTimer);
         }
       }
       this.publish(mapped.channel, mapped.type, mapped.data);
@@ -389,6 +423,15 @@ export class StreamHub {
     }
   }
 
+  _clearPendingTurnEndTimer(sessionId) {
+    if (!sessionId) return;
+    const t = this.pendingTurnEndTimers.get(sessionId);
+    if (t) {
+      clearTimeout(t);
+      this.pendingTurnEndTimers.delete(sessionId);
+    }
+  }
+
   /** Publish a durable event into the ring buffer and deliver to subscribed clients. */
   publish(channel, type, data, { isDelta = false } = {}) {
     const seq = ++this.seq;
@@ -400,35 +443,65 @@ export class StreamHub {
       ts: Date.now(),
       data,
     };
-    const serialized = JSON.stringify(frame);
-    const bytes = Buffer.byteLength(serialized);
+    // Avoid wasted JSON.stringify on coalesced high-rate deltas; serialize lazily only when sent directly.
+    let serialized = null;
+    const getSerialized = () => {
+      if (serialized === null) serialized = JSON.stringify(frame);
+      return serialized;
+    };
+    const bytes = isDelta ? estimateDeltaBytes(data) : Buffer.byteLength(getSerialized());
     this.ring.push({ seq, bytes, frame });
     this.ringBytes += bytes;
-    while (this.ring.length > this.replayCapacity || (this.ringBytes > DEFAULT_REPLAY_MAX_BYTES && this.ring.length > 1)) {
-      const dropped = this.ring.shift();
+    while (
+      (this.ring.length - this.ringHead) > this.replayCapacity ||
+      (this.ringBytes > DEFAULT_REPLAY_MAX_BYTES && (this.ring.length - this.ringHead) > 1)
+    ) {
+      const dropped = this.ring[this.ringHead];
+      this.ring[this.ringHead] = undefined;
+      this.ringHead += 1;
       this.ringBytes -= dropped.bytes;
     }
+    if (this.ringHead >= 256 && this.ringHead * 2 >= this.ring.length) {
+      this.ring = this.ring.slice(this.ringHead);
+      this.ringHead = 0;
+    }
     if (!isDelta) {
-      this.durableRing.push({ seq, frame });
-      if (this.durableRing.length > 250) this.durableRing.shift();
       if (type === 'turn.snapshot' || type === 'term.snapshot') {
         this.latestSnapshots.set(channel, frame);
         if (this.latestSnapshots.size > 64) {
           const oldestCh = this.latestSnapshots.keys().next().value;
           if (oldestCh !== undefined) this.latestSnapshots.delete(oldestCh);
         }
-      } else if (
-        channel.startsWith('session:') &&
-        (type === 'turn.start' ||
-          type === 'turn.completed' ||
-          type === 'turn.cancelled' ||
-          type === 'turn.error' ||
-          type === 'session.event' ||
-          type === 'projection.updated')
-      ) {
-        // Invalidate cached initial turn.snapshot once newer durable session frames arrive
-        // so re-subscribing during the 8s grace window never rewinds the client to an old turn!
-        this.latestSnapshots.delete(channel);
+      } else {
+        this.durableRing.push({ seq, bytes, frame });
+        this.durableRingBytes += bytes;
+        while (
+          (this.durableRing.length - this.durableRingHead) > 250 ||
+          (this.durableRingBytes > this.durableReplayMaxBytes &&
+            (this.durableRing.length - this.durableRingHead) > 1)
+        ) {
+          const dropped = this.durableRing[this.durableRingHead];
+          this.durableRing[this.durableRingHead] = undefined;
+          this.durableRingHead += 1;
+          this.durableRingBytes -= dropped.bytes;
+        }
+        if (this.durableRingHead >= 64 && this.durableRingHead * 2 >= this.durableRing.length) {
+          this.durableRing = this.durableRing.slice(this.durableRingHead);
+          this.durableRingHead = 0;
+        }
+        if (
+          channel.startsWith('session:') &&
+          (type === 'turn.start' ||
+            type === 'turn.completed' ||
+            type === 'turn.cancelled' ||
+            type === 'turn.error' ||
+            type === 'session.event' ||
+            type === 'projection.updated')
+        ) {
+          // Invalidate cached initial turn.snapshot once newer durable session frames arrive
+          // so re-subscribing during the 8s grace window never rewinds the client to an old turn!
+          this.latestSnapshots.delete(channel);
+        }
       }
     }
 
@@ -443,7 +516,7 @@ export class StreamHub {
         this._enqueueDelta(client, frame);
       } else {
         this._flushClientDeltas(client);
-        client.ws.sendText(serialized);
+        client.ws.sendText(getSerialized());
       }
     }
     return frame;
@@ -533,8 +606,10 @@ export class StreamHub {
         const replayChannelSet = new Set([...client.channels, ...requestedChannels]);
         client.welcomed = true;
 
-        const oldestRingSeq = this.ring.length > 0 ? this.ring[0].seq : this.seq + 1;
-        const oldestDurableSeq = this.durableRing.length > 0 ? this.durableRing[0].seq : oldestRingSeq;
+        const oldestRingSeq = this.ringHead < this.ring.length ? this.ring[this.ringHead].seq : this.seq + 1;
+        const oldestDurableSeq = this.durableRingHead < this.durableRing.length
+          ? this.durableRing[this.durableRingHead].seq
+          : oldestRingSeq;
         let requiresContiguousRing = false;
         let hasTornDownChannel = false;
         for (const ch of replayChannelSet) {
@@ -567,13 +642,15 @@ export class StreamHub {
         let replayFrames = [];
         if (canResume) {
           const bySeq = new Map();
-          for (const entry of this.durableRing) {
-            if (entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
+          for (let i = this.durableRingHead; i < this.durableRing.length; i++) {
+            const entry = this.durableRing[i];
+            if (entry && entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
               bySeq.set(entry.seq, entry);
             }
           }
-          for (const entry of this.ring) {
-            if (entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
+          for (let i = this.ringHead; i < this.ring.length; i++) {
+            const entry = this.ring[i];
+            if (entry && entry.seq > msg.resumeFromSeq && replayChannelSet.has(entry.frame.channel)) {
               bySeq.set(entry.seq, entry);
             }
           }
@@ -785,9 +862,18 @@ export class StreamHub {
           this.publish(channel, `${prefix}.stream_error`, { id: effectiveTermId, message: err?.message || String(err) });
         }
       } finally {
+        if (entry.releaseTimer) {
+          clearTimeout(entry.releaseTimer);
+          entry.releaseTimer = null;
+        }
         uplink?.close?.();
         if (this.upstreamStreams.get(channel) === entry) {
           this.upstreamStreams.delete(channel);
+          if (channel.startsWith('session:')) {
+            const sid = channel.slice(8);
+            this.activeTurns.delete(sid);
+            this.normalizer?.clearSessionStat(sid);
+          }
         }
       }
     })();
@@ -895,6 +981,7 @@ export class StreamHub {
       const ev = item.event;
       const eventSeq = typeof ev.seq === 'number' ? ev.seq : undefined;
       if (ev.type === 'turn/start' || ev.type === 'turn_start') {
+        this._clearPendingTurnEndTimer(targetId);
         const turnId = ev.data?.turnId ||
           (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : (ev.id || `turn-${ev.seq ?? Date.now()}`));
         this.activeTurns.set(targetId, turnId);
@@ -907,6 +994,7 @@ export class StreamHub {
         return;
       }
       if (ev.type === 'turn/end' || ev.type === 'turn_end') {
+        this._clearPendingTurnEndTimer(targetId);
         const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : this.activeTurns.get(targetId));
         this.activeTurns.delete(targetId);
         this.normalizer?.clearSessionStat(targetId);
@@ -932,10 +1020,15 @@ export class StreamHub {
         incremental: true,
         activeTurnId,
       }) ?? [];
+      // When normalizedTurn is produced, avoid duplicating massive raw tool outputs/base64 payloads over WS;
+      // retain full `raw: ev` for non-normalized events (e.g. `todo/write`, `goal/*`).
+      const wireRaw = deltaTurns.length > 0
+        ? { type: ev.type, ...(eventSeq !== undefined ? { seq: eventSeq } : {}) }
+        : ev;
       this.publish(channel, 'session.event', {
         sessionId: targetId,
         ...(eventSeq !== undefined ? { eventSeq } : {}),
-        raw: ev,
+        raw: wireRaw,
         ...(deltaTurns.length > 0 ? { normalizedTurn: deltaTurns[0] } : {}),
       });
       return;
@@ -948,6 +1041,7 @@ export class StreamHub {
       return;
     }
     if (kind === 'turn/end' || kind === 'turn_end' || item?.event?.type === 'turn/end' || item?.event?.type === 'turn_end') {
+      this._clearPendingTurnEndTimer(targetId);
       const evData = item?.event?.data ?? item?.data ?? item;
       const turnId = evData?.turnId || (evData?.turn !== undefined ? `turn-${evData.turn}` : this.activeTurns.get(targetId));
       this.activeTurns.delete(targetId);
@@ -1047,6 +1141,7 @@ export class StreamHub {
           data: { ...merged.batch[merged.batch.length - 1], chunk: joined },
         });
       } else {
+        const { chunk: _omittedChunk, ...rest } = merged.batch[merged.batch.length - 1];
         client.ws.sendJson({
           op: 'delta',
           seq: merged.seq,
@@ -1054,7 +1149,7 @@ export class StreamHub {
           type: merged.type,
           ts: merged.ts,
           data: {
-            ...merged.batch[merged.batch.length - 1],
+            ...rest,
             chunks: merged.batch.map((b) => b.chunk ?? b),
           },
         });
@@ -1097,15 +1192,20 @@ export class StreamHub {
       if (entry.releaseTimer) clearTimeout(entry.releaseTimer);
       entry.abort.abort();
     }
+    for (const t of this.pendingTurnEndTimers.values()) clearTimeout(t);
+    this.pendingTurnEndTimers.clear();
     this.upstreamStreams.clear();
     this.pendingInteractions.clear();
     this.sessionAlwaysAllowed.clear();
     this.activeTurns.clear();
     this.tornDownChannels.clear();
     this.ring.length = 0;
+    this.ringHead = 0;
     this.durableRing.length = 0;
+    this.durableRingHead = 0;
     this.latestSnapshots.clear();
     this.ringBytes = 0;
+    this.durableRingBytes = 0;
     for (const client of [...this.clients.values()]) {
       client.ws.close(1001, 'gbridge shutting down');
     }

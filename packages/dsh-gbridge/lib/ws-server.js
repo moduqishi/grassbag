@@ -17,26 +17,41 @@ function isValidWireCloseCode(code) {
   return (code >= 1000 && code <= 1014) && code !== 1004 && code !== 1005 && code !== 1006;
 }
 
+function buildTextFrame(text) {
+  const len = Buffer.byteLength(text, 'utf8');
+  const headerLen = len < 126 ? 2 : len < 65536 ? 4 : 10;
+  const frame = Buffer.allocUnsafe(headerLen + len);
+  frame[0] = 0x80 | OP_TEXT;
+  if (len < 126) {
+    frame[1] = len;
+  } else if (len < 65536) {
+    frame[1] = 126;
+    frame.writeUInt16BE(len, 2);
+  } else {
+    frame[1] = 127;
+    frame.writeBigUInt64BE(BigInt(len), 2);
+  }
+  frame.write(text, headerLen, len, 'utf8');
+  return frame;
+}
+
 function buildFrame(opcode, payloadBuf) {
   const payload = Buffer.isBuffer(payloadBuf) ? payloadBuf : Buffer.from(payloadBuf);
   const len = payload.length;
-  let header;
+  const headerLen = len < 126 ? 2 : len < 65536 ? 4 : 10;
+  const frame = Buffer.allocUnsafe(headerLen + len);
+  frame[0] = 0x80 | (opcode & 0x0f);
   if (len < 126) {
-    header = Buffer.allocUnsafe(2);
-    header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = len;
+    frame[1] = len;
   } else if (len < 65536) {
-    header = Buffer.allocUnsafe(4);
-    header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = 126;
-    header.writeUInt16BE(len, 2);
+    frame[1] = 126;
+    frame.writeUInt16BE(len, 2);
   } else {
-    header = Buffer.allocUnsafe(10);
-    header[0] = 0x80 | (opcode & 0x0f);
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(len), 2);
+    frame[1] = 127;
+    frame.writeBigUInt64BE(BigInt(len), 2);
   }
-  return Buffer.concat([header, payload]);
+  payload.copy(frame, headerLen);
+  return frame;
 }
 
 /**
@@ -79,7 +94,7 @@ export class GbridgeWsConnection extends EventEmitter {
 
   sendText(text) {
     if (this.closed || this.socket.destroyed) return false;
-    return this._safeWrite(buildFrame(OP_TEXT, Buffer.from(text, 'utf8')));
+    return this._safeWrite(buildTextFrame(text));
   }
 
   sendJson(obj) {

@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
@@ -29,13 +30,12 @@ abstract final class GrassBagGlassConfig {
     // On Flutter Web (CanvasKit WebGL), multi-pass `premium` fragment readbacks cause
     // severe scroll/typing jank; `standard` delivers silky 60/120fps frosted glass!
     if (kIsWeb) return GlassQuality.standard;
-    // On mobile Impeller, BOTH `liquid` and `frosted` route through `GlassQuality.premium`
-    // so `GrassBagGlassBarLayer` sibling batching, `GlassBackdropGroup` blur sharing, and
-    // baked light-mode shadows stay active (`frosted` uses flat thickness=0.5, n=1.01,
-    // saturation=1.0 instead of unbatched `standard` double-pass BackdropFilters!).
+    // On mobile Impeller: `liquid` unlocks full curved optical refraction (`GlassQuality.premium`),
+    // while `frosted` routes through single-pass `GlassQuality.standard` so it is genuinely lighter
+    // on GPU/battery, and `solid` mounts zero BackdropFilter shaders (`GlassQuality.minimal`).
     return switch (tier) {
       GrassBagGlassTier.liquid => GlassQuality.premium,
-      GrassBagGlassTier.frosted => GlassQuality.premium,
+      GrassBagGlassTier.frosted => GlassQuality.standard,
       GrassBagGlassTier.solid => GlassQuality.minimal,
     };
   }
@@ -78,11 +78,11 @@ abstract final class GrassBagGlassConfig {
       );
     }
     if (tier == GrassBagGlassTier.frosted || kIsWeb) {
-      final blurSigma = kIsWeb ? 8.0 : 6.5;
+      const blurSigma = 8.0;
       if (t.isDark) {
         return LiquidGlassSettings(
           glassColor: Colors.white.withValues(alpha: elevated ? 0.14 : 0.10),
-          blur: blurSigma + 2.5,
+          blur: blurSigma,
           frost: 0.0,
           frostOpacity: 0.0,
           thickness: 1.0,
@@ -105,7 +105,7 @@ abstract final class GrassBagGlassConfig {
       }
       return LiquidGlassSettings(
         glassColor: Colors.white.withValues(alpha: elevated ? 0.54 : 0.44),
-        blur: blurSigma + 2.5,
+        blur: blurSigma,
         frost: 0.0,
         frostOpacity: 0.0,
         thickness: 1.0,
@@ -289,7 +289,7 @@ abstract final class GrassBagGlassConfig {
       light: GlassThemeVariant.ios27Light.copyWith(
         settings: GlassThemeSettings.ios27Light.copyWith(
           glassColor: Colors.white.withValues(alpha: isFrosted ? 0.44 : 0.22),
-          blur: isFrosted ? (kIsWeb ? 10.5 : 9.0) : 4.0,
+          blur: isFrosted ? 8.0 : 4.0,
           frost: 0.0,
           frostOpacity: 0.0,
           thickness: isFrosted ? 1.0 : 24.0,
@@ -322,7 +322,7 @@ abstract final class GrassBagGlassConfig {
       dark: GlassThemeVariant.ios27Dark.copyWith(
         settings: GlassThemeSettings.ios27Dark.copyWith(
           glassColor: Colors.white.withValues(alpha: isFrosted ? 0.10 : 0.09),
-          blur: isFrosted ? (kIsWeb ? 10.5 : 9.0) : 4.0,
+          blur: isFrosted ? 8.0 : 4.0,
           frost: 0.0,
           frostOpacity: 0.0,
           thickness: isFrosted ? 1.0 : 24.0,
@@ -530,26 +530,18 @@ class _GrassBagMaterializeTransitionState
         ),
       );
     }
-    // Pass `scaleFrom: 1.0` to `GlassMaterializeTransition` so we control scale with our
-    // smooth `easeOutCubic` curve (no linear t=0.92 hard-stop), while keeping `GrassBagMaterializeScope`
-    // inside `ScaleTransition` so outer shadows scale in 1:1 lock-step!
-    final materialized = GrassBagMaterializeScope(
+    // Pass `scaleFrom` directly into `GlassMaterializeTransition` instead of wrapping an
+    // outer `ScaleTransition` (which would invalidate `FrostRows`'s 500-band clip path cache
+    // on every frame at 120Hz!), keeping outer elevation shadows synchronized via scope!
+    return GrassBagMaterializeScope(
       animation: widget.animation,
       child: GlassMaterializeTransition(
         animation: widget.animation,
         alignment: widget.alignment,
-        scaleFrom: 1.0,
+        scaleFrom: widget.scaleFrom,
         contentSigma: widget.contentSigma,
         child: widget.child,
       ),
-    );
-    if ((widget.scaleFrom - 1.0).abs() < 0.0005) {
-      return materialized;
-    }
-    return ScaleTransition(
-      alignment: widget.alignment,
-      scale: _scaleAnim,
-      child: materialized,
     );
   }
 }
@@ -670,13 +662,11 @@ class GrassBagGlass extends StatelessWidget {
         : GrassBagGlassConfig.surfaceSettings(t, tier, elevated: elevated);
     final materializeAnim = GrassBagMaterializeScope.animationOf(context);
     final rawBaseShadows = baseSettings.shadow ?? const <BoxShadow>[];
-    // Inside `GrassBagMaterializeTransition` (sheets, popovers, menus, toasts, '+' deck),
-    // Light-mode `settings.shadow` would otherwise trigger synchronous `picture.toImageSync`
-    // shadow re-baking on every vsync frame! Externalize the shadow with `BlurStyle.outer`
-    // just like Dark mode so `GlassContainer` stays 100% shadow-bake-free at 60/120Hz!
+    // Always externalize Light-mode standalone `GrassBagGlass` shadows via `BlurStyle.outer`
+    // so `LiquidGlassLayer._bakeShadows()` NEVER calls synchronous `picture.toImageSync()`
+    // (~11–14.5 MB GPU texture bake stall on Frame 2 for sheets, drawer & elevated cards)!
     final externalizeLightShadow = !t.isDark &&
         effectiveOwnLayer &&
-        materializeAnim != null &&
         rawBaseShadows.isNotEmpty;
     final externalizeDarkShadow =
         t.isDark && effectiveOwnLayer && (useSheetSettings || elevated);
@@ -2474,8 +2464,9 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
             false;
     final inSolidCard =
         InheritedGlassSurfaceStyle.maybeOf(context) == GlassSurfaceStyle.solid;
-    // Never spawn per-button Impeller `BackdropFilterLayer` shaders inside scrolling cards!
-    final renderAsSolidCapsule = isSolid || (inSolidCard && !inRefractiveGlass) || (insideGlass && !inRefractiveGlass);
+    // Route `insideGlass: true`, solid cards, and Solid tier cleanly to solid capsule rendering
+    // so sheets/dialogs/cards NEVER spawn nested `_VibrancyFill` `ImageFiltered` `saveLayer`s!
+    final renderAsSolidCapsule = isSolid || insideGlass || inSolidCard;
     final useOwn = !renderAsSolidCapsule && !inRefractiveGlass;
 
     final compact = height <= 34;
@@ -2516,7 +2507,7 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
                   ? (t.isDark ? 0.84 : 0.90)
                   : (t.isDark ? 0.80 : 0.86),
             ),
-            blur: isFrosted ? 7.0 : 3.0,
+            blur: isFrosted ? 8.0 : 4.0,
             frost: 0.0,
             frostOpacity: 0.0,
             thickness: isFrosted ? 1.0 : 22.0,
@@ -2603,15 +2594,16 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final active = enabled && onTap != null;
-    final fg = destructive ? t.err : (accentForeground ? t.primary : t.text);
+    final fg = destructive
+        ? (t.isDark ? const Color(0xFFFF9A97) : t.err)
+        : (accentForeground ? (t.isDark ? t.primaryHi : t.primary) : t.text);
     final isSolid = tier == GrassBagGlassTier.solid;
     final inRefractiveGlass =
         context.dependOnInheritedWidgetOfExactType<InheritedLiquidGlass>()?.avoidsRefraction ??
             false;
     final inSolidCard =
         InheritedGlassSurfaceStyle.maybeOf(context) == GlassSurfaceStyle.solid;
-    final renderAsSolidCapsule =
-        isSolid || (inSolidCard && !inRefractiveGlass) || (insideGlass && !inRefractiveGlass);
+    final renderAsSolidCapsule = isSolid || insideGlass || inSolidCard;
     final useOwn = !renderAsSolidCapsule && !inRefractiveGlass;
 
     final Color solidBg = destructive
@@ -2670,7 +2662,7 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
         : LiquidGlassSettings(
             bodyMode: GlassBodyMode.clear,
             glassColor: glassTint,
-            blur: isFrosted ? 8.0 : 3.2,
+            blur: isFrosted ? 8.0 : 4.0,
             frost: 0.0,
             frostOpacity: 0.0,
             thickness: isFrosted ? 1.0 : 22.0,
@@ -4378,20 +4370,113 @@ class _DirectionalSlideFadeTransitionState
 
   @override
   Widget build(BuildContext context) {
-    if (widget.direction == 0) {
-      return FadeTransition(opacity: _fadeCurve, child: widget.child);
+    return AnimatedBuilder(
+      animation: widget.animation,
+      child: widget.child,
+      builder: (context, child) {
+        final fade = _fadeCurve.value.clamp(0.0, 1.0);
+        if (widget.direction == 0) {
+          return GrassBagControlledOpacity(opacity: fade, child: child!);
+        }
+        // Read animation.status dynamically on EVERY tick (AnimatedSwitcher caches its
+        // transitionBuilder subtree and never rebuilds on reverse!).
+        final isOutgoing = widget.animation.status == AnimationStatus.reverse;
+        final dx = (widget.direction >= 0 ? 0.03 : -0.03) * (isOutgoing ? -1.0 : 1.0);
+        final offsetX = dx * (1.0 - _slideCurve.value);
+        return GrassBagControlledOpacity(
+          opacity: fade,
+          child: FractionalTranslation(
+            translation: Offset(offsetX, 0),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Zero-`OpacityLayer` opacity widget at rest: when `opacity >= 0.999`, skips
+/// `pushOpacity` and `alwaysNeedsCompositing` completely so resting widgets/glass
+/// keep ZERO offscreen compositing layers (unlike `FadeTransition`!).
+class GrassBagControlledOpacity extends SingleChildRenderObjectWidget {
+  const GrassBagControlledOpacity({
+    super.key,
+    required this.opacity,
+    super.child,
+  });
+
+  final double opacity;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderGrassBagControlledOpacity(opacity: opacity);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    covariant RenderObject renderObject,
+  ) {
+    (renderObject as _RenderGrassBagControlledOpacity).opacity = opacity;
+  }
+}
+
+class _RenderGrassBagControlledOpacity extends RenderProxyBox {
+  _RenderGrassBagControlledOpacity({required double opacity})
+      : _opacity = opacity.clamp(0.0, 1.0);
+
+  double _opacity;
+  double get opacity => _opacity;
+  set opacity(double value) {
+    final next = value.clamp(0.0, 1.0);
+    if ((_opacity - next).abs() < 0.0005) return;
+    final prevCompositing = alwaysNeedsCompositing;
+    _opacity = next;
+    if (prevCompositing != alwaysNeedsCompositing) {
+      markNeedsCompositingBitsUpdate();
     }
-    final isOutgoing = widget.animation.status == AnimationStatus.reverse;
-    final dx = (widget.direction >= 0 ? 0.03 : -0.03) * (isOutgoing ? -1.0 : 1.0);
-    return FadeTransition(
-      opacity: _fadeCurve,
-      child: SlideTransition(
-        position: Tween<Offset>(
-          begin: Offset(dx, 0),
-          end: Offset.zero,
-        ).animate(_slideCurve),
-        child: widget.child,
-      ),
+    markNeedsPaint();
+  }
+
+  @override
+  bool get alwaysNeedsCompositing => _opacity > 0.0 && _opacity < 0.999;
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    if (child == null || _opacity <= 0.001) return;
+    if (_opacity >= 0.999) {
+      context.paintChild(child!, offset);
+      return;
+    }
+    layer = context.pushOpacity(
+      offset,
+      (_opacity * 255.0).round().clamp(0, 255),
+      super.paint,
+      oldLayer: layer as OpacityLayer?,
+    );
+  }
+}
+
+/// Route-aware Cupertino activity indicator that automatically pauses its ticker
+/// whenever its enclosing route is covered (zero idle background GPU/CPU drain).
+class GrassBagActivityIndicator extends StatelessWidget {
+  const GrassBagActivityIndicator({
+    super.key,
+    this.radius = 10.0,
+    this.color,
+    this.animating = true,
+  });
+
+  final double radius;
+  final Color? color;
+  final bool animating;
+
+  @override
+  Widget build(BuildContext context) {
+    final isCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+    return CupertinoActivityIndicator(
+      radius: radius,
+      color: color,
+      animating: animating && isCurrent,
     );
   }
 }

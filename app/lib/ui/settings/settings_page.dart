@@ -1595,7 +1595,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                           : AdaptiveLiquidGlassLayer(
                               settings: GrassBagGlassConfig.surfaceSettings(t, state.glassTier)
                                   .copyWith(shadow: const []),
-                              quality: GrassBagGlassConfig.chromeQualityFor(state.glassTier),
+                              quality: GlassQuality.standard,
                               blendAmount: 0.0,
                               child: _buildDioramaPills(t, state, tierHint),
                             ),

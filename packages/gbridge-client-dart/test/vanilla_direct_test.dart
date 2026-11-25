@@ -959,6 +959,282 @@ void main() {
       expect(mux.phase, ConnectionPhase.connected);
       await serverCtrl.close();
     });
+
+    test('VanillaDshNormalizer humanizes phone_* tools, flags blocked results as error, and preserves image attachment data', () {
+      final norm = VanillaDshNormalizer();
+      final turns = norm.normalizeEvents('s-vanilla-v27', [
+        {'seq': 1, 'type': 'turn/start', 'turnId': 'tv-1', 'data': {'turnId': 'tv-1'}},
+        {
+          'seq': 2,
+          'type': 'user/message',
+          'turnId': 'tv-1',
+          'data': {
+            'id': 'uv-1',
+            'content': [
+              {'type': 'text', 'text': '打开时钟'},
+              {'type': 'image', 'name': 'p.png', 'mimeType': 'image/png', 'data': 'BASE64_IMG'},
+            ],
+          },
+        },
+        {
+          'seq': 3,
+          'type': 'tool/call',
+          'turnId': 'tv-1',
+          'data': {'callId': 'v-open', 'name': 'phone_open', 'arguments': {'package': 'com.android.deskclock'}},
+        },
+        {
+          'seq': 4,
+          'type': 'tool/result',
+          'turnId': 'tv-1',
+          'data': {
+            'callId': 'v-open',
+            'name': 'phone_open',
+            'output': jsonEncode({'ok': true, 'opened': '时钟', 'package': 'com.android.deskclock'}),
+          },
+        },
+        {
+          'seq': 5,
+          'type': 'tool/call',
+          'turnId': 'tv-1',
+          'data': {'callId': 'v-tap', 'name': 'phone_tap', 'arguments': {'x': 120, 'y': 240}},
+        },
+        {
+          'seq': 6,
+          'type': 'tool/result',
+          'turnId': 'tv-1',
+          'data': {
+            'callId': 'v-tap',
+            'name': 'phone_tap',
+            'output': jsonEncode({'ok': false, 'blocked': true, 'hint': '高风险按钮已拦截'}),
+          },
+        },
+        {'seq': 7, 'type': 'turn/end', 'turnId': 'tv-1', 'data': {'turnId': 'tv-1'}},
+      ]);
+
+      expect(turns.length, 1);
+      final t0 = turns.first;
+      final userMsg = t0['userMessage'] as Map<String, dynamic>;
+      final atts = (userMsg['attachments'] as List).cast<Map<String, dynamic>>();
+      expect(atts.length, 1);
+      expect(atts.first['data'], 'BASE64_IMG');
+      final steps = (t0['steps'] as List).cast<Map<String, dynamic>>();
+      final openStep = steps.firstWhere((s) => s['callId'] == 'v-open');
+      expect(openStep['title'].toString(), contains('时钟'));
+      final tapStep = steps.firstWhere((s) => s['callId'] == 'v-tap');
+      expect(tapStep['status'], 'error');
+      expect(tapStep['summary'].toString(), contains('高风险按钮已拦截'));
+    });
+
+    test('VanillaDshNormalizer never wipes cached tool output on replayed tool/call & mux disconnect settles pending interactions', () async {
+      final norm = VanillaDshNormalizer();
+      norm.normalizeEvents('s-v28-cache', [
+        {'seq': 1, 'type': 'turn/start', 'turnId': 't1', 'data': {'turnId': 't1'}},
+        {'seq': 2, 'type': 'tool/call', 'turnId': 't1', 'data': {'callId': 'c1', 'name': 'bash', 'arguments': {'command': 'pwd'}}},
+        {'seq': 3, 'type': 'tool/result', 'turnId': 't1', 'data': {'callId': 'c1', 'name': 'bash', 'output': '/root/workspace'}},
+        {'seq': 4, 'type': 'tool/call', 'turnId': 't1', 'data': {'callId': 'c1', 'name': 'bash', 'arguments': {'command': 'pwd'}}},
+      ]);
+      final cached = norm.getToolOutput('s-v28-cache', 'c1');
+      expect(cached?['output'], '/root/workspace');
+      expect(cached?['status'], 'ok');
+
+      // Socket drop emits interaction.resolved (reason: disconnected) for any open interaction!
+      final serverCtrl = StreamController<String>.broadcast();
+      final sent = <Map<String, dynamic>>[];
+      final done = Completer<void>();
+      final mux = VanillaDshMuxEngine(
+        normalizer: norm,
+        autoReconnect: false,
+        openSocket: (_) async => _FakeRawWs(serverCtrl.stream, sent, done),
+      );
+      addTearDown(() async {
+        mux.dispose();
+        await serverCtrl.close();
+      });
+
+      final frames = <StreamFrame>[];
+      final sub = mux.frames.listen(frames.add);
+      addTearDown(sub.cancel);
+
+      final connectFut = mux.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final evOpen = sent.firstWhere((m) => m['endpoint'] == r'$events');
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {'type': 'ready', 'clientId': 'c-drop-test'},
+      }));
+      await connectFut;
+
+      // Simulate an incoming cordis/request-run interaction on $events
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'emit',
+          'event': 'cordis/request-run',
+          'args': [
+            {'id': 'req-42', 'sessionId': 's-drop', 'plugin': 'demo'},
+          ],
+        },
+      }));
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+
+      // Drop the socket abruptly
+      if (!done.isCompleted) done.complete();
+      await serverCtrl.close();
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+
+      final resolved = frames.where((f) => f.type == 'interaction.resolved').toList();
+      expect(resolved, isNotEmpty);
+      expect(resolved.first.dataMap?['reason'], 'disconnected');
+    });
+
+    test('v33 regression: deleteSession propagates errors, startSignIn uses loopback callbackOrigin, session always-allow excludes phone_*, and getSettingsSchema(forceFresh: true) bypasses cache', () async {
+      final autoApproved = <(String, String)>[];
+      final serverCtrl = StreamController<String>.broadcast();
+      final sent = <Map<String, dynamic>>[];
+      final done = Completer<void>();
+      final mux = VanillaDshMuxEngine(
+        normalizer: VanillaDshNormalizer(),
+        autoReconnect: false,
+        openSocket: (_) async => _FakeRawWs(serverCtrl.stream, sent, done),
+        onAutoApprove: (clientId, eventId) async {
+          autoApproved.add((clientId, eventId));
+        },
+      );
+      addTearDown(() async {
+        mux.dispose();
+        await serverCtrl.close();
+      });
+
+      final frames = <StreamFrame>[];
+      final sub = mux.frames.listen(frames.add);
+      addTearDown(sub.cancel);
+
+      final connectFut = mux.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final evOpen = sent.firstWhere((m) => m['endpoint'] == r'$events');
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {'type': 'ready', 'clientId': 'c-v33'},
+      }));
+      await connectFut;
+
+      // Remember 'bash' and attempt to remember 'phone_tap' (phone_* MUST be ignored!)
+      mux.rememberSessionAlwaysAllowed('s-1', {'tool': 'bash'});
+      mux.rememberSessionAlwaysAllowed('s-1', {'tool': 'phone_tap'});
+
+      // bash approval on s-1 -> auto-approved, NOT emitted to UI
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'waterfall',
+          'event': 'approval/request',
+          'eventId': 'ev-bash',
+          'agentId': 's-1',
+          'request': {'tool': 'bash', 'command': 'ls'},
+        },
+      }));
+      // phone_tap approval on s-1 -> NEVER auto-approved, emitted to UI!
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'waterfall',
+          'event': 'approval/request',
+          'eventId': 'ev-phone',
+          'agentId': 's-1',
+          'request': {'tool': 'phone_tap', 'x': 10, 'y': 20},
+        },
+      }));
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+
+      expect(autoApproved, [('c-v33', 'ev-bash')]);
+      final reqs = frames.where((f) => f.type == 'interaction.requested').toList();
+      expect(reqs.length, 1);
+      expect(reqs.first.dataMap?['id'], 'ev-phone');
+
+      // Local HTTP mock for deleteSession error propagation, settings/describe forceFresh, and startSignIn callbackOrigin
+      var describeCalls = 0;
+      String? capturedCallbackOrigin;
+      final srv = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => srv.close(force: true));
+      srv.listen((req) async {
+        final rawBody = await utf8.decoder.bind(req).join();
+        final body = rawBody.isEmpty ? <String, dynamic>{} : (jsonDecode(rawBody) as Map<String, dynamic>);
+        final payload = body['payload'] is Map ? body['payload'] as Map : const <String, dynamic>{};
+        final args = payload['args'] is Map ? payload['args'] as Map : const <String, dynamic>{};
+        if (req.uri.path == '/api/session/delete') {
+          req.response.statusCode = 500;
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({'result': {'ok': false, 'error': {'message': 'session locked'}}}));
+        } else if (req.uri.path == '/api/settings/describe') {
+          describeCalls++;
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({
+            'result': {
+              'ok': true,
+              'value': {
+                'sections': [
+                  {'ns': 'llm-pi-ai', 'revision': describeCalls, 'value': {}},
+                ],
+              },
+            },
+          }));
+        } else if (req.uri.path == '/api/account/startSignIn') {
+          capturedCallbackOrigin = args['callbackOrigin']?.toString();
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({
+            'result': {
+              'ok': true,
+              'value': {'attemptId': 'att-1'},
+            },
+          }));
+        } else if (req.uri.path == '/api/account/getState') {
+          req.response.headers.contentType = ContentType.json;
+          req.response.write(jsonEncode({
+            'result': {
+              'ok': true,
+              'value': {
+                'status': 'signing_in',
+                'attempt': {'phase': 'awaiting_callback', 'authorizeUrl': 'https://auth.example/oauth'},
+              },
+            },
+          }));
+        } else {
+          req.response.statusCode = 404;
+        }
+        await req.response.close();
+      });
+
+      final endpoint = HostEndpoint.http(
+        baseUri: Uri.parse('http://127.0.0.1:${srv.port}'),
+      );
+      final client = GbridgeClient(endpoint, autoReconnect: false);
+      addTearDown(client.dispose);
+      client.enableVanillaDirectMode(dshVersion: '0.2.2-rc.5');
+
+      // 1. deleteSession must NOT swallow HTTP 500 error!
+      await expectLater(
+        () => client.deleteSession('s-locked'),
+        throwsA(isA<GbridgeException>()),
+      );
+
+      // 2. getSettingsSchema(forceFresh: true) bypasses micro-cache
+      await client.getSettingsSchema();
+      expect(describeCalls, 1);
+      await client.getSettingsSchema();
+      expect(describeCalls, 1);
+      await client.getSettingsSchema(forceFresh: true);
+      expect(describeCalls, 2);
+
+      // 3. startSignIn defaults callbackOrigin to loopback http://127.0.0.1:<port> & reads st['attempt'].authorizeUrl
+      final signInRes = await client.accountAction('startSignIn');
+      expect(capturedCallbackOrigin, 'http://127.0.0.1:${srv.port}');
+      expect((signInRes['result'] as Map)['authorizeUrl'], 'https://auth.example/oauth');
+    });
   });
 }
 

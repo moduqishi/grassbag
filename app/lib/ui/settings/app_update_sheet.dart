@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../services/native_bridge.dart';
@@ -14,15 +13,10 @@ import '../onboarding/onboarding_page.dart';
 /// Opens a Liquid Glass bottom sheet displaying the latest GitHub Release details,
 /// changelog, download progress, and one-tap Android APK installer.
 Future<void> showAppUpdateSheet(BuildContext context, WidgetRef ref) {
-  final state = ref.read(appProvider);
-  final release = state.appUpdateInfo;
-  final hasUpdate = state.hasAppUpdate;
   return showGrassBagSheet<void>(
     context,
-    title: hasUpdate ? '发现 GrassBag 新版本' : '应用版本与更新',
-    subtitle: release != null
-        ? 'GitHub Releases · ${release.tagName}'
-        : '当前版本 v${state.appVersionLabel}',
+    title: '应用版本与更新',
+    subtitle: 'GitHub Releases 自动检测与一键安装',
     bodyBuilder: (_) => const _AppUpdateSheetBody(),
   );
 }
@@ -97,20 +91,35 @@ class _AppUpdateSheetBody extends ConsumerWidget {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: (s.hasAppUpdate ? t.primary : t.ok).withValues(alpha: 0.14),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                            s.hasAppUpdate ? '可更新' : '最新',
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                              color: s.hasAppUpdate ? t.primary : t.ok,
-                            ),
-                          ),
+                        Builder(
+                          builder: (_) {
+                            final hasErr =
+                                s.appUpdateError != null && s.appUpdateError!.isNotEmpty;
+                            final (label, fg, bg) = s.checkingAppUpdate
+                                ? ('检查中', t.primary, t.primarySoft)
+                                : s.hasAppUpdate
+                                    ? ('可更新', t.primary, t.primarySoft)
+                                    : hasErr
+                                        ? ('检查失败', t.warn, t.warnSoft)
+                                        : release != null
+                                            ? ('最新', t.ok, t.okSoft)
+                                            : ('待检查', t.text3, t.fill1);
+                            return Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: bg,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text(
+                                label,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: fg,
+                                ),
+                              ),
+                            );
+                          },
                         ),
                       ],
                     ),
@@ -146,16 +155,11 @@ class _AppUpdateSheetBody extends ConsumerWidget {
         ),
         if (s.appUpdateError != null && s.appUpdateError!.isNotEmpty) ...[
           const SizedBox(height: 10),
-          Container(
+          GrassBagStatusBanner(
+            tone: GrassBagBannerTone.warn,
+            message: s.appUpdateError!,
+            borderRadius: 14,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-            decoration: BoxDecoration(
-              color: t.warn.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Text(
-              s.appUpdateError!,
-              style: TextStyle(fontSize: 12, height: 1.4, color: t.warn),
-            ),
           ),
         ],
         if (release != null && release.body.isNotEmpty) ...[
@@ -224,6 +228,19 @@ class _AppUpdateSheetBody extends ConsumerWidget {
           const SizedBox(height: 10),
           Row(
             children: [
+              if (release != null && s.hasAppUpdate && hasLocalApk && isAndroid && release.apkDownloadUrl != null) ...[
+                Expanded(
+                  child: GrassBagSecondaryGlassButton(
+                    label: '重新下载',
+                    icon: CupertinoIcons.arrow_clockwise,
+                    height: 38,
+                    tier: s.glassTier,
+                    insideGlass: true,
+                    onTap: () => unawaited(ctrl.downloadAndInstallAppUpdate(forceRedownload: true)),
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
               Expanded(
                 child: GrassBagSecondaryGlassButton(
                   label: 'GitHub Release',
@@ -235,7 +252,7 @@ class _AppUpdateSheetBody extends ConsumerWidget {
                 ),
               ),
               if (release != null && s.hasAppUpdate) ...[
-                const SizedBox(width: 10),
+                const SizedBox(width: 8),
                 Expanded(
                   child: GrassBagSecondaryGlassButton(
                     label: '跳过此版本',
@@ -555,7 +572,7 @@ class _DownloadProgressCard extends StatelessWidget {
               ),
               const Spacer(),
               Text(
-                pct != null ? '$pct%' : bytesLabel,
+                pct != null ? '$pct%' : '下载中',
                 style: TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
@@ -566,14 +583,11 @@ class _DownloadProgressCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(999),
-            child: LinearProgressIndicator(
-              value: determinate ? progress!.clamp(0.0, 1.0) : null,
-              minHeight: 6,
-              backgroundColor: t.fill1,
-              valueColor: AlwaysStoppedAnimation<Color>(t.primary),
-            ),
+          GrassBagProgressBar(
+            value: determinate ? progress!.clamp(0.0, 1.0) : null,
+            height: 6,
+            color: t.primary,
+            trackColor: t.fill1,
           ),
           const SizedBox(height: 5),
           Text(
@@ -611,7 +625,66 @@ class _ReleaseNotesBlock extends StatelessWidget {
     );
   }
 
+  static final RegExp _inlineRe = RegExp(
+    r'(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))',
+  );
+
+  List<InlineSpan> _parseInline(GrassBagTokens t, String text, TextStyle base) {
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final m in _inlineRe.allMatches(text)) {
+      if (m.start > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, m.start)));
+      }
+      final tok = m.group(0)!;
+      if (tok.startsWith('**') && tok.endsWith('**') && tok.length > 4) {
+        spans.add(
+          TextSpan(
+            text: tok.substring(2, tok.length - 2),
+            style: base.copyWith(fontWeight: FontWeight.w700, color: t.text),
+          ),
+        );
+      } else if (tok.startsWith('`') && tok.endsWith('`') && tok.length > 2) {
+        spans.add(
+          TextSpan(
+            text: tok.substring(1, tok.length - 1),
+            style: base.copyWith(
+              fontFamily: 'monospace',
+              fontSize: (base.fontSize ?? 12.5) - 0.8,
+              color: t.text,
+            ),
+          ),
+        );
+      } else if (tok.startsWith('[')) {
+        final closeBracket = tok.indexOf('](');
+        final label = closeBracket > 1 ? tok.substring(1, closeBracket) : tok;
+        spans.add(
+          TextSpan(
+            text: label,
+            style: base.copyWith(color: t.primary, fontWeight: FontWeight.w500),
+          ),
+        );
+      } else {
+        spans.add(TextSpan(text: tok));
+      }
+      cursor = m.end;
+    }
+    if (cursor < text.length) {
+      spans.add(TextSpan(text: text.substring(cursor)));
+    }
+    return spans;
+  }
+
   Widget _renderLine(GrassBagTokens t, String line) {
+    if (line.startsWith('# ')) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 5),
+        child: Text(
+          line.substring(2).trim(),
+          style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700, color: t.text),
+        ),
+      );
+    }
     if (line.startsWith('## ')) {
       return Padding(
         padding: const EdgeInsets.only(top: 4),
@@ -631,7 +704,11 @@ class _ReleaseNotesBlock extends StatelessWidget {
       );
     }
     final isBullet = line.startsWith('- ') || line.startsWith('* ');
-    final clean = (isBullet ? line.substring(2) : line).replaceAll('`', '').trim();
+    final clean = (isBullet ? line.substring(2) : line).trim();
+    final bodyStyle = TextStyle(fontSize: 12.5, height: 1.45, color: t.text2);
+    final rich = Text.rich(
+      TextSpan(style: bodyStyle, children: _parseInline(t, clean, bodyStyle)),
+    );
     if (isBullet) {
       return Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -644,19 +721,11 @@ class _ReleaseNotesBlock extends StatelessWidget {
               decoration: BoxDecoration(color: t.primary, shape: BoxShape.circle),
             ),
           ),
-          Expanded(
-            child: Text(
-              clean,
-              style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text2),
-            ),
-          ),
+          Expanded(child: rich),
         ],
       );
     }
-    return Text(
-      clean,
-      style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text2),
-    );
+    return rich;
   }
 }
 

@@ -65,9 +65,10 @@ const PHONE_TOOL_DEFS = [
   },
   {
     name: 'phone_type',
-    description: 'Type text into the currently focused Android input field (password/OTP fields blocked by SafetyGate).',
+    description: 'Type text into the currently focused Android input field (password/OTP fields blocked by SafetyGate). Set submit=true to press IME Enter/Search immediately after typing.',
     properties: {
       text: { type: 'string', description: 'Text to enter into the focused editable field.' },
+      submit: { type: 'boolean', description: 'Optional: press IME Enter/Search action after typing (default false).' },
     },
     required: ['text'],
   },
@@ -110,6 +111,13 @@ const PHONE_TOOL_DEFS = [
       message: { type: 'string', description: 'Clear Chinese instruction shown on the floating handoff card.' },
     },
   },
+  {
+    name: 'phone_return_app',
+    description: 'Bring GrassBag app back to the foreground immediately (Note: GrassBag also returns automatically when the turn finishes).',
+    properties: {
+      summary: { type: 'string', description: 'Optional brief Chinese completion summary shown on the floating island.' },
+    },
+  },
 ];
 
 /**
@@ -147,6 +155,7 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
       signal,
     }, (res) => {
       const chunks = [];
+      res.on('error', reject);
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf8');
@@ -194,6 +203,40 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     return null;
   };
 
+  const normalizeTurnEndReason = (rawReason) => {
+    let tag = '';
+    if (typeof rawReason === 'string') {
+      tag = rawReason.trim().toLowerCase();
+    } else if (rawReason && typeof rawReason === 'object') {
+      tag = String(rawReason.kind ?? rawReason.status ?? rawReason.type ?? rawReason.reason ?? '').trim().toLowerCase();
+    }
+    if (!tag || tag === 'completed' || tag === 'ok' || tag === 'done' || tag === 'success' || tag === 'end_turn' || tag === 'stop') {
+      return 'completed';
+    }
+    if (tag.includes('emergency')) return 'emergency_stop';
+    if (tag.includes('abort') || tag.includes('cancel') || tag === 'stopped' || tag === 'interrupted') {
+      return 'stopped';
+    }
+    if (tag.includes('err') || tag.includes('fail') || tag.includes('timeout')) {
+      return 'error';
+    }
+    return tag;
+  };
+
+  const notifyTurnEnd = (sessionId, reason = 'completed', summary = '') => {
+    const sid = sessionId ? String(sessionId) : null;
+    if (sid) activeTurnBySession.delete(sid);
+    const shouldNotify = sid ? phoneActiveSessions.delete(sid) : phoneActiveSessions.size > 0;
+    if (!sid && shouldNotify) phoneActiveSessions.clear();
+    if (!shouldNotify) return false;
+    callDaemon('/v1/turn-end', {
+      sessionId: sid,
+      reason: normalizeTurnEndReason(reason),
+      ...(summary ? { summary: String(summary).slice(0, 120) } : {}),
+    }, undefined, 10_000).catch(() => {});
+    return true;
+  };
+
   // Track active turns & forward turn/end ONLY for sessions that actually used phone tools
   // (or when sessionId is known) so unrelated title/background sessions NEVER wipe ALLOW_TURN!
   if (typeof ctx.on === 'function') {
@@ -203,14 +246,7 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
         const tid = event?.data?.turnId ?? (event?.data?.turn !== undefined ? `turn-${event.data.turn}` : `seq-${event?.seq ?? Date.now()}`);
         activeTurnBySession.set(sid, String(tid));
       } else if (event?.type === 'turn/end') {
-        if (sid) activeTurnBySession.delete(sid);
-        const shouldNotify = !sid || phoneActiveSessions.delete(sid);
-        if (shouldNotify) {
-          callDaemon('/v1/turn-end', {
-            sessionId: sid,
-            reason: event?.data?.reason ?? 'completed',
-          }, undefined, 10_000).catch(() => {});
-        }
+        notifyTurnEnd(sid, event?.data?.reason ?? 'completed');
       }
     });
     if (typeof off === 'function') disposers.push(off);
@@ -299,6 +335,7 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     get active() { return registered > 0; },
     get registered() { return registered; },
     get reason() { return registered > 0 ? 'ready' : 'tools-service-unavailable'; },
+    notifyTurnEnd,
     dispose() {
       activeTurnBySession.clear();
       phoneActiveSessions.clear();

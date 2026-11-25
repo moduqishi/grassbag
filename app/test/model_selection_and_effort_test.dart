@@ -22,7 +22,10 @@ class _FakeDshServer {
   int selectModelCalls = 0;
   int mutateDefaultModelCalls = 0;
   int conflictResponsesSent = 0;
+  int forcedConflictBudget = 0;
   bool forceOneStaleConflict = false;
+  bool forceOnePiAiConflict = false;
+  final List<int?> seenDefaultModelExpectedRevs = <int?>[];
 
   String get baseUrl => 'http://127.0.0.1:${server.port}';
 
@@ -178,14 +181,28 @@ class _FakeDshServer {
 
       if (ns == 'agent-default-model') {
         mutateDefaultModelCalls++;
-        if (forceOneStaleConflict) {
+        seenDefaultModelExpectedRevs.add(expected);
+        if (forceOneStaleConflict || forcedConflictBudget > 0) {
           forceOneStaleConflict = false;
+          if (forcedConflictBudget > 0) forcedConflictBudget--;
+          final staleExpected = expected ?? defaultModelRevision;
           defaultModelRevision++;
           conflictResponsesSent++;
           await _sendJson(req.response, 409, {
-            'code': 'SETTINGS_CONFLICT',
-            'message':
-                'settings namespace "agent-default-model" changed since it was read (expected revision $expected, now $defaultModelRevision)',
+            'error': {
+              'code': 'gbridge/upstream_error',
+              'message':
+                  'settings namespace "agent-default-model" changed since it was read (expected revision $staleExpected, now $defaultModelRevision)',
+              'details': {
+                'endpoint': 'settings/mutate',
+                'upstreamCode': 'settings/conflict',
+                'upstreamDetails': {
+                  'ns': 'agent-default-model',
+                  'expected': staleExpected,
+                  'actual': defaultModelRevision,
+                },
+              },
+            },
           });
           return;
         }
@@ -219,6 +236,28 @@ class _FakeDshServer {
       }
 
       if (ns == 'llm-pi-ai') {
+        if (forceOnePiAiConflict) {
+          forceOnePiAiConflict = false;
+          llmPiAiRevision++;
+          conflictResponsesSent++;
+          await _sendJson(req.response, 409, {
+            'error': {
+              'code': 'gbridge/upstream_error',
+              'message':
+                  'settings namespace "llm-pi-ai" changed since it was read (expected revision $expected, now $llmPiAiRevision)',
+              'details': {
+                'endpoint': 'settings/replace',
+                'upstreamCode': 'settings/conflict',
+                'upstreamDetails': {
+                  'ns': 'llm-pi-ai',
+                  'expected': expected,
+                  'actual': llmPiAiRevision,
+                },
+              },
+            },
+          });
+          return;
+        }
         if (expected != null && expected != llmPiAiRevision) {
           conflictResponsesSent++;
           await _sendJson(req.response, 409, {
@@ -355,8 +394,46 @@ void main() {
       silent: true,
     );
     expect(fakeDsh.conflictResponsesSent, 1);
+    // Path-addressed settings/mutate omits expectedRevision so background revision drift cannot spuriously 409.
+    expect(fakeDsh.seenDefaultModelExpectedRevs.every((r) => r == null), isTrue);
     expect(ctrl.state.modelEffortId, 'xhigh');
     expect(ctrl.state.modelEffort, '超高');
+    expect(ctrl.state.recentErrors, isEmpty);
+
+    // 3b. Rapid concurrent effort toggles + back-to-back 409 conflicts serialize cleanly and land on latest choice!
+    fakeDsh.forcedConflictBudget = 2;
+    await Future.wait([
+      ctrl.setModel(
+        ctrl.state.modelName,
+        ctrl.state.modelShort,
+        provider: ctrl.state.activeModelProvider,
+        modelId: ctrl.state.activeModelId,
+        effortId: 'low',
+        silent: true,
+      ),
+      ctrl.setModel(
+        ctrl.state.modelName,
+        ctrl.state.modelShort,
+        provider: ctrl.state.activeModelProvider,
+        modelId: ctrl.state.activeModelId,
+        effortId: 'high',
+        silent: true,
+      ),
+    ]);
+    expect(ctrl.state.modelEffortId, 'high');
+    expect(fakeDsh.defaultModel['reasoningEffort'], 'high');
+    expect(ctrl.state.recentErrors, isEmpty);
+
+    // 3c. Wholesale replace (`llm-pi-ai`) with forced 409 conflict auto-recovers using fresh server revision!
+    fakeDsh.forceOnePiAiConflict = true;
+    final replaceErr = await ctrl.patchDshNamespace(
+      'llm-pi-ai',
+      {'providers': fakeDsh.piAiProviders},
+      replace: true,
+      silent: true,
+      skipHydrate: true,
+    );
+    expect(replaceErr, isNull);
     expect(ctrl.state.recentErrors, isEmpty);
 
     // 4. Switch thinking effort WITH an active server session -> calls selectModel ONLY (no double-write SettingsConflictError!)
@@ -486,5 +563,18 @@ void main() {
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 4));
+  });
+
+  test('Default appearance is Light Mode + Bay Blue (teal) when no saved prefs exist', () {
+    final prevPrefs = GrassBagController.preloadedInitialPrefs;
+    GrassBagController.preloadedInitialPrefs = null;
+    addTearDown(() => GrassBagController.preloadedInitialPrefs = prevPrefs);
+
+    final ctrl = GrassBagController();
+    addTearDown(ctrl.dispose);
+
+    expect(ctrl.state.isDark, isFalse);
+    expect(ctrl.state.accent, GrassBagAccent.teal);
+    expect(ctrl.state.accent.label, '海湾蓝');
   });
 }

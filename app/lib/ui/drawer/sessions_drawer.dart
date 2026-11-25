@@ -16,6 +16,7 @@ class SessionsSidebar extends ConsumerStatefulWidget {
     super.key,
     required this.isTabletDocked,
     this.onCloseDrawer,
+    this.backHandlerNotifier,
     required this.onOpenTerminal,
     required this.onOpenFeatures,
     required this.onOpenSettings,
@@ -24,6 +25,7 @@ class SessionsSidebar extends ConsumerStatefulWidget {
 
   final bool isTabletDocked;
   final VoidCallback? onCloseDrawer;
+  final ValueNotifier<bool Function()?>? backHandlerNotifier;
   final VoidCallback onOpenTerminal;
   final VoidCallback onOpenFeatures;
   final VoidCallback onOpenSettings;
@@ -34,6 +36,8 @@ class SessionsSidebar extends ConsumerStatefulWidget {
 }
 
 class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
+  static final Map<String, Set<String>> _persistedCollapsedByHost = <String, Set<String>>{};
+
   late final TextEditingController _searchCtrl;
   final ValueNotifier<bool> _searchFocused = ValueNotifier<bool>(false);
   bool _multiSelectMode = false;
@@ -52,6 +56,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
   SessionGroupMode? _cacheGroupMode;
   int _cacheCollapsedVer = -1;
   List<Object> _cachedFlatItems = const [];
+  Set<String> _cachedMatchedSessionIds = const {};
   int _cachedUngroupedWithCwdCount = 0;
 
   static String _normalizeDirPath(String path) {
@@ -151,6 +156,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
       final tsCmp = (b.updatedAt ?? 0).compareTo(a.updatedAt ?? 0);
       return tsCmp != 0 ? tsCmp : a.id.compareTo(b.id);
     });
+    _cachedMatchedSessionIds = {for (final s in matched) s.id};
 
     final wsById = {for (final w in workspaces) w.id: w};
     final wsByPath = {
@@ -171,9 +177,9 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
         if (s.workspaceId != null && s.workspaceId!.isNotEmpty) {
           final w = wsById[s.workspaceId!];
           key = 'ws:${s.workspaceId}';
-          label = s.workspaceName?.isNotEmpty == true
-              ? s.workspaceName!
-              : (w?.name ?? s.workspaceId!);
+          label = (w != null && w.name.isNotEmpty)
+              ? w.name
+              : (s.workspaceName?.isNotEmpty == true ? s.workspaceName! : s.workspaceId!);
           explicit = true;
           dirPath = w?.path ?? s.cwd;
         } else if (s.cwd != null && s.cwd!.isNotEmpty) {
@@ -275,16 +281,53 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     _cachedUngroupedWithCwdCount = ungroupedWithCwdCount;
   }
 
+  bool _handleDrawerBack() {
+    if (!mounted) return false;
+    if (_multiSelectMode) {
+      setState(() {
+        _multiSelectMode = false;
+        _selectedIds.clear();
+      });
+      return true;
+    }
+    if (_searchCtrl.text.isNotEmpty || ref.read(appProvider).searchQuery.isNotEmpty) {
+      _searchCtrl.clear();
+      ref.read(appProvider.notifier).setSearchQuery('');
+      FocusScope.of(context).unfocus();
+      return true;
+    }
+    return false;
+  }
+
   @override
   void initState() {
     super.initState();
     final init = ref.read(appProvider);
     _searchCtrl = TextEditingController(text: init.searchQuery);
     _lastHostId = init.activeHostId;
+    final savedCollapsed = _persistedCollapsedByHost[_lastHostId];
+    if (savedCollapsed != null && savedCollapsed.isNotEmpty) {
+      _collapsedGroups.addAll(savedCollapsed);
+    }
+    widget.backHandlerNotifier?.value = _handleDrawerBack;
+  }
+
+  @override
+  void didUpdateWidget(covariant SessionsSidebar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.backHandlerNotifier != widget.backHandlerNotifier) {
+      if (oldWidget.backHandlerNotifier?.value == _handleDrawerBack) {
+        oldWidget.backHandlerNotifier?.value = null;
+      }
+      widget.backHandlerNotifier?.value = _handleDrawerBack;
+    }
   }
 
   @override
   void dispose() {
+    if (widget.backHandlerNotifier?.value == _handleDrawerBack) {
+      widget.backHandlerNotifier?.value = null;
+    }
     _searchCtrl.dispose();
     _searchFocused.dispose();
     super.dispose();
@@ -371,6 +414,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           isActiveHostDesktop: s.isActiveHostDesktop,
           hostStatusLabel: s.hostStatusLabel(s.activeHost),
           hostIsHealthy: s.hostIsHealthy(s.activeHost),
+          hostIsConnecting: s.hostIsConnecting(s.activeHost),
           hostHasError: s.hostHasError(s.activeHost),
           connectionPhase: s.connectionPhase,
           glassTier: s.glassTier,
@@ -381,7 +425,9 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
       _lastHostId = state.activeHostId;
       _multiSelectMode = false;
       _selectedIds.clear();
-      _collapsedGroups.clear();
+      _collapsedGroups
+        ..clear()
+        ..addAll(_persistedCollapsedByHost[state.activeHostId] ?? const <String>{});
       _collapsedGroupsVersion++;
     }
     if (_multiSelectMode &&
@@ -418,11 +464,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     final ungroupedWithCwdCount = _cachedUngroupedWithCwdCount;
 
     if (_selectedIds.isNotEmpty) {
-      final visibleIds = {
-        for (final item in flatItems)
-          if (item is ChatSessionItem) item.id,
-      };
-      _selectedIds.removeWhere((id) => !visibleIds.contains(id));
+      _selectedIds.removeWhere((id) => !_cachedMatchedSessionIds.contains(id));
     }
 
     final host = state.activeHost;
@@ -565,7 +607,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           ),
         ),
 
-        // Subtle Workspace Filter + Group Toggle + Multi-Select + Terminal Line
+        // Subtle Workspace Filter + Compact Action Cluster (leaves ≥145dp for workspace label!)
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
           child: Row(
@@ -574,164 +616,174 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () => showWorkspaceSheet(context, ref, forSidebarFilter: true),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        state.sidebarWorkspaceFilter != null
-                            ? CupertinoIcons.folder_fill
-                            : CupertinoIcons.square_stack_3d_down_right,
-                        size: 13.5,
-                        color: state.sidebarWorkspaceFilter != null ? t.primary : t.text2,
-                      ),
-                      const SizedBox(width: 5),
-                      Flexible(
-                        child: Text(
-                          () {
-                            final f = state.sidebarWorkspaceFilter;
-                            if (f == null) return '全部工作区';
-                            final matchedWs = state.workspaces
-                                .where((w) => w.id == f || w.path == f || w.name == f)
-                                .firstOrNull;
-                            return matchedWs?.name ?? f;
-                          }(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: state.sidebarWorkspaceFilter != null
-                                ? FontWeight.w600
-                                : FontWeight.w500,
-                            color: state.sidebarWorkspaceFilter != null ? t.primary : t.text2,
-                          ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          state.sidebarWorkspaceFilter != null
+                              ? CupertinoIcons.folder_fill
+                              : CupertinoIcons.square_stack_3d_down_right,
+                          size: 13.5,
+                          color: state.sidebarWorkspaceFilter != null ? t.primary : t.text2,
                         ),
-                      ),
-                      if (state.sidebarWorkspaceFilter != null) ...[
-                        const SizedBox(width: 2),
-                        GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () => ctrl.setSidebarWorkspaceFilter(null),
-                          child: SizedBox(
-                            width: 30,
-                            height: 28,
-                            child: Center(
-                              child: Container(
-                                width: 16,
-                                height: 16,
-                                decoration: BoxDecoration(
-                                  color: t.primarySoft,
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Icon(CupertinoIcons.xmark, size: 9.5, color: t.primary),
-                              ),
+                        const SizedBox(width: 5),
+                        Flexible(
+                          child: Text(
+                            () {
+                              final f = state.sidebarWorkspaceFilter;
+                              if (f == null) return '全部工作区';
+                              final normF = _normalizeDirPath(f);
+                              final matchedWs = state.workspaces
+                                  .where(
+                                    (w) =>
+                                        w.id == f ||
+                                        w.path == f ||
+                                        w.name == f ||
+                                        (w.path.isNotEmpty && _normalizeDirPath(w.path) == normF),
+                                  )
+                                  .firstOrNull;
+                              return matchedWs?.name ?? f;
+                            }(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12.2,
+                              fontWeight: state.sidebarWorkspaceFilter != null
+                                  ? FontWeight.w600
+                                  : FontWeight.w500,
+                              color: state.sidebarWorkspaceFilter != null ? t.primary : t.text2,
                             ),
                           ),
                         ),
-                      ] else ...[
-                        const SizedBox(width: 2),
-                        Icon(CupertinoIcons.chevron_down, size: 10.5, color: t.text3),
+                        if (state.sidebarWorkspaceFilter != null) ...[
+                          const SizedBox(width: 2),
+                          GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () => ctrl.setSidebarWorkspaceFilter(null),
+                            child: SizedBox(
+                              width: 26,
+                              height: 26,
+                              child: Center(
+                                child: Container(
+                                  width: 16,
+                                  height: 16,
+                                  decoration: BoxDecoration(
+                                    color: t.primarySoft,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(CupertinoIcons.xmark, size: 9.5, color: t.primary),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ] else ...[
+                          const SizedBox(width: 2),
+                          Icon(CupertinoIcons.chevron_down, size: 10.5, color: t.text3),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
                 ),
               ),
               const SizedBox(width: 4),
-              Flexible(
-                flex: 0,
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      GestureDetector(
-                        onTap: () => ctrl.setSessionGroupMode(
-                          state.sessionGroupMode == SessionGroupMode.workspace
-                              ? SessionGroupMode.date
-                              : SessionGroupMode.workspace,
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                state.sessionGroupMode == SessionGroupMode.workspace
-                                    ? CupertinoIcons.folder
-                                    : CupertinoIcons.clock,
-                                size: 12,
-                                color: t.primary,
-                              ),
-                              const SizedBox(width: 3),
-                              Text(
-                                state.sessionGroupMode == SessionGroupMode.workspace ? '按目录' : '按时间',
-                                style: TextStyle(
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: t.primary,
-                                ),
-                              ),
-                            ],
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Tooltip(
+                    message: state.sessionGroupMode == SessionGroupMode.workspace
+                        ? '当前按目录分组，点击切换按时间'
+                        : '当前按时间分组，点击切换按目录',
+                    child: GrassBagSpringTap(
+                      pressedScale: 0.9,
+                      haptic: true,
+                      onTap: () => ctrl.setSessionGroupMode(
+                        state.sessionGroupMode == SessionGroupMode.workspace
+                            ? SessionGroupMode.date
+                            : SessionGroupMode.workspace,
+                      ),
+                      child: SizedBox(
+                        width: 28,
+                        height: 28,
+                        child: Center(
+                          child: Icon(
+                            state.sessionGroupMode == SessionGroupMode.workspace
+                                ? CupertinoIcons.folder
+                                : CupertinoIcons.clock,
+                            size: 14.5,
+                            color: t.primary,
                           ),
                         ),
                       ),
-                      GestureDetector(
-                        onTap: () => setState(() {
-                          _multiSelectMode = !_multiSelectMode;
-                          _selectedIds.clear();
-                        }),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
-                          child: Text(
-                            _multiSelectMode ? '完成' : '多选',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              color: _multiSelectMode ? t.primary : t.text3,
-                            ),
-                          ),
-                        ),
-                      ),
-                      Tooltip(
-                        message: '刷新当前主机对话列表',
-                        child: GrassBagSpringTap(
-                          pressedScale: 0.9,
-                          haptic: true,
-                          onTap: () {
-                            if (!state.loadingSessions) ctrl.refreshSessionsList();
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 5),
-                            child: state.loadingSessions
-                                ? CupertinoActivityIndicator(radius: 6.5, color: t.primary)
-                                : Icon(CupertinoIcons.refresh, size: 13.5, color: t.text2),
-                          ),
-                        ),
-                      ),
-                      GrassBagSpringTap(
-                        pressedScale: 0.93,
-                        haptic: true,
-                        onTap: () {
-                          widget.onCloseDrawer?.call();
-                          widget.onOpenTerminal();
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 5),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.chevron_left_slash_chevron_right, size: 13.5, color: t.text2),
-                              const SizedBox(width: 3),
-                              Text(
-                                '终端',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
-                ),
+                  Tooltip(
+                    message: _multiSelectMode ? '退出多选' : '批量多选',
+                    child: GrassBagSpringTap(
+                      pressedScale: 0.9,
+                      haptic: true,
+                      onTap: () => setState(() {
+                        _multiSelectMode = !_multiSelectMode;
+                        _selectedIds.clear();
+                      }),
+                      child: SizedBox(
+                        width: 28,
+                        height: 28,
+                        child: Center(
+                          child: Icon(
+                            _multiSelectMode
+                                ? CupertinoIcons.checkmark_circle_fill
+                                : CupertinoIcons.checkmark_circle,
+                            size: 14.5,
+                            color: _multiSelectMode ? t.primary : t.text2,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Tooltip(
+                    message: '刷新当前主机对话列表',
+                    child: GrassBagSpringTap(
+                      pressedScale: 0.9,
+                      haptic: true,
+                      onTap: () {
+                        if (!state.loadingSessions) ctrl.refreshSessionsList();
+                      },
+                      child: SizedBox(
+                        width: 28,
+                        height: 28,
+                        child: Center(
+                          child: state.loadingSessions
+                              ? CupertinoActivityIndicator(radius: 6.5, color: t.primary)
+                              : Icon(CupertinoIcons.refresh, size: 14, color: t.text2),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Tooltip(
+                    message: '打开终端',
+                    child: GrassBagSpringTap(
+                      pressedScale: 0.9,
+                      haptic: true,
+                      onTap: () {
+                        widget.onCloseDrawer?.call();
+                        widget.onOpenTerminal();
+                      },
+                      child: SizedBox(
+                        width: 28,
+                        height: 28,
+                        child: Center(
+                          child: Icon(
+                            CupertinoIcons.chevron_left_slash_chevron_right,
+                            size: 14,
+                            color: t.text2,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -778,372 +830,393 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               final allSelected =
                   allVisibleIds.isNotEmpty && _selectedIds.length == allVisibleIds.length;
               return Padding(
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
-                child: Row(
-                  children: [
+                padding: const EdgeInsets.fromLTRB(14, 4, 14, 6),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    alignment: WrapAlignment.spaceBetween,
+                    children: [
                     Text(
                       _selectedIds.isEmpty ? '请选择要操作的对话' : '已选 ${_selectedIds.length} 项',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2),
                     ),
-                    const Spacer(),
-                    if (allVisibleIds.isNotEmpty) ...[
-                      GrassBagSpringTap(
-                        onTap: () {
-                          setState(() {
-                            if (allSelected) {
-                              _selectedIds.clear();
-                            } else {
-                              _selectedIds
-                                ..clear()
-                                ..addAll(allVisibleIds);
-                            }
-                          });
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: t.primarySoft,
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                            allSelected ? '取消全选' : '全选',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              color: t.primary,
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (allVisibleIds.isNotEmpty) ...[
+                          GrassBagSpringTap(
+                            onTap: () {
+                              setState(() {
+                                if (allSelected) {
+                                  _selectedIds.clear();
+                                } else {
+                                  _selectedIds
+                                    ..clear()
+                                    ..addAll(allVisibleIds);
+                                }
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: t.primarySoft,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text(
+                                allSelected ? '全不选' : '全选',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.primary,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                    ],
-                    if (_selectedIds.isNotEmpty) ...[
-                      const SizedBox(width: 6),
-                      GrassBagSpringTap(
-                        onTap: () {
-                          final ids = Set<String>.of(_selectedIds);
-                          final targetArchived = state.filter != SessionFilter.archived;
-                          ctrl.archiveSessionsBatch(ids, archived: targetArchived);
-                          setState(() {
-                            _selectedIds.clear();
-                            _multiSelectMode = false;
-                          });
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: t.fill1,
-                            borderRadius: BorderRadius.circular(999),
+                        ],
+                        if (_selectedIds.isNotEmpty) ...[
+                          const SizedBox(width: 6),
+                          GrassBagSpringTap(
+                            onTap: () {
+                              final ids = Set<String>.of(_selectedIds);
+                              final targetArchived = state.filter != SessionFilter.archived;
+                              ctrl.archiveSessionsBatch(ids, archived: targetArchived);
+                              setState(() {
+                                _selectedIds.clear();
+                                _multiSelectMode = false;
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: t.fill1,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text(
+                                state.filter == SessionFilter.archived ? '还原' : '归档',
+                                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text),
+                              ),
+                            ),
                           ),
-                          child: Text(
-                            state.filter == SessionFilter.archived ? '取消归档' : '归档',
-                            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text),
+                          const SizedBox(width: 6),
+                          GrassBagSpringTap(
+                            onTap: () async {
+                              final ids = Set<String>.of(_selectedIds);
+                              final ok = await showGrassBagConfirmDialog(
+                                context,
+                                title: '删除已选 ${ids.length} 条对话？',
+                                message: '删除后所选对话历史将从当前 DSH 主机永久移除，不可恢复。',
+                                confirmLabel: '删除 (${ids.length})',
+                                isDestructive: true,
+                              );
+                              if (!ok || !mounted) return;
+                              ctrl.deleteSessionsBatch(ids);
+                              setState(() {
+                                _selectedIds.clear();
+                                _multiSelectMode = false;
+                              });
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: t.errSoft,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text('删除', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.err)),
+                            ),
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      GrassBagSpringTap(
-                        onTap: () async {
-                          final ids = Set<String>.of(_selectedIds);
-                          final ok = await showGrassBagConfirmDialog(
-                            context,
-                            title: '删除已选 ${ids.length} 条对话？',
-                            message: '删除后所选对话历史将从当前 DSH 主机永久移除，不可恢复。',
-                            confirmLabel: '删除 (${ids.length})',
-                            isDestructive: true,
-                          );
-                          if (!ok || !mounted) return;
-                          ctrl.deleteSessionsBatch(ids);
-                          setState(() {
-                            _selectedIds.clear();
-                            _multiSelectMode = false;
-                          });
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: t.errSoft,
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text('删除', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.err)),
-                        ),
-                      ),
-                    ],
+                        ],
+                      ],
+                    ),
                   ],
+                ),
                 ),
               );
             },
           ),
 
-        // Grouped Sessions List
+        // Grouped Sessions List (always keeps CustomScrollView + pull-to-refresh + keyboard dismiss;
+        // zero ShaderMask saveLayer and zero opaque top band over translucent Liquid Glass!)
         Expanded(
-          child: flatItems.isEmpty
-              ? Builder(
-                  builder: (_) {
-                    final isSyncingSessions = state.sessions.isEmpty &&
-                        (state.loadingSessions ||
-                            state.connectionPhase == ConnectionPhase.connecting ||
-                            state.connectionPhase == ConnectionPhase.reconnecting);
-                    final isNeedsAuth = state.sessions.isEmpty &&
-                        (state.connectionPhase == ConnectionPhase.needsAuth || host.needsAuth);
-                    final isConnectError = !isNeedsAuth &&
-                        state.sessions.isEmpty &&
-                        state.connectionPhase == ConnectionPhase.error;
-                    return ValueListenableBuilder<bool>(
-                      valueListenable: _searchFocused,
-                      builder: (_, focused, emptyChild) => focused
-                          ? _FocusedSearchInsetPadding(child: emptyChild!)
-                          : emptyChild!,
-                      child: Center(
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 24),
-                          child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (isSyncingSessions)
-                              CupertinoActivityIndicator(radius: 12, color: t.primary)
-                            else
-                              Icon(
-                                isNeedsAuth
-                                    ? CupertinoIcons.lock_shield_fill
-                                    : isConnectError
-                                        ? CupertinoIcons.wifi_exclamationmark
-                                        : (state.sessions.isEmpty
-                                            ? CupertinoIcons.sparkles
-                                            : CupertinoIcons.chat_bubble_2),
-                                size: 28,
-                                color: isNeedsAuth
-                                    ? t.primary.withValues(alpha: 0.85)
-                                    : isConnectError
-                                        ? t.err.withValues(alpha: 0.8)
-                                        : t.text3.withValues(alpha: 0.65),
-                              ),
-                            const SizedBox(height: 8),
-                            Text(
-                              isSyncingSessions
-                                  ? '正在同步「${host.name}」的对话…'
-                                  : isNeedsAuth
-                                      ? '「${host.name}」等待一次授权'
+          child: CustomScrollView(
+                key: PageStorageKey<String>(
+                  'sessions-drawer-${state.activeHostId}-${state.sessionGroupMode.name}',
+                ),
+                cacheExtent: 700,
+                physics: const BouncingScrollPhysics(
+                  parent: AlwaysScrollableScrollPhysics(),
+                ),
+                keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                slivers: [
+              CupertinoSliverRefreshControl(
+                onRefresh: () => ctrl.refreshSessionsList(silent: true),
+              ),
+              if (flatItems.isEmpty)
+                SliverFillRemaining(
+                  hasScrollBody: false,
+                  child: Builder(
+                    builder: (_) {
+                      final isSyncingSessions = state.sessions.isEmpty &&
+                          (state.loadingSessions ||
+                              state.connectionPhase == ConnectionPhase.connecting ||
+                              state.connectionPhase == ConnectionPhase.reconnecting);
+                      final isNeedsAuth = state.sessions.isEmpty &&
+                          (state.connectionPhase == ConnectionPhase.needsAuth || host.needsAuth);
+                      final isConnectError = !isNeedsAuth &&
+                          state.sessions.isEmpty &&
+                          state.connectionPhase == ConnectionPhase.error;
+                      return ValueListenableBuilder<bool>(
+                        valueListenable: _searchFocused,
+                        builder: (_, focused, emptyChild) => focused
+                            ? _FocusedSearchInsetPadding(child: emptyChild!)
+                            : emptyChild!,
+                        child: Center(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+                            child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isSyncingSessions)
+                                CupertinoActivityIndicator(radius: 12, color: t.primary)
+                              else
+                                Icon(
+                                  isNeedsAuth
+                                      ? CupertinoIcons.lock_shield_fill
                                       : isConnectError
-                                          ? '无法连接到「${host.name}」'
+                                          ? CupertinoIcons.wifi_exclamationmark
                                           : (state.sessions.isEmpty
-                                              ? '还没有历史对话'
-                                              : (state.searchQuery.trim().isNotEmpty ||
-                                                      state.sidebarWorkspaceFilter != null
-                                                  ? '没有找到匹配对话'
-                                                  : switch (state.filter) {
-                                                      SessionFilter.pending => '暂无待确认审批',
-                                                      SessionFilter.running => '暂无运行中对话',
-                                                      SessionFilter.unread => '暂无未读对话',
-                                                      SessionFilter.archived => '暂无归档对话',
-                                                      SessionFilter.all => '没有找到匹配对话',
-                                                    })),
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontSize: 13.5,
-                                fontWeight: FontWeight.w500,
-                                color: t.text2,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              isSyncingSessions
-                                  ? '正在拉取最新会话列表与工作区目录'
-                                  : isNeedsAuth
-                                      ? '主机已连通，粘贴启动链接或完成网页登录后 30 天内免填 Token'
+                                              ? CupertinoIcons.sparkles
+                                              : CupertinoIcons.chat_bubble_2),
+                                  size: 28,
+                                  color: isNeedsAuth
+                                      ? t.primary.withValues(alpha: 0.85)
                                       : isConnectError
-                                          ? (host.lastError?.isNotEmpty == true
-                                              ? host.lastError!
-                                              : '请检查主机地址、网络连通性或电脑端是否已开启局域网访问')
-                                          : (state.sessions.isEmpty
-                                              ? '发送第一条消息即可自动创建并按工作区归组'
-                                              : (state.searchQuery.trim().isNotEmpty ||
-                                                      state.sidebarWorkspaceFilter != null
-                                                  ? '尝试更改搜索关键词或切换到其他筛选分类'
-                                                  : switch (state.filter) {
-                                                      SessionFilter.pending => '当助手请求执行命令或修改文件时会在此提醒',
-                                                      SessionFilter.running => '正在后台生成或执行任务的对话会自动出现在此处',
-                                                      SessionFilter.unread => '所有历史对话均已查看完毕',
-                                                      SessionFilter.archived => '可在对话「···」菜单中归档不再常用的会话',
-                                                      SessionFilter.all => '尝试更改搜索关键词或切换到其他筛选分类',
-                                                    })),
-                              textAlign: TextAlign.center,
-                              maxLines: 3,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11.5, color: t.text3),
-                            ),
-                            const SizedBox(height: 12),
-                            if (isNeedsAuth)
-                              GrassBagSpringTap(
-                                onTap: () => showRemoteHostAuthSheet(context, ref, host),
-                                pressedScale: 0.94,
-                                haptic: true,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: t.primarySoft,
-                                    borderRadius: BorderRadius.circular(999),
-                                  ),
-                                  child: Text(
-                                    '立即授权',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: t.primary,
-                                    ),
-                                  ),
+                                          ? t.err.withValues(alpha: 0.8)
+                                          : t.text3.withValues(alpha: 0.65),
                                 ),
-                              )
-                            else if (isConnectError)
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  GrassBagSpringTap(
-                                    onTap: () => ctrl.probeAndRefreshHost(state.activeHostId),
-                                    pressedScale: 0.94,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                                      decoration: BoxDecoration(
-                                        color: t.primarySoft,
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
-                                      child: Text(
-                                        '重新连接',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.primary,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  GrassBagSpringTap(
-                                    onTap: () {
-                                      widget.onCloseDrawer?.call();
-                                      widget.onOpenHostsSettings();
-                                    },
-                                    pressedScale: 0.94,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                                      decoration: BoxDecoration(
-                                        color: t.fill1,
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
-                                      child: Text(
-                                        '主机设置',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.text2,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              )
-                            else if (!isSyncingSessions &&
-                                (state.searchQuery.isNotEmpty ||
-                                    state.filter != SessionFilter.all ||
-                                    state.sidebarWorkspaceFilter != null))
-                              GrassBagSpringTap(
-                                onTap: () {
-                                  _searchCtrl.clear();
-                                  ctrl.setSearchQuery('');
-                                  ctrl.setFilter(SessionFilter.all);
-                                  ctrl.setSidebarWorkspaceFilter(null);
-                                },
-                                pressedScale: 0.94,
-                                haptic: true,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: t.primarySoft,
-                                    borderRadius: BorderRadius.circular(999),
-                                  ),
-                                  child: Text(
-                                    '重置筛选',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: t.primary,
-                                    ),
-                                  ),
+                              const SizedBox(height: 8),
+                              Text(
+                                isSyncingSessions
+                                    ? '正在同步「${host.name}」的对话…'
+                                    : isNeedsAuth
+                                        ? '「${host.name}」等待一次授权'
+                                        : isConnectError
+                                            ? '无法连接到「${host.name}」'
+                                            : (state.sessions.isEmpty
+                                                ? '还没有历史对话'
+                                                : (state.searchQuery.trim().isNotEmpty ||
+                                                        state.sidebarWorkspaceFilter != null
+                                                    ? '没有找到匹配对话'
+                                                    : switch (state.filter) {
+                                                        SessionFilter.pending => '暂无待确认审批',
+                                                        SessionFilter.running => '暂无运行中对话',
+                                                        SessionFilter.unread => '暂无未读对话',
+                                                        SessionFilter.archived => '暂无归档对话',
+                                                        SessionFilter.all => '没有找到匹配对话',
+                                                      })),
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontSize: 13.5,
+                                  fontWeight: FontWeight.w500,
+                                  color: t.text2,
                                 ),
-                              )
-                            else if (!isSyncingSessions && state.sessions.isEmpty)
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  GrassBagSpringTap(
-                                    onTap: () {
-                                      ctrl.startNewChat();
-                                      widget.onCloseDrawer?.call();
-                                    },
-                                    pressedScale: 0.94,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-                                      decoration: BoxDecoration(
-                                        color: t.primarySoft,
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
-                                      child: Text(
-                                        '开始新对话',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.primary,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  GrassBagSpringTap(
-                                    onTap: () => ctrl.refreshSessionsList(),
-                                    pressedScale: 0.94,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                                      decoration: BoxDecoration(
-                                        color: t.fill1,
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
-                                      child: Text(
-                                        '刷新',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.text2,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
                               ),
-                            ],
+                              const SizedBox(height: 4),
+                              Text(
+                                isSyncingSessions
+                                    ? '正在拉取最新会话列表与工作区目录'
+                                    : isNeedsAuth
+                                        ? '主机已连通，粘贴启动链接或完成网页登录后 30 天内免填 Token'
+                                        : isConnectError
+                                            ? (host.lastError?.isNotEmpty == true
+                                                ? host.lastError!
+                                                : '请检查主机地址、网络连通性或电脑端是否已开启局域网访问')
+                                            : (state.sessions.isEmpty
+                                                ? '发送第一条消息即可自动创建并按工作区归组'
+                                                : (state.searchQuery.trim().isNotEmpty ||
+                                                        state.sidebarWorkspaceFilter != null
+                                                    ? '尝试更改搜索关键词或切换到其他筛选分类'
+                                                    : switch (state.filter) {
+                                                        SessionFilter.pending => '当助手请求执行命令或修改文件时会在此提醒',
+                                                        SessionFilter.running => '正在后台生成或执行任务的对话会自动出现在此处',
+                                                        SessionFilter.unread => '所有历史对话均已查看完毕',
+                                                        SessionFilter.archived => '可在对话「···」菜单中归档不再常用的会话',
+                                                        SessionFilter.all => '尝试更改搜索关键词或切换到其他筛选分类',
+                                                      })),
+                                textAlign: TextAlign.center,
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 11.5, color: t.text3),
+                              ),
+                              const SizedBox(height: 12),
+                              if (isNeedsAuth)
+                                GrassBagSpringTap(
+                                  onTap: () => showRemoteHostAuthSheet(context, ref, host),
+                                  pressedScale: 0.94,
+                                  haptic: true,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: t.primarySoft,
+                                      borderRadius: BorderRadius.circular(999),
+                                    ),
+                                    child: Text(
+                                      '立即授权',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              else if (isConnectError)
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    GrassBagSpringTap(
+                                      onTap: () => ctrl.probeAndRefreshHost(state.activeHostId),
+                                      pressedScale: 0.94,
+                                      haptic: true,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: t.primarySoft,
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                        child: Text(
+                                          '重新连接',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.primary,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    GrassBagSpringTap(
+                                      onTap: () {
+                                        widget.onCloseDrawer?.call();
+                                        widget.onOpenHostsSettings();
+                                      },
+                                      pressedScale: 0.94,
+                                      haptic: true,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: t.fill1,
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                        child: Text(
+                                          '主机设置',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.text2,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              else if (!isSyncingSessions &&
+                                  (state.searchQuery.isNotEmpty ||
+                                      state.filter != SessionFilter.all ||
+                                      state.sidebarWorkspaceFilter != null))
+                                GrassBagSpringTap(
+                                  onTap: () {
+                                    _searchCtrl.clear();
+                                    ctrl.setSearchQuery('');
+                                    ctrl.setFilter(SessionFilter.all);
+                                    ctrl.setSidebarWorkspaceFilter(null);
+                                  },
+                                  pressedScale: 0.94,
+                                  haptic: true,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: t.primarySoft,
+                                      borderRadius: BorderRadius.circular(999),
+                                    ),
+                                    child: Text(
+                                      '重置筛选',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              else if (!isSyncingSessions && state.sessions.isEmpty)
+                                Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    GrassBagSpringTap(
+                                      onTap: () {
+                                        ctrl.startNewChat();
+                                        widget.onCloseDrawer?.call();
+                                      },
+                                      pressedScale: 0.94,
+                                      haptic: true,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: t.primarySoft,
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                        child: Text(
+                                          '开始新对话',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.primary,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    GrassBagSpringTap(
+                                      onTap: () => ctrl.refreshSessionsList(),
+                                      pressedScale: 0.94,
+                                      haptic: true,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: t.fill1,
+                                          borderRadius: BorderRadius.circular(999),
+                                        ),
+                                        child: Text(
+                                          '刷新',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.text2,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
                           ),
                         ),
-                      ),
-                    );
-                  },
-                )
-              : CustomScrollView(
-                  cacheExtent: 700,
-                  physics: const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
+                      );
+                    },
                   ),
-                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                  slivers: [
-                    CupertinoSliverRefreshControl(
-                      onRefresh: () => ctrl.refreshSessionsList(silent: true),
-                    ),
-                    SliverPadding(
-                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-                      sliver: SliverList.builder(
-                        itemCount: flatItems.length,
-                        itemBuilder: (ctx, idx) {
+                )
+              else
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                  sliver: SliverList.builder(
+                    itemCount: flatItems.length,
+                    itemBuilder: (ctx, idx) {
                     final item = flatItems[idx];
                     if (item is _SidebarGroupHeader) {
                       return GestureDetector(
@@ -1153,6 +1226,9 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                                   if (!_collapsedGroups.add(item.groupKey)) {
                                     _collapsedGroups.remove(item.groupKey);
                                   }
+                                  final hostKey = _lastHostId ?? state.activeHostId;
+                                  _persistedCollapsedByHost[hostKey] =
+                                      Set<String>.of(_collapsedGroups);
                                   _collapsedGroupsVersion++;
                                 })
                             : null,
@@ -1287,6 +1363,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                   onTap: () => showHostQuickSheet(
                     context,
                     ref,
+                    onConnected: widget.onCloseDrawer,
                     onOpenHostSettings: () {
                       widget.onCloseDrawer?.call();
                       widget.onOpenHostsSettings();
@@ -1317,17 +1394,19 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             Positioned(
                               right: 0,
                               bottom: 0,
-                              child: Container(
-                                width: 10,
-                                height: 10,
-                                decoration: BoxDecoration(
-                                  color: state.hostIsHealthy
-                                      ? t.ok
-                                      : (host.needsAuth
-                                          ? t.primary
-                                          : (state.hostHasError ? t.err : t.warn)),
-                                  shape: BoxShape.circle,
-                                  border: Border.all(color: t.cardSolid, width: 1.5),
+                              child: GrassBagStatusDot(
+                                size: 10,
+                                pulsing: state.hostIsConnecting,
+                                color: state.hostIsHealthy
+                                    ? t.ok
+                                    : (host.needsAuth || state.hostIsConnecting
+                                        ? t.primary
+                                        : (state.hostHasError ? t.err : t.text3)),
+                                border: Border.all(
+                                  color: widget.isTabletDocked
+                                      ? t.sidebarDocked
+                                      : t.sheetTop,
+                                  width: 1.5,
                                 ),
                               ),
                             ),
@@ -1424,7 +1503,6 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
         borderRadius: 32,
         elevated: true,
         useSheetSettings: true,
-        width: 296,
         // Isolate drawer scroll repaints from the outer RenderLiquidGlassLayer!
         child: RepaintBoundary(child: content),
       ),
@@ -1486,6 +1564,7 @@ class _SessionListRow extends StatefulWidget {
 
 class _SessionListRowState extends State<_SessionListRow> {
   bool _hovered = false;
+  bool _pressed = false;
 
   @override
   Widget build(BuildContext context) {
@@ -1536,15 +1615,28 @@ class _SessionListRowState extends State<_SessionListRow> {
         onExit: (_) => setState(() => _hovered = false),
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
+          onTapDown: (_) {
+            if (!_pressed) setState(() => _pressed = true);
+          },
+          onTapUp: (_) {
+            if (_pressed) setState(() => _pressed = false);
+          },
+          onTapCancel: () {
+            if (_pressed) setState(() => _pressed = false);
+          },
           onTap: widget.onTap,
           onLongPressStart: widget.multiSelectMode
               ? null
-              : (d) => widget.onMoreActions(d.globalPosition),
+              : (d) {
+                  if (_pressed) setState(() => _pressed = false);
+                  widget.onMoreActions(d.globalPosition);
+                },
           onSecondaryTapDown: widget.multiSelectMode
               ? null
               : (d) => widget.onMoreActions(d.globalPosition),
-          child: Container(
-            constraints: BoxConstraints(minHeight: showSnippet ? 54 : 42),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 110),
+            constraints: BoxConstraints(minHeight: showSnippet ? 54 : 44),
             padding: EdgeInsets.symmetric(
               horizontal: 11,
               vertical: showSnippet ? 7 : 0,
@@ -1552,7 +1644,7 @@ class _SessionListRowState extends State<_SessionListRow> {
             decoration: BoxDecoration(
               color: highlighted
                   ? t.primarySoft
-                  : (_hovered ? t.fill1 : Colors.transparent),
+                  : (_pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent)),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
                 color: highlighted ? t.primary.withValues(alpha: 0.26) : Colors.transparent,
@@ -1646,15 +1738,15 @@ class _SessionListRowState extends State<_SessionListRow> {
                       pressedScale: 0.88,
                       haptic: true,
                       child: SizedBox(
-                        width: 30,
-                        height: 34,
+                        width: 38,
+                        height: 40,
                         child: Center(
                           child: Icon(
                             CupertinoIcons.ellipsis,
-                            size: 14,
+                            size: 15,
                             color: (_hovered || widget.active)
                                 ? t.text2
-                                : t.text3.withValues(alpha: 0.78),
+                                : t.text2.withValues(alpha: 0.72),
                           ),
                         ),
                       ),

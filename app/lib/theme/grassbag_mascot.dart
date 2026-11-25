@@ -22,11 +22,9 @@ class GrassBagMascot extends StatelessWidget {
       lo: t.primary,
       isDark: t.isDark,
     );
-    Widget widget = RepaintBoundary(
-      child: SizedBox.square(
-        dimension: size,
-        child: CustomPaint(painter: painter),
-      ),
+    Widget widget = SizedBox.square(
+      dimension: size,
+      child: CustomPaint(painter: painter),
     );
     if (withShadow) {
       widget = DecoratedBox(
@@ -44,7 +42,7 @@ class GrassBagMascot extends StatelessWidget {
         child: widget,
       );
     }
-    return widget;
+    return RepaintBoundary(child: widget);
   }
 }
 

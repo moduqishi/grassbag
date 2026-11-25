@@ -205,7 +205,10 @@ class AllFeaturesPage extends ConsumerWidget {
                       crossAxisCount: isWide ? 4 : 2,
                       mainAxisSpacing: 12,
                       crossAxisSpacing: 12,
-                      mainAxisExtent: isWide ? 132 : 128,
+                      mainAxisExtent: (isWide ? 144.0 : 142.0) *
+                          (1.0 +
+                              (MediaQuery.textScalerOf(context).scale(1.0).clamp(1.0, 1.6) - 1.0) *
+                                  0.55),
                     ),
                     itemCount: tiles.length,
                     itemBuilder: (_, i) {
@@ -261,9 +264,9 @@ class AllFeaturesPage extends ConsumerWidget {
                                   const SizedBox(height: 2),
                                   Text(
                                     item.$4,
-                                    maxLines: 1,
+                                    maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(fontSize: 11.5, color: t.text3),
+                                    style: TextStyle(fontSize: 11.5, height: 1.32, color: t.text3),
                                   ),
                                 ],
                               ),

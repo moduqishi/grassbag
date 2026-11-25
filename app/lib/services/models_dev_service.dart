@@ -31,6 +31,29 @@ class ModelsDevSpec {
   final bool supportsImage;
 }
 
+class _IndexedModelSpec {
+  _IndexedModelSpec(this.spec)
+      : idLower = spec.id.toLowerCase(),
+        fullLower = '${spec.providerId.toLowerCase()}/${spec.id.toLowerCase()}',
+        nameLower = spec.name.toLowerCase(),
+        bareId = _extractBare(spec.id.toLowerCase()),
+        normBareId = ModelsDevCatalogService._normalize(_extractBare(spec.id.toLowerCase())),
+        primaryBonus = ModelsDevCatalogService._primaryProviders
+                .contains(spec.providerId.toLowerCase())
+            ? 8
+            : 0;
+
+  static String _extractBare(String s) => s.contains('/') ? s.split('/').last : s;
+
+  final ModelsDevSpec spec;
+  final String idLower;
+  final String fullLower;
+  final String nameLower;
+  final String bareId;
+  final String normBareId;
+  final int primaryBonus;
+}
+
 /// Fetches, caches, and fuzzy-matches model metadata from `https://models.dev/api.json`
 /// so users typing any model ID (e.g. `deepseek-v4-flash`, `claude-sonnet-4-5`, `gpt-5`,
 /// `gemini-2.5-pro`) automatically get accurate context window, max output tokens,
@@ -41,21 +64,39 @@ class ModelsDevCatalogService {
 
   static const String catalogUrl = 'https://models.dev/api.json';
   static const Duration _cacheTtl = Duration(hours: 12);
+  static const Duration _failureCooldown = Duration(seconds: 60);
+  static final RegExp _nonAlnumRe = RegExp(r'[^a-z0-9]');
+  static const Set<String> _primaryProviders = {
+    'deepseek',
+    'openai',
+    'anthropic',
+    'google',
+    'xai',
+    'moonshotai',
+    'alibaba',
+    'zhipuai',
+  };
 
   List<ModelsDevSpec>? _cachedSpecs;
+  List<_IndexedModelSpec>? _indexedSpecs;
   DateTime? _fetchedAt;
+  DateTime? _lastFailureAt;
   Future<List<ModelsDevSpec>>? _inFlight;
 
   @visibleForTesting
   void seedForTest(List<ModelsDevSpec> specs) {
     _cachedSpecs = specs;
+    _indexedSpecs = specs.map(_IndexedModelSpec.new).toList(growable: false);
     _fetchedAt = DateTime.now();
+    _lastFailureAt = null;
   }
 
   @visibleForTesting
   void clearCache() {
     _cachedSpecs = null;
+    _indexedSpecs = null;
     _fetchedAt = null;
+    _lastFailureAt = null;
     _inFlight = null;
   }
 
@@ -68,23 +109,34 @@ class ModelsDevCatalogService {
         now.difference(_fetchedAt!) < _cacheTtl) {
       return _cachedSpecs!;
     }
+    if (fetcher == null &&
+        _lastFailureAt != null &&
+        now.difference(_lastFailureAt!) < _failureCooldown) {
+      return _cachedSpecs ?? const [];
+    }
     if (_inFlight != null) return _inFlight!;
 
-    final fut = _fetchAndParse(fetcher: fetcher);
-    _inFlight = fut;
-    try {
-      final list = await fut;
-      if (list.isNotEmpty) {
-        _cachedSpecs = list;
+    final fetchFut = _fetchAndParse(fetcher: fetcher);
+    final listFut = fetchFut.then((res) {
+      if (res.ok && res.specs.isNotEmpty) {
+        _cachedSpecs = res.specs;
+        _indexedSpecs = res.specs.map(_IndexedModelSpec.new).toList(growable: false);
         _fetchedAt = DateTime.now();
+        _lastFailureAt = null;
+      } else if (fetcher == null) {
+        _lastFailureAt = DateTime.now();
       }
-      return list;
+      return res.specs;
+    });
+    _inFlight = listFut;
+    try {
+      return await listFut;
     } finally {
-      if (identical(_inFlight, fut)) _inFlight = null;
+      if (identical(_inFlight, listFut)) _inFlight = null;
     }
   }
 
-  Future<List<ModelsDevSpec>> _fetchAndParse({
+  Future<({List<ModelsDevSpec> specs, bool ok})> _fetchAndParse({
     Future<String?> Function(Uri uri)? fetcher,
   }) async {
     try {
@@ -100,11 +152,17 @@ class ModelsDevCatalogService {
         body = resp.statusCode == 200 ? resp.body : null;
       }
       if (body == null || body.isEmpty) {
-        return _cachedSpecs ?? const [];
+        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
       }
-      return parseCatalogJson(body);
+      final parsed = body.length > 64 * 1024
+          ? await compute(parseCatalogJson, body)
+          : parseCatalogJson(body);
+      if (parsed.isEmpty) {
+        return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
+      }
+      return (specs: parsed, ok: true);
     } catch (_) {
-      return _cachedSpecs ?? const [];
+      return (specs: _cachedSpecs ?? const <ModelsDevSpec>[], ok: false);
     }
   }
 
@@ -149,15 +207,15 @@ class ModelsDevCatalogService {
         }
         bool supportsImage = false;
         final modalities = rawM['modalities'];
-        if (modalities is Map && modalities['input'] is List) {
+        final hasExplicitInputModalities = modalities is Map && modalities['input'] is List;
+        if (hasExplicitInputModalities) {
           for (final mod in modalities['input'] as List) {
             if (mod?.toString().toLowerCase() == 'image') {
               supportsImage = true;
               break;
             }
           }
-        }
-        if (!supportsImage && rawM['attachment'] == true) {
+        } else if (rawM['attachment'] == true) {
           supportsImage = true;
         }
         out.add(
@@ -198,61 +256,110 @@ class ModelsDevCatalogService {
     final q = rawQuery.trim();
     if (q.length < 2) return const [];
     final specs = await loadCatalog(fetcher: fetcher);
-    final normQ = _normalize(q);
-    final scored = <(int, ModelsDevSpec)>[];
-    final seenIds = <String>{};
-    for (final s in specs) {
-      final score = _score(s, q.toLowerCase(), normQ);
-      if (score > 0 && seenIds.add(s.id.toLowerCase())) {
-        scored.add((score, s));
+    if (specs.isEmpty) return const [];
+    final qLower = q.toLowerCase();
+    final bareQ = qLower.contains('/') ? qLower.split('/').last : qLower;
+    final normBareQ = _normalize(bareQ);
+    final indexed = identical(specs, _cachedSpecs) ? _indexedSpecs : null;
+    final bestById = <String, (int, ModelsDevSpec)>{};
+    if (indexed != null) {
+      for (final idx in indexed) {
+        final score = _scoreIndexed(idx, qLower, bareQ, normBareQ);
+        if (score <= 0) continue;
+        final prev = bestById[idx.idLower];
+        if (prev == null || score > prev.$1) {
+          bestById[idx.idLower] = (score, idx.spec);
+        }
+      }
+    } else {
+      for (final s in specs) {
+        final score = _scoreRaw(s, qLower, bareQ, normBareQ);
+        if (score <= 0) continue;
+        final key = s.id.toLowerCase();
+        final prev = bestById[key];
+        if (prev == null || score > prev.$1) {
+          bestById[key] = (score, s);
+        }
       }
     }
-    scored.sort((a, b) => b.$1.compareTo(a.$1));
+    final scored = bestById.values.toList()..sort((a, b) => b.$1.compareTo(a.$1));
     return scored.take(limit).map((e) => e.$2).toList(growable: false);
   }
 
   static ModelsDevSpec? matchInList(List<ModelsDevSpec> specs, String rawQuery) {
     final qLower = rawQuery.trim().toLowerCase();
     if (qLower.length < 2 || specs.isEmpty) return null;
-    final normQ = _normalize(qLower);
+    final bareQ = qLower.contains('/') ? qLower.split('/').last : qLower;
+    final normBareQ = _normalize(bareQ);
+    final indexed = identical(specs, instance._cachedSpecs) ? instance._indexedSpecs : null;
     ModelsDevSpec? best;
     var bestScore = 0;
-    for (final s in specs) {
-      final sc = _score(s, qLower, normQ);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = s;
+    if (indexed != null) {
+      for (final idx in indexed) {
+        final sc = _scoreIndexed(idx, qLower, bareQ, normBareQ);
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = idx.spec;
+        }
+      }
+    } else {
+      for (final s in specs) {
+        final sc = _scoreRaw(s, qLower, bareQ, normBareQ);
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = s;
+        }
       }
     }
     // Require a reasonably strong match so arbitrary short prefixes don't misfire.
     return bestScore >= 60 ? best : null;
   }
 
-  static int _score(ModelsDevSpec s, String qLower, String normQ) {
-    final idLower = s.id.toLowerCase();
-    final fullLower = '${s.providerId.toLowerCase()}/$idLower';
-    final nameLower = s.name.toLowerCase();
-    final bareQ = qLower.contains('/') ? qLower.split('/').last : qLower;
-    final bareId = idLower.contains('/') ? idLower.split('/').last : idLower;
-    // Prefer canonical primary providers slightly over aggregator duplicates
-    final primaryBonus = const {'deepseek', 'openai', 'anthropic', 'google', 'xai', 'moonshotai', 'alibaba', 'zhipuai'}
-            .contains(s.providerId.toLowerCase())
-        ? 8
-        : 0;
-    if (idLower == qLower || fullLower == qLower) return 120 + primaryBonus;
-    if (bareId == bareQ) return 110 + primaryBonus;
-    if (_normalize(bareId) == _normalize(bareQ)) return 100 + primaryBonus;
-    if (nameLower == qLower) return 94 + primaryBonus;
-    if (bareId.startsWith(bareQ) && bareQ.length >= 4) return 82 + primaryBonus;
-    if (_normalize(bareId).startsWith(normQ) && normQ.length >= 4) return 76 + primaryBonus;
-    if (bareQ.startsWith(bareId) && bareId.length >= 5) return 70 + primaryBonus;
-    if (bareId.contains(bareQ) && bareQ.length >= 5) return 64 + primaryBonus;
-    if (nameLower.contains(qLower) && qLower.length >= 5) return 52 + primaryBonus;
+  static int _scoreIndexed(
+    _IndexedModelSpec idx,
+    String qLower,
+    String bareQ,
+    String normBareQ,
+  ) {
+    if (idx.idLower == qLower || idx.fullLower == qLower) return 120 + idx.primaryBonus;
+    if (idx.bareId == bareQ) return 110 + idx.primaryBonus;
+    if (idx.normBareId == normBareQ && normBareQ.isNotEmpty) return 100 + idx.primaryBonus;
+    if (idx.nameLower == qLower) return 94 + idx.primaryBonus;
+    if (idx.bareId.startsWith(bareQ) && bareQ.length >= 2) return 82 + idx.primaryBonus;
+    if (idx.normBareId.startsWith(normBareQ) && normBareQ.length >= 2) {
+      return 76 + idx.primaryBonus;
+    }
+    if (bareQ.startsWith(idx.bareId) && idx.bareId.length >= 5) return 70 + idx.primaryBonus;
+    if (idx.bareId.contains(bareQ) && bareQ.length >= 4) return 64 + idx.primaryBonus;
+    if (idx.nameLower.contains(qLower) && qLower.length >= 4) return 52 + idx.primaryBonus;
     return 0;
   }
 
-  static String _normalize(String s) =>
-      s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+  static int _scoreRaw(
+    ModelsDevSpec s,
+    String qLower,
+    String bareQ,
+    String normBareQ,
+  ) {
+    final idLower = s.id.toLowerCase();
+    final fullLower = '${s.providerId.toLowerCase()}/$idLower';
+    final nameLower = s.name.toLowerCase();
+    final bareId = idLower.contains('/') ? idLower.split('/').last : idLower;
+    final normBareId = _normalize(bareId);
+    final primaryBonus = _primaryProviders.contains(s.providerId.toLowerCase()) ? 8 : 0;
+    if (idLower == qLower || fullLower == qLower) return 120 + primaryBonus;
+    if (bareId == bareQ) return 110 + primaryBonus;
+    if (normBareId == normBareQ && normBareQ.isNotEmpty) return 100 + primaryBonus;
+    if (nameLower == qLower) return 94 + primaryBonus;
+    if (bareId.startsWith(bareQ) && bareQ.length >= 2) return 82 + primaryBonus;
+    if (normBareId.startsWith(normBareQ) && normBareQ.length >= 2) return 76 + primaryBonus;
+    if (bareQ.startsWith(bareId) && bareId.length >= 5) return 70 + primaryBonus;
+    if (bareId.contains(bareQ) && bareQ.length >= 4) return 64 + primaryBonus;
+    if (nameLower.contains(qLower) && qLower.length >= 4) return 52 + primaryBonus;
+    return 0;
+  }
+
+  static String _normalize(String s) => s.toLowerCase().replaceAll(_nonAlnumRe, '');
 
   static int? _asInt(Object? raw) {
     if (raw is int) return raw;

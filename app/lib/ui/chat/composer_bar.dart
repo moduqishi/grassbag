@@ -9,10 +9,31 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
+import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+
+/// Active contextual edit-message session shown above the composer pill.
+@immutable
+class EditingMessageContext {
+  const EditingMessageContext({
+    required this.turnId,
+    required this.originalText,
+    required this.stashedDraft,
+    this.forkBeforeTurnId,
+    this.references = const [],
+  });
+
+  final String turnId;
+  final String originalText;
+  final String stashedDraft;
+  final String? forkBeforeTurnId;
+  final List<Map<String, dynamic>> references;
+
+  bool get canForkBefore => forkBeforeTurnId != null && forkBeforeTurnId!.isNotEmpty;
+}
 
 /// Floating bottom thumb-zone Apple iOS 26 Liquid Glass Composer:
 /// - Rock-solid spring-animated Floating Liquid Glass '+' Deck directly above composer (NO WebUI, zero mobile clipping!)
@@ -35,8 +56,11 @@ class ChatComposerDock extends ConsumerStatefulWidget {
     this.onPlusOpenChanged,
     this.showScrollToBottom = false,
     this.showScrollToBottomListenable,
+    this.hasNewBelowListenable,
     this.onScrollToBottom,
     this.composerHeightNotifier,
+    this.suggestionsOpenNotifier,
+    this.editingContextNotifier,
   });
 
   final TextEditingController controller;
@@ -49,8 +73,11 @@ class ChatComposerDock extends ConsumerStatefulWidget {
   final ValueChanged<bool>? onPlusOpenChanged;
   final bool showScrollToBottom;
   final ValueListenable<bool>? showScrollToBottomListenable;
+  final ValueListenable<bool>? hasNewBelowListenable;
   final VoidCallback? onScrollToBottom;
   final ValueNotifier<double>? composerHeightNotifier;
+  final ValueNotifier<bool>? suggestionsOpenNotifier;
+  final ValueNotifier<EditingMessageContext?>? editingContextNotifier;
 
   @override
   ConsumerState<ChatComposerDock> createState() => _ChatComposerDockState();
@@ -58,15 +85,24 @@ class ChatComposerDock extends ConsumerStatefulWidget {
 
 class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     with SingleTickerProviderStateMixin {
-  static final RegExp _slashTriggerRe = RegExp(r'^/(\S*)$');
-  static final RegExp _atTriggerRe = RegExp(r'(?:^|\s)(@([^\s]*))$');
+  static final RegExp _slashTriggerRe = RegExp(r'^/([a-zA-Z0-9_:.-]*)$');
+  // Allow Chinese prose or punctuation immediately before `@` (e.g. `看看@composer`),
+  // while ignoring email addresses (`foo@bar.com`).
+  static final RegExp _atTriggerRe = RegExp(r'(?:^|[^a-zA-Z0-9._+-])(@([^\s]*))$');
 
   late final SingleSpringController _plusSpring;
+  final ValueNotifier<int> _suggestionTickNotifier = ValueNotifier<int>(0);
+  final ScrollController _suggestionScrollCtrl = ScrollController();
   bool _plusOpen = false;
   bool _hasText = false;
+  bool _compactNudgeDismissed = false;
+  bool _wasImeComposing = false;
+  int _lastImeComposingEndMs = 0;
+  bool _editBranchResend = true;
   String? _mentionTrigger; // '/' or '@'
   String _mentionQuery = '';
   int _mentionStartOffset = -1;
+  String? _dismissedMentionText;
   int _activeSuggestionIdx = 0;
   bool _submitting = false;
   Timer? _refDebounceTimer;
@@ -86,6 +122,16 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       defaultTargetPlatform == TargetPlatform.windows ||
       defaultTargetPlatform == TargetPlatform.linux;
 
+  void _showEditQueuedDialog(BuildContext context, QueuedMessageItem item) {
+    showGrassBagSheet(
+      context,
+      title: item.mode == 'steer' ? '编辑插话内容' : '编辑排队消息',
+      subtitle: '修改后将同步更新待发送队列',
+      preferredHeight: 240,
+      bodyBuilder: (sheetCtx) => _EditQueuedMessageSheetBody(item: item),
+    );
+  }
+
   void _insertNewlineAtCursor() {
     final val = widget.controller.value;
     final sel = val.selection;
@@ -98,26 +144,50 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     );
   }
 
+  void _cancelEditingMessage() {
+    final editCtx = widget.editingContextNotifier?.value;
+    if (editCtx == null) return;
+    HapticFeedback.selectionClick();
+    widget.editingContextNotifier!.value = null;
+    final restore = editCtx.stashedDraft;
+    widget.controller.value = TextEditingValue(
+      text: restore,
+      selection: TextSelection.collapsed(offset: restore.length),
+    );
+    _flushDraftSync();
+  }
+
   KeyEventResult _handleComposerKeyEvent(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
       return KeyEventResult.ignored;
     }
+    // CRITICAL CJK IME guard: NEVER steal ArrowUp/ArrowDown/Escape/Enter while Pinyin/Kana/Hangul
+    // composition is active (or within the 60ms post-commit window on macOS/Web Chrome/Safari)!
+    final composing = widget.controller.value.composing;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final isImeComposing = (composing.isValid && !composing.isCollapsed) ||
+        event.logicalKey == LogicalKeyboardKey.process ||
+        (event.logicalKey == LogicalKeyboardKey.enter && (nowMs - _lastImeComposingEndMs) < 60);
+    if (isImeComposing) {
+      return KeyEventResult.ignored;
+    }
+
     if (_mentionTrigger != null) {
       final count = _mentionTrigger == '/' ? _latestCommands.length : _latestRefs.length;
       if (event.logicalKey == LogicalKeyboardKey.escape) {
-        setState(() {
-          _mentionTrigger = null;
-          _mentionQuery = '';
-          _activeSuggestionIdx = 0;
-        });
+        _dismissSuggestions();
         return KeyEventResult.handled;
       }
       if (count > 0 && event.logicalKey == LogicalKeyboardKey.arrowDown) {
-        setState(() => _activeSuggestionIdx = (_activeSuggestionIdx + 1) % count);
+        _activeSuggestionIdx = (_activeSuggestionIdx + 1) % count;
+        _suggestionTickNotifier.value++;
+        _scrollActiveSuggestionIntoView();
         return KeyEventResult.handled;
       }
       if (count > 0 && event.logicalKey == LogicalKeyboardKey.arrowUp) {
-        setState(() => _activeSuggestionIdx = (_activeSuggestionIdx - 1 + count) % count);
+        _activeSuggestionIdx = (_activeSuggestionIdx - 1 + count) % count;
+        _suggestionTickNotifier.value++;
+        _scrollActiveSuggestionIntoView();
         return KeyEventResult.handled;
       }
       if (count > 0 &&
@@ -125,19 +195,25 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           (event.logicalKey == LogicalKeyboardKey.tab ||
               event.logicalKey == LogicalKeyboardKey.enter ||
               event.logicalKey == LogicalKeyboardKey.numpadEnter)) {
-        final composing = widget.controller.value.composing;
-        if (composing.isValid && !composing.isCollapsed) {
-          return KeyEventResult.ignored;
+        final keys = HardwareKeyboard.instance.logicalKeysPressed;
+        final shiftPressed = HardwareKeyboard.instance.isShiftPressed ||
+            keys.contains(LogicalKeyboardKey.shiftLeft) ||
+            keys.contains(LogicalKeyboardKey.shiftRight) ||
+            keys.contains(LogicalKeyboardKey.shift);
+        if (shiftPressed && event.logicalKey != LogicalKeyboardKey.tab) {
+          _insertNewlineAtCursor();
+          return KeyEventResult.handled;
         }
         final idx = _activeSuggestionIdx.clamp(0, count - 1);
         final isTab = event.logicalKey == LogicalKeyboardKey.tab;
         if (_mentionTrigger == '/') {
           final cmd = _latestCommands[idx];
+          final isEmptyChat = ref.read(appProvider).isEmptyChat;
+          final canInstant = const {'/new', '/plan', '/status'}.contains(cmd.command) ||
+              (!isEmptyChat && const {'/fork', '/export'}.contains(cmd.command));
           _applySuggestion(
             cmd.command,
-            executeImmediately: !isTab &&
-                const {'/compact', '/new', '/plan', '/fork', '/export', '/status'}
-                    .contains(cmd.command),
+            executeImmediately: !isTab && canInstant,
           );
         } else {
           final refItem = _latestRefs[idx];
@@ -146,12 +222,46 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         return KeyEventResult.handled;
       }
     }
+
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape &&
+        widget.editingContextNotifier?.value != null) {
+      _cancelEditingMessage();
+      return KeyEventResult.handled;
+    }
+
+    // Desktop power-user shortcut: press ArrowUp in an empty composer to quickly edit the last prompt!
+    if (_isDesktopPlatform &&
+        event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.arrowUp &&
+        widget.controller.text.isEmpty &&
+        widget.editingContextNotifier != null) {
+      final snap = ref.read(appProvider);
+      if (!snap.isStreaming && snap.turns.isNotEmpty) {
+        for (var i = snap.turns.length - 1; i >= 0; i--) {
+          final turn = snap.turns[i];
+          final txt = turn.userMessage?.text.trim() ?? '';
+          if (txt.isNotEmpty) {
+            final forkBeforeId = i > 0 ? snap.turns[i - 1].turnId : null;
+            widget.editingContextNotifier!.value = EditingMessageContext(
+              turnId: turn.turnId,
+              originalText: txt,
+              stashedDraft: '',
+              forkBeforeTurnId: forkBeforeId,
+              references: turn.userMessage?.references ?? const [],
+            );
+            widget.controller.value = TextEditingValue(
+              text: txt,
+              selection: TextSelection.collapsed(offset: txt.length),
+            );
+            return KeyEventResult.handled;
+          }
+        }
+      }
+    }
+
     if (event.logicalKey == LogicalKeyboardKey.enter ||
         event.logicalKey == LogicalKeyboardKey.numpadEnter) {
-      final composing = widget.controller.value.composing;
-      final isImeComposing = composing.isValid && !composing.isCollapsed;
-      if (isImeComposing) return KeyEventResult.ignored;
-
       final keys = HardwareKeyboard.instance.logicalKeysPressed;
       final shiftPressed = HardwareKeyboard.instance.isShiftPressed ||
           keys.contains(LogicalKeyboardKey.shiftLeft) ||
@@ -168,6 +278,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           keys.contains(LogicalKeyboardKey.controlRight);
 
       if (_isDesktopPlatform) {
+        if (shiftPressed && cmdOrCtrlPressed && ref.read(appProvider).isStreaming) {
+          if (event is KeyDownEvent) {
+            unawaited(_submit(mode: 'steer'));
+          }
+          return KeyEventResult.handled;
+        }
         if (shiftPressed || altPressed) {
           _insertNewlineAtCursor();
           return KeyEventResult.handled;
@@ -208,6 +324,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     widget.focusNode.addListener(_onFocusChanged);
     widget.focusNode.onKeyEvent = _handleComposerKeyEvent;
     widget.plusOpenNotifier?.addListener(_onExternalPlusChanged);
+    widget.suggestionsOpenNotifier?.addListener(_onExternalSuggestionsChanged);
   }
 
   @override
@@ -230,6 +347,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       oldWidget.plusOpenNotifier?.removeListener(_onExternalPlusChanged);
       widget.plusOpenNotifier?.addListener(_onExternalPlusChanged);
     }
+    if (oldWidget.suggestionsOpenNotifier != widget.suggestionsOpenNotifier) {
+      oldWidget.suggestionsOpenNotifier?.removeListener(_onExternalSuggestionsChanged);
+      widget.suggestionsOpenNotifier?.addListener(_onExternalSuggestionsChanged);
+    }
   }
 
   @override
@@ -242,8 +363,60 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       widget.focusNode.onKeyEvent = null;
     }
     widget.plusOpenNotifier?.removeListener(_onExternalPlusChanged);
+    widget.suggestionsOpenNotifier?.removeListener(_onExternalSuggestionsChanged);
     _plusSpring.dispose();
+    _suggestionTickNotifier.dispose();
+    _suggestionScrollCtrl.dispose();
     super.dispose();
+  }
+
+  void _scrollActiveSuggestionIntoView() {
+    if (!_suggestionScrollCtrl.hasClients) return;
+    const itemExtent = 38.0;
+    final targetTop = _activeSuggestionIdx * itemExtent;
+    final targetBottom = targetTop + itemExtent;
+    final pos = _suggestionScrollCtrl.position;
+    if (targetTop < pos.pixels) {
+      _suggestionScrollCtrl.animateTo(
+        targetTop.clamp(0.0, pos.maxScrollExtent),
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOutCubic,
+      );
+    } else if (targetBottom > pos.pixels + pos.viewportDimension) {
+      _suggestionScrollCtrl.animateTo(
+        (targetBottom - pos.viewportDimension).clamp(0.0, pos.maxScrollExtent),
+        duration: const Duration(milliseconds: 120),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
+
+  void _onExternalSuggestionsChanged() {
+    final open = widget.suggestionsOpenNotifier?.value ?? false;
+    if (!open && _mentionTrigger != null) {
+      _dismissSuggestions();
+    }
+  }
+
+  void _syncSuggestionsNotifier(bool open) {
+    final n = widget.suggestionsOpenNotifier;
+    if (n != null && n.value != open) {
+      n.value = open;
+    }
+  }
+
+  void _dismissSuggestions() {
+    _refDebounceTimer?.cancel();
+    setState(() {
+      _dismissedMentionText = widget.controller.text;
+      _mentionTrigger = null;
+      _mentionQuery = '';
+      _mentionStartOffset = -1;
+      _activeSuggestionIdx = 0;
+      _loadingRefs = false;
+      _remoteRefs = const [];
+    });
+    _syncSuggestionsNotifier(false);
   }
 
   void _onExternalPlusChanged() {
@@ -328,6 +501,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   void _onTextChanged() {
     if (_suppressDraftSync) return;
     final val = widget.controller.value;
+    final nowComposing = val.composing.isValid && !val.composing.isCollapsed;
+    if (_wasImeComposing && !nowComposing) {
+      _lastImeComposingEndMs = DateTime.now().millisecondsSinceEpoch;
+    }
+    _wasImeComposing = nowComposing;
     final raw = val.text;
     // Debounce draft persistence sync (400ms) so fast typing never clones host draft maps
     // or churns persistence timers on every single keystroke.
@@ -335,13 +513,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final snap = ref.read(appProvider);
     final draftHostId = snap.activeHostId;
     final draftSessionId = snap.activeSessionId;
+    final draftRenderGen = snap.sessionRenderGen;
     _draftScopeHostId = draftHostId;
     _draftScopeSessionId = draftSessionId;
     _hasUnsyncedDraftEdit = true;
     _draftSyncTimer = Timer(const Duration(milliseconds: 400), () {
       if (!mounted) return;
       final cur = ref.read(appProvider);
-      if (cur.activeHostId != draftHostId || cur.activeSessionId != draftSessionId) {
+      if (cur.activeHostId != draftHostId || cur.sessionRenderGen != draftRenderGen) {
         return;
       }
       _hasUnsyncedDraftEdit = false;
@@ -352,6 +531,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       }
     });
     final nextHasText = raw.trim().isNotEmpty;
+    if (_dismissedMentionText != null && _dismissedMentionText != raw) {
+      _dismissedMentionText = null;
+    }
     final cursor = val.selection.isValid
         ? val.selection.baseOffset.clamp(0, raw.length)
         : raw.length;
@@ -362,7 +544,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     // Fast-path: skip RegExp matching entirely on normal prose keystrokes!
     RegExpMatch? slashMatch;
     var slashLeadingOffset = 0;
-    if (beforeCursor.isNotEmpty) {
+    if (_dismissedMentionText == null && beforeCursor.isNotEmpty) {
       var firstNonWs = 0;
       while (firstNonWs < beforeCursor.length && beforeCursor.codeUnitAt(firstNonWs) <= 32) {
         firstNonWs++;
@@ -373,7 +555,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         slashMatch = _slashTriggerRe.firstMatch(trimmedBefore);
       }
     }
-    final atMatch = slashMatch == null && beforeCursor.contains('@')
+    final atMatch = _dismissedMentionText == null &&
+            slashMatch == null &&
+            beforeCursor.contains('@')
         ? _atTriggerRe.firstMatch(beforeCursor)
         : null;
     if (slashMatch != null) {
@@ -406,27 +590,47 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
             ref.read(appProvider).activeHostId != reqHostId) {
           return;
         }
-        setState(() {
-          _loadingRefs = false;
-          _remoteRefs = refs;
-        });
+        _loadingRefs = false;
+        _remoteRefs = refs;
+        _suggestionTickNotifier.value++;
       });
     }
 
-    if (nextHasText != _hasText ||
-        nextTrigger != _mentionTrigger ||
-        nextQuery != _mentionQuery ||
-        nextStart != _mentionStartOffset) {
+    final triggerVisibilityOrKindChanged = nextTrigger != _mentionTrigger;
+    final queryChanged = nextQuery != _mentionQuery;
+    final startChanged = nextStart != _mentionStartOffset;
+    if (nextHasText != _hasText || triggerVisibilityOrKindChanged) {
       setState(() {
         _hasText = nextHasText;
-        if (nextTrigger != _mentionTrigger || nextQuery != _mentionQuery) {
+        if (triggerVisibilityOrKindChanged || queryChanged) {
           _activeSuggestionIdx = 0;
         }
         _mentionTrigger = nextTrigger;
         _mentionQuery = nextQuery;
         _mentionStartOffset = nextStart;
       });
+      _suggestionTickNotifier.value++;
+      _syncSuggestionsNotifier(nextTrigger != null);
+    } else if (queryChanged || startChanged) {
+      // Filtering inside an already-open `/` or `@` popover updates ONLY the popover leaf —
+      // ZERO rebuilds of ChatComposerDock, TextField, or Liquid Glass composer chrome!
+      if (queryChanged) {
+        _activeSuggestionIdx = 0;
+      }
+      _mentionQuery = nextQuery;
+      _mentionStartOffset = nextStart;
+      _suggestionTickNotifier.value++;
     }
+  }
+
+  static int _findTokenEnd(String raw, int cursor) {
+    var end = cursor;
+    while (end < raw.length) {
+      final cu = raw.codeUnitAt(end);
+      if (cu == 0x20 || cu == 0x0A || cu == 0x0D || cu == 0x09) break;
+      end++;
+    }
+    return end;
   }
 
   void _applySuggestion(
@@ -444,14 +648,15 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       final start = (_mentionStartOffset >= 0 && _mentionStartOffset <= cursor)
           ? _mentionStartOffset
           : 0;
-      final afterCursor = raw.substring(cursor);
-      final insert = afterCursor.startsWith(' ') ? replacement : '$replacement ';
-      final updated = raw.replaceRange(start, cursor, insert);
+      final tokenEnd = _findTokenEnd(raw, cursor);
+      final afterToken = raw.substring(tokenEnd);
+      final insert = afterToken.startsWith(' ') ? replacement : '$replacement ';
+      final updated = raw.replaceRange(start, tokenEnd, insert);
       widget.controller.value = TextEditingValue(
         text: updated,
         selection: TextSelection.collapsed(offset: start + insert.length),
       );
-      if (executeImmediately && afterCursor.trim().isEmpty) {
+      if (executeImmediately && afterToken.trim().isEmpty) {
         unawaited(_submit());
       }
     } else if (_mentionTrigger == '@') {
@@ -464,8 +669,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           ? _mentionStartOffset
           : raw.lastIndexOf('@', cursor > 0 ? cursor - 1 : 0);
       if (start >= 0 && start <= cursor) {
-        final insert = '@$replacement ';
-        final updated = raw.replaceRange(start, cursor, insert);
+        final tokenEnd = _findTokenEnd(raw, cursor);
+        final afterToken = raw.substring(tokenEnd);
+        final insert = afterToken.startsWith(' ') ? '@$replacement' : '@$replacement ';
+        final updated = raw.replaceRange(start, tokenEnd, insert);
         widget.controller.value = TextEditingValue(
           text: updated,
           selection: TextSelection.collapsed(offset: start + insert.length),
@@ -484,12 +691,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     _refDebounceTimer?.cancel();
     setState(() {
+      _dismissedMentionText = null;
       _mentionTrigger = null;
       _mentionQuery = '';
       _mentionStartOffset = -1;
       _activeSuggestionIdx = 0;
       _remoteRefs = const [];
     });
+    _syncSuggestionsNotifier(false);
   }
 
   List<String> _getFlattenedFilePaths(List<WorkspaceFileNode> nodes) {
@@ -523,6 +732,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _pickedReferences.clear();
     _cachedWorkspaceFilesRef = null;
     _cachedFlatFilePaths = const [];
+    if (widget.editingContextNotifier?.value != null) {
+      widget.editingContextNotifier!.value = null;
+    }
     if (mounted) {
       setState(() {
         _submitting = false;
@@ -534,6 +746,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         _remoteRefs = const [];
       });
     }
+    _syncSuggestionsNotifier(false);
   }
 
   Future<void> _submit({String mode = 'auto'}) async {
@@ -545,8 +758,32 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     if (text.isEmpty && !hasAtt) return;
     final ctrl = ref.read(appProvider.notifier);
 
-    // Pre-flight guard: preserve user's draft and guide directly to 1-tap resolution
-    // when remote host awaits auth or connected DSH has 0 configured model providers!
+    // Pre-flight guard: preserve user's draft when hydrated local Android engine is still booting
+    // or not deployed, host is mid-reconnect/bootstrap, remote host awaits auth, or connected DSH has 0 models!
+    if (GrassBagNativeBridge.instance.isAndroidNative &&
+        appSnapshot.activeHost.isLocal &&
+        appSnapshot.nativeStatusHydrated &&
+        !appSnapshot.nativeRuntimeStatus.engineRunning) {
+      if (appSnapshot.nativeRuntimeStatus.engineState == 'starting' ||
+          (appSnapshot.runtimeProgressPct > 0 && appSnapshot.runtimeProgressPct < 100)) {
+        ctrl.showToast('本机 DSH 引擎正在启动中，已保留输入内容…', tone: ToastTone.info);
+        return;
+      }
+      if (!appSnapshot.nativeRuntimeStatus.initialized) {
+        ctrl.showToast('正在部署本机运行环境，已保留输入内容…', tone: ToastTone.info);
+        unawaited(ctrl.bootstrapLocalRuntime());
+        return;
+      }
+      ctrl.showToast('正在启动本机 DSH 引擎，已保留输入内容…', tone: ToastTone.info);
+      unawaited(ctrl.restartLocalEngine());
+      return;
+    }
+    if (!appSnapshot.isDshConnected &&
+        (appSnapshot.connectionPhase == ConnectionPhase.reconnecting ||
+            appSnapshot.connectionPhase == ConnectionPhase.bootstrapping)) {
+      ctrl.showToast('正在连接主机，连接成功后可立即发送（已保留输入内容）', tone: ToastTone.info);
+      return;
+    }
     if (!appSnapshot.activeHost.isLocal &&
         (appSnapshot.activeHost.needsAuth ||
             appSnapshot.connectionPhase == ConnectionPhase.needsAuth)) {
@@ -569,6 +806,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
 
     final startHostId = appSnapshot.activeHostId;
+    var expectedRenderGen = appSnapshot.sessionRenderGen;
+    final editCtx = widget.editingContextNotifier?.value;
+    final shouldForkBefore = editCtx != null && _editBranchResend && editCtx.canForkBefore && !appSnapshot.isStreaming;
     // Preserve soft-keyboard focus across keyboard Send and Send-orb tap so users
     // never get their IME collapsed on every message!
     final hadFocus = widget.focusNode.hasFocus;
@@ -576,13 +816,22 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     if (_plusOpen) {
       _setPlusOpen(false);
     }
-    final activeRefs = _pickedReferences
-        .where((r) => text.contains('@${r['path']}'))
-        .toList(growable: false);
+    final activeRefs = <Map<String, dynamic>>[
+      ..._pickedReferences.where((r) => text.contains('@${r['path']}')),
+      if (editCtx != null)
+        ...editCtx.references.where(
+          (r) =>
+              !_pickedReferences.any((p) => p['path'] == r['path']) &&
+              (r['path'] == null || text.contains('@${r['path']}')),
+        ),
+    ];
     // Clear input optimistically BEFORE awaiting async send so typing stays instant
     // and Android IME composing state resets cleanly without dismissing the keyboard.
     widget.controller.clear();
     _flushDraftSync();
+    if (widget.editingContextNotifier?.value != null) {
+      widget.editingContextNotifier!.value = null;
+    }
     if (hadFocus && !widget.focusNode.hasFocus) {
       widget.focusNode.requestFocus();
     }
@@ -593,24 +842,51 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       _mentionQuery = '';
       _activeSuggestionIdx = 0;
     });
+    _syncSuggestionsNotifier(false);
+    if (shouldForkBefore && editCtx.forkBeforeTurnId != null) {
+      final forked = await ctrl.forkActiveSession(
+        turnId: editCtx.forkBeforeTurnId,
+        syncAfter: false,
+      );
+      if (!mounted) return;
+      if (!forked) {
+        setState(() => _submitting = false);
+        widget.editingContextNotifier?.value = editCtx;
+        widget.controller.value = TextEditingValue(
+          text: rawText,
+          selection: TextSelection.collapsed(offset: rawText.length),
+        );
+        return;
+      }
+      expectedRenderGen = ref.read(appProvider).sessionRenderGen;
+    }
     final sent = await ref.read(appProvider.notifier).sendPrompt(
-          text.isEmpty ? '请帮我分析这些附件' : text,
+          text,
           mode: mode,
           references: activeRefs.isEmpty ? null : activeRefs,
         );
     if (!mounted) return;
-    final sameHost = ref.read(appProvider).activeHostId == startHostId;
+    final curState = ref.read(appProvider);
+    // `sessionRenderGen` stays invariant across Empty Chat -> `pending-session-*` -> real UUID promotion,
+    // while switching sessions or hosts ALWAYS increments `sessionRenderGen` — fixing first-turn `sameScope`!
+    final sameScope =
+        curState.activeHostId == startHostId && curState.sessionRenderGen == expectedRenderGen;
     setState(() => _submitting = false);
-    if (!sameHost) {
-      // User switched hosts while sending; never overwrite the new host's composer or refs!
+    if (!sameScope) {
+      // User switched hosts or sessions while sending; never overwrite the new composer or refs!
       return;
     }
     if (sent) {
       _pickedReferences.clear();
       widget.onMessageSent?.call();
-    } else if (widget.controller.text.isEmpty && rawText.isNotEmpty) {
-      widget.controller.text = rawText;
-      widget.controller.selection = TextSelection.collapsed(offset: rawText.length);
+    } else if (rawText.isNotEmpty) {
+      // Never drop user's failed prompt even if they started typing while the send was in flight!
+      final curText = widget.controller.text;
+      final restored = curText.isEmpty ? rawText : '$rawText\n\n$curText';
+      widget.controller.value = TextEditingValue(
+        text: restored,
+        selection: TextSelection.collapsed(offset: restored.length),
+      );
     }
     if (hadFocus && mounted && !widget.focusNode.hasFocus) {
       widget.focusNode.requestFocus();
@@ -665,42 +941,58 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     });
     final state = ref.watch(
       appProvider.select(
-        (s) => (
-          glassTier: s.glassTier,
-          activePermission: s.activePermission,
-          planMode: s.planMode,
-          speechConfigured: s.speechConfigured,
-          pendingApprovalCommand: s.pendingApprovalCommand,
-          activeQuestion: s.activeQuestion,
-          activeCordisRequest: s.activeCordisRequest,
-          pendingAttachments: s.pendingAttachments,
-          queuedMessages: s.queuedMessages,
-          slashCommands: s.slashCommands,
-          workspaceFiles: s.workspaceFiles,
-          activeWorkspace: s.activeWorkspaceDisplayName,
-          isEmptyChat: s.isEmptyChat,
-          isStreaming: s.isStreaming,
-          activeModelId: s.activeModelId,
-          modelShort: s.modelShort,
-          modelEffort: s.modelEffort,
-          hasAvailableModels: s.hasAvailableModels,
-          fallbackModelShort: s.effectiveActiveModelEntry?.shortLabel ?? '',
-          fallbackModelEffort: s.effectiveActiveModelEntry != null
-              ? (s.modelEffort.isNotEmpty
-                  ? s.modelEffort
-                  : (s.effectiveActiveModelEntry!.efforts
-                          .where((e) => e.id == s.effectiveActiveModelEntry!.defaultEffort)
-                          .firstOrNull
-                          ?.zhLabel ??
-                      ''))
-              : '',
-          connectionPhase: s.connectionPhase,
-          isDshConnected: s.isDshConnected,
-          hydratingDomains: s.hydratingDomains,
-          hostIsLocal: s.activeHost.isLocal,
-          hostNeedsAuth: s.activeHost.needsAuth,
-          routableProvidersCount: s.routableProviders.length,
-        ),
+        (s) {
+          final host = s.activeHost;
+          final model = s.effectiveActiveModelEntry;
+          return (
+            glassTier: s.glassTier,
+            activePermission: s.activePermission,
+            planMode: s.planMode,
+            speechConfigured: s.speechConfigured,
+            pendingApprovalCommand: s.pendingApprovalCommand,
+            pendingApprovalInteractionId: s.pendingApprovalInteractionId,
+            pendingApprovalToolName: s.pendingApprovalToolName,
+            activePendingInteractionCount: s.activePendingInteractionCount,
+            activeQuestion: s.activeQuestion,
+            activeCordisRequest: s.activeCordisRequest,
+            contextPctHigh: s.contextPct >= 80 ? s.contextPct : 0,
+            pendingAttachments: s.pendingAttachments,
+            queuedMessages: s.queuedMessages,
+            slashCommands: s.slashCommands,
+            workspaceFiles: s.workspaceFiles,
+            activeWorkspace: s.activeWorkspaceDisplayName,
+            isEmptyChat: s.isEmptyChat,
+            isStreaming: s.isStreaming,
+            isStopping: s.isStopping,
+            sendStage: s.sendStage,
+            busyEnterMode: () {
+              final conv = s.dshNamespaces.where((n) => n.ns == 'ui-conversation').firstOrNull;
+              final raw = conv?.value['busyEnter']?.toString().trim().toLowerCase();
+              return raw == 'steer' ? 'steer' : 'queue';
+            }(),
+            activeModelId: s.activeModelId,
+            modelShort: s.modelShort,
+            modelEffort: s.modelEffort,
+            hasAvailableModels: s.hasAvailableModels,
+            fallbackModelShort: model?.shortLabel ?? '',
+            fallbackModelEffort: model != null
+                ? (s.modelEffort.isNotEmpty
+                    ? s.modelEffort
+                    : (model.efforts
+                            .where((e) => e.id == model.defaultEffort)
+                            .firstOrNull
+                            ?.zhLabel ??
+                        ''))
+                : '',
+            connectionPhase: s.connectionPhase,
+            isDshConnected: s.isDshConnected,
+            hydratingDomains: s.hydratingDomains,
+            hostIsLocal: host.isLocal,
+            hostDirectMode: host.directMode,
+            hostNeedsAuth: host.needsAuth,
+            routableProvidersCount: s.routableProviders.length,
+          );
+        },
       ),
     );
     final ctrl = ref.read(appProvider.notifier);
@@ -712,50 +1004,57 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final showCordis = !showApproval && !showQuestion && state.activeCordisRequest != null;
     final hasTakeover = showApproval || showQuestion || showCordis;
     final showRiskPill = perm.risky && !hasTakeover && !state.isEmptyChat && !_plusOpen;
+    final showReadOnlyPill =
+        perm.id == 'read-only' && !hasTakeover && !state.isEmptyChat && !_plusOpen;
     final showPlanPill = state.planMode && !hasTakeover && !_plusOpen;
+    final showCompactNudgePill = state.contextPctHigh >= 80 &&
+        !_compactNudgeDismissed &&
+        !state.isStreaming &&
+        !state.isEmptyChat &&
+        !hasTakeover &&
+        !_plusOpen;
+    if (state.contextPctHigh < 80 && _compactNudgeDismissed) {
+      _compactNudgeDismissed = false;
+    }
+    final hasStatusPills = showRiskPill || showReadOnlyPill || showPlanPill || showCompactNudgePill;
     final screenW = MediaQuery.sizeOf(context).width;
     final isWide = screenW >= 540;
 
-    final filteredCommands = _mentionTrigger == '/'
-        ? state.slashCommands
-            .where((c) =>
-                c.command.toLowerCase().contains(_mentionQuery) ||
-                c.title.toLowerCase().contains(_mentionQuery))
-            .take(5)
-            .toList(growable: false)
-        : const <SlashCommandItem>[];
-    final filteredRefs = _mentionTrigger == '@'
-        ? () {
-            final seen = <String>{};
-            final list = <Map<String, String>>[];
-            for (final r in _remoteRefs) {
-              final p = r['path'] ?? '';
-              if (p.isNotEmpty && seen.add(p)) {
-                list.add(r);
-                if (list.length >= 6) break;
-              }
-            }
-            if (list.length < 6) {
-              for (final p in _getFlattenedFilePaths(state.workspaceFiles)) {
-                if (p.toLowerCase().contains(_mentionQuery) && seen.add(p)) {
-                  list.add({'path': p, 'kind': 'file'});
-                  if (list.length >= 6) break;
-                }
-              }
-            }
-            return list;
-          }()
-        : const <Map<String, String>>[];
-    _latestCommands = filteredCommands;
-    _latestRefs = filteredRefs;
+    if (hasTakeover && (_plusOpen || _mentionTrigger != null)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (_plusOpen) _setPlusOpen(false);
+        if (_mentionTrigger != null) {
+          setState(() {
+            _mentionTrigger = null;
+            _mentionQuery = '';
+            _activeSuggestionIdx = 0;
+          });
+          _syncSuggestionsNotifier(false);
+        }
+      });
+    }
     final showSuggestions = !hasTakeover &&
         !_plusOpen &&
         (_mentionTrigger == '/' || _mentionTrigger == '@');
+    if (!showSuggestions) {
+      _latestCommands = const [];
+      _latestRefs = const [];
+      if (widget.suggestionsOpenNotifier?.value == true) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _syncSuggestionsNotifier(false);
+        });
+      }
+    }
     final isHostNeedsAuth = !state.hostIsLocal &&
         (state.hostNeedsAuth || state.connectionPhase == ConnectionPhase.needsAuth);
-    final isHostConnecting = state.connectionPhase == ConnectionPhase.connecting;
+    final isHostConnecting = state.connectionPhase == ConnectionPhase.connecting ||
+        state.connectionPhase == ConnectionPhase.reconnecting ||
+        state.connectionPhase == ConnectionPhase.bootstrapping;
     final isHostConnected = state.isDshConnected &&
         state.connectionPhase == ConnectionPhase.connected;
+    final hasCachedModelWhileReconnecting =
+        state.connectionPhase == ConnectionPhase.reconnecting && state.hasAvailableModels;
     final isHydratingModels =
         isHostConnected && state.hydratingDomains && !state.hasAvailableModels;
     final needsModelConfig = isHostConnected &&
@@ -765,41 +1064,112 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
 
     final isDesktopPlatform = _isDesktopPlatform;
 
-    Widget buildScrollDroplet(bool showDroplet) {
+    Widget buildScrollDroplet(
+      bool showDroplet, {
+      bool hasNewBelow = false,
+      bool inlineWithPills = false,
+    }) {
+      final visible = showDroplet &&
+          !state.isEmptyChat &&
+          !_plusOpen &&
+          !hasTakeover &&
+          !showSuggestions;
+      final size = inlineWithPills ? 34.0 : 40.0;
+      final showActivityPill = state.isStreaming || hasNewBelow;
+      final pillLabel = state.isStreaming ? '正在回复' : '有新回复';
       return AnimatedSwitcher(
-        duration: const Duration(milliseconds: 190),
-        reverseDuration: const Duration(milliseconds: 140),
-        switchInCurve: Curves.easeOutCubic,
-        switchOutCurve: Curves.easeInCubic,
-        // Always pure GPU Fade + Scale so mid-fling droplet mount never allocates
-        // an offscreen GlassMaterialize saveLayer during chat scrolling.
+        duration: const Duration(milliseconds: 210),
+        reverseDuration: const Duration(milliseconds: 160),
+        switchInCurve: Curves.linear,
+        switchOutCurve: Curves.linear,
         transitionBuilder: (child, anim) {
-          return FadeTransition(
-            opacity: anim,
-            child: ScaleTransition(
-              scale: Tween<double>(begin: 0.82, end: 1.0).animate(anim),
-              alignment: Alignment.bottomRight,
-              child: child,
-            ),
+          return GrassBagMaterializeTransition(
+            animation: anim,
+            tier: state.glassTier,
+            alignment: Alignment.bottomRight,
+            scaleFrom: 0.86,
+            contentSigma: 3.5,
+            child: child,
           );
         },
-        child: showDroplet && !state.isEmptyChat && !_plusOpen && !hasTakeover
+        child: visible
             ? Padding(
-                key: const ValueKey('scroll-down-pill'),
-                padding: const EdgeInsets.only(bottom: 10),
+                key: ValueKey('scroll-down-${showActivityPill ? pillLabel : 'circle'}'),
+                padding: inlineWithPills
+                    ? const EdgeInsets.only(left: 8)
+                    : const EdgeInsets.only(bottom: 10),
                 child: Align(
                   alignment: Alignment.centerRight,
-                  child: GrassBagGlassCircleButton(
-                    icon: CupertinoIcons.chevron_down,
-                    size: 40,
-                    iconSize: 19,
-                    tooltip: '回到底部',
-                    tier: state.glassTier,
-                    onTap: () => widget.onScrollToBottom?.call(),
-                  ),
+                  child: showActivityPill
+                      ? GrassBagGlassPillButton(
+                          tier: state.glassTier,
+                          height: inlineWithPills ? 34 : 38,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          onTap: () => widget.onScrollToBottom?.call(),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              GrassBagStatusDot(
+                                color: t.primary,
+                                pulsing: state.isStreaming,
+                                size: 7,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                pillLabel,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.primary,
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              Icon(
+                                CupertinoIcons.chevron_down,
+                                size: 13.5,
+                                color: t.primary,
+                              ),
+                            ],
+                          ),
+                        )
+                      : GrassBagGlassCircleButton(
+                          icon: CupertinoIcons.chevron_down,
+                          size: size,
+                          iconSize: inlineWithPills ? 17 : 19,
+                          tooltip: '回到底部',
+                          tier: state.glassTier,
+                          onTap: () => widget.onScrollToBottom?.call(),
+                        ),
                 ),
               )
             : const SizedBox.shrink(key: ValueKey('scroll-down-empty')),
+      );
+    }
+
+    Widget scrollDropletWidget({bool inlineWithPills = false}) {
+      final showListen = widget.showScrollToBottomListenable;
+      final newListen = widget.hasNewBelowListenable;
+      if (showListen != null && newListen != null) {
+        return ListenableBuilder(
+          listenable: Listenable.merge([showListen, newListen]),
+          builder: (_, __) => buildScrollDroplet(
+            showListen.value,
+            hasNewBelow: newListen.value,
+            inlineWithPills: inlineWithPills,
+          ),
+        );
+      }
+      if (showListen != null) {
+        return ValueListenableBuilder<bool>(
+          valueListenable: showListen,
+          builder: (_, visible, __) =>
+              buildScrollDroplet(visible, inlineWithPills: inlineWithPills),
+        );
+      }
+      return buildScrollDroplet(
+        widget.showScrollToBottom,
+        hasNewBelow: newListen?.value ?? false,
+        inlineWithPills: inlineWithPills,
       );
     }
 
@@ -807,382 +1177,425 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       heightFactor: 1.0,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 680),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Floating Liquid Glass "Scroll to latest" droplet (pure GPU Scale+Fade, zero blur stall!)
-            if (widget.showScrollToBottomListenable != null)
-              ValueListenableBuilder<bool>(
-                valueListenable: widget.showScrollToBottomListenable!,
-                builder: (_, visible, __) => buildScrollDroplet(visible),
-              )
-            else
-              buildScrollDroplet(widget.showScrollToBottom),
+        child: LayoutBuilder(
+          builder: (context, dockBox) {
+            final maxDockH = dockBox.maxHeight.isFinite ? dockBox.maxHeight : 560.0;
+            final takeoverMaxH = math.min(
+              560.0,
+              math.max(160.0, maxDockH - (hasStatusPills ? 48.0 : 0.0)),
+            );
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Standalone floating "Scroll to latest" droplet when no status pill row is present.
+                // Kept OUTSIDE _ComposerHeightReporter so scrolling up never alters ListView tail height.
+                if (!hasStatusPills) scrollDropletWidget(),
 
-            // Docked live Goal & Todo status strip (isolated leaf Consumer: zero composer churn!)
-            if (!_plusOpen && !hasTakeover) const _LiveGoalTodoStrip(),
-
-            // Active Status Pills above Composer — batched in ONE GrassBagGlassBarLayer (zero extra GPU passes!)
-            AnimatedSize(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              clipBehavior: Clip.none,
-              child: (showRiskPill || showPlanPill)
-                  ? Padding(
-                      padding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: GrassBagGlassBarLayer(
-                          tier: state.glassTier,
-                          child: Wrap(
-                            spacing: 8,
-                            runSpacing: 6,
-                            children: [
-                              if (showPlanPill)
-                                GrassBagGlassPillButton(
-                                  tier: state.glassTier,
-                                  height: 34,
-                                  useOwnLayer: false,
-                                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                                  onTap: () => ctrl.setPlanMode(false),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(CupertinoIcons.list_bullet_indent,
-                                          size: 13.5, color: t.dusk),
-                                      const SizedBox(width: 6),
-                                      Text(
-                                        '计划模式',
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.dusk,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 5),
-                                      Icon(CupertinoIcons.xmark, size: 11, color: t.dusk),
-                                    ],
-                                  ),
-                                ),
-                              if (showRiskPill)
-                                GrassBagGlassPillButton(
-                                  tier: state.glassTier,
-                                  height: 34,
-                                  useOwnLayer: false,
-                                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                                  onTap: () => showPermissionSheet(context, ref),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(CupertinoIcons.exclamationmark_shield_fill,
-                                          size: 14, color: t.warn),
-                                      const SizedBox(width: 6),
-                                      Text(
-                                        perm.name,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.warn,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 2),
-                                      Icon(CupertinoIcons.chevron_right, size: 12, color: t.warn),
-                                    ],
-                                  ),
-                                ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    )
-                  : const SizedBox.shrink(),
-            ),
-
-            // Floating Liquid Glass `/` Slash Command & `@` File Reference suggestion strip
-            // Smoothly animates height + opacity/slide in and out without hard pop-in/out.
-            AnimatedSize(
-              duration: const Duration(milliseconds: 200),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.bottomCenter,
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 180),
-                reverseDuration: const Duration(milliseconds: 130),
-                switchInCurve: Curves.linear,
-                switchOutCurve: Curves.linear,
-                transitionBuilder: (child, anim) {
-                  final curved = CurvedAnimation(
-                    parent: anim,
-                    curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-                    reverseCurve: Curves.easeInCubic,
-                  );
-                  return FadeTransition(
-                    opacity: curved,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: const Offset(0, 0.08),
-                        end: Offset.zero,
-                      ).animate(curved),
-                      child: ScaleTransition(
-                        alignment: Alignment.bottomCenter,
-                        scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-                        child: child,
-                      ),
-                    ),
-                  );
-                },
-                child: showSuggestions
-                    ? Padding(
-                        key: ValueKey('suggestions-$_mentionTrigger'),
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: GlassBackdropGroup(
-                          enabled: false,
-                          child: GrassBagGlass(
-                            tier: state.glassTier,
-                            borderRadius: 22,
-                            elevated: true,
-                            useSheetSettings: true,
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                            child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              if (_mentionTrigger == '/' && filteredCommands.isEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                                  child: Text(
-                                    '未匹配到内置快捷指令，直接发送将交给 DSH 执行',
-                                    style: TextStyle(fontSize: 12, color: t.text3),
-                                  ),
-                                )
-                              else if (_mentionTrigger == '/')
-                                for (var ci = 0; ci < filteredCommands.length; ci++)
-                                  () {
-                                    final cmd = filteredCommands[ci];
-                                    final active = ci ==
-                                        _activeSuggestionIdx.clamp(0, filteredCommands.length - 1);
-                                    final isInstant = const {
-                                      '/compact',
-                                      '/new',
-                                      '/plan',
-                                      '/fork',
-                                      '/export',
-                                      '/status',
-                                    }.contains(cmd.command);
-                                    return GrassBagSpringTap(
-                                      onTap: () => _applySuggestion(
-                                        cmd.command,
-                                        executeImmediately: isInstant,
-                                      ),
-                                      child: Container(
-                                        decoration: BoxDecoration(
-                                          color: active ? t.fill1 : Colors.transparent,
-                                          borderRadius: BorderRadius.circular(11),
-                                        ),
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 8,
-                                          vertical: 7,
-                                        ),
-                                        child: Row(
-                                          children: [
-                                            Container(
-                                              padding: const EdgeInsets.symmetric(
-                                                horizontal: 7,
-                                                vertical: 2,
-                                              ),
-                                              decoration: BoxDecoration(
-                                                color: t.primarySoft,
-                                                borderRadius: BorderRadius.circular(7),
-                                              ),
-                                              child: Text(
-                                                cmd.command,
-                                                style: TextStyle(
-                                                  fontFamily: 'monospace',
-                                                  fontSize: 12,
-                                                  fontWeight: FontWeight.w600,
-                                                  color: t.primary,
-                                                ),
-                                              ),
-                                            ),
-                                            const SizedBox(width: 9),
-                                            Expanded(
-                                              child: Text(
-                                                '${cmd.title} · ${cmd.desc}',
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(fontSize: 12.5, color: t.text2),
-                                              ),
-                                            ),
-                                            if (isInstant) ...[
-                                              const SizedBox(width: 6),
-                                              Container(
-                                                padding: const EdgeInsets.symmetric(
-                                                  horizontal: 6,
-                                                  vertical: 2,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color: t.fill2,
-                                                  borderRadius: BorderRadius.circular(999),
-                                                ),
-                                                child: Text(
-                                                  '直达',
-                                                  style: TextStyle(
-                                                    fontSize: 10,
-                                                    fontWeight: FontWeight.w600,
-                                                    color: t.text3,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ],
-                                        ),
-                                      ),
-                                    );
-                                  }()
-                              else if (filteredRefs.isEmpty)
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      if (_loadingRefs) ...[
-                                        CupertinoActivityIndicator(radius: 6.5, color: t.primary),
-                                        const SizedBox(width: 8),
+                // Single Flexible slot shared by `/` & `@` suggestions and the `+` Deck (mutually exclusive)
+                // so the active overlay receives 100% of available height above the composer pill without
+                // RenderFlex dividing free space across multiple Flexible siblings.
+                Flexible(
+                  fit: FlexFit.loose,
+                  child: Stack(
+                    alignment: Alignment.bottomCenter,
+                    clipBehavior: Clip.none,
+                    children: [
+                      AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              reverseDuration: const Duration(milliseconds: 130),
+              switchInCurve: Curves.linear,
+              switchOutCurve: Curves.linear,
+              transitionBuilder: (child, anim) => _ComposerSlideMaterialize(
+                animation: anim,
+                tier: state.glassTier,
+                beginOffset: const Offset(0, 0.06),
+                scaleFrom: 0.95,
+                contentSigma: 4.0,
+                child: child,
+              ),
+              child: showSuggestions
+                  ? ValueListenableBuilder<int>(
+                      key: ValueKey('suggestions-$_mentionTrigger'),
+                      valueListenable: _suggestionTickNotifier,
+                      builder: (context, _, __) {
+                        final filteredCommands = _mentionTrigger == '/'
+                            ? state.slashCommands
+                                .where((c) =>
+                                    _mentionQuery.isEmpty ||
+                                    c.command.toLowerCase().contains(_mentionQuery) ||
+                                    c.title.toLowerCase().contains(_mentionQuery) ||
+                                    c.desc.toLowerCase().contains(_mentionQuery) ||
+                                    c.category.toLowerCase().contains(_mentionQuery))
+                                .take(24)
+                                .toList(growable: false)
+                            : const <SlashCommandItem>[];
+                        final filteredRefs = _mentionTrigger == '@'
+                            ? () {
+                                final seen = <String>{};
+                                final list = <Map<String, String>>[];
+                                for (final r in _remoteRefs) {
+                                  final p = r['path'] ?? '';
+                                  final lbl = r['label'] ?? '';
+                                  final matchesQ = _mentionQuery.isEmpty ||
+                                      p.toLowerCase().contains(_mentionQuery) ||
+                                      lbl.toLowerCase().contains(_mentionQuery);
+                                  if (p.isNotEmpty && matchesQ && seen.add(p)) {
+                                    list.add(r);
+                                    if (list.length >= 24) break;
+                                  }
+                                }
+                                if (list.length < 24) {
+                                  for (final p in _getFlattenedFilePaths(state.workspaceFiles)) {
+                                    if (p.toLowerCase().contains(_mentionQuery) && seen.add(p)) {
+                                      list.add({'path': p, 'kind': 'file'});
+                                      if (list.length >= 24) break;
+                                    }
+                                  }
+                                }
+                                return list;
+                              }()
+                            : const <Map<String, String>>[];
+                        _latestCommands = filteredCommands;
+                        _latestRefs = filteredRefs;
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: GlassBackdropGroup(
+                            enabled: false,
+                            child: GrassBagGlass(
+                              tier: state.glassTier,
+                              borderRadius: 22,
+                              elevated: true,
+                              useSheetSettings: true,
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(8, 0, 2, 4),
+                                    child: Row(
+                                      children: [
                                         Text(
-                                          '正在搜索工作区文件与引用…',
-                                          style: TextStyle(fontSize: 12, color: t.text3),
-                                        ),
-                                      ] else
-                                        Expanded(
-                                          child: Text(
-                                            state.activeWorkspace.isEmpty
-                                                ? '暂未选择工作区，请先选择工作区后可用 @ 引用文件'
-                                                : '未找到匹配文件，可继续输入路径关键词',
-                                            style: TextStyle(fontSize: 12, color: t.text3),
+                                          _mentionTrigger == '/'
+                                              ? '快捷指令${filteredCommands.isNotEmpty ? ' (${filteredCommands.length})' : ''}'
+                                              : '引用文件与会话${filteredRefs.isNotEmpty ? ' (${filteredRefs.length})' : ''}',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.text3,
                                           ),
                                         ),
-                                    ],
+                                        if (_mentionTrigger == '@' && _loadingRefs) ...[
+                                          const SizedBox(width: 7),
+                                          CupertinoActivityIndicator(radius: 5.5, color: t.primary),
+                                        ],
+                                        const Spacer(),
+                                        GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onTap: _dismissSuggestions,
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(4),
+                                            child: Icon(
+                                              CupertinoIcons.xmark,
+                                              size: 13,
+                                              color: t.text3,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                )
-                              else
-                                for (var ri = 0; ri < filteredRefs.length; ri++)
-                                  () {
-                                    final refItem = filteredRefs[ri];
-                                    final active = ri ==
-                                        _activeSuggestionIdx.clamp(0, filteredRefs.length - 1);
-                                    return GrassBagSpringTap(
-                                      onTap: () => _applySuggestion(
-                                        refItem['path'] ?? '',
-                                        refItem: refItem,
-                                      ),
-                                      child: Container(
-                                        decoration: BoxDecoration(
-                                          color: active ? t.fill1 : Colors.transparent,
-                                          borderRadius: BorderRadius.circular(11),
-                                        ),
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 8,
-                                          vertical: 7,
-                                        ),
-                                        child: Row(
+                                  Flexible(
+                                    fit: FlexFit.loose,
+                                    child: ConstrainedBox(
+                                      constraints: const BoxConstraints(maxHeight: 220),
+                                      child: SingleChildScrollView(
+                                        controller: _suggestionScrollCtrl,
+                                        physics: const BouncingScrollPhysics(),
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          crossAxisAlignment: CrossAxisAlignment.stretch,
                                           children: [
-                                            Icon(
-                                              refItem['kind'] == 'session'
-                                                  ? CupertinoIcons.chat_bubble_text_fill
-                                                  : CupertinoIcons.doc_text_fill,
-                                              size: 14,
-                                              color: refItem['kind'] == 'session'
-                                                  ? t.dusk
-                                                  : t.primary,
-                                            ),
-                                            const SizedBox(width: 8),
-                                            Expanded(
-                                              child: Text(
-                                                refItem['label']?.isNotEmpty == true
-                                                    ? '${refItem['label']} (${refItem['path']})'
-                                                    : (refItem['path'] ?? ''),
-                                                maxLines: 1,
-                                                overflow: TextOverflow.ellipsis,
-                                                style: TextStyle(
-                                                  fontFamily: refItem['kind'] == 'session'
-                                                      ? null
-                                                      : 'monospace',
-                                                  fontSize: 12.5,
-                                                  color: t.text,
+                                            if (_mentionTrigger == '/' && filteredCommands.isEmpty)
+                                              Padding(
+                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                                                child: Text(
+                                                  '未匹配到内置快捷指令，直接发送将交给 DSH 执行',
+                                                  style: TextStyle(fontSize: 12, color: t.text3),
                                                 ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
+                                              )
+                                            else if (_mentionTrigger == '/')
+                                              for (var ci = 0; ci < filteredCommands.length; ci++)
+                                                () {
+                                                  final cmd = filteredCommands[ci];
+                                                  final active = ci ==
+                                                      _activeSuggestionIdx.clamp(0, filteredCommands.length - 1);
+                                                  final isInstant = const {'/new', '/plan', '/status'}.contains(cmd.command) ||
+                                                      (!state.isEmptyChat &&
+                                                          const {'/fork', '/export'}.contains(cmd.command));
+                                                  final isSkill = cmd.command.startsWith('/skill:');
+                                                  final subtitle = cmd.desc.trim().isEmpty
+                                                      ? cmd.title
+                                                      : (cmd.title.trim().isEmpty
+                                                          ? cmd.desc
+                                                          : '${cmd.title} · ${cmd.desc}');
+                                                  return GrassBagSpringTap(
+                                                    onTap: () => _applySuggestion(
+                                                      cmd.command,
+                                                      executeImmediately: isInstant,
+                                                    ),
+                                                    child: Container(
+                                                      decoration: BoxDecoration(
+                                                        color: active ? t.fill1 : Colors.transparent,
+                                                        borderRadius: BorderRadius.circular(11),
+                                                      ),
+                                                      padding: const EdgeInsets.symmetric(
+                                                        horizontal: 8,
+                                                        vertical: 7,
+                                                      ),
+                                                      child: Row(
+                                                        children: [
+                                                          Container(
+                                                            padding: const EdgeInsets.symmetric(
+                                                              horizontal: 7,
+                                                              vertical: 2,
+                                                            ),
+                                                            decoration: BoxDecoration(
+                                                              color: isSkill ? t.okSoft : t.primarySoft,
+                                                              borderRadius: BorderRadius.circular(7),
+                                                            ),
+                                                            child: Text(
+                                                              cmd.command,
+                                                              style: TextStyle(
+                                                                fontFamily: 'monospace',
+                                                                fontSize: 12,
+                                                                fontWeight: FontWeight.w600,
+                                                                color: isSkill ? t.ok : t.primary,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          const SizedBox(width: 9),
+                                                          Expanded(
+                                                            child: Text(
+                                                              subtitle,
+                                                              maxLines: 1,
+                                                              overflow: TextOverflow.ellipsis,
+                                                              style: TextStyle(fontSize: 12.5, color: t.text2),
+                                                            ),
+                                                          ),
+                                                          if (isInstant) ...[
+                                                            const SizedBox(width: 6),
+                                                            Container(
+                                                              padding: const EdgeInsets.symmetric(
+                                                                horizontal: 6,
+                                                                vertical: 2,
+                                                              ),
+                                                              decoration: BoxDecoration(
+                                                                color: t.fill2,
+                                                                borderRadius: BorderRadius.circular(999),
+                                                              ),
+                                                              child: Text(
+                                                                '直达',
+                                                                style: TextStyle(
+                                                                  fontSize: 10,
+                                                                  fontWeight: FontWeight.w600,
+                                                                  color: t.text3,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  );
+                                                }()
+                                            else if (filteredRefs.isEmpty)
+                                              Padding(
+                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                                                child: Row(
+                                                  children: [
+                                                    if (_loadingRefs) ...[
+                                                      CupertinoActivityIndicator(radius: 6.5, color: t.primary),
+                                                      const SizedBox(width: 8),
+                                                      Text(
+                                                        '正在搜索工作区文件与引用…',
+                                                        style: TextStyle(fontSize: 12, color: t.text3),
+                                                      ),
+                                                    ] else ...[
+                                                      Expanded(
+                                                        child: Text(
+                                                          state.activeWorkspace.isEmpty
+                                                              ? '暂未选择工作区，选择后可用 @ 引用文件'
+                                                              : '未找到匹配文件，可继续输入路径关键词',
+                                                          style: TextStyle(fontSize: 12, color: t.text3),
+                                                        ),
+                                                      ),
+                                                      if (state.activeWorkspace.isEmpty) ...[
+                                                        const SizedBox(width: 8),
+                                                        GrassBagSpringTap(
+                                                          onTap: () {
+                                                            _dismissSuggestions();
+                                                            showWorkspaceSheet(context, ref);
+                                                          },
+                                                          child: Container(
+                                                            padding: const EdgeInsets.symmetric(
+                                                              horizontal: 9,
+                                                              vertical: 4,
+                                                            ),
+                                                            decoration: BoxDecoration(
+                                                              color: t.primarySoft,
+                                                              borderRadius: BorderRadius.circular(999),
+                                                            ),
+                                                            child: Text(
+                                                              '选择工作区',
+                                                              style: TextStyle(
+                                                                fontSize: 11.5,
+                                                                fontWeight: FontWeight.w600,
+                                                                color: t.primary,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ],
+                                                  ],
+                                                ),
+                                              )
+                                          else
+                                            for (var ri = 0; ri < filteredRefs.length; ri++)
+                                              () {
+                                                final refItem = filteredRefs[ri];
+                                                final active = ri ==
+                                                    _activeSuggestionIdx.clamp(0, filteredRefs.length - 1);
+                                                return GrassBagSpringTap(
+                                                  onTap: () => _applySuggestion(
+                                                    refItem['path'] ?? '',
+                                                    refItem: refItem,
+                                                  ),
+                                                  child: Container(
+                                                    decoration: BoxDecoration(
+                                                      color: active ? t.fill1 : Colors.transparent,
+                                                      borderRadius: BorderRadius.circular(11),
+                                                    ),
+                                                    padding: const EdgeInsets.symmetric(
+                                                      horizontal: 8,
+                                                      vertical: 7,
+                                                    ),
+                                                    child: Row(
+                                                      children: [
+                                                        Icon(
+                                                          refItem['kind'] == 'session'
+                                                              ? CupertinoIcons.chat_bubble_text_fill
+                                                              : CupertinoIcons.doc_text_fill,
+                                                          size: 14,
+                                                          color: refItem['kind'] == 'session'
+                                                              ? t.dusk
+                                                              : t.primary,
+                                                        ),
+                                                        const SizedBox(width: 8),
+                                                        Expanded(
+                                                          child: Text(
+                                                            refItem['label']?.isNotEmpty == true
+                                                                ? '${refItem['label']} (${refItem['path']})'
+                                                                : (refItem['path'] ?? ''),
+                                                            maxLines: 1,
+                                                            overflow: TextOverflow.ellipsis,
+                                                            style: TextStyle(
+                                                              fontFamily: refItem['kind'] == 'session'
+                                                                  ? null
+                                                                  : 'monospace',
+                                                              fontSize: 12.5,
+                                                              color: t.text,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                );
+                                              }(),
+                                        ],
                                       ),
-                                    );
-                                  }(),
-                            ],
+                                    ),
+                                  ),
+                                ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    )
+                  : const SizedBox.shrink(key: ValueKey('suggestions-empty')),
+            ),
+
+            // Spring-Animated Floating Liquid Glass '+' Deck directly above composer.
+            // Pure GPU scale+translate+fade at fixed layout bounds (NO Align heightFactor thrash
+            // and NO ClipRRect shearing outer glass shadows mid-flight!).
+            if (!hasTakeover)
+              ListenableBuilder(
+                  listenable: _plusSpring,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: isWide ? 344.0 : double.infinity,
+                    ),
+                    child: RepaintBoundary(
+                      child: GlassBackdropGroup(
+                        enabled: false,
+                        child: GrassBagGlass(
+                          tier: state.glassTier,
+                          borderRadius: 26,
+                          elevated: true,
+                          useSheetSettings: true,
+                          child: SingleChildScrollView(
+                            primary: false,
+                            child: _PlusDeckContent(
+                              onClose: () => _setPlusOpen(false),
+                              onOpenTerminal: widget.onOpenTerminal,
+                            ),
                           ),
                         ),
                       ),
-                    )
-                    : const SizedBox.shrink(key: ValueKey('suggestions-empty')),
-              ),
-            ),
-
-            // Spring-Animated Floating Liquid Glass '+' Deck directly above composer
-            // Hoisted static child inside ListenableBuilder -> ZERO rebuilds of _PlusDeckContent at 120Hz!
-            if (!hasTakeover)
-              ListenableBuilder(
-                listenable: _plusSpring,
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxWidth: isWide ? 344.0 : double.infinity,
+                    ),
                   ),
-                  child: RepaintBoundary(
-                    child: GlassBackdropGroup(
-                      enabled: false,
-                      child: GrassBagGlass(
-                        tier: state.glassTier,
-                        borderRadius: 26,
-                        elevated: true,
-                        useSheetSettings: true,
-                        child: _PlusDeckContent(
-                          onClose: () => _setPlusOpen(false),
-                          onOpenTerminal: widget.onOpenTerminal,
+                  builder: (ctx, staticDeck) {
+                    final raw = _plusSpring.value;
+                    if (raw <= 0.005 && !_plusOpen) return const SizedBox.shrink();
+                    final v = raw.clamp(0.0, 1.0);
+                    final scale = (0.92 + 0.08 * raw).clamp(0.88, 1.02);
+                    return IgnorePointer(
+                      ignoring: !_plusOpen,
+                      child: Align(
+                        alignment: Alignment.bottomLeft,
+                        heightFactor: 1.0,
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: FadeTransition(
+                            opacity: AlwaysStoppedAnimation<double>(v),
+                            child: Transform.translate(
+                              offset: Offset(0, (1.0 - v) * 16.0),
+                              child: Transform.scale(
+                                scale: scale,
+                                alignment: Alignment.bottomLeft,
+                                child: GrassBagMaterializeScope(
+                                  progress: v,
+                                  child: staticDeck!,
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
-                    ),
-                  ),
+                    );
+                  },
                 ),
-                builder: (ctx, staticDeck) {
-                  final raw = _plusSpring.value;
-                  if (raw <= 0.005 && !_plusOpen) return const SizedBox.shrink();
-                  final v = raw.clamp(0.0, 1.0);
-                  final scale = 0.94 + 0.06 * raw;
-                  final deckCard = Transform.translate(
-                    offset: Offset(0, (1.0 - v) * 12.0),
-                    child: Transform.scale(
-                      scale: scale.clamp(0.90, 1.02),
-                      alignment: Alignment.bottomLeft,
-                      child: staticDeck,
-                    ),
-                  );
-                  final aligned = Align(
-                    alignment: Alignment.bottomLeft,
-                    heightFactor: v,
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: deckCard,
-                    ),
-                  );
-                  // Keep ClipRect mounted at fixed tree depth across the spring so _PlusDeckContent
-                  // never remounts mid-flight, disabling clip at rest so elevated drop shadows show cleanly.
-                  return ClipRect(
-                    clipBehavior: v < 0.999 ? Clip.hardEdge : Clip.none,
-                    child: aligned,
-                  );
-                },
-              ),
+              ],
+            ),
+          ),
 
-            // Smooth Transition between Elevated Liquid Glass Approval Card & Floating Composer.
-            // Deliberately avoid wrapping `composer-pill` in `AnimatedSize` so multi-line text
-            // wrapping performs ONE layout pass instead of 24 consecutive `toImageSync` frames!
+            // Persistent Bottom Dock measured as ONE unit (Goal/Todo strip + active mode pills + composer/takeover)
+            // so ListView tail spacer, bottom progressive scrim, and toast anchor NEVER overlap chat text!
             _ComposerHeightReporter(
               onHeightChanged: (h) {
                 final n = widget.composerHeightNotifier;
@@ -1190,10 +1603,168 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   n.value = h;
                 }
               },
-              child: AnimatedSwitcher(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // Docked live Goal & Todo status strip (isolated leaf Consumer: zero composer churn!)
+                  if (!_plusOpen && !hasTakeover) const _LiveGoalTodoStrip(),
+
+                  // Active Status Pills row (shares horizontal row with scroll-to-bottom droplet!)
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutCubic,
+                    alignment: Alignment.bottomCenter,
+                    clipBehavior: Clip.none,
+                    child: hasStatusPills
+                        ? Padding(
+                            padding: const EdgeInsets.fromLTRB(6, 4, 6, 8),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Expanded(
+                                  child: Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: GrassBagGlassBarLayer(
+                                      tier: state.glassTier,
+                                      child: Wrap(
+                                        spacing: 8,
+                                        runSpacing: 6,
+                                        children: [
+                                          if (showCompactNudgePill)
+                                            GrassBagGlassPillButton(
+                                              tier: state.glassTier,
+                                              height: 34,
+                                              useOwnLayer: false,
+                                              padding: const EdgeInsets.only(left: 11, right: 6),
+                                              onTap: () => unawaited(ctrl.compactContext()),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(
+                                                    CupertinoIcons.arrow_down_right_arrow_up_left,
+                                                    size: 13,
+                                                    color: state.contextPctHigh >= 90 ? t.err : t.warn,
+                                                  ),
+                                                  const SizedBox(width: 5),
+                                                  Text(
+                                                    '上下文 ${state.contextPctHigh}% · 精简',
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      fontWeight: FontWeight.w600,
+                                                      fontFeatures: const [FontFeature.tabularFigures()],
+                                                      color: state.contextPctHigh >= 90 ? t.err : t.warn,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 4),
+                                                  GestureDetector(
+                                                    behavior: HitTestBehavior.opaque,
+                                                    onTap: () => setState(() => _compactNudgeDismissed = true),
+                                                    child: Padding(
+                                                      padding: const EdgeInsets.all(4),
+                                                      child: Icon(CupertinoIcons.xmark, size: 11, color: t.text3),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          if (showPlanPill)
+                                            GrassBagGlassPillButton(
+                                              tier: state.glassTier,
+                                              height: 34,
+                                              useOwnLayer: false,
+                                              padding: const EdgeInsets.symmetric(horizontal: 12),
+                                              onTap: () => ctrl.setPlanMode(false),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(CupertinoIcons.list_bullet_indent,
+                                                      size: 13.5, color: t.dusk),
+                                                  const SizedBox(width: 6),
+                                                  Text(
+                                                    '计划模式',
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.dusk,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 5),
+                                                  Icon(CupertinoIcons.xmark, size: 11, color: t.dusk),
+                                                ],
+                                              ),
+                                            ),
+                                          if (showRiskPill)
+                                            GrassBagGlassPillButton(
+                                              tier: state.glassTier,
+                                              height: 34,
+                                              useOwnLayer: false,
+                                              padding: const EdgeInsets.symmetric(horizontal: 12),
+                                              onTap: () => showPermissionSheet(context, ref),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(CupertinoIcons.exclamationmark_shield_fill,
+                                                      size: 14, color: t.warn),
+                                                  const SizedBox(width: 6),
+                                                  Text(
+                                                    perm.name,
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.warn,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 2),
+                                                  Icon(CupertinoIcons.chevron_right, size: 12, color: t.warn),
+                                                ],
+                                              ),
+                                            ),
+                                          if (showReadOnlyPill)
+                                            GrassBagGlassPillButton(
+                                              tier: state.glassTier,
+                                              height: 34,
+                                              useOwnLayer: false,
+                                              padding: const EdgeInsets.symmetric(horizontal: 12),
+                                              onTap: () => showPermissionSheet(context, ref),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(CupertinoIcons.lock_shield_fill,
+                                                      size: 13.5, color: t.text2),
+                                                  const SizedBox(width: 6),
+                                                  Text(
+                                                    perm.name,
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.text2,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 2),
+                                                  Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                                                ],
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                scrollDropletWidget(inlineWithPills: true),
+                              ],
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+
+                  // Smooth Transition between Elevated Liquid Glass Approval Card & Floating Composer.
+                  // Deliberately avoid wrapping `composer-pill` in `AnimatedSize` so multi-line text
+                  // wrapping performs ONE layout pass instead of 24 consecutive `toImageSync` frames!
+                  AnimatedSwitcher(
                 duration: const Duration(milliseconds: 200),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
+                switchInCurve: Curves.linear,
+                switchOutCurve: Curves.linear,
                 layoutBuilder: (currentChild, previousChildren) => Stack(
                   alignment: Alignment.bottomCenter,
                   children: [
@@ -1201,154 +1772,42 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                     if (currentChild != null) currentChild,
                   ],
                 ),
-                transitionBuilder: (child, anim) {
-                  return FadeTransition(
-                    opacity: anim,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: const Offset(0, 0.06),
-                        end: Offset.zero,
-                      ).animate(anim),
-                      child: ScaleTransition(
-                        alignment: Alignment.bottomCenter,
-                        scale: Tween<double>(begin: 0.97, end: 1.0).animate(anim),
-                        child: child,
-                      ),
-                    ),
-                  );
-                },
+                transitionBuilder: (child, anim) => _ComposerSlideMaterialize(
+                  animation: anim,
+                  tier: state.glassTier,
+                  beginOffset: const Offset(0, 0.05),
+                  scaleFrom: 0.96,
+                  contentSigma: 4.5,
+                  child: child,
+                ),
                 child: showApproval
-                  ? GlassBackdropGroup(
-                      key: const ValueKey('approval-card'),
-                      enabled: false,
-                      child: GrassBagGlass(
+                  ? _ApprovalTakeoverCard(
+                      key: ValueKey('approval-${state.pendingApprovalInteractionId ?? 'none'}'),
+                      command: state.pendingApprovalCommand!,
+                      toolName: state.pendingApprovalToolName,
+                      workspaceName: state.activeWorkspace,
+                      isDirectMode: state.hostDirectMode,
+                      pendingCount: state.activePendingInteractionCount,
+                      maxHeight: takeoverMaxH,
                       tier: state.glassTier,
-                      borderRadius: 28,
-                      elevated: true,
-                      useSheetSettings: true,
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                            Row(
-                              children: [
-                                GrassBagSquircleIcon(
-                                  icon: (state.pendingApprovalCommand ?? '').contains('phone_')
-                                      ? CupertinoIcons.device_phone_portrait
-                                      : CupertinoIcons.shield_lefthalf_fill,
-                                  color: (state.pendingApprovalCommand ?? '').contains('phone_')
-                                      ? t.primary
-                                      : t.warn,
-                                  size: 36,
-                                  iconSize: 18,
-                                ),
-                                const SizedBox(width: 11),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        (state.pendingApprovalCommand ?? '').contains('phone_')
-                                            ? '请求操控手机'
-                                            : '请求执行命令',
-                                        style: TextStyle(
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w600,
-                                          letterSpacing: -0.2,
-                                          color: t.text,
-                                        ),
-                                      ),
-                                      Text(
-                                        (state.pendingApprovalCommand ?? '').contains('phone_')
-                                            ? '无障碍操控确认 · 可在手机操控设置中调整策略'
-                                            : '工作区：${state.activeWorkspace}',
-                                        style: TextStyle(fontSize: 12, color: t.text3),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          const SizedBox(height: 12),
-                          Container(
-                            constraints: const BoxConstraints(maxHeight: 160),
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: t.codeBg,
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.09),
-                                width: 0.6,
-                              ),
-                            ),
-                            child: SingleChildScrollView(
-                              child: SelectableText(
-                                state.pendingApprovalCommand!,
-contextMenuBuilder: buildGrassBagEditableContextMenu,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 12,
-                                  height: 1.45,
-                                  color: t.codeFg,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 14),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: GrassBagSecondaryGlassButton(
-                                  label: '拒绝',
-                                  height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                                  tier: state.glassTier,
-                                  insideGlass: true,
-                                  destructive: true,
-                                  onTap: () => ctrl.resolveApproval('deny'),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Expanded(
-                                child: GrassBagSecondaryGlassButton(
-                                  label: '本会话允许',
-                                  height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                                  tier: state.glassTier,
-                                  insideGlass: true,
-                                  onTap: () => ctrl.resolveApproval('always'),
-                                ),
-                              ),
-                              const SizedBox(width: 6),
-                              Expanded(
-                                child: GrassBagPrimaryGlassButton(
-                                  label: '允许一次',
-                                  height: 40,
-                                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                                  tier: state.glassTier,
-                                  insideGlass: true,
-                                  onTap: () => ctrl.resolveApproval('allow'),
-                                ),
-                              ),
-                            ],
-                          ),
-                          ],
-                        ),
-                      ),
+                      onDecision: ctrl.resolveApproval,
                     )
                   : showQuestion
                       ? _UserQuestionTakeoverCard(
                           key: ValueKey('question-${state.activeQuestion!.interactionId}'),
                           question: state.activeQuestion!,
+                          pendingCount: state.activePendingInteractionCount,
+                          maxHeight: takeoverMaxH,
                           tier: state.glassTier,
                           onSubmit: ctrl.resolveUserQuestion,
-                          onCancel: () => ctrl.cancelStreaming(),
+                          onCancel: () => unawaited(ctrl.skipUserQuestion()),
                         )
                       : showCordis
                           ? _CordisRunTakeoverCard(
                               key: ValueKey('cordis-${state.activeCordisRequest!.interactionId}'),
                               request: state.activeCordisRequest!,
+                              pendingCount: state.activePendingInteractionCount,
+                              maxHeight: takeoverMaxH,
                               tier: state.glassTier,
                               onDecision: ctrl.resolveCordisRun,
                             )
@@ -1361,21 +1820,110 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                               child: Column(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  AnimatedSize(
-                                    duration: const Duration(milliseconds: 160),
-                                    curve: Curves.easeOutCubic,
-                                    alignment: Alignment.bottomCenter,
-                                    child: state.pendingAttachments.isEmpty
-                                        ? const SizedBox.shrink()
-                                        : SizedBox(
+                                  if (widget.editingContextNotifier != null)
+                                    ValueListenableBuilder<EditingMessageContext?>(
+                                      valueListenable: widget.editingContextNotifier!,
+                                      builder: (_, editCtx, __) {
+                                        if (editCtx == null) return const SizedBox.shrink();
+                                        return Padding(
+                                          padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: t.primarySoft,
+                                              borderRadius: BorderRadius.circular(12),
+                                              border: Border.all(
+                                                color: t.primary.withValues(alpha: 0.25),
+                                                width: 0.6,
+                                              ),
+                                            ),
+                                            child: Row(
+                                              children: [
+                                                Icon(
+                                                  CupertinoIcons.pencil,
+                                                  size: 13,
+                                                  color: t.primary,
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Expanded(
+                                                  child: Text(
+                                                    '正在编辑：${editCtx.originalText.replaceAll('\n', ' ')}',
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 11.5,
+                                                      fontWeight: FontWeight.w500,
+                                                      color: t.primary,
+                                                    ),
+                                                  ),
+                                                ),
+                                                if (editCtx.canForkBefore) ...[
+                                                  const SizedBox(width: 6),
+                                                  GestureDetector(
+                                                    behavior: HitTestBehavior.opaque,
+                                                    onTap: () {
+                                                      HapticFeedback.selectionClick();
+                                                      setState(() => _editBranchResend = !_editBranchResend);
+                                                    },
+                                                    child: Container(
+                                                      padding: const EdgeInsets.symmetric(
+                                                        horizontal: 7,
+                                                        vertical: 2.5,
+                                                      ),
+                                                      decoration: BoxDecoration(
+                                                        color: _editBranchResend
+                                                            ? t.primary.withValues(alpha: 0.16)
+                                                            : t.fill1,
+                                                        borderRadius: BorderRadius.circular(999),
+                                                      ),
+                                                      child: Text(
+                                                        _editBranchResend ? '分支重发' : '末尾重发',
+                                                        style: TextStyle(
+                                                          fontSize: 10.5,
+                                                          fontWeight: FontWeight.w600,
+                                                          color: _editBranchResend ? t.primary : t.text3,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                                const SizedBox(width: 4),
+                                                GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onTap: _cancelEditingMessage,
+                                                  child: SizedBox(
+                                                    width: 24,
+                                                    height: 24,
+                                                    child: Center(
+                                                      child: Icon(
+                                                        CupertinoIcons.xmark,
+                                                        size: 13,
+                                                        color: t.primary,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  // Avoid inner AnimatedSize inside `composer-pill` GrassBagGlass so attaching/removing
+                                  // files or popping queued messages never triggers 20 consecutive toImageSync GPU stalls!
+                                  if (state.pendingAttachments.isNotEmpty)
+                                    SizedBox(
                                             height: state.pendingAttachments.any(
                                               (a) => a.isImage && a.bytes != null && a.bytes!.isNotEmpty,
                                             )
-                                                ? 58
+                                                ? 62
                                                 : 38,
                                             child: ListView.separated(
                                               scrollDirection: Axis.horizontal,
-                                              padding: const EdgeInsets.fromLTRB(6, 6, 10, 4),
+                                              padding: const EdgeInsets.fromLTRB(6, 9, 10, 4),
                                               itemCount: state.pendingAttachments.length,
                                               separatorBuilder: (_, __) => const SizedBox(width: 8),
                                               itemBuilder: (_, idx) {
@@ -1383,140 +1931,175 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                                 final hasImgBytes =
                                                     att.isImage && att.bytes != null && att.bytes!.isNotEmpty;
                                                 if (hasImgBytes) {
-                                                  return Stack(
-                                                    clipBehavior: Clip.none,
-                                                    children: [
-                                                      GestureDetector(
-                                                        onTap: () => showImagePreviewDialog(
-                                                          context,
-                                                          bytes: att.bytes,
-                                                          title: att.name,
-                                                        ),
-                                                        child: Container(
-                                                          width: 44,
-                                                          height: 44,
-                                                          decoration: BoxDecoration(
-                                                            borderRadius: BorderRadius.circular(11),
-                                                            border: Border.all(
-                                                              color: t.primary.withValues(alpha: 0.35),
-                                                              width: 0.8,
+                                                  // Keep the 28x28 remove badge 100% INSIDE the 52x52
+                                                  // Stack hit-test bounds so the entire badge is tappable!
+                                                  return SizedBox(
+                                                    width: 52,
+                                                    height: 52,
+                                                    child: Stack(
+                                                      children: [
+                                                        Positioned(
+                                                          left: 0,
+                                                          bottom: 0,
+                                                          child: GestureDetector(
+                                                            onTap: () => showImagePreviewDialog(
+                                                              context,
+                                                              bytes: att.bytes,
+                                                              title: att.name,
+                                                            ),
+                                                            child: Container(
+                                                              width: 44,
+                                                              height: 44,
+                                                              decoration: BoxDecoration(
+                                                                borderRadius: BorderRadius.circular(11),
+                                                                border: Border.all(
+                                                                  color: t.primary.withValues(alpha: 0.35),
+                                                                  width: 0.8,
+                                                                ),
+                                                              ),
+                                                              clipBehavior: Clip.antiAlias,
+                                                              child: Image.memory(
+                                                                att.bytes!,
+                                                                cacheWidth: 132,
+                                                                fit: BoxFit.cover,
+                                                                gaplessPlayback: true,
+                                                                errorBuilder: (_, __, ___) => Center(
+                                                                  child: Icon(
+                                                                    CupertinoIcons.photo_fill,
+                                                                    size: 16,
+                                                                    color: t.primary,
+                                                                  ),
+                                                                ),
+                                                              ),
                                                             ),
                                                           ),
-                                                          clipBehavior: Clip.antiAlias,
-                                                          child: Image.memory(
-                                                            att.bytes!,
-                                                            cacheWidth: 132,
-                                                            fit: BoxFit.cover,
-                                                            gaplessPlayback: true,
-                                                            errorBuilder: (_, __, ___) => Center(
-                                                              child: Icon(
-                                                                CupertinoIcons.photo_fill,
-                                                                size: 16,
+                                                        ),
+                                                        Positioned(
+                                                          top: 0,
+                                                          right: 0,
+                                                          child: GestureDetector(
+                                                            behavior: HitTestBehavior.opaque,
+                                                            onTap: () {
+                                                              HapticFeedback.selectionClick();
+                                                              ctrl.removePendingAttachment(att.id);
+                                                            },
+                                                            child: SizedBox(
+                                                              width: 28,
+                                                              height: 28,
+                                                              child: Align(
+                                                                alignment: Alignment.topRight,
+                                                                child: Container(
+                                                                  width: 19,
+                                                                  height: 19,
+                                                                  decoration: BoxDecoration(
+                                                                    color: t.isDark
+                                                                        ? const Color(0xFF1F232B)
+                                                                        : Colors.white,
+                                                                    shape: BoxShape.circle,
+                                                                    border: Border.all(
+                                                                      color: t.sepStrong,
+                                                                      width: 0.6,
+                                                                    ),
+                                                                  ),
+                                                                  child: Icon(
+                                                                    CupertinoIcons.xmark,
+                                                                    size: 10.5,
+                                                                    color: t.text,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                }
+                                                return Center(
+                                                  child: GestureDetector(
+                                                    onTap: () {
+                                                      HapticFeedback.selectionClick();
+                                                      ctrl.showToast(
+                                                        att.sizeBytes > 0
+                                                            ? '${att.name} (${att.humanSize})'
+                                                            : att.name,
+                                                        tone: ToastTone.info,
+                                                      );
+                                                    },
+                                                    child: Container(
+                                                      height: 28,
+                                                      padding: const EdgeInsets.only(left: 9, right: 2),
+                                                      decoration: BoxDecoration(
+                                                        color: t.primarySoft,
+                                                        borderRadius: BorderRadius.circular(999),
+                                                        border: Border.all(
+                                                          color: t.primary.withValues(alpha: 0.25),
+                                                          width: 0.6,
+                                                        ),
+                                                      ),
+                                                      child: Row(
+                                                        mainAxisSize: MainAxisSize.min,
+                                                        children: [
+                                                          Icon(
+                                                            att.isImage
+                                                                ? CupertinoIcons.photo_fill
+                                                                : CupertinoIcons.doc_fill,
+                                                            size: 13,
+                                                            color: t.primary,
+                                                          ),
+                                                          const SizedBox(width: 5),
+                                                          ConstrainedBox(
+                                                            constraints: const BoxConstraints(maxWidth: 132),
+                                                            child: Text(
+                                                              att.name,
+                                                              maxLines: 1,
+                                                              overflow: TextOverflow.ellipsis,
+                                                              style: TextStyle(
+                                                                fontSize: 11.5,
+                                                                fontWeight: FontWeight.w600,
                                                                 color: t.primary,
                                                               ),
                                                             ),
                                                           ),
-                                                        ),
-                                                      ),
-                                                      Positioned(
-                                                        top: -7,
-                                                        right: -7,
-                                                        child: GestureDetector(
-                                                          behavior: HitTestBehavior.opaque,
-                                                          onTap: () => ctrl.removePendingAttachment(att.id),
-                                                          child: SizedBox(
-                                                            width: 24,
-                                                            height: 24,
-                                                            child: Center(
-                                                              child: Container(
-                                                                width: 18,
-                                                                height: 18,
-                                                                decoration: BoxDecoration(
-                                                                  color: t.isDark
-                                                                      ? const Color(0xFF1F232B)
-                                                                      : Colors.white,
-                                                                  shape: BoxShape.circle,
-                                                                  border: Border.all(
-                                                                    color: t.sepStrong,
-                                                                    width: 0.6,
-                                                                  ),
-                                                                ),
+                                                          if (att.sizeBytes > 0) ...[
+                                                            const SizedBox(width: 4),
+                                                            Text(
+                                                              att.humanSize,
+                                                              style: TextStyle(
+                                                                fontSize: 10,
+                                                                fontFeatures: const [FontFeature.tabularFigures()],
+                                                                color: t.primary.withValues(alpha: 0.72),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                          GestureDetector(
+                                                            behavior: HitTestBehavior.opaque,
+                                                            onTap: () {
+                                                              HapticFeedback.selectionClick();
+                                                              ctrl.removePendingAttachment(att.id);
+                                                            },
+                                                            child: SizedBox(
+                                                              width: 26,
+                                                              height: 26,
+                                                              child: Center(
                                                                 child: Icon(
-                                                                  CupertinoIcons.xmark,
-                                                                  size: 10,
-                                                                  color: t.text,
+                                                                  CupertinoIcons.xmark_circle_fill,
+                                                                  size: 15,
+                                                                  color: t.primary.withValues(alpha: 0.75),
                                                                 ),
                                                               ),
                                                             ),
                                                           ),
-                                                        ),
+                                                        ],
                                                       ),
-                                                    ],
-                                                  );
-                                                }
-                                                return Container(
-                                                  padding: const EdgeInsets.only(left: 9, right: 2),
-                                                  decoration: BoxDecoration(
-                                                    color: t.primarySoft,
-                                                    borderRadius: BorderRadius.circular(999),
-                                                    border: Border.all(
-                                                      color: t.primary.withValues(alpha: 0.25),
-                                                      width: 0.6,
                                                     ),
-                                                  ),
-                                                  child: Row(
-                                                    mainAxisSize: MainAxisSize.min,
-                                                    children: [
-                                                      Icon(
-                                                        att.isImage
-                                                            ? CupertinoIcons.photo_fill
-                                                            : CupertinoIcons.doc_fill,
-                                                        size: 13,
-                                                        color: t.primary,
-                                                      ),
-                                                      const SizedBox(width: 5),
-                                                      ConstrainedBox(
-                                                        constraints: const BoxConstraints(maxWidth: 120),
-                                                        child: Text(
-                                                          att.name,
-                                                          maxLines: 1,
-                                                          overflow: TextOverflow.ellipsis,
-                                                          style: TextStyle(
-                                                            fontSize: 11.5,
-                                                            fontWeight: FontWeight.w600,
-                                                            color: t.primary,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                      GestureDetector(
-                                                        behavior: HitTestBehavior.opaque,
-                                                        onTap: () => ctrl.removePendingAttachment(att.id),
-                                                        child: SizedBox(
-                                                          width: 26,
-                                                          height: 26,
-                                                          child: Center(
-                                                            child: Icon(
-                                                              CupertinoIcons.xmark_circle_fill,
-                                                              size: 15,
-                                                              color: t.primary.withValues(alpha: 0.75),
-                                                            ),
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
                                                   ),
                                                 );
                                               },
                                             ),
                                           ),
-                                  ),
-                                  AnimatedSize(
-                                    duration: const Duration(milliseconds: 160),
-                                    curve: Curves.easeOutCubic,
-                                    alignment: Alignment.bottomCenter,
-                                    child: state.queuedMessages.isEmpty
-                                        ? const SizedBox.shrink()
-                                        : Padding(
+                                  if (state.queuedMessages.isNotEmpty)
+                                    Padding(
                                             padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
                                             child: Container(
                                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
@@ -1567,36 +2150,64 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                                               ),
                                                               const SizedBox(width: 6),
                                                               Expanded(
-                                                                child: Text(
-                                                                  q.text,
-                                                                  maxLines: 1,
-                                                                  overflow: TextOverflow.ellipsis,
-                                                                  style: TextStyle(fontSize: 12.5, color: t.text),
-                                                                ),
-                                                              ),
-                                                              GestureDetector(
-                                                                behavior: HitTestBehavior.opaque,
-                                                                onTap: () => ctrl.promoteQueuedMessage(q.id),
-                                                                child: Padding(
-                                                                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                                                                child: GestureDetector(
+                                                                  behavior: HitTestBehavior.opaque,
+                                                                  onTap: () {
+                                                                    HapticFeedback.selectionClick();
+                                                                    _showEditQueuedDialog(context, q);
+                                                                  },
                                                                   child: Text(
-                                                                    '立即发',
-                                                                    style: TextStyle(
-                                                                      fontSize: 11.5,
-                                                                      fontWeight: FontWeight.w600,
-                                                                      color: t.primary,
-                                                                    ),
+                                                                    q.text,
+                                                                    maxLines: 1,
+                                                                    overflow: TextOverflow.ellipsis,
+                                                                    style: TextStyle(fontSize: 12.5, color: t.text),
                                                                   ),
                                                                 ),
                                                               ),
                                                               GestureDetector(
                                                                 behavior: HitTestBehavior.opaque,
-                                                                onTap: () => ctrl.removeQueuedMessage(q.id),
+                                                                onTap: () {
+                                                                  HapticFeedback.selectionClick();
+                                                                  _showEditQueuedDialog(context, q);
+                                                                },
                                                                 child: SizedBox(
-                                                                  width: 26,
-                                                                  height: 26,
+                                                                  width: 30,
+                                                                  height: 30,
                                                                   child: Center(
-                                                                    child: Icon(CupertinoIcons.xmark, size: 13, color: t.text3),
+                                                                    child: Icon(CupertinoIcons.pencil, size: 13, color: t.text3),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                              if (q.mode != 'steer')
+                                                                GestureDetector(
+                                                                  behavior: HitTestBehavior.opaque,
+                                                                  onTap: () {
+                                                                    HapticFeedback.selectionClick();
+                                                                    ctrl.promoteQueuedMessage(q.id);
+                                                                  },
+                                                                  child: Padding(
+                                                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                                                    child: Text(
+                                                                      '改插话',
+                                                                      style: TextStyle(
+                                                                        fontSize: 11.5,
+                                                                        fontWeight: FontWeight.w600,
+                                                                        color: t.primary,
+                                                                      ),
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              GestureDetector(
+                                                                behavior: HitTestBehavior.opaque,
+                                                                onTap: () {
+                                                                  HapticFeedback.selectionClick();
+                                                                  ctrl.removeQueuedMessage(q.id);
+                                                                },
+                                                                child: SizedBox(
+                                                                  width: 30,
+                                                                  height: 30,
+                                                                  child: Center(
+                                                                    child: Icon(CupertinoIcons.xmark, size: 13.5, color: t.text3),
                                                                   ),
                                                                 ),
                                                               ),
@@ -1609,60 +2220,145 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                               ),
                                             ),
                                           ),
-                                  ),
                                   RepaintBoundary(
-                                    child: Padding(
-                                      padding: const EdgeInsets.fromLTRB(8, 2, 8, 6),
-                                      child: TextField(
-                              controller: widget.controller,
-                              focusNode: widget.focusNode,
-                              minLines: 1,
-                              maxLines: 5,
-                              keyboardType: TextInputType.multiline,
-                              // Mobile uses TextInputAction.newline (matching ChatGPT/Claude) so users
-                              // can freely compose multi-line prompts without dismissing the soft IME;
-                              // desktop/hardware keyboards send on Enter / Cmd+Enter.
-                              textInputAction: TextInputAction.newline,
-                              // Empty onEditingComplete prevents Flutter's default unfocus() on IME actions,
-                              // keeping the Android/iOS soft keyboard smoothly open across messages!
-                              onEditingComplete: () {},
-                              onSubmitted: null,
-                              contextMenuBuilder: buildGrassBagEditableContextMenu,
-                              style: TextStyle(
-                                fontSize: 15,
-                                height: 1.4,
-                                letterSpacing: -0.15,
-                                color: t.text,
-                              ),
-                              decoration: InputDecoration(
-                                hintText: isHostNeedsAuth
-                                    ? '远程主机待授权，点击完成授权后即可对话…'
-                                    : (needsModelConfig
-                                        ? '先登录 DeepSeek 或添加 API Key 后即可开始对话…'
-                                        : (state.planMode
-                                            ? '计划模式：先出执行方案，确认后再动手…'
-                                            : (isDesktopPlatform
-                                                ? '给 GrassBag 发消息…（Enter 发送 · Shift+Enter 换行）'
-                                                : '给 GrassBag 发消息…'))),
-                                hintStyle: TextStyle(
-                                  fontSize: 15,
-                                  letterSpacing: -0.15,
-                                  color: t.isDark
-                                      ? t.text2.withValues(alpha: 0.68)
-                                      : t.text3,
-                                ),
-                                isDense: true,
-                                contentPadding: const EdgeInsets.symmetric(vertical: 3),
-                                border: InputBorder.none,
-                              ),
-                            ),
-                          ),
-                          ),
+                                    child: GestureDetector(
+                                      behavior: HitTestBehavior.translucent,
+                                      onTap: () {
+                                        if (!widget.focusNode.hasFocus) {
+                                          widget.focusNode.requestFocus();
+                                        }
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.fromLTRB(8, 2, 8, 6),
+                                        child: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                                          children: [
+                                            TextField(
+                                              controller: widget.controller,
+                                              focusNode: widget.focusNode,
+                                              minLines: 1,
+                                              maxLines: 5,
+                                              keyboardType: TextInputType.multiline,
+                                              // Mobile uses TextInputAction.newline (matching ChatGPT/Claude) so users
+                                              // can freely compose multi-line prompts without dismissing the soft IME;
+                                              // desktop/hardware keyboards send on Enter / Cmd+Enter.
+                                              textInputAction: TextInputAction.newline,
+                                              // Empty onEditingComplete prevents Flutter's default unfocus() on IME actions,
+                                              // keeping the Android/iOS soft keyboard smoothly open across messages!
+                                              onEditingComplete: () {},
+                                              onSubmitted: null,
+                                              contextMenuBuilder: buildGrassBagEditableContextMenu,
+                                              contentInsertionConfiguration:
+                                                  ContentInsertionConfiguration(
+                                                allowedMimeTypes: const <String>[
+                                                  'image/png',
+                                                  'image/jpeg',
+                                                  'image/webp',
+                                                  'image/gif',
+                                                ],
+                                                onContentInserted: (KeyboardInsertedContent data) {
+                                                  final bytes = data.data;
+                                                  if (bytes == null || bytes.isEmpty) return;
+                                                  final mime = data.mimeType.isNotEmpty
+                                                      ? data.mimeType
+                                                      : 'image/png';
+                                                  final ext = switch (mime.toLowerCase()) {
+                                                    'image/jpeg' => 'jpg',
+                                                    'image/webp' => 'webp',
+                                                    'image/gif' => 'gif',
+                                                    _ => 'png',
+                                                  };
+                                                  final ts =
+                                                      DateTime.now().millisecondsSinceEpoch;
+                                                  HapticFeedback.selectionClick();
+                                                  ctrl.addPendingAttachment(
+                                                    ComposerAttachment(
+                                                      id: 'paste-$ts',
+                                                      name: 'pasted_$ts.$ext',
+                                                      mimeType: mime,
+                                                      sizeBytes: bytes.length,
+                                                      bytes: bytes,
+                                                    ),
+                                                  );
+                                                  ctrl.showToast('已粘贴图片附件',
+                                                      tone: ToastTone.info);
+                                                },
+                                              ),
+                                              style: TextStyle(
+                                                fontSize: 15,
+                                                height: 1.4,
+                                                letterSpacing: -0.15,
+                                                color: t.text,
+                                              ),
+                                              decoration: InputDecoration(
+                                                hintText: state.isStopping
+                                                    ? '正在停止当前生成…'
+                                                    : (isHostNeedsAuth
+                                                        ? '远程主机待授权，点击完成授权后即可对话…'
+                                                        : (needsModelConfig
+                                                            ? '先登录 DeepSeek 或添加 API Key 后即可开始对话…'
+                                                            : (state.pendingAttachments.isNotEmpty
+                                                                ? '添加说明，或直接发送附件…'
+                                                                : (state.isStreaming
+                                                                    ? (state.busyEnterMode == 'steer'
+                                                                        ? '正在生成中，输入内容可直接插话…'
+                                                                        : '正在生成中，输入内容可排队发送…')
+                                                                    : (state.planMode
+                                                                        ? '计划模式：先出执行方案，确认后再动手…'
+                                                                        : (isDesktopPlatform
+                                                                            ? '给 GrassBag 发消息…（Enter 发送 · Shift+Enter 换行）'
+                                                                            : '给 GrassBag 发消息…')))))),
+                                                hintStyle: TextStyle(
+                                                  fontSize: 15,
+                                                  letterSpacing: -0.15,
+                                                  color: t.isDark
+                                                      ? t.text2.withValues(alpha: 0.68)
+                                                      : t.text3,
+                                                ),
+                                                isDense: true,
+                                                contentPadding:
+                                                    const EdgeInsets.symmetric(vertical: 6),
+                                                border: InputBorder.none,
+                                              ),
+                                            ),
+                                            ValueListenableBuilder<TextEditingValue>(
+                                              valueListenable: widget.controller,
+                                              builder: (ctx, val, _) {
+                                                final len = val.text.length;
+                                                if (len < 2000) return const SizedBox.shrink();
+                                                final warn = len >= 8000;
+                                                return Padding(
+                                                  padding: const EdgeInsets.only(top: 2),
+                                                  child: Align(
+                                                    alignment: Alignment.centerRight,
+                                                    child: Text(
+                                                      '$len 字',
+                                                      style: TextStyle(
+                                                        fontSize: 10.5,
+                                                        fontWeight: FontWeight.w500,
+                                                        fontFeatures: const [
+                                                          FontFeature.tabularFigures(),
+                                                        ],
+                                                        color: warn ? t.warn : t.text3,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                );
+                                              },
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
                           LayoutBuilder(
                             builder: (ctx, rowBox) {
                               final hasExtraStreamActions = state.isStreaming && hasText;
+                              final veryTightRow = rowBox.maxWidth < 240;
                               final tightRow = rowBox.maxWidth < (hasExtraStreamActions ? 364 : 316);
-                              final showInlineRing = !(tightRow && hasExtraStreamActions);
+                              final showInlineRing =
+                                  !veryTightRow && !(tightRow && hasExtraStreamActions);
                               return Row(
                             children: [
                               // Crisp spring-animated '+' toggle button (rotates 45° into '×')
@@ -1676,24 +2372,45 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                   width: 36,
                                   height: 36,
                                   decoration: BoxDecoration(
-                                    color: _plusOpen
-                                        ? (t.isDark
-                                            ? t.primary.withValues(alpha: 0.28)
-                                            : Color.lerp(Colors.white, t.primary, 0.18)!
-                                                .withValues(alpha: 0.80))
-                                        : Colors.white.withValues(alpha: t.isDark ? 0.11 : 0.62),
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                      colors: _plusOpen
+                                          ? (t.isDark
+                                              ? [
+                                                  t.primary.withValues(alpha: 0.34),
+                                                  t.primary.withValues(alpha: 0.20),
+                                                ]
+                                              : [
+                                                  Color.lerp(Colors.white, t.primary, 0.14)!
+                                                      .withValues(alpha: 0.88),
+                                                  Color.lerp(Colors.white, t.primary, 0.22)!
+                                                      .withValues(alpha: 0.72),
+                                                ])
+                                          : (t.isDark
+                                              ? [
+                                                  Colors.white.withValues(alpha: 0.16),
+                                                  Colors.white.withValues(alpha: 0.08),
+                                                ]
+                                              : [
+                                                  Colors.white.withValues(alpha: 0.80),
+                                                  Colors.white.withValues(alpha: 0.54),
+                                                ]),
+                                    ),
                                     shape: BoxShape.circle,
                                     border: Border.all(
                                       color: _plusOpen
-                                          ? t.primary.withValues(alpha: t.isDark ? 0.42 : 0.30)
-                                          : Colors.white.withValues(alpha: t.isDark ? 0.18 : 0.90),
-                                      width: 0.65,
+                                          ? t.primary.withValues(alpha: t.isDark ? 0.42 : 0.28)
+                                          : (t.isDark
+                                              ? Colors.white.withValues(alpha: 0.14)
+                                              : const Color(0x16162E42)),
+                                      width: 0.6,
                                     ),
                                     boxShadow: t.isDark
                                         ? null
                                         : const [
                                             BoxShadow(
-                                              color: Color(0x0D000000),
+                                              color: Color(0x0B000000),
                                               blurRadius: 6,
                                               offset: Offset(0, 2),
                                             ),
@@ -1735,10 +2452,15 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                               ref,
                                               ref.read(appProvider).activeHost,
                                             );
-                                      } else if (isHostConnecting || isHydratingModels) {
+                                      } else if (!hasCachedModelWhileReconnecting &&
+                                          (isHostConnecting || isHydratingModels)) {
                                         pillIcon = CupertinoIcons.sparkles;
                                         pillIconColor = t.text3;
-                                        pillLabel = isHydratingModels ? '同步中…' : '连接中…';
+                                        pillLabel = isHydratingModels
+                                            ? '同步中…'
+                                            : (state.connectionPhase == ConnectionPhase.reconnecting
+                                                ? '重连中…'
+                                                : '连接中…');
                                         effortBadge = null;
                                         pillTextColor = t.text3;
                                         pillTap = () => showHostQuickSheet(
@@ -1746,7 +2468,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                               ref,
                                               onOpenHostSettings: widget.onOpenHostSettings,
                                             );
-                                      } else if (!isHostConnected) {
+                                      } else if (!isHostConnected && !hasCachedModelWhileReconnecting) {
                                         pillIcon = CupertinoIcons.wifi_exclamationmark;
                                         pillIconColor = t.warn;
                                         pillLabel = '未连接';
@@ -1807,19 +2529,31 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                           height: 36,
                                           padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
                                           decoration: BoxDecoration(
-                                            color: Colors.white.withValues(alpha: t.isDark ? 0.10 : 0.60),
+                                            gradient: LinearGradient(
+                                              begin: Alignment.topCenter,
+                                              end: Alignment.bottomCenter,
+                                              colors: t.isDark
+                                                  ? [
+                                                      Colors.white.withValues(alpha: 0.15),
+                                                      Colors.white.withValues(alpha: 0.08),
+                                                    ]
+                                                  : [
+                                                      Colors.white.withValues(alpha: 0.80),
+                                                      Colors.white.withValues(alpha: 0.54),
+                                                    ],
+                                            ),
                                             borderRadius: BorderRadius.circular(999),
                                             border: Border.all(
-                                              color: Colors.white.withValues(
-                                                alpha: t.isDark ? 0.18 : 0.90,
-                                              ),
-                                              width: 0.65,
+                                              color: t.isDark
+                                                  ? Colors.white.withValues(alpha: 0.14)
+                                                  : const Color(0x16162E42),
+                                              width: 0.6,
                                             ),
                                             boxShadow: t.isDark
                                                 ? null
                                                 : const [
                                                     BoxShadow(
-                                                      color: Color(0x0C000000),
+                                                      color: Color(0x0B000000),
                                                       blurRadius: 6,
                                                       offset: Offset(0, 2),
                                                     ),
@@ -1844,6 +2578,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                                 ),
                                               ),
                                               if (effortBadge != null &&
+                                                  !veryTightRow &&
                                                   !(tightRow && hasExtraStreamActions)) ...[
                                                 const SizedBox(width: 5),
                                                 Container(
@@ -1884,6 +2619,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                   menuWidth: 214,
                                   menuBorderRadius: 24,
                                   menuAlignment: GlassMenuAlignment.bottomRight,
+                                  autoAdjustToScreen: true,
+                                  opaqueColor: state.glassTier == GrassBagGlassTier.solid
+                                      ? t.cardSolid
+                                      : null,
                                   settings: GrassBagGlassConfig.sheetSettings(t, state.glassTier),
                                   quality: GrassBagGlassConfig.chromeQualityFor(state.glassTier),
                                   triggerBuilder: (ctx, toggleMenu) => GrassBagSpringTap(
@@ -1901,7 +2640,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
                                           Text(
-                                            '补充',
+                                            state.busyEnterMode == 'steer' ? '插话' : '排队',
                                             style: TextStyle(
                                               fontSize: 12,
                                               fontWeight: FontWeight.w600,
@@ -1917,12 +2656,16 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                   ),
                                   items: [
                                     GlassMenuItem(
-                                      title: '插话 · 引导当前任务',
+                                      title: state.busyEnterMode == 'steer'
+                                          ? '插话 · 引导当前任务（默认）'
+                                          : '插话 · 引导当前任务',
                                       icon: const Icon(CupertinoIcons.arrow_turn_down_right),
                                       onTap: () => _submit(mode: 'steer'),
                                     ),
                                     GlassMenuItem(
-                                      title: '排队 · 本轮结束后发',
+                                      title: state.busyEnterMode != 'steer'
+                                          ? '排队 · 本轮结束后发（默认）'
+                                          : '排队 · 本轮结束后发',
                                       icon: const Icon(CupertinoIcons.clock),
                                       onTap: () => _submit(mode: 'queue'),
                                     ),
@@ -1949,9 +2692,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                               // Compact Stop orb remains accessible when streaming AND drafting follow-up text!
                               if (state.isStreaming && hasText) ...[
                                 Tooltip(
-                                  message: '停止当前生成',
+                                  message: state.isStopping ? '正在停止生成…' : '停止当前生成',
                                   child: GrassBagSpringTap(
+                                    enabled: !state.isStopping,
                                     onTap: () {
+                                      if (state.isStopping) return;
                                       HapticFeedback.lightImpact();
                                       ctrl.cancelStreaming();
                                     },
@@ -1967,139 +2712,207 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                           width: 0.6,
                                         ),
                                       ),
-                                      child: Icon(
-                                        CupertinoIcons.stop_fill,
-                                        size: 13.5,
-                                        color: t.err,
-                                      ),
+                                      child: state.isStopping
+                                          ? Center(
+                                              child: CupertinoActivityIndicator(
+                                                radius: 6.5,
+                                                color: t.err,
+                                              ),
+                                            )
+                                          : Icon(
+                                              CupertinoIcons.stop_fill,
+                                              size: 13.5,
+                                              color: t.err,
+                                            ),
                                     ),
                                   ),
                                 ),
                                 const SizedBox(width: 6),
                               ],
 
-                              // Concentric Action Orb (Send / Stop / Mic when speech is configured)
-                              GrassBagSpringTap(
-                                key: const ValueKey('composer-action-btn'),
-                                enabled: !_submitting,
-                                pressedScale: (hasText || state.isStreaming || state.speechConfigured) ? 0.86 : 1.0,
-                                onTap: () {
-                                  if (_submitting) return;
-                                  if (state.isStreaming && !hasText) {
-                                    HapticFeedback.lightImpact();
-                                    ctrl.cancelStreaming();
-                                  } else if (hasText) {
-                                    _submit();
-                                  } else if (state.speechConfigured) {
-                                    HapticFeedback.selectionClick();
-                                    showVoiceInputSheet(
-                                      context,
-                                      ref,
-                                      onTranscriptConfirmed: (text) {
-                                        final cur = widget.controller.text;
-                                        widget.controller.text = cur.isEmpty ? text : '$cur $text';
-                                        widget.controller.selection = TextSelection.collapsed(
-                                          offset: widget.controller.text.length,
-                                        );
-                                        setState(() {});
-                                      },
-                                    );
-                                  }
-                                },
-                                child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 220),
-                                  curve: Curves.easeOutCubic,
-                                  width: 36,
-                                  height: 36,
-                                  decoration: BoxDecoration(
-                                    gradient: (hasText || _submitting)
-                                        ? LinearGradient(
-                                            begin: Alignment.topCenter,
-                                            end: Alignment.bottomCenter,
-                                            colors: [t.primaryHi, t.primary],
-                                          )
-                                        : null,
-                                    color: (hasText || _submitting)
-                                        ? null
-                                        : state.isStreaming
-                                            ? t.errSoft
-                                            : Colors.white.withValues(
-                                                alpha: t.isDark ? 0.11 : 0.62,
+                              // Concentric Action Orb (Send / Steer / Queue / Stop / Mic when speech is configured)
+                              () {
+                                final isStopOrb = state.isStreaming && !hasText;
+                                final isFollowUpSend = state.isStreaming && hasText;
+                                final showPrimarySpinner = _submitting && !isStopOrb;
+                                final orbEnabled = isStopOrb ? !state.isStopping : !_submitting;
+                                final primaryActive = hasText || showPrimarySpinner;
+                                final sendIcon = isFollowUpSend
+                                    ? (state.busyEnterMode == 'steer'
+                                        ? CupertinoIcons.arrow_turn_down_right
+                                        : CupertinoIcons.clock_fill)
+                                    : CupertinoIcons.arrow_up;
+                                final orbTooltip = isStopOrb
+                                    ? (state.isStopping ? '正在停止生成…' : '停止生成')
+                                    : (isFollowUpSend
+                                        ? (state.busyEnterMode == 'steer' ? '插话发送' : '排队发送')
+                                        : (hasText
+                                            ? '发送消息'
+                                            : (state.speechConfigured ? '语音输入' : '发送消息')));
+                                return Tooltip(
+                                  message: orbTooltip,
+                                  child: GrassBagSpringTap(
+                                    key: const ValueKey('composer-action-btn'),
+                                    enabled: orbEnabled,
+                                    pressedScale:
+                                        (hasText || state.isStreaming || state.speechConfigured)
+                                            ? 0.86
+                                            : 1.0,
+                                    onTap: () {
+                                      if (isStopOrb) {
+                                        if (state.isStopping) return;
+                                        HapticFeedback.lightImpact();
+                                        ctrl.cancelStreaming();
+                                      } else if (_submitting) {
+                                        return;
+                                      } else if (hasText) {
+                                        _submit();
+                                      } else if (state.speechConfigured) {
+                                        HapticFeedback.selectionClick();
+                                        showVoiceInputSheet(
+                                          context,
+                                          ref,
+                                          onTranscriptConfirmed: (text) {
+                                            final val = widget.controller.value;
+                                            final cur = val.text;
+                                            final sel = val.selection;
+                                            final start = sel.isValid
+                                                ? sel.start.clamp(0, cur.length)
+                                                : cur.length;
+                                            final end = sel.isValid
+                                                ? sel.end.clamp(start, cur.length)
+                                                : cur.length;
+                                            final needsLeadSpace = start > 0 &&
+                                                cur.codeUnitAt(start - 1) != 0x20 &&
+                                                cur.codeUnitAt(start - 1) != 0x0A;
+                                            final insert = needsLeadSpace ? ' $text' : text;
+                                            final updated = cur.replaceRange(start, end, insert);
+                                            widget.controller.value = TextEditingValue(
+                                              text: updated,
+                                              selection: TextSelection.collapsed(
+                                                offset: start + insert.length,
                                               ),
-                                    shape: BoxShape.circle,
-                                    border: (hasText || _submitting)
-                                        ? Border.all(
-                                            color: Colors.white.withValues(alpha: 0.28),
-                                            width: 0.6,
-                                          )
-                                        : Border.all(
-                                            color: state.isStreaming
-                                                ? t.err.withValues(alpha: 0.30)
-                                                : Colors.white.withValues(
-                                                    alpha: t.isDark ? 0.18 : 0.90,
-                                                  ),
-                                            width: 0.65,
-                                          ),
-                                    boxShadow: (hasText || _submitting)
-                                        ? [
-                                            BoxShadow(
-                                              color: t.primary.withValues(alpha: 0.36),
-                                              blurRadius: 10,
-                                              offset: const Offset(0, 3),
-                                            ),
-                                          ]
-                                        : (t.isDark
-                                            ? null
-                                            : const [
+                                            );
+                                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                                              if (mounted) widget.focusNode.requestFocus();
+                                            });
+                                          },
+                                        );
+                                      }
+                                    },
+                                    child: AnimatedContainer(
+                                      duration: const Duration(milliseconds: 220),
+                                      curve: Curves.easeOutCubic,
+                                      width: 36,
+                                      height: 36,
+                                      decoration: BoxDecoration(
+                                        // Always provide a 2-stop LinearGradient so BoxDecoration.lerp
+                                        // interpolates Send <-> Stop <-> Mic smoothly instead of snapping at t=0.5!
+                                        gradient: LinearGradient(
+                                          begin: Alignment.topCenter,
+                                          end: Alignment.bottomCenter,
+                                          colors: primaryActive
+                                              ? [t.primaryHi, t.primary]
+                                              : () {
+                                                  final flat = isStopOrb
+                                                      ? t.errSoft
+                                                      : Colors.white.withValues(
+                                                          alpha: t.isDark ? 0.11 : 0.62,
+                                                        );
+                                                  return [flat, flat];
+                                                }(),
+                                        ),
+                                        shape: BoxShape.circle,
+                                        border: primaryActive
+                                            ? Border.all(
+                                                color: Colors.white.withValues(alpha: 0.28),
+                                                width: 0.6,
+                                              )
+                                            : Border.all(
+                                                color: isStopOrb
+                                                    ? t.err.withValues(alpha: 0.30)
+                                                    : Colors.white.withValues(
+                                                        alpha: t.isDark ? 0.18 : 0.90,
+                                                      ),
+                                                width: 0.65,
+                                              ),
+                                        boxShadow: primaryActive
+                                            ? [
                                                 BoxShadow(
-                                                  color: Color(0x0D000000),
-                                                  blurRadius: 6,
-                                                  offset: Offset(0, 2),
+                                                  color: t.primary.withValues(alpha: 0.36),
+                                                  blurRadius: 10,
+                                                  offset: const Offset(0, 3),
                                                 ),
-                                              ]),
-                                  ),
-                                  child: AnimatedSwitcher(
-                                    duration: const Duration(milliseconds: 200),
-                                    switchInCurve: Curves.easeOutCubic,
-                                    switchOutCurve: Curves.easeInCubic,
-                                    transitionBuilder: (child, anim) => FadeTransition(
-                                      opacity: anim,
-                                      child: ScaleTransition(
-                                        scale: Tween<double>(begin: 0.72, end: 1.0).animate(anim),
-                                        child: child,
+                                              ]
+                                            : (t.isDark
+                                                ? null
+                                                : const [
+                                                    BoxShadow(
+                                                      color: Color(0x0D000000),
+                                                      blurRadius: 6,
+                                                      offset: Offset(0, 2),
+                                                    ),
+                                                  ]),
+                                      ),
+                                      child: AnimatedSwitcher(
+                                        duration: const Duration(milliseconds: 200),
+                                        switchInCurve: Curves.easeOutCubic,
+                                        switchOutCurve: Curves.easeInCubic,
+                                        transitionBuilder: (child, anim) => FadeTransition(
+                                          opacity: anim,
+                                          child: ScaleTransition(
+                                            scale: Tween<double>(begin: 0.72, end: 1.0)
+                                                .animate(anim),
+                                            child: child,
+                                          ),
+                                        ),
+                                        child: showPrimarySpinner
+                                            ? CupertinoActivityIndicator(
+                                                key: const ValueKey('sending'),
+                                                radius: 7.5,
+                                                color: t.onPrimary,
+                                              )
+                                            : (isStopOrb && state.isStopping)
+                                                ? CupertinoActivityIndicator(
+                                                    key: const ValueKey('stopping'),
+                                                    radius: 7.0,
+                                                    color: t.err,
+                                                  )
+                                                : Icon(
+                                                    hasText
+                                                        ? sendIcon
+                                                        : isStopOrb
+                                                            ? CupertinoIcons.stop_fill
+                                                            : (state.speechConfigured
+                                                                ? CupertinoIcons.mic_fill
+                                                                : CupertinoIcons.arrow_up),
+                                                    key: ValueKey(
+                                                      hasText
+                                                          ? (isFollowUpSend
+                                                              ? 'send-${state.busyEnterMode}'
+                                                              : 'send')
+                                                          : (isStopOrb
+                                                              ? 'stop'
+                                                              : (state.speechConfigured
+                                                                  ? 'mic'
+                                                                  : 'send')),
+                                                    ),
+                                                    size: hasText
+                                                        ? (isFollowUpSend ? 15.5 : 17)
+                                                        : (isStopOrb ? 14 : 16.5),
+                                                    color: hasText
+                                                        ? t.onPrimary
+                                                        : isStopOrb
+                                                            ? t.err
+                                                            : (state.speechConfigured
+                                                                ? t.text
+                                                                : t.text3),
+                                                  ),
                                       ),
                                     ),
-                                    child: _submitting
-                                        ? CupertinoActivityIndicator(
-                                            key: const ValueKey('sending'),
-                                            radius: 7.5,
-                                            color: t.onPrimary,
-                                          )
-                                        : Icon(
-                                            hasText
-                                                ? CupertinoIcons.arrow_up
-                                                : state.isStreaming
-                                                    ? CupertinoIcons.stop_fill
-                                                    : (state.speechConfigured
-                                                        ? CupertinoIcons.mic_fill
-                                                        : CupertinoIcons.arrow_up),
-                                            key: ValueKey(
-                                              hasText
-                                                  ? 'send'
-                                                  : (state.isStreaming
-                                                      ? 'stop'
-                                                      : (state.speechConfigured ? 'mic' : 'send')),
-                                            ),
-                                            size: hasText ? 17 : (state.isStreaming ? 14 : 16.5),
-                                            color: hasText
-                                                ? t.onPrimary
-                                                : state.isStreaming
-                                                    ? t.err
-                                                    : (state.speechConfigured ? t.text : t.text3),
-                                          ),
                                   ),
-                                ),
-                              ),
+                                );
+                              }(),
                             ],
                           );
                             },
@@ -2107,9 +2920,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                         ],
                       ),
                     ),
+                  ),
+                ],
               ),
             ),
           ],
+        );
+          },
         ),
       ),
     );
@@ -2485,18 +3302,271 @@ class _PlusDeckContent extends ConsumerWidget {
   }
 }
 
+class _ApprovalTakeoverCard extends StatefulWidget {
+  const _ApprovalTakeoverCard({
+    super.key,
+    required this.command,
+    required this.toolName,
+    required this.workspaceName,
+    required this.isDirectMode,
+    this.pendingCount = 1,
+    this.maxHeight = 560.0,
+    required this.tier,
+    required this.onDecision,
+  });
+
+  final String command;
+  final String? toolName;
+  final String workspaceName;
+  final bool isDirectMode;
+  final int pendingCount;
+  final double maxHeight;
+  final GrassBagGlassTier tier;
+  final Future<bool> Function(String) onDecision;
+
+  @override
+  State<_ApprovalTakeoverCard> createState() => _ApprovalTakeoverCardState();
+}
+
+class _ApprovalTakeoverCardState extends State<_ApprovalTakeoverCard> {
+  late final DateTime _mountedAt = DateTime.now();
+  bool _decided = false;
+
+  Future<void> _handleTap(String action) async {
+    if (_decided) return;
+    // Brief 260ms arming window on ALL actions (including deny!) prevents accidental taps
+    // when an approval card slides up over the bottom composer buttons!
+    if (DateTime.now().difference(_mountedAt).inMilliseconds < 260) {
+      return;
+    }
+    setState(() => _decided = true);
+    final ok = await widget.onDecision(action);
+    if (!ok && mounted) {
+      setState(() => _decided = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final rawTool = (widget.toolName ?? '').trim();
+    final lowerTool = rawTool.toLowerCase();
+    final isPhoneTool = lowerTool.startsWith('phone_') ||
+        widget.command.trimLeft().toLowerCase().startsWith('phone_');
+    final isFileTool = lowerTool.contains('file') ||
+        lowerTool.contains('write') ||
+        lowerTool.contains('edit') ||
+        lowerTool.contains('patch') ||
+        lowerTool.contains('delete');
+    final isCmdTool = lowerTool.isEmpty ||
+        lowerTool.contains('bash') ||
+        lowerTool.contains('shell') ||
+        lowerTool.contains('cmd') ||
+        lowerTool.contains('exec') ||
+        lowerTool.contains('terminal');
+    final headerTitle = isPhoneTool
+        ? '请求操控手机'
+        : (isFileTool
+            ? '请求修改文件'
+            : (isCmdTool ? '请求执行命令' : '请求调用工具'));
+    final showAllowSession = !isPhoneTool && !widget.isDirectMode;
+    final maxCardH = widget.maxHeight;
+
+    return GlassBackdropGroup(
+      enabled: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxCardH),
+        child: GrassBagGlass(
+          tier: widget.tier,
+          borderRadius: 28,
+          elevated: true,
+          useSheetSettings: true,
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  GrassBagSquircleIcon(
+                    icon: isPhoneTool
+                        ? CupertinoIcons.device_phone_portrait
+                        : (isFileTool
+                            ? CupertinoIcons.doc_text_fill
+                            : CupertinoIcons.shield_lefthalf_fill),
+                    color: isPhoneTool ? t.primary : t.warn,
+                    size: 36,
+                    iconSize: 18,
+                  ),
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Flexible(
+                              child: Text(
+                                headerTitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  letterSpacing: -0.2,
+                                  color: t.text,
+                                ),
+                              ),
+                            ),
+                            if (rawTool.isNotEmpty) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                                decoration: BoxDecoration(
+                                  color: t.fill1,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  rawTool,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.text2,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        Text(
+                          isPhoneTool
+                              ? '无障碍操控确认 · 可在手机操控设置中调整策略'
+                              : '工作区：${widget.workspaceName}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 12, color: t.text3),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (widget.pendingCount > 1) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: t.warnSoft,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        '待确认 1/${widget.pendingCount}',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.warn,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 12),
+              Flexible(
+                child: Container(
+                  constraints: const BoxConstraints(maxHeight: 160),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: t.codeBg,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.09),
+                      width: 0.6,
+                    ),
+                  ),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      widget.command,
+                      contextMenuBuilder: buildGrassBagEditableContextMenu,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        height: 1.45,
+                        color: t.codeFg,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: GrassBagSecondaryGlassButton(
+                      label: '拒绝',
+                      height: 40,
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      destructive: true,
+                      enabled: !_decided,
+                      onTap: () => unawaited(_handleTap('deny')),
+                    ),
+                  ),
+                  if (showAllowSession) ...[
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '本会话允许',
+                        height: 40,
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        tier: widget.tier,
+                        insideGlass: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('always')),
+                      ),
+                    ),
+                  ],
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: GrassBagPrimaryGlassButton(
+                      label: _decided ? '处理中…' : '允许一次',
+                      height: 40,
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !_decided,
+                      onTap: () => unawaited(_handleTap('allow')),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _UserQuestionTakeoverCard extends StatefulWidget {
   const _UserQuestionTakeoverCard({
     super.key,
     required this.question,
+    this.pendingCount = 1,
+    this.maxHeight = 560.0,
     required this.tier,
     required this.onSubmit,
     required this.onCancel,
   });
 
   final ActiveUserQuestion question;
+  final int pendingCount;
+  final double maxHeight;
   final GrassBagGlassTier tier;
-  final ValueChanged<Object> onSubmit;
+  final Future<bool> Function(Object) onSubmit;
   final VoidCallback onCancel;
 
   @override
@@ -2507,6 +3577,17 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
   final Map<String, Set<String>> _selectedById = {};
   final Map<String, TextEditingController> _customCtrls = {};
   final ValueNotifier<int> _answerVersion = ValueNotifier<int>(0);
+  late final DateTime _mountedAt = DateTime.now();
+  bool _submitting = false;
+
+  void _handleSkip() {
+    if (_submitting) return;
+    if (DateTime.now().difference(_mountedAt).inMilliseconds < 260) {
+      return;
+    }
+    setState(() => _submitting = true);
+    widget.onCancel();
+  }
 
   List<UserQuestionItem> get _items => widget.question.allQuestions;
 
@@ -2534,10 +3615,11 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
     return missing;
   }
 
-  bool get _canSubmit => _items.isNotEmpty && _unansweredCount == 0;
+  bool get _canSubmit => _items.isNotEmpty && _unansweredCount == 0 && !_submitting;
 
-  void _confirm() {
+  Future<void> _confirm() async {
     if (!_canSubmit) return;
+    setState(() => _submitting = true);
     final answers = <Map<String, dynamic>>[];
     for (final q in _items) {
       final sel = _selectedById[q.id]?.toList(growable: false) ?? const <String>[];
@@ -2548,7 +3630,10 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
         if (free.isNotEmpty) 'custom': free,
       });
     }
-    widget.onSubmit({'answers': answers});
+    final ok = await widget.onSubmit({'answers': answers});
+    if (mounted && !ok) {
+      setState(() => _submitting = false);
+    }
   }
 
   @override
@@ -2558,54 +3643,71 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
     final multiQ = items.length > 1;
     return GlassBackdropGroup(
       enabled: false,
-      child: GrassBagGlass(
-        tier: widget.tier,
-        borderRadius: 28,
-        elevated: true,
-        useSheetSettings: true,
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                GrassBagSquircleIcon(
-                  icon: CupertinoIcons.question_circle_fill,
-                  color: t.primary,
-                  size: 34,
-                  iconSize: 17,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        multiQ ? '${widget.question.title}（共 ${items.length} 题）' : widget.question.title,
-                        style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
-                      ),
-                      if (!multiQ && (widget.question.prompt.isNotEmpty || (items.isNotEmpty && items.first.multiSelect)))
-                        Text(
-                          '${widget.question.prompt}${items.isNotEmpty && items.first.multiSelect ? (widget.question.prompt.isNotEmpty ? '（可多选）' : '可多选') : ''}',
-                          style: TextStyle(fontSize: 12, color: t.text2),
-                        ),
-                    ],
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: widget.maxHeight),
+        child: GrassBagGlass(
+          tier: widget.tier,
+          borderRadius: 28,
+          elevated: true,
+          useSheetSettings: true,
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  GrassBagSquircleIcon(
+                    icon: CupertinoIcons.question_circle_fill,
+                    color: t.primary,
+                    size: 34,
+                    iconSize: 17,
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 11),
-            ConstrainedBox(
-              constraints: BoxConstraints(
-                maxHeight: (MediaQuery.sizeOf(context).height * 0.36).clamp(130.0, 280.0),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      multiQ ? '${widget.question.title}（共 ${items.length} 题）' : widget.question.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+                    ),
+                  ),
+                  if (widget.pendingCount > 1) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: t.primarySoft,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        '待确认 1/${widget.pendingCount}',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.primary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
-              child: RepaintBoundary(
-                child: SingleChildScrollView(
+              const SizedBox(height: 11),
+              Flexible(
+                child: RepaintBoundary(
+                  child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  if (!multiQ && (widget.question.prompt.isNotEmpty || (items.isNotEmpty && items.first.multiSelect))) ...[
+                    Text(
+                      '${widget.question.prompt}${items.isNotEmpty && items.first.multiSelect ? (widget.question.prompt.isNotEmpty ? '（可多选）' : '可多选') : ''}',
+                      style: TextStyle(fontSize: 13, height: 1.48, color: t.text2),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
                   for (var qi = 0; qi < items.length; qi++) ...[
                     if (qi > 0)
                       Padding(
@@ -2704,7 +3806,11 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
                               fontSize: 13,
                               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                               insideGlass: true,
+                              textInputAction: TextInputAction.done,
                               onChanged: (_) => _answerVersion.value++,
+                              onSubmitted: (_) {
+                                if (_canSubmit) _confirm();
+                              },
                             ),
                           ],
                         ],
@@ -2720,22 +3826,24 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
           Row(
             children: [
               GrassBagSecondaryGlassButton(
-                label: '停止',
+                label: '跳过',
                 height: 40,
                 padding: const EdgeInsets.symmetric(horizontal: 14),
                 tier: widget.tier,
                 insideGlass: true,
-                destructive: true,
-                onTap: widget.onCancel,
+                enabled: !_submitting,
+                onTap: _handleSkip,
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: ValueListenableBuilder<int>(
                   valueListenable: _answerVersion,
                   builder: (_, __, ___) => GrassBagPrimaryGlassButton(
-                    label: _canSubmit
-                        ? '提交选择'
-                        : (multiQ ? '还有 $_unansweredCount 题未完成' : '请先完成以上选择或输入'),
+                    label: _submitting
+                        ? '正在提交…'
+                        : (_canSubmit
+                            ? '提交选择'
+                            : (multiQ ? '还有 $_unansweredCount 题未完成' : '请先完成以上选择或输入')),
                     height: 40,
                     tier: widget.tier,
                     insideGlass: true,
@@ -2749,108 +3857,162 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
         ],
       ),
     ),
+    ),
     );
   }
 }
 
-class _CordisRunTakeoverCard extends StatelessWidget {
+class _CordisRunTakeoverCard extends StatefulWidget {
   const _CordisRunTakeoverCard({
     super.key,
     required this.request,
+    this.pendingCount = 1,
+    this.maxHeight = 560.0,
     required this.tier,
     required this.onDecision,
   });
 
   final ActiveCordisRunRequest request;
+  final int pendingCount;
+  final double maxHeight;
   final GrassBagGlassTier tier;
-  final ValueChanged<bool> onDecision;
+  final Future<bool> Function(bool) onDecision;
+
+  @override
+  State<_CordisRunTakeoverCard> createState() => _CordisRunTakeoverCardState();
+}
+
+class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
+  late final DateTime _mountedAt = DateTime.now();
+  bool _decided = false;
+
+  Future<void> _handleTap(bool allow) async {
+    if (_decided) return;
+    if (DateTime.now().difference(_mountedAt).inMilliseconds < 260) {
+      return;
+    }
+    setState(() => _decided = true);
+    final ok = await widget.onDecision(allow);
+    if (!ok && mounted) {
+      setState(() => _decided = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
+    final request = widget.request;
     return GlassBackdropGroup(
       enabled: false,
-      child: GrassBagGlass(
-      tier: tier,
-      borderRadius: 28,
-      elevated: true,
-      useSheetSettings: true,
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: widget.maxHeight),
+        child: GrassBagGlass(
+          tier: widget.tier,
+          borderRadius: 28,
+          elevated: true,
+          useSheetSettings: true,
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              GrassBagSquircleIcon(
-                icon: CupertinoIcons.cube_box_fill,
-                color: t.dusk,
-                size: 34,
-                iconSize: 17,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '请求运行动态扩展模块',
-                      style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+              Row(
+                children: [
+                  GrassBagSquircleIcon(
+                    icon: CupertinoIcons.cube_box_fill,
+                    color: t.dusk,
+                    size: 34,
+                    iconSize: 17,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '请求运行动态扩展模块',
+                          style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+                        ),
+                        Text(
+                          '${request.pluginName} · ${request.summary.isNotEmpty ? request.summary : '助手按需加载扩展能力以完成任务'}',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 12, color: t.text3),
+                        ),
+                      ],
                     ),
-                    Text(
-                      '${request.pluginName} · ${request.summary.isNotEmpty ? request.summary : '助手按需加载扩展能力以完成任务'}',
-                      style: TextStyle(fontSize: 12, color: t.text3),
+                  ),
+                  if (widget.pendingCount > 1) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: t.fill1,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: Text(
+                        '待确认 1/${widget.pendingCount}',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.dusk,
+                        ),
+                      ),
                     ),
                   ],
-                ),
+                ],
               ),
-            ],
-          ),
-          if (request.codePreview.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            ClipRSuperellipse(
-              borderRadius: BorderRadius.circular(14),
-              child: Container(
-                constraints: const BoxConstraints(maxHeight: 110),
-                padding: const EdgeInsets.all(10),
-                color: t.codeBg,
-                child: SingleChildScrollView(
-                  child: Text(
-                    request.codePreview,
-                    style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
+              if (request.codePreview.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Flexible(
+                  child: ClipRSuperellipse(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      constraints: const BoxConstraints(maxHeight: 110),
+                      padding: const EdgeInsets.all(10),
+                      color: t.codeBg,
+                      child: SingleChildScrollView(
+                        child: Text(
+                          request.codePreview,
+                          style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
-          ],
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: GrassBagSecondaryGlassButton(
-                  label: '拒绝加载',
-                  height: 40,
-                  tier: tier,
-                  insideGlass: true,
-                  destructive: true,
-                  onTap: () => onDecision(false),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: GrassBagPrimaryGlassButton(
-                  label: '允许运行',
-                  height: 40,
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () => onDecision(true),
-                ),
+              ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: GrassBagSecondaryGlassButton(
+                      label: '拒绝加载',
+                      height: 40,
+                      tier: widget.tier,
+                      insideGlass: true,
+                      destructive: true,
+                      enabled: !_decided,
+                      onTap: () => unawaited(_handleTap(false)),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: GrassBagPrimaryGlassButton(
+                      label: _decided ? '处理中…' : '允许运行',
+                      height: 40,
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !_decided,
+                      onTap: () => unawaited(_handleTap(true)),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
-        ],
+        ),
       ),
-    ),
     );
   }
 }
@@ -2866,10 +4028,14 @@ class _ComposerContextRingButton extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final slice = ref.watch(
       appProvider.select(
-        (s) => (isEmptyChat: s.isEmptyChat, contextPct: s.contextPct),
+        (s) => (
+          isEmptyChat: s.isEmptyChat,
+          contextPct: s.contextPct,
+          hasAnyData: s.sessionTelemetry.hasAnyData,
+        ),
       ),
     );
-    if (slice.contextPct <= 0) {
+    if (slice.isEmptyChat || (slice.contextPct <= 0 && !slice.hasAnyData)) {
       return const SizedBox.shrink();
     }
     final t = GrassBagTokens.of(context);
@@ -2917,28 +4083,35 @@ class _ComposerContextRingButton extends ConsumerWidget {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  RepaintBoundary(
-                    child: TweenAnimationBuilder<double>(
-                      tween: Tween<double>(end: pctInt / 100.0),
-                      duration: const Duration(milliseconds: 420),
-                      curve: Curves.easeOutCubic,
-                      builder: (context, pct, _) => SizedBox(
-                        width: 19,
-                        height: 19,
-                        child: CustomPaint(
-                          painter: _ContextRingPainter(
-                            percent: pct,
-                            trackColor: t.text3.withValues(alpha: 0.24),
-                            arcColor: pctInt >= 85
-                                ? t.err
-                                : pctInt >= 65
-                                    ? t.warn
-                                    : t.primary,
+                  if (pctInt <= 0)
+                    Icon(
+                      CupertinoIcons.chart_pie,
+                      size: 15,
+                      color: t.primary.withValues(alpha: 0.85),
+                    )
+                  else
+                    RepaintBoundary(
+                      child: TweenAnimationBuilder<double>(
+                        tween: Tween<double>(end: pctInt / 100.0),
+                        duration: const Duration(milliseconds: 420),
+                        curve: Curves.easeOutCubic,
+                        builder: (context, pct, _) => SizedBox(
+                          width: 19,
+                          height: 19,
+                          child: CustomPaint(
+                            painter: _ContextRingPainter(
+                              percent: pct,
+                              trackColor: t.text3.withValues(alpha: 0.24),
+                              arcColor: pctInt >= 85
+                                  ? t.err
+                                  : pctInt >= 65
+                                      ? t.warn
+                                      : t.primary,
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
                   if (pctInt >= 65) ...[
                     const SizedBox(width: 4),
                     Text(
@@ -2998,7 +4171,15 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
         bodyBuilder: (ctx) => Consumer(
           builder: (ctx, sheetRef, _) {
             final st = GrassBagTokens.of(ctx);
-            final s = sheetRef.watch(appProvider);
+            final s = sheetRef.watch(
+              appProvider.select(
+                (st) => (
+                  goals: st.goals,
+                  todos: st.todos,
+                  glassTier: st.glassTier,
+                ),
+              ),
+            );
             final c = sheetRef.read(appProvider.notifier);
             final curGoal = s.goals.where((g) => !g.isCompleted).firstOrNull;
             return Column(
@@ -3200,7 +4381,7 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
                 ),
               ),
               if (activeGoal != null) ...[
-                const SizedBox(width: 6),
+                const SizedBox(width: 2),
                 GrassBagSpringTap(
                   onTap: () => ctrl.updateGoalStatus(
                     activeGoal.id,
@@ -3208,10 +4389,16 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
                   ),
                   pressedScale: 0.90,
                   haptic: true,
-                  child: Icon(
-                    activeGoal.isArmed ? CupertinoIcons.pause_fill : CupertinoIcons.play_fill,
-                    size: 13.5,
-                    color: accentCol,
+                  child: SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: Center(
+                      child: Icon(
+                        activeGoal.isArmed ? CupertinoIcons.pause_fill : CupertinoIcons.play_fill,
+                        size: 14,
+                        color: accentCol,
+                      ),
+                    ),
                   ),
                 ),
               ],
@@ -3219,6 +4406,159 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Stateful slide + Liquid Glass materialize transition owning & disposing its [CurvedAnimation]
+/// cleanly so AnimatedSwitcher popovers never double-curve or leak listeners.
+class _ComposerSlideMaterialize extends StatefulWidget {
+  const _ComposerSlideMaterialize({
+    required this.animation,
+    required this.tier,
+    required this.beginOffset,
+    required this.scaleFrom,
+    required this.contentSigma,
+    required this.child,
+  });
+
+  final Animation<double> animation;
+  final GrassBagGlassTier tier;
+  final Offset beginOffset;
+  final double scaleFrom;
+  final double contentSigma;
+  final Widget child;
+
+  @override
+  State<_ComposerSlideMaterialize> createState() =>
+      _ComposerSlideMaterializeState();
+}
+
+class _ComposerSlideMaterializeState extends State<_ComposerSlideMaterialize> {
+  late CurvedAnimation _slideCurve;
+  late Animation<Offset> _slideAnim;
+
+  void _initCurve() {
+    _slideCurve = CurvedAnimation(
+      parent: widget.animation,
+      curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+      reverseCurve: Curves.easeInCubic,
+    );
+    _slideAnim = Tween<Offset>(
+      begin: widget.beginOffset,
+      end: Offset.zero,
+    ).animate(_slideCurve);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _initCurve();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ComposerSlideMaterialize oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.animation != widget.animation) {
+      _slideCurve.dispose();
+      _initCurve();
+    } else if (oldWidget.beginOffset != widget.beginOffset) {
+      _slideAnim = Tween<Offset>(
+        begin: widget.beginOffset,
+        end: Offset.zero,
+      ).animate(_slideCurve);
+    }
+  }
+
+  @override
+  void dispose() {
+    _slideCurve.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SlideTransition(
+      position: _slideAnim,
+      child: GrassBagMaterializeTransition(
+        animation: widget.animation,
+        tier: widget.tier,
+        alignment: Alignment.bottomCenter,
+        scaleFrom: widget.scaleFrom,
+        contentSigma: widget.contentSigma,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _EditQueuedMessageSheetBody extends ConsumerStatefulWidget {
+  const _EditQueuedMessageSheetBody({required this.item});
+
+  final QueuedMessageItem item;
+
+  @override
+  ConsumerState<_EditQueuedMessageSheetBody> createState() => _EditQueuedMessageSheetBodyState();
+}
+
+class _EditQueuedMessageSheetBodyState extends ConsumerState<_EditQueuedMessageSheetBody> {
+  late final TextEditingController _editCtrl = TextEditingController(text: widget.item.text);
+
+  @override
+  void dispose() {
+    _editCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tier = ref.watch(appProvider.select((s) => s.glassTier));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        GrassBagTextField(
+          controller: _editCtrl,
+          placeholder: '输入新的消息内容…',
+          maxLines: 4,
+          minLines: 2,
+          insideGlass: true,
+          autofocus: true,
+        ),
+        const SizedBox(height: 14),
+        Row(
+          children: [
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '取消',
+                height: 40,
+                tier: tier,
+                insideGlass: true,
+                onTap: () => Navigator.of(context).pop(),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: GrassBagPrimaryGlassButton(
+                label: '保存修改',
+                height: 40,
+                tier: tier,
+                insideGlass: true,
+                onTap: () {
+                  final next = _editCtrl.text.trim();
+                  if (next.isEmpty) {
+                    ref.read(appProvider.notifier).showToast('内容不能为空', tone: ToastTone.warn);
+                    return;
+                  }
+                  Navigator.of(context).pop();
+                  unawaited(ref.read(appProvider.notifier).editQueuedMessage(widget.item.id, next));
+                },
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+      ],
     );
   }
 }

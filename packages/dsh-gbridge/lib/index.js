@@ -38,16 +38,31 @@ export const PAIRING_API_PATH = '/api/gbridge/pairing';
 const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 // Latch Android container secrets once in module-private memory before scrubbing `process.env`.
-// Cordis reloads plugins during DSH web profile hydration (~0.5-1s after boot); without latching,
-// the 2nd `apply(ctx)` sees deleted env vars and drops UDS + Bearer auth + phone-control auth!
-const latchedAndroidEnv = {
-  token: process.env.GBRIDGE_TOKEN || undefined,
-  unixSocket: process.env.GBRIDGE_UNIX_SOCKET || undefined,
-  phoneSocket: process.env.GBRIDGE_PHONE_SOCKET || undefined,
-  phoneToken: process.env.GBRIDGE_PHONE_TOKEN || undefined,
-  pidFile: process.env.GBRIDGE_PID_FILE || undefined,
-  isLocalAndroid: process.env.GBRIDGE_LOCAL_ANDROID === '1',
-};
+// Prefer one-time `0600` `GBRIDGE_SECRETS_FILE` (unlinked immediately after read) so `/proc/<pid>/environ`
+// never exposes privileged bearer tokens to same-UID child/terminal processes.
+const latchedAndroidEnv = (() => {
+  let token = process.env.GBRIDGE_TOKEN || undefined;
+  let phoneToken = process.env.GBRIDGE_PHONE_TOKEN || undefined;
+  const secretsFile = process.env.GBRIDGE_SECRETS_FILE || undefined;
+  if (secretsFile) {
+    try {
+      const raw = readFileSync(secretsFile, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.token === 'string' && parsed.token.trim()) token = parsed.token.trim();
+      if (typeof parsed?.phoneToken === 'string' && parsed.phoneToken.trim()) phoneToken = parsed.phoneToken.trim();
+    } catch {}
+    try { unlinkSync(secretsFile); } catch {}
+    delete process.env.GBRIDGE_SECRETS_FILE;
+  }
+  return {
+    token,
+    unixSocket: process.env.GBRIDGE_UNIX_SOCKET || undefined,
+    phoneSocket: process.env.GBRIDGE_PHONE_SOCKET || undefined,
+    phoneToken,
+    pidFile: process.env.GBRIDGE_PID_FILE || undefined,
+    isLocalAndroid: process.env.GBRIDGE_LOCAL_ANDROID === '1',
+  };
+})();
 if (latchedAndroidEnv.unixSocket) {
   delete process.env.GBRIDGE_TOKEN;
   delete process.env.GBRIDGE_PHONE_TOKEN;
@@ -174,24 +189,48 @@ function inspectWebServerBinding(ctx) {
 
 function scheduleLanTeardown(listenKey, expectedGen, { immediate = false } = {}) {
   const entry = activeLanListeners.get(listenKey);
-  if (!entry || entry.gen !== expectedGen) return;
-  const closeNow = () => {
+  if (!entry || entry.gen !== expectedGen) return Promise.resolve();
+  const closeNow = () => new Promise((resolve) => {
     const cur = activeLanListeners.get(listenKey);
-    if (!cur || cur.gen !== expectedGen) return;
+    if (!cur || cur.gen !== expectedGen) {
+      resolve();
+      return;
+    }
     activeLanListeners.delete(listenKey);
-    try { cur.server?.closeAllConnections?.(); } catch {}
-    try { cur.server?.close(); } catch {}
-  };
+    const srv = cur.server;
+    if (!srv) {
+      resolve();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const guard = setTimeout(finish, 800);
+    guard.unref?.();
+    try { srv.closeAllConnections?.(); } catch {}
+    try {
+      srv.close(() => {
+        clearTimeout(guard);
+        finish();
+      });
+    } catch {
+      clearTimeout(guard);
+      finish();
+    }
+  });
   if (immediate) {
     if (entry.closeTimer) {
       clearTimeout(entry.closeTimer);
       entry.closeTimer = null;
     }
-    closeNow();
-    return;
+    return closeNow();
   }
-  entry.closeTimer = setTimeout(closeNow, 5000);
+  entry.closeTimer = setTimeout(() => { closeNow(); }, 5000);
   entry.closeTimer.unref?.();
+  return Promise.resolve();
 }
 
 /**
@@ -487,7 +526,7 @@ export function startLanBridgeListener(core, {
       const ifaces = listReachableNetworkInterfaces();
       const sampleIp = ifaces[0]?.ip || '127.0.0.1';
       entry.logger?.info?.(
-        `[gbridge] Zero-conflict LAN Bridge ready on :${actualPort}${entry.conflictAvoided ? ` (avoided busy :${preferredPort})` : ''}: http://${sampleIp}:${actualPort}/?token=${entry.bearerToken}`,
+        `[gbridge] Zero-conflict LAN Bridge ready on :${actualPort}${entry.conflictAvoided ? ` (avoided busy :${preferredPort})` : ''}: http://${sampleIp}:${actualPort}/?token=***`,
       );
       onListening?.({ host, port: actualPort, preferredPort, conflictAvoided: entry.conflictAvoided });
       resolveReady({ host, port: actualPort, conflictAvoided: entry.conflictAvoided });
@@ -558,6 +597,11 @@ export function createGbridgeCore(ctx, options = {}) {
     token: capturedPhoneToken,
     logger,
   });
+  if (typeof phoneState.notifyTurnEnd === 'function') {
+    hub.setOnTurnCompleted(({ sessionId, reason }) => {
+      phoneState.notifyTurnEnd(sessionId, reason);
+    });
+  }
 
   // Live pairing controller wired by `apply(ctx)` (and safely usable standalone in tests).
   let pairingController = options.pairingController ?? null;
@@ -587,7 +631,7 @@ export function createGbridgeCore(ctx, options = {}) {
     sendJson(res, 200, snap);
   }, { domain: 'meta' });
 
-  router.post('/pairing', async (req, res) => {
+  router.post('/pairing', async (req, res, { mode: reqMode, lanPort: reqLanPort } = {}) => {
     if (!pairingController) {
       throw new GbridgeError(501, 'gbridge/pairing_unavailable', 'pairing controller not attached');
     }
@@ -598,7 +642,25 @@ export function createGbridgeCore(ctx, options = {}) {
         throw new GbridgeError(400, 'gbridge/invalid_json', 'invalid JSON payload');
       }
     }
-    const next = await pairingController.applyAction(body);
+    const action = String(body?.action || '').trim();
+    const deferStop = reqMode === 'lan' && action === 'setLanEnabled' && !Boolean(body?.enabled);
+    const next = await pairingController.applyAction(body, { deferLanStop: deferStop });
+    if (reqMode === 'lan' && action === 'rotateToken' && next?.token && reqLanPort) {
+      const cookieName = lanCookieNameForPort(reqLanPort);
+      const cookieVal = signLanCookieValue(next.token);
+      res.setHeader(
+        'set-cookie',
+        `${cookieName}=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
+      );
+    }
+    if (deferStop) {
+      res.once('finish', () => {
+        const t = setTimeout(() => {
+          try { pairingController.stopLan(true); } catch {}
+        }, 150);
+        t.unref?.();
+      });
+    }
     sendJson(res, 200, next);
   }, { domain: 'meta' });
 
@@ -646,6 +708,7 @@ export function createGbridgeCore(ctx, options = {}) {
         searchParams,
         peer: auth.peer,
         mode,
+        lanPort,
       });
     } catch (err) {
       sendError(res, err);
@@ -661,7 +724,7 @@ export function createGbridgeCore(ctx, options = {}) {
       }
       const ws = upgradeWebSocket(req, socket, head, { peer: auth.peer });
       if (ws) {
-        hub.attachClient(ws, { peer: auth.peer });
+        hub.attachClient(ws, { peer: auth.peer, mode });
       }
     } catch {
       rejectUpgrade(socket, 400, 'Bad Request');
@@ -829,6 +892,27 @@ export function createPairingController(ctx, core, config = {}) {
   let lanToken = resolveOrCreateLanToken(config.lanToken ?? process.env.GBRIDGE_LAN_TOKEN);
   let lanHandle = null;
   let lanWanted = false;
+  let lanOpChain = Promise.resolve();
+
+  const runLanOp = (fn) => {
+    const next = lanOpChain.then(fn, fn);
+    lanOpChain = next.catch(() => {});
+    return next;
+  };
+
+  const resolveSharedWebToken = () => {
+    const explicit = core.udsToken || process.env.GBRIDGE_TOKEN || null;
+    if (explicit) return explicit;
+    try {
+      const conn = ctx?.get?.('connection');
+      if (typeof conn?.authenticatedUrl === 'function') {
+        const authed = conn.authenticatedUrl('http://127.0.0.1/');
+        const t = new URL(authed).searchParams.get('token');
+        if (t && t.trim()) return t.trim();
+      }
+    } catch {}
+    return null;
+  };
 
   const computeShouldAutoEnableLan = () => {
     if (udsPath) return false;
@@ -845,25 +929,28 @@ export function createPairingController(ctx, core, config = {}) {
       isDesktopProfile;
   };
 
-  const stopLan = (immediate = true) => {
+  const stopLan = (immediate = true) => runLanOp(async () => {
     lanWanted = false;
-    if (lanHandle) {
-      try { lanHandle.dispose({ immediate }); } catch {}
-      lanHandle = null;
+    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch {}
+    const prev = lanHandle;
+    lanHandle = null;
+    if (prev) {
+      try { await prev.dispose({ immediate }); } catch {}
     }
-  };
+  });
 
-  const startLan = async (portOverride) => {
+  const startLan = (portOverride) => runLanOp(async () => {
     if (udsPath) return;
     if (portOverride !== undefined) preferredPort = portOverride;
     const wsInfo = inspectWebServerBinding(ctx);
     const avoidPorts = wsInfo.port ? [wsInfo.port] : [];
-    if (lanHandle) {
-      try { lanHandle.dispose({ immediate: true }); } catch {}
-      lanHandle = null;
+    const prev = lanHandle;
+    lanHandle = null;
+    if (prev) {
+      try { await prev.dispose({ immediate: true }); } catch {}
     }
     lanWanted = true;
-    lanHandle = startLanBridgeListener(core, {
+    const nextHandle = startLanBridgeListener(core, {
       host: lanHost,
       port: preferredPort,
       avoidPorts,
@@ -872,12 +959,14 @@ export function createPairingController(ctx, core, config = {}) {
       logger,
       getPairingSnapshot: () => getSnapshot(),
     });
-    await lanHandle.ready;
-  };
+    lanHandle = nextHandle;
+    await nextHandle.ready;
+  });
 
   const buildEndpoints = (port, tokenForUrl) => {
     if (!port) return [];
-    const hostLabel = hostname() || 'DSH';
+    const rawHostLabel = (hostname() || 'DSH').trim();
+    const hostLabel = rawHostLabel.length > 24 ? rawHostLabel.slice(0, 24) : rawHostLabel;
     const ifaces = listReachableNetworkInterfaces();
     return ifaces.map((item) => {
       const base = `http://${item.ip}:${port}`;
@@ -889,9 +978,15 @@ export function createPairingController(ctx, core, config = {}) {
       if (tokenForUrl) pairQs.set('token', tokenForUrl);
       if (hostLabel) pairQs.set('name', hostLabel);
       const pairUri = `grassbag://pair?${pairQs.toString()}`;
+      let qrUrl = url;
+      if (Buffer.byteLength(qrUrl, 'utf8') > 200) {
+        const compactQs = new URLSearchParams();
+        if (tokenForUrl) compactQs.set('token', tokenForUrl);
+        qrUrl = compactQs.toString() ? `${base}/?${compactQs.toString()}` : base;
+      }
       let qr = null;
       try {
-        qr = buildQrPathData(encodeQrMatrix(url), 3);
+        qr = buildQrPathData(encodeQrMatrix(qrUrl), 3);
       } catch {}
       return {
         iface: item.iface,
@@ -921,7 +1016,7 @@ export function createPairingController(ctx, core, config = {}) {
     if (wsInfo.isRemotelyReachable && !lanListening) {
       mode = 'shared-webserver';
       activePort = wsInfo.port;
-      activeToken = core.udsToken || process.env.GBRIDGE_TOKEN || null;
+      activeToken = resolveSharedWebToken();
     } else if (lanListening) {
       mode = 'lan-bridge';
       activePort = lanPort;
@@ -930,7 +1025,7 @@ export function createPairingController(ctx, core, config = {}) {
     } else if (wsInfo.isRemotelyReachable) {
       mode = 'shared-webserver';
       activePort = wsInfo.port;
-      activeToken = core.udsToken || process.env.GBRIDGE_TOKEN || null;
+      activeToken = resolveSharedWebToken();
     }
 
     const endpoints = buildEndpoints(activePort, activeToken);
@@ -947,6 +1042,7 @@ export function createPairingController(ctx, core, config = {}) {
       activePort,
       portConflictAvoided,
       hasBridgeToken: mode === 'lan-bridge' || Boolean(activeToken),
+      canRotateToken: mode === 'lan-bridge',
       token: activeToken,
       connectedClients: core.hub.clients.size,
       webServer: {
@@ -969,20 +1065,44 @@ export function createPairingController(ctx, core, config = {}) {
     };
   };
 
-  const applyAction = async (body = {}) => {
+  const applyAction = async (body = {}, { deferLanStop = false } = {}) => {
     const action = String(body?.action || '').trim();
     if (action === 'rotateToken') {
       lanToken = persistRotatedLanToken();
       if (lanHandle) lanHandle.setToken(lanToken);
+      // Immediately revoke active LAN WebSocket sessions so rotated-out devices must re-authorize.
+      try { core.hub.disconnectByMode('lan', 4001, 'token rotated'); } catch {}
       return getSnapshot();
     }
     if (action === 'setLanEnabled') {
       const enabled = Boolean(body?.enabled);
       if (enabled) {
         await startLan();
-      } else {
-        stopLan(true);
+        return getSnapshot();
       }
+      if (deferLanStop) {
+        lanWanted = false;
+        const snap = getSnapshot();
+        const sharedOk = Boolean(snap.webServer?.isRemotelyReachable);
+        const sharedToken = resolveSharedWebToken();
+        const sharedEndpoints = sharedOk ? buildEndpoints(snap.webServer.port, sharedToken) : [];
+        return {
+          ...snap,
+          mode: sharedOk ? 'shared-webserver' : 'loopback-only',
+          activePort: sharedOk ? snap.webServer.port : null,
+          hasBridgeToken: Boolean(sharedToken),
+          canRotateToken: false,
+          token: sharedOk ? sharedToken : null,
+          lan: {
+            ...snap.lan,
+            enabled: false,
+            listening: false,
+          },
+          endpoints: sharedEndpoints,
+          primaryEndpoint: sharedEndpoints[0] ?? null,
+        };
+      }
+      await stopLan(true);
       return getSnapshot();
     }
     if (action === 'setLanPort') {
@@ -1054,7 +1174,12 @@ export function apply(ctx, config = {}) {
             try {
               if (request.method === 'POST') {
                 const text = await request.text();
-                const body = text ? JSON.parse(text) : {};
+                let body = {};
+                if (text) {
+                  try { body = JSON.parse(text); } catch {
+                    throw new GbridgeError(400, 'gbridge/invalid_json', 'invalid JSON payload');
+                  }
+                }
                 const next = await pairing.applyAction(body);
                 return new Response(JSON.stringify(next), {
                   status: 200,

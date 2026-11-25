@@ -24,6 +24,7 @@ import 'dsh_dynamic_sections.dart';
 import 'dsh_settings_sheets.dart';
 import 'model_config_view.dart';
 import 'permissions_center_page.dart';
+import 'phone_control_view.dart';
 
 enum SettingsSection {
   account('账号与余额', 'account'),
@@ -58,7 +59,7 @@ enum SettingsSection {
 /// "Base URL", "备份", "电池", "Token" or "深色" always locates the right Settings section.
 const Map<SettingsSection, String> kSettingsSearchAliases = {
   SettingsSection.account: 'deepseek 账号 登录 余额 充值 account balance sign in',
-  SettingsSection.general: '通用 对话 权限 审批 预设 角色 折叠 代理 proxy preset permission language locale',
+  SettingsSection.general: '通用 对话 权限 审批 预设 角色 折叠 preset permission language locale',
   SettingsSection.model: '模型 渠道 中转 聚合 base url api key 密钥 openai claude gemini deepseek 思考深度 model provider',
   SettingsSection.webSearch: '联网 搜索 抓取 网页 web search fetch tavily brave exa',
   SettingsSection.agentRuntime: '子代理 子智能体 并发 循环 终端 沙箱 subagent sandbox bash loop',
@@ -86,10 +87,9 @@ bool settingsSectionMatchesQuery(
   final q = rawQuery.trim().toLowerCase();
   if (q.isEmpty) return true;
   final aliases = kSettingsSearchAliases[section] ?? '';
-  return title.toLowerCase().contains(q) ||
-      summary.toLowerCase().contains(q) ||
-      groupTitle.toLowerCase().contains(q) ||
-      aliases.contains(q);
+  final haystack = '${title.toLowerCase()} ${summary.toLowerCase()} ${groupTitle.toLowerCase()} $aliases';
+  final tokens = q.split(RegExp(r'\s+')).where((t) => t.isNotEmpty);
+  return tokens.every(haystack.contains);
 }
 
 /// Unified Settings Page:
@@ -114,10 +114,9 @@ class SettingsPage extends ConsumerStatefulWidget {
 class _SettingsPageState extends ConsumerState<SettingsPage> {
   late SettingsSection _selected;
   String? _hostDetailId;
-  bool _didAutoPushInitial = false;
+  int _paneDirection = 0;
   final ValueNotifier<String> _queryNotifier = ValueNotifier<String>('');
   final _searchCtrl = TextEditingController();
-  final _detailScrollCtrl = ScrollController();
 
   @override
   void initState() {
@@ -125,25 +124,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     _selected = widget.initialSection ?? SettingsSection.account;
     _hostDetailId = widget.initialHostDetailId ??
         (widget.initialSection == SettingsSection.local ? 'local' : null);
-    if (widget.initialSection != null || widget.initialHostDetailId != null) {
+    if (widget.initialSection == SettingsSection.webui) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || _didAutoPushInitial || _isTablet(context)) return;
-        _didAutoPushInitial = true;
-        final targetSection = widget.initialSection ?? SettingsSection.hosts;
-        if (targetSection == SettingsSection.webui) {
-          widget.onOpenWebUi();
-          return;
-        }
-        Navigator.of(context).push(
-          GrassBagPageRoute<void>(
-            builder: (_) => _PhoneSettingsSubpage(
-              section: targetSection,
-              initialHostDetailId: widget.initialHostDetailId ??
-                  (targetSection == SettingsSection.local ? 'local' : null),
-              onOpenWebUi: widget.onOpenWebUi,
-            ),
-          ),
-        );
+        if (!mounted || _isTablet(context)) return;
+        widget.onOpenWebUi();
       });
     }
   }
@@ -152,14 +136,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   void dispose() {
     _queryNotifier.dispose();
     _searchCtrl.dispose();
-    _detailScrollCtrl.dispose();
     super.dispose();
-  }
-
-  void _resetDetailScroll() {
-    if (_detailScrollCtrl.hasClients && _detailScrollCtrl.offset > 0) {
-      _detailScrollCtrl.jumpTo(0);
-    }
   }
 
   bool _isTablet(BuildContext context) {
@@ -173,8 +150,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         widget.onOpenWebUi();
         return;
       }
-      _resetDetailScroll();
       setState(() {
+        _paneDirection = 0;
         _selected = section;
         _hostDetailId = section == SettingsSection.local ? 'local' : null;
       });
@@ -209,6 +186,20 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final state = ref.read(appProvider);
     final t = GrassBagTokens.of(context);
     final isTab = _isTablet(context);
+
+    // On Phone, render deep-linked subpages directly on Frame 0 instead of pushing a second
+    // route in a post-frame callback (eliminates the jarring root-Settings list flash!).
+    if (!isTab &&
+        (widget.initialSection != null || widget.initialHostDetailId != null) &&
+        widget.initialSection != SettingsSection.webui) {
+      final targetSection = widget.initialSection ?? SettingsSection.hosts;
+      return _PhoneSettingsSubpage(
+        section: targetSection,
+        initialHostDetailId: widget.initialHostDetailId ??
+            (targetSection == SettingsSection.local ? 'local' : null),
+        onOpenWebUi: widget.onOpenWebUi,
+      );
+    }
 
     if (isTab) {
       final detailHost = _hostDetailId != null
@@ -279,20 +270,28 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                                     iconSize: 17,
                                     tier: state.glassTier,
                                     onTap: () {
-                                      _resetDetailScroll();
-                                      setState(() => _hostDetailId = null);
+                                      setState(() {
+                                        _paneDirection = -1;
+                                        _hostDetailId = null;
+                                      });
                                     },
                                   ),
                                   const SizedBox(width: 10),
                                 ],
                                 Expanded(
-                                  child: Text(
-                                    rightTitle,
-                                    style: TextStyle(
-                                      fontSize: 20,
-                                      fontWeight: FontWeight.w600,
-                                      letterSpacing: -0.3,
-                                      color: t.text,
+                                  child: GrassBagDirectionalTabSwitcher(
+                                    direction: _paneDirection,
+                                    duration: const Duration(milliseconds: 160),
+                                    alignment: Alignment.centerLeft,
+                                    child: Text(
+                                      rightTitle,
+                                      key: ValueKey('settings-title-$rightTitle'),
+                                      style: TextStyle(
+                                        fontSize: 20,
+                                        fontWeight: FontWeight.w600,
+                                        letterSpacing: -0.3,
+                                        color: t.text,
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -301,75 +300,44 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                           ),
                         ),
                         Expanded(
-                          child: Stack(
-                            children: [
-                              Positioned.fill(
-                                child: SingleChildScrollView(
-                                  controller: _detailScrollCtrl,
-                                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                                  padding: EdgeInsets.fromLTRB(
-                                    24,
-                                    4,
-                                    24,
-                                    40 + MediaQuery.viewPaddingOf(context).bottom,
-                                  ),
-                                  child: Center(
-                                    child: ConstrainedBox(
-                                      constraints: const BoxConstraints(maxWidth: 620),
-                                      child: AnimatedSwitcher(
-                                        duration: const Duration(milliseconds: 180),
-                                        switchInCurve: Curves.easeOutCubic,
-                                        switchOutCurve: Curves.easeInCubic,
-                                        layoutBuilder: (currentChild, previousChildren) => Stack(
-                                          alignment: Alignment.topCenter,
-                                          children: [
-                                            ...previousChildren,
-                                            if (currentChild != null) currentChild,
-                                          ],
-                                        ),
-                                        child: KeyedSubtree(
-                                          key: ValueKey('${_selected.name}-${_hostDetailId ?? ''}'),
-                                          child: _SettingsDetailBody(
-                                            section: _selected,
-                                            hostDetailId: _hostDetailId,
-                                            onSelectHostDetail: (id) {
-                                              _resetDetailScroll();
-                                              setState(() => _hostDetailId = id);
-                                            },
-                                            onHostRemoved: () {
-                                              _resetDetailScroll();
-                                              setState(() => _hostDetailId = null);
-                                            },
-                                            onOpenSection: _selectSection,
-                                            onOpenWebUi: widget.onOpenWebUi,
-                                          ),
-                                        ),
-                                      ),
-                                    ),
+                          // Per-pane SingleChildScrollView inside the switcher prevents outgoing
+                          // content from jumping to scroll offset 0 mid-fade!
+                          child: GrassBagDirectionalTabSwitcher(
+                            direction: _paneDirection,
+                            duration: const Duration(milliseconds: 180),
+                            child: SingleChildScrollView(
+                              key: PageStorageKey('settings-pane-${_selected.name}-${_hostDetailId ?? ''}'),
+                              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                              padding: EdgeInsets.fromLTRB(
+                                24,
+                                8,
+                                24,
+                                40 + MediaQuery.viewPaddingOf(context).bottom,
+                              ),
+                              child: Center(
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(maxWidth: 620),
+                                  child: _SettingsDetailBody(
+                                    section: _selected,
+                                    hostDetailId: _hostDetailId,
+                                    onSelectHostDetail: (id) {
+                                      setState(() {
+                                        _paneDirection = 1;
+                                        _hostDetailId = id;
+                                      });
+                                    },
+                                    onHostRemoved: () {
+                                      setState(() {
+                                        _paneDirection = -1;
+                                        _hostDetailId = null;
+                                      });
+                                    },
+                                    onOpenSection: _selectSection,
+                                    onOpenWebUi: widget.onOpenWebUi,
                                   ),
                                 ),
                               ),
-                              Positioned(
-                                top: 0,
-                                left: 0,
-                                right: 0,
-                                height: 16,
-                                child: IgnorePointer(
-                                  child: DecoratedBox(
-                                    decoration: BoxDecoration(
-                                      gradient: LinearGradient(
-                                        begin: Alignment.topCenter,
-                                        end: Alignment.bottomCenter,
-                                        colors: [
-                                          t.feather,
-                                          t.feather.withValues(alpha: 0.0),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
                         ),
                       ],
@@ -400,7 +368,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   selected: _selected,
                   query: query,
                   searchCtrl: _searchCtrl,
-                  topInsetPadding: topPad + 70,
+                  topInsetPadding: topPad + 78,
                   onQueryChanged: (q) => _queryNotifier.value = q,
                   onSelect: _selectSection,
                 ),
@@ -441,11 +409,20 @@ class _PhoneSettingsSubpage extends ConsumerStatefulWidget {
 
 class _PhoneSettingsSubpageState extends ConsumerState<_PhoneSettingsSubpage> {
   String? _hostDetailId;
+  int _drillDir = 1;
 
   @override
   void initState() {
     super.initState();
     _hostDetailId = widget.initialHostDetailId;
+  }
+
+  void _setHostDetailId(String? id) {
+    if (_hostDetailId == id) return;
+    setState(() {
+      _drillDir = id != null ? 1 : -1;
+      _hostDetailId = id;
+    });
   }
 
   @override
@@ -473,7 +450,7 @@ class _PhoneSettingsSubpageState extends ConsumerState<_PhoneSettingsSubpage> {
       canPop: canPopDirect,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop && _hostDetailId != null && widget.section == SettingsSection.hosts) {
-          setState(() => _hostDetailId = null);
+          _setHostDetailId(null);
         }
       },
       child: GrassBagGlassPage(
@@ -482,28 +459,38 @@ class _PhoneSettingsSubpageState extends ConsumerState<_PhoneSettingsSubpage> {
           body: Stack(
             children: [
               Positioned.fill(
-                child: SingleChildScrollView(
-                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                  physics: const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
-                  ),
-                  padding: EdgeInsets.fromLTRB(16, topPad + 70, 16, 44 + botPad),
-                  child: _SettingsDetailBody(
-                    section: widget.section,
-                    hostDetailId: _hostDetailId,
-                    onSelectHostDetail: (id) => setState(() => _hostDetailId = id),
-                    onHostRemoved: () => setState(() => _hostDetailId = null),
-                    onOpenSection: (sec) {
-                      Navigator.of(context).push(
-                        GrassBagPageRoute<void>(
-                          builder: (_) => _PhoneSettingsSubpage(
-                            section: sec,
-                            onOpenWebUi: widget.onOpenWebUi,
+                child: GrassBagDirectionalTabSwitcher(
+                  direction: _drillDir,
+                  duration: const Duration(milliseconds: 180),
+                  child: SingleChildScrollView(
+                    key: PageStorageKey('phone-settings-${widget.section.name}-${_hostDetailId ?? ''}'),
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    padding: EdgeInsets.fromLTRB(16, topPad + 78, 16, 44 + botPad),
+                    child: _SettingsDetailBody(
+                      section: widget.section,
+                      hostDetailId: _hostDetailId,
+                      onSelectHostDetail: _setHostDetailId,
+                      onHostRemoved: () => _setHostDetailId(null),
+                      onOpenSection: (sec) {
+                        if (sec == SettingsSection.webui) {
+                          widget.onOpenWebUi();
+                          return;
+                        }
+                        Navigator.of(context).push(
+                          GrassBagPageRoute<void>(
+                            builder: (_) => _PhoneSettingsSubpage(
+                              section: sec,
+                              initialHostDetailId: sec == SettingsSection.local ? 'local' : null,
+                              onOpenWebUi: widget.onOpenWebUi,
+                            ),
                           ),
-                        ),
-                      );
-                    },
-                    onOpenWebUi: widget.onOpenWebUi,
+                        );
+                      },
+                      onOpenWebUi: widget.onOpenWebUi,
+                    ),
                   ),
                 ),
               ),
@@ -516,7 +503,7 @@ class _PhoneSettingsSubpageState extends ConsumerState<_PhoneSettingsSubpage> {
                   tier: state.glassTier,
                   onBack: () {
                     if (_hostDetailId != null && widget.section == SettingsSection.hosts) {
-                      setState(() => _hostDetailId = null);
+                      _setHostDetailId(null);
                     } else {
                       Navigator.of(context).pop();
                     }
@@ -562,6 +549,7 @@ class _SettingsNavList extends ConsumerWidget {
           hosts: s.hosts,
           activeHostId: s.activeHostId,
           connectionPhase: s.connectionPhase,
+          hydratingDomains: s.hydratingDomains,
           dshNamespaces: s.dshNamespaces,
           dshSettingsSections: s.dshSettingsSections,
           presets: s.presets,
@@ -606,11 +594,14 @@ class _SettingsNavList extends ConsumerWidget {
       return switch (sec) {
         SettingsSection.general => '${state.activePreset.name} · ${state.activePermission.name}',
         SettingsSection.model => (state.isDshConnected &&
+                !state.hydratingDomains &&
                 !state.hasAvailableModels &&
                 state.routableProviders.isEmpty)
             ? '去配置'
-            : (state.effectiveActiveModelEntry?.name ??
-                (state.modelName.isEmpty ? '未配置' : state.modelName)),
+            : (state.hydratingDomains && !state.hasAvailableModels
+                ? '同步中…'
+                : (state.effectiveActiveModelEntry?.name ??
+                    (state.modelName.isEmpty ? '未配置' : state.modelName))),
         SettingsSection.webSearch => () {
             final sp = nsMap['web']?.value['searchProvider']?.toString() ?? '';
             return sp.isNotEmpty ? sp : '按需配置';
@@ -667,6 +658,7 @@ class _SettingsNavList extends ConsumerWidget {
     bool needsBadgeFor(SettingsSection sec) =>
         sec == SettingsSection.model &&
         state.isDshConnected &&
+        !state.hydratingDomains &&
         !state.hasAvailableModels &&
         state.routableProviders.isEmpty;
 
@@ -795,7 +787,8 @@ class _SettingsNavList extends ConsumerWidget {
 
     final accountSearchHaystack =
         '${kSettingsSearchAliases[SettingsSection.account]} ${state.accountSummaryLabel}'.toLowerCase();
-    final accountMatchesSearch = q.isEmpty || accountSearchHaystack.contains(q);
+    final accountTokens = q.split(RegExp(r'\s+')).where((t) => t.isNotEmpty);
+    final accountMatchesSearch = q.isEmpty || accountTokens.every(accountSearchHaystack.contains);
 
     final hasAnySearchHit = q.isEmpty ||
         accountMatchesSearch ||
@@ -917,17 +910,14 @@ class _SettingsNavList extends ConsumerWidget {
                     ),
                     child: Row(
                       children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: state.hostIsHealthy(curHost)
-                                ? t.ok
-                                : (curHost.needsAuth
-                                    ? t.primary
-                                    : (state.hostHasError(curHost) ? t.err : t.warn)),
-                            shape: BoxShape.circle,
-                          ),
+                        GrassBagStatusDot(
+                          size: 8,
+                          pulsing: state.hostIsConnecting(curHost),
+                          color: state.hostIsHealthy(curHost)
+                              ? t.ok
+                              : (curHost.needsAuth || state.hostIsConnecting(curHost)
+                                  ? t.primary
+                                  : (state.hostHasError(curHost) ? t.err : t.text3)),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
@@ -1008,7 +998,7 @@ class _SettingsNavList extends ConsumerWidget {
                         children: [
                           if (item.$6)
                             ConstrainedBox(
-                              constraints: BoxConstraints(maxWidth: isSplit ? 108 : 136),
+                              constraints: BoxConstraints(maxWidth: isSplit ? 88 : 104),
                               child: Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
                                 decoration: BoxDecoration(
@@ -1029,7 +1019,7 @@ class _SettingsNavList extends ConsumerWidget {
                             )
                           else
                             ConstrainedBox(
-                              constraints: BoxConstraints(maxWidth: isSplit ? 108 : 136),
+                              constraints: BoxConstraints(maxWidth: isSplit ? 88 : 104),
                               child: Text(
                                 item.$5,
                                 maxLines: 1,
@@ -1096,32 +1086,41 @@ class _SettingsDetailBody extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Narrow section-aware watch: background chat streaming, turns, toasts, and
-    // sidebar search NEVER rebuild Settings detail panels!
+    // Narrow section-aware watch: self-contained ConsumerWidget sections return `null`
+    // for `sectionPayload` so parent `_SettingsDetailBody` skips redundant outer rebuilds!
     ref.watch(
       appProvider.select(
         (s) => (
           glassTier: s.glassTier,
           isDark: s.isDark,
           accent: s.accent,
-          hosts: s.hosts,
+          hosts: hostDetailId != null ||
+                  section == SettingsSection.hosts ||
+                  section == SettingsSection.local
+              ? s.hosts
+              : null,
           activeHostId: s.activeHostId,
           connectionPhase: s.connectionPhase,
-          dshSettingsSections: s.dshSettingsSections,
+          dshSettingsSections: section == SettingsSection.webSearch ||
+                  section == SettingsSection.agentRuntime ||
+                  section == SettingsSection.plugins
+              ? s.dshSettingsSections
+              : null,
           sectionPayload: switch (section) {
+            SettingsSection.general ||
+            SettingsSection.model ||
+            SettingsSection.webSearch ||
+            SettingsSection.agentRuntime ||
+            SettingsSection.mcp ||
+            SettingsSection.permissions ||
+            SettingsSection.phone ||
+            SettingsSection.plugins =>
+              null,
             SettingsSection.account => (
                 s.accountSnapshot,
                 s.accountSigningIn,
                 s.providerCredentials,
                 s.routableProviders,
-              ),
-            SettingsSection.general => (
-                s.activePresetId,
-                s.activePermissionId,
-                s.autoFoldSteps,
-                s.useSystemProxy,
-                s.dshNamespaces,
-                s.dshDynamicOptions,
               ),
             SettingsSection.hosts || SettingsSection.local => (
                 s.nativeRuntimeStatus,
@@ -1135,19 +1134,6 @@ class _SettingsDetailBody extends ConsumerWidget {
                 s.useSystemProxy,
               ),
             SettingsSection.appearance => (s.isDark, s.accent, s.glassTier),
-            SettingsSection.permissions => (s.nativePermissions,),
-            SettingsSection.phone => (
-                s.isDshConnected,
-                s.routableProviders.length,
-                s.phoneAccessibility,
-                s.phoneOverlay,
-                s.phoneShizuku,
-                s.phoneConfirmHighRisk,
-                s.emergencyStopped,
-                s.safetyPolicy,
-                s.safetyAudit,
-                s.nativePermissions,
-              ),
             SettingsSection.diagnostics => (
                 s.liveCapabilities,
                 s.dshNamespaces,
@@ -1163,7 +1149,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                 s.appUpdateDownloading,
                 s.appUpdateDownloadProgress,
               ),
-            _ => (s.dshNamespaces, s.plugins, s.mcpServers),
+            _ => null,
           },
         ),
       ),
@@ -1174,19 +1160,18 @@ class _SettingsDetailBody extends ConsumerWidget {
 
     if (hostDetailId != null &&
         (section == SettingsSection.hosts || section == SettingsSection.local)) {
-      final host = state.hosts.firstWhere(
-        (h) => h.id == hostDetailId,
-        orElse: () => state.localHost,
-      );
-      return _HostDetailSection(
-        host: host,
-        isCurrent: host.id == state.activeHostId,
-        onOpenWebUi: onOpenWebUi,
-        onRemove: () {
-          ctrl.removeRemoteHost(host.id);
-          onHostRemoved();
-        },
-      );
+      final host = state.hosts.where((h) => h.id == hostDetailId).firstOrNull;
+      if (host != null) {
+        return _HostDetailSection(
+          host: host,
+          isCurrent: host.id == state.activeHostId,
+          onOpenWebUi: onOpenWebUi,
+          onRemove: () {
+            ctrl.removeRemoteHost(host.id);
+            onHostRemoved();
+          },
+        );
+      }
     }
 
     switch (section) {
@@ -1247,13 +1232,17 @@ class _SettingsDetailBody extends ConsumerWidget {
                           children: [
                             Row(
                               children: [
-                                Text(
-                                  'DeepSeek 账号',
-                                  style: TextStyle(
-                                    fontSize: 17,
-                                    fontWeight: FontWeight.w600,
-                                    letterSpacing: -0.3,
-                                    color: t.text,
+                                Flexible(
+                                  child: Text(
+                                    'DeepSeek 账号',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 17,
+                                      fontWeight: FontWeight.w600,
+                                      letterSpacing: -0.3,
+                                      color: t.text,
+                                    ),
                                   ),
                                 ),
                                 const SizedBox(width: 7),
@@ -1437,11 +1426,16 @@ class _SettingsDetailBody extends ConsumerWidget {
                     ),
                     showChevron: true,
                     onTap: () async {
-                      final u = links['usageUrl'].toString();
+                      final u = links['usageUrl'].toString().trim();
+                      final parsed = Uri.tryParse(u);
+                      if (parsed == null || (parsed.scheme != 'http' && parsed.scheme != 'https')) {
+                        ctrl.showToast('平台地址格式无效', tone: ToastTone.warn);
+                        return;
+                      }
                       if (kIsWeb) {
-                        openUrlInNewTab(u);
+                        openUrlInNewTab(parsed.toString());
                       } else if (GrassBagNativeBridge.instance.isAndroidNative) {
-                        final ok = await GrassBagNativeBridge.instance.openExternalUrl(u);
+                        final ok = await GrassBagNativeBridge.instance.openExternalUrl(parsed.toString());
                         if (!ok) ctrl.showToast('平台地址：$u', tone: ToastTone.info);
                       } else {
                         ctrl.showToast('平台地址：$u', tone: ToastTone.info);
@@ -1629,7 +1623,6 @@ class _SettingsDetailBody extends ConsumerWidget {
                   trailing: GrassBagGlassSwitch(
                     value: state.isDark,
                     tier: state.glassTier,
-                    activeColor: t.ok,
                     onChanged: ctrl.setDark,
                   ),
                 ),
@@ -1684,7 +1677,7 @@ class _SettingsDetailBody extends ConsumerWidget {
                                   ? Icon(
                                       CupertinoIcons.checkmark_alt,
                                       size: 10,
-                                      color: acc.swatchFor(t.isDark).computeLuminance() > 0.50
+                                      color: acc.swatchFor(t.isDark).computeLuminance() > 0.38
                                           ? const Color(0xFF0E1117)
                                           : Colors.white,
                                     )
@@ -1920,7 +1913,7 @@ class _SettingsDetailBody extends ConsumerWidget {
               const SizedBox(height: 18),
             ],
             Padding(
-              padding: const EdgeInsets.only(left: 6, bottom: 6),
+              padding: const EdgeInsets.only(left: 14, bottom: 8),
               child: Text('添加远程主机', style: TextStyle(fontSize: 12, color: t.text3)),
             ),
             RemoteHostConnectCard(
@@ -1950,316 +1943,7 @@ class _SettingsDetailBody extends ConsumerWidget {
         return const PermissionsCenterView();
 
       case SettingsSection.phone:
-        final perms = state.nativePermissions;
-        final needsRetoggle = perms.accessibilityNeedsRetoggle;
-        final isAndroid = GrassBagNativeBridge.instance.isAndroidNative;
-        final canRunSafeDemo = isAndroid &&
-            perms.accessibilityEnabled &&
-            !state.emergencyStopped &&
-            state.isDshConnected &&
-            state.routableProviders.isNotEmpty;
-        const policies = ['ask', 'allow_turn', 'always'];
-        final polIdx = policies.indexOf(state.safetyPolicy).clamp(0, 2);
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (needsRetoggle || !perms.accessibilityEnabled) ...[
-              GrassBagStatusBanner(
-                tone: needsRetoggle ? GrassBagBannerTone.error : GrassBagBannerTone.warn,
-                icon: needsRetoggle
-                    ? CupertinoIcons.exclamationmark_triangle_fill
-                    : CupertinoIcons.hand_draw_fill,
-                title: needsRetoggle
-                    ? '无障碍开关已开，但系统未绑定服务'
-                    : '尚未开启无障碍屏幕操控权限',
-                message: needsRetoggle
-                    ? '请前往无障碍设置先关闭再重新开启「GrassBag」，并在权限管理中关闭电池优化与解锁受限设置。'
-                    : '完成下方 3 项权限准备后，即可直接用自然语言让助手帮你操作手机。',
-                padding: const EdgeInsets.all(14),
-                borderRadius: 20,
-                action: Row(
-                  children: [
-                    Expanded(
-                      child: GrassBagPrimaryGlassButton(
-                        label: needsRetoggle ? '重开无障碍开关' : '去开启无障碍',
-                        height: 34,
-                        tier: state.glassTier,
-                        insideGlass: true,
-                        onTap: () => GrassBagNativeBridge.instance
-                            .openPermissionSettings('accessibility'),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    GrassBagSecondaryGlassButton(
-                      label: perms.sdkInt >= 33 ? '解锁指南' : '权限管理',
-                      height: 34,
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      tier: state.glassTier,
-                      insideGlass: true,
-                      onTap: () => Navigator.of(context).push(
-                        GrassBagPageRoute<void>(builder: (_) => const PermissionsCenterPage()),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 14),
-            ],
-            if (isAndroid) ...[
-              GrassBagGroupedSection(
-                header: '手机操控就绪检查',
-                dividerIndent: 54,
-                children: [
-                  GrassBagListTile(
-                    leading: Icon(
-                      perms.accessibilityEnabled
-                          ? CupertinoIcons.checkmark_circle_fill
-                          : CupertinoIcons.circle,
-                      size: 19,
-                      color: perms.accessibilityEnabled ? t.ok : t.warn,
-                    ),
-                    title: const Text('必需：无障碍屏幕操控'),
-                    subtitle: Text(
-                      perms.accessibilityEnabled ? '运行正常 · 可识别屏幕并执行操控' : '未开启 · 点击前往系统无障碍',
-                    ),
-                    trailing: _SmallPill(
-                      label: perms.accessibilityEnabled ? '已就绪' : '去开启',
-                      bg: perms.accessibilityEnabled ? t.okSoft : t.warnSoft,
-                      fg: perms.accessibilityEnabled ? t.ok : t.warn,
-                    ),
-                    onTap: () => GrassBagNativeBridge.instance
-                        .openPermissionSettings('accessibility'),
-                  ),
-                  GrassBagListTile(
-                    leading: Icon(
-                      perms.overlayGranted
-                          ? CupertinoIcons.checkmark_circle_fill
-                          : CupertinoIcons.circle,
-                      size: 19,
-                      color: perms.overlayGranted ? t.ok : t.text3,
-                    ),
-                    title: const Text('推荐：悬浮急停球'),
-                    subtitle: Text(
-                      perms.overlayGranted ? '已授权 · 自动化时随时一键暂停' : '跨应用执行时展示悬浮急停按钮',
-                    ),
-                    trailing: _SmallPill(
-                      label: perms.overlayGranted ? '已授权' : '去开启',
-                      bg: perms.overlayGranted ? t.okSoft : t.fill1,
-                      fg: perms.overlayGranted ? t.ok : t.text2,
-                    ),
-                    onTap: () => GrassBagNativeBridge.instance
-                        .openPermissionSettings('overlay'),
-                  ),
-                  GrassBagListTile(
-                    leading: Icon(
-                      perms.batteryOptIgnored
-                          ? CupertinoIcons.checkmark_circle_fill
-                          : CupertinoIcons.circle,
-                      size: 19,
-                      color: perms.batteryOptIgnored ? t.ok : t.text3,
-                    ),
-                    title: const Text('稳定：忽略电池优化'),
-                    subtitle: Text(
-                      perms.batteryOptIgnored ? '已允许后台保活' : '防止锁屏或切后台时断开无障碍连接',
-                    ),
-                    trailing: _SmallPill(
-                      label: perms.batteryOptIgnored ? '已允许' : '去设置',
-                      bg: perms.batteryOptIgnored ? t.okSoft : t.fill1,
-                      fg: perms.batteryOptIgnored ? t.ok : t.text2,
-                    ),
-                    onTap: () => GrassBagNativeBridge.instance
-                        .openPermissionSettings('battery'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 14),
-            ],
-            if (canRunSafeDemo) ...[
-              GrassBagCard(
-                padding: const EdgeInsets.all(14),
-                child: Row(
-                  children: [
-                    GrassBagSquircleIcon(
-                      icon: CupertinoIcons.sparkles,
-                      color: t.ok,
-                      size: 36,
-                      iconSize: 17,
-                      filled: true,
-                    ),
-                    const SizedBox(width: 11),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '手机操控已就绪',
-                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '发送一条安全指令验证屏幕自动化通路',
-                            style: TextStyle(fontSize: 11.5, color: t.text3),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    GrassBagPrimaryGlassButton(
-                      label: '试一试',
-                      icon: CupertinoIcons.play_fill,
-                      height: 34,
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      tier: state.glassTier,
-                      insideGlass: true,
-                      onTap: () {
-                        Navigator.of(context).popUntil((route) => route.isFirst);
-                        unawaited(ctrl.sendPrompt('请用手机操控帮我列出常用应用，并打开时钟或计算器确认屏幕画面'));
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 14),
-            ],
-            GrassBagCard(
-              padding: const EdgeInsets.all(15),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      GrassBagSquircleIcon(
-                        icon: CupertinoIcons.shield_lefthalf_fill,
-                        color: t.primary,
-                        size: 36,
-                        iconSize: 17,
-                      ),
-                      const SizedBox(width: 11),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '手机操控安全护栏',
-                              style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
-                            ),
-                            Text(
-                              '银行/支付/系统设置/密码框始终硬拦截，不可绕过',
-                              style: TextStyle(fontSize: 11.5, color: t.text3),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  GrassBagSegmentedControl(
-                    labels: const ['每次询问', '本轮允许', '免确认'],
-                    selectedIndex: polIdx,
-                    tier: state.glassTier,
-                    onSelected: (i) => ctrl.setSafetyPolicy(policies[i]),
-                  ),
-                  const SizedBox(height: 10),
-                  if (state.emergencyStopped) ...[
-                    GrassBagStatusBanner(
-                      tone: GrassBagBannerTone.error,
-                      icon: CupertinoIcons.exclamationmark_octagon_fill,
-                      message: '当前已处于急停锁定状态，所有操控与自动化调用均被阻断。',
-                      borderRadius: 14,
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-                    ),
-                    const SizedBox(height: 8),
-                    GrassBagPrimaryGlassButton(
-                      label: '解除急停锁（恢复手机操控）',
-                      icon: CupertinoIcons.play_circle_fill,
-                      tier: state.glassTier,
-                      insideGlass: true,
-                      onTap: ctrl.resetEmergencyStop,
-                    ),
-                  ] else
-                    GrassBagSecondaryGlassButton(
-                      label: '紧急急停（立刻终止一切操控与生成）',
-                      icon: CupertinoIcons.stop_circle_fill,
-                      tier: state.glassTier,
-                      insideGlass: true,
-                      destructive: true,
-                      onTap: ctrl.triggerEmergencyStop,
-                    ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            GrassBagGroupedSection(
-              header: '操控安全与系统授权',
-              children: [
-                GrassBagListTile(
-                  leading: GrassBagSquircleIcon(
-                    icon: CupertinoIcons.checkmark_shield_fill,
-                    color: needsRetoggle ? t.err : (perms.accessibilityEnabled ? t.ok : t.primary),
-                    size: 32,
-                    iconSize: 15,
-                  ),
-                  title: const Text('打开统一权限管理中心'),
-                  subtitle: Text(
-                    '已授权 ${perms.grantedCoreCount}/6 项 · 管理无障碍、悬浮窗、保活与存储',
-                  ),
-                  showChevron: true,
-                  onTap: () => Navigator.of(context).push(
-                    GrassBagPageRoute<void>(builder: (_) => const PermissionsCenterPage()),
-                  ),
-                ),
-                GrassBagListTile(
-                  leading: GrassBagSquircleIcon(
-                    icon: CupertinoIcons.sparkles,
-                    color: t.primary,
-                    size: 32,
-                    iconSize: 15,
-                  ),
-                  title: const Text('预览液态玻璃悬浮岛与确认卡'),
-                  subtitle: const Text('实时体验带 Logo 与屏幕流光的跨应用悬浮操控弹窗'),
-                  showChevron: true,
-                  onTap: () async {
-                    if (!perms.accessibilityEnabled && !perms.overlayGranted) {
-                      ctrl.showToast('请先开启无障碍服务或悬浮窗权限以预览悬浮岛', tone: ToastTone.warn);
-                      return;
-                    }
-                    await GrassBagNativeBridge.instance.previewPhoneOverlay();
-                  },
-                ),
-                GrassBagListTile(
-                  title: const Text('跨应用悬浮确认卡保护'),
-                  subtitle: const Text('工作区模式下在任意 App 上方弹出液态玻璃确认卡；完全权限下仅敏感动作弹窗'),
-                  trailing: GrassBagGlassSwitch(
-                    value: state.phoneConfirmHighRisk,
-                    tier: state.glassTier,
-                    onChanged: (v) => ctrl.setPhoneSetting(confirmHighRisk: v),
-                  ),
-                ),
-              ],
-            ),
-            if (state.safetyAudit.isNotEmpty) ...[
-              const SizedBox(height: 14),
-              GrassBagGroupedSection(
-                header: '最近安全审计记录 (${state.safetyAudit.length})',
-                children: [
-                  for (final entry in state.safetyAudit.take(5))
-                    GrassBagListTile(
-                      title: Text(
-                        entry['tool']?.toString() ?? 'tool',
-                        style: const TextStyle(fontFamily: 'monospace', fontSize: 12.5),
-                      ),
-                      subtitle: Text(entry['reason']?.toString() ?? ''),
-                      trailing: _SmallPill(
-                        label: entry['allowed'] == true ? '放行' : '拦截',
-                        bg: entry['allowed'] == true ? t.okSoft : t.errSoft,
-                        fg: entry['allowed'] == true ? t.ok : t.err,
-                      ),
-                    ),
-                ],
-              ),
-            ],
-          ],
-        );
+        return const PhoneControlView();
 
       case SettingsSection.plugins:
         final plugManifest = state.dshSettingsSections
@@ -2274,73 +1958,79 @@ class _SettingsDetailBody extends ConsumerWidget {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: GrassBagCard(
-                    borderRadius: 22,
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      children: [
-                        Text(
-                          caps != null ? '已连接' : '未连接',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                            color: caps != null ? t.ok : t.warn,
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(
+                    child: GrassBagCard(
+                      borderRadius: 22,
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            caps != null ? '已连接' : '未连接',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              color: caps != null ? t.ok : t.warn,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text('引擎状态', style: TextStyle(fontSize: 11.5, color: t.text3)),
-                      ],
+                          const SizedBox(height: 2),
+                          Text('引擎状态', style: TextStyle(fontSize: 11.5, color: t.text3)),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: GrassBagCard(
-                    borderRadius: 22,
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      children: [
-                        Text(
-                          caps != null ? '${caps.endpointsCount}' : '0',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                            color: t.text,
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: GrassBagCard(
+                      borderRadius: 22,
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            caps != null ? '${caps.endpointsCount}' : '0',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.text,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text('已发现接口', style: TextStyle(fontSize: 11.5, color: t.text3)),
-                      ],
+                          const SizedBox(height: 2),
+                          Text('已发现接口', style: TextStyle(fontSize: 11.5, color: t.text3)),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: GrassBagCard(
-                    borderRadius: 22,
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                      children: [
-                        Text(
-                          '${state.effectiveDshNamespaces.length}',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                            color: t.text,
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: GrassBagCard(
+                      borderRadius: 22,
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            '${state.effectiveDshNamespaces.length}',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.text,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 2),
-                        Text('配置模块', style: TextStyle(fontSize: 11.5, color: t.text3)),
-                      ],
+                          const SizedBox(height: 2),
+                          Text('配置模块', style: TextStyle(fontSize: 11.5, color: t.text3)),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
             if (caps == null) ...[
               const SizedBox(height: 12),
@@ -2498,7 +2188,7 @@ class _SettingsDetailBody extends ConsumerWidget {
   }
 }
 
-class _HostDetailSection extends ConsumerWidget {
+class _HostDetailSection extends ConsumerStatefulWidget {
   const _HostDetailSection({
     required this.host,
     required this.isCurrent,
@@ -2512,7 +2202,18 @@ class _HostDetailSection extends ConsumerWidget {
   final VoidCallback onRemove;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_HostDetailSection> createState() => _HostDetailSectionState();
+}
+
+class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
+  bool _openingWebUi = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final host = widget.host;
+    final isCurrent = widget.isCurrent;
+    final onOpenWebUi = widget.onOpenWebUi;
+    final onRemove = widget.onRemove;
     final ctrl = ref.read(appProvider.notifier);
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
     final t = GrassBagTokens.of(context);
@@ -2636,7 +2337,16 @@ class _HostDetailSection extends ConsumerWidget {
                           tier: tier,
                           insideGlass: true,
                           destructive: true,
-                          onTap: () => unawaited(ctrl.stopLocalEngine()),
+                          onTap: () async {
+                            final ok = await showGrassBagConfirmDialog(
+                              context,
+                              title: '停止本机 DSH 引擎？',
+                              message: '停止后当前本机对话、终端会话与后台任务将中断，需要时可一键重新启动。',
+                              confirmLabel: '停止引擎',
+                              isDestructive: true,
+                            );
+                            if (ok) unawaited(ctrl.stopLocalEngine());
+                          },
                         ),
                         const SizedBox(width: 6),
                         primaryBtn,
@@ -2731,18 +2441,22 @@ class _HostDetailSection extends ConsumerWidget {
                         onTap: host.updatingDsh ? null : ctrl.upgradeLocalDsh,
                       )
                     : GrassBagSecondaryGlassButton(
-                        label: appState.checkingUpdate
-                            ? '检测中…'
-                            : (updateCheck != null && !updateCheck.hasUpdate && updateCheck.error == null
-                                ? '已是最新'
-                                : '检查更新'),
+                        label: !isCurrent
+                            ? '切换后检测'
+                            : (appState.checkingUpdate
+                                ? '检测中…'
+                                : (updateCheck != null && !updateCheck.hasUpdate && updateCheck.error == null
+                                    ? '已是最新'
+                                    : '检查更新')),
                         height: 30,
                         padding: const EdgeInsets.symmetric(horizontal: 11),
                         tier: tier,
                         insideGlass: true,
-                        enabled: !appState.checkingUpdate,
-                        accentForeground: updateCheck == null || updateCheck.error != null,
-                        onTap: appState.checkingUpdate ? null : () => ctrl.checkForDshUpdates(),
+                        enabled: !isCurrent || !appState.checkingUpdate,
+                        accentForeground: isCurrent && (updateCheck == null || updateCheck.error != null),
+                        onTap: !isCurrent
+                            ? () => ctrl.showToast('请先切换到本机后再检查本机 DSH 更新', tone: ToastTone.info)
+                            : (appState.checkingUpdate ? null : () => ctrl.checkForDshUpdates()),
                       ),
               ),
               if (isAndroidLocal && rt.canRollback && rt.dshPrevVersion.isNotEmpty)
@@ -2913,7 +2627,6 @@ class _HostDetailSection extends ConsumerWidget {
                   trailing: GrassBagGlassSwitch(
                     value: host.sdcardMounted,
                     tier: tier,
-                    activeColor: t.ok,
                     onChanged: (_) => ctrl.toggleSdcardMounted(),
                   ),
                 ),
@@ -3010,6 +2723,7 @@ class _HostDetailSection extends ConsumerWidget {
               maxLines: 10,
               topSpacing: 16,
               headerPrefix: '本机容器启动日志',
+              forceLocal: true,
             ),
             const SizedBox(height: 16),
             GrassBagGroupedSection(
@@ -3067,7 +2781,12 @@ class _HostDetailSection extends ConsumerWidget {
         errLower.contains('401') ||
         errLower.contains('unauthorized') ||
         errLower.contains('authentication');
-    final isUntrustedHost = errCode == 'untrusted_host' || errLower.contains('403');
+    final isUntrustedHost = errCode == 'untrusted_host' ||
+        (errLower.contains('403') &&
+            (errLower.contains('trusted') ||
+                errLower.contains('untrusted') ||
+                errLower.contains('白名单') ||
+                errLower.contains('主机名')));
     final isTlsError = errCode == 'tls_cert' || errLower.contains('handshake');
     final isBridgedReady = host.bridged && host.online;
     final isDirectReady = host.directMode && host.online;
@@ -3079,11 +2798,13 @@ class _HostDetailSection extends ConsumerWidget {
     final portFlag = (parsedUri != null && parsedUri.hasPort && parsedUri.port != 3080)
         ? ' --port ${parsedUri.port}'
         : '';
-    final isIpHost = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(hostLiteral);
+    final isIpv6Host = hostLiteral.contains(':') && !hostLiteral.startsWith('[');
+    final formattedHost = isIpv6Host ? '[$hostLiteral]' : hostLiteral;
+    final isIpHost = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(hostLiteral) || isIpv6Host;
     final suggestedStartCmd = isUntrustedHost
         ? (isIpHost
             ? 'dsh web --host $hostLiteral$portFlag --no-open'
-            : 'dsh web --trusted-host ${parsedUri?.hasPort == true ? '$hostLiteral:${parsedUri!.port}' : hostLiteral}$portFlag --no-open')
+            : 'dsh web --trusted-host ${parsedUri?.hasPort == true ? '$formattedHost:${parsedUri!.port}' : formattedHost}$portFlag --no-open')
         : 'dsh web --host ${isIpHost ? hostLiteral : '<局域网IP>'}$portFlag --no-open';
 
     void openTokenEditorSheet() {
@@ -3248,7 +2969,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               if (isAuthError) ...[
                 Row(
                   children: [
-                    if (host.isHtmlProxyAuth && canWebViewLogin) ...[
+                    if (host.isHtmlProxyAuth && canWebViewLogin && !host.isDesktopLanBridge) ...[
                       Expanded(
                         child: GrassBagPrimaryGlassButton(
                           label: 'App 内网页登录',
@@ -3278,7 +2999,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           onTap: () => showRemoteHostAuthSheet(context, ref, host),
                         ),
                       ),
-                      if (canWebViewLogin) ...[
+                      if (canWebViewLogin && !host.isDesktopLanBridge) ...[
                         const SizedBox(width: 8),
                         Expanded(
                           child: GrassBagSecondaryGlassButton(
@@ -3294,7 +3015,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   ],
                 ),
                 const SizedBox(height: 8),
-              ] else if (isTlsError) ...[
+              ] else if (isTlsError && !host.allowBadCertificates) ...[
                 GrassBagPrimaryGlassButton(
                   label: '信任自签名证书并重连',
                   icon: CupertinoIcons.checkmark_shield_fill,
@@ -3511,15 +3232,23 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     onOpenWebUi();
                     return;
                   }
-                  final ticketUrl = await ctrl.createWebUiTicketUrl(host: host);
-                  if (!context.mounted) return;
-                  Navigator.of(context).push(
-                    GrassBagPageRoute<void>(
-                      builder: (_) => OfficialWebPage(
-                        initialUrl: ticketUrl ?? host.address,
+                  if (_openingWebUi) return;
+                  _openingWebUi = true;
+                  try {
+                    final ticketUrl = await ctrl.createWebUiTicketUrl(host: host);
+                    if (!context.mounted) return;
+                    Navigator.of(context).push(
+                      GrassBagPageRoute<void>(
+                        builder: (_) => OfficialWebPage(
+                          initialUrl: ticketUrl ?? host.address,
+                          hostName: host.name,
+                          allowBadCertificates: host.allowBadCertificates,
+                        ),
                       ),
-                    ),
-                  );
+                    );
+                  } finally {
+                    _openingWebUi = false;
+                  }
                 },
               ),
             GrassBagListTile(
@@ -3551,18 +3280,28 @@ class _BackupPassphraseSheetBody extends ConsumerStatefulWidget {
 
 class _BackupPassphraseSheetBodyState extends ConsumerState<_BackupPassphraseSheetBody> {
   final _passCtrl = TextEditingController();
+  final _confirmCtrl = TextEditingController();
+  final _confirmFocus = FocusNode();
+  bool _obscure = true;
   String? _err;
 
   @override
   void dispose() {
     _passCtrl.dispose();
+    _confirmCtrl.dispose();
+    _confirmFocus.dispose();
     super.dispose();
   }
 
   void _submit() {
     final p = _passCtrl.text.trim();
+    final c = _confirmCtrl.text.trim();
     if (p.length < 6) {
       setState(() => _err = '请输入至少 6 位加密口令，避免使用弱口令');
+      return;
+    }
+    if (p != c) {
+      setState(() => _err = '两次输入的加密口令不一致，请核对后再导出');
       return;
     }
     Navigator.of(context).pop();
@@ -3579,10 +3318,39 @@ class _BackupPassphraseSheetBodyState extends ConsumerState<_BackupPassphraseShe
       children: [
         GrassBagTextField(
           controller: _passCtrl,
-          obscureText: true,
+          obscureText: _obscure,
           autofocus: true,
           insideGlass: true,
+          textInputAction: TextInputAction.next,
           placeholder: '输入至少 6 位加密口令…',
+          fontSize: 14,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          hasError: _err != null,
+          suffix: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _obscure = !_obscure),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              child: Icon(
+                _obscure ? CupertinoIcons.eye_slash : CupertinoIcons.eye,
+                size: 17,
+                color: st.text3,
+              ),
+            ),
+          ),
+          onChanged: (_) {
+            if (_err != null) setState(() => _err = null);
+          },
+          onSubmitted: (_) => _confirmFocus.requestFocus(),
+        ),
+        const SizedBox(height: 10),
+        GrassBagTextField(
+          controller: _confirmCtrl,
+          focusNode: _confirmFocus,
+          obscureText: _obscure,
+          insideGlass: true,
+          textInputAction: TextInputAction.done,
+          placeholder: '再次输入口令以防输错…',
           fontSize: 14,
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           hasError: _err != null,
@@ -3633,11 +3401,9 @@ class _HostTokenSheetBodyState extends ConsumerState<_HostTokenSheetBody> {
   }
 
   static bool _looksLikePlainUrl(String value) {
-    final lower = value.toLowerCase();
-    return lower.startsWith('http://') ||
-        lower.startsWith('https://') ||
-        lower.startsWith('ws://') ||
-        lower.startsWith('wss://');
+    final trimmed = value.trim();
+    if (trimmed.isEmpty) return false;
+    return RegExp(r'(?:https?|wss?)://', caseSensitive: false).hasMatch(trimmed);
   }
 
   Future<void> _pasteToken() async {
@@ -4010,21 +3776,40 @@ class _EngineLogsConsole extends ConsumerWidget {
     this.maxLines = 12,
     this.topSpacing = 0,
     this.headerPrefix = '引擎实时日志',
+    this.forceLocal = false,
   });
 
   final bool showSummaryWhenEmpty;
   final int maxLines;
   final double topSpacing;
   final String headerPrefix;
+  final bool forceLocal;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final logs = ref.watch(appProvider.select((s) => s.engineLogs));
+    final slice = ref.watch(
+      appProvider.select(
+        (s) => (
+          logs: s.engineLogs,
+          activeHostId: s.activeHostId,
+          activeHostName: s.activeHost.name,
+          activeHostIsLocal: s.activeHost.isLocal,
+          activeHostDshVersion: s.activeHost.dshVersion,
+          activeHostContainerVersion: s.activeHost.containerVersion,
+          connectionPhase: s.connectionPhase,
+          namespacesCount: s.effectiveDshNamespaces.length,
+          activeSlot: s.nativeRuntimeStatus.activeSlot,
+        ),
+      ),
+    );
+    final logs = slice.logs;
     if (logs.isEmpty && !showSummaryWhenEmpty) return const SizedBox.shrink();
-    final state = ref.read(appProvider);
     final ctrl = ref.read(appProvider.notifier);
     final t = GrassBagTokens.of(context);
     final visible = logs.length > maxLines ? logs.sublist(logs.length - maxLines) : logs;
+    final showLocalSlot = forceLocal || slice.activeHostIsLocal;
+    final slotTag = showLocalSlot && slice.activeSlot.isNotEmpty ? ' (${slice.activeSlot})' : '';
+    final canRefresh = forceLocal || slice.activeHostIsLocal;
 
     final card = RepaintBoundary(
       child: ClipRSuperellipse(
@@ -4061,9 +3846,9 @@ class _EngineLogsConsole extends ConsumerWidget {
                   behavior: HitTestBehavior.opaque,
                   onTap: () {
                     final content = logs.isEmpty
-                        ? '[engine] ${state.activeHost.name} · DSH ${state.activeHost.dshVersion} (${state.nativeRuntimeStatus.activeSlot})\n'
-                            '[bridge] 通道状态：${state.connectionPhase.name} · ${state.effectiveDshNamespaces.length} 组配置模块\n'
-                            '[runtime] 环境：${state.activeHost.containerVersion}'
+                        ? '[engine] ${slice.activeHostName} · DSH ${slice.activeHostDshVersion}$slotTag\n'
+                            '[bridge] 通道状态：${slice.connectionPhase.name} · ${slice.namespacesCount} 组配置模块\n'
+                            '[runtime] 环境：${slice.activeHostContainerVersion}'
                         : logs.join('\n');
                     Clipboard.setData(ClipboardData(text: content));
                     ctrl.showToast('已复制引擎日志到剪贴板', tone: ToastTone.ok);
@@ -4076,37 +3861,38 @@ class _EngineLogsConsole extends ConsumerWidget {
                     ),
                   ),
                 ),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: ctrl.refreshEngineLogs,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    child: Text(
-                      '刷新',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi,
+                if (canRefresh)
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => ctrl.refreshEngineLogs(forceLocal: forceLocal),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      child: Text(
+                        '刷新',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi,
+                        ),
                       ),
                     ),
                   ),
-                ),
               ],
             ),
             const SizedBox(height: 8),
             if (logs.isEmpty) ...[
               Text(
-                '[engine] ${state.activeHost.name} · DSH ${state.activeHost.dshVersion} (${state.nativeRuntimeStatus.activeSlot})',
+                '[engine] ${slice.activeHostName} · DSH ${slice.activeHostDshVersion}$slotTag',
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: Color(0xFF5DD199)),
               ),
               const SizedBox(height: 4),
               Text(
-                '[bridge] 通道状态：${state.connectionPhase.name} · ${state.effectiveDshNamespaces.length} 组配置命名空间',
+                '[bridge] 通道状态：${slice.connectionPhase.name} · ${slice.namespacesCount} 组配置命名空间',
                 style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
               ),
               const SizedBox(height: 4),
               Text(
-                '[runtime] 环境：${state.activeHost.containerVersion}',
+                '[runtime] 环境：${slice.activeHostContainerVersion}',
                 style: const TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: Color(0xFF94A3B8)),
               ),
             ] else

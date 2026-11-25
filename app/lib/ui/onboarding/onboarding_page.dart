@@ -11,9 +11,11 @@ import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
+import '../common/grassbag_sheets.dart';
 import '../common/remote_host_connect_card.dart';
 import '../settings/settings_page.dart';
 import '../web/deepseek_signin_page.dart';
+import '../web/official_web_page.dart';
 import 'launch_splash_overlay.dart';
 
 /// Luxury 3-step Liquid Glass first-launch & replayable onboarding flow:
@@ -40,17 +42,31 @@ class OnboardingPage extends ConsumerStatefulWidget {
 class _OnboardingPageState extends ConsumerState<OnboardingPage>
     with TickerProviderStateMixin, WidgetsBindingObserver {
   final PageController _pageCtrl = PageController();
+  final ValueNotifier<double> _pageOffsetNotifier = ValueNotifier<double>(0.0);
   late final AnimationController _ambientCtrl;
   late final AnimationController _welcomeEntranceCtrl;
 
-  double _pageOffset = 0.0;
   int _currentPage = 0;
   int _selectedMode = 0; // 0: Local container, 1: Remote PC/Server
   bool _bootstrapping = false;
   bool _finishing = false;
+  bool _lifecycleResumed = true;
+  bool _routeCurrent = true;
+  bool _animationsEnabled = true;
 
   bool get _isAndroidDevice =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  void _syncAmbientTicker() {
+    final shouldRun = _lifecycleResumed && _routeCurrent && _animationsEnabled;
+    if (shouldRun) {
+      if (!_ambientCtrl.isAnimating) {
+        _ambientCtrl.repeat();
+      }
+    } else if (_ambientCtrl.isAnimating) {
+      _ambientCtrl.stop();
+    }
+  }
 
   @override
   void initState() {
@@ -59,7 +75,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     _ambientCtrl = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 12),
-    )..repeat();
+    );
     _welcomeEntranceCtrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 920),
@@ -77,7 +93,17 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _routeCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+    _animationsEnabled = !MediaQuery.disableAnimationsOf(context);
+    _syncAmbientTicker();
+  }
+
+  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _lifecycleResumed = state == AppLifecycleState.resumed;
+    _syncAmbientTicker();
     if (state == AppLifecycleState.resumed && _isAndroidDevice && mounted) {
       unawaited(ref.read(appProvider.notifier).refreshPermissionsOnly());
     }
@@ -86,8 +112,8 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
   void _onPageScroll() {
     if (!_pageCtrl.hasClients) return;
     final next = _pageCtrl.page ?? _currentPage.toDouble();
-    if ((next - _pageOffset).abs() > 0.002) {
-      setState(() => _pageOffset = next);
+    if ((next - _pageOffsetNotifier.value).abs() > 0.002) {
+      _pageOffsetNotifier.value = next;
     }
   }
 
@@ -96,6 +122,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     WidgetsBinding.instance.removeObserver(this);
     _pageCtrl.removeListener(_onPageScroll);
     _pageCtrl.dispose();
+    _pageOffsetNotifier.dispose();
     _ambientCtrl.dispose();
     _welcomeEntranceCtrl.dispose();
     super.dispose();
@@ -140,12 +167,18 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     }
   }
 
+  void _openWebUi() {
+    Navigator.of(context).push(
+      GrassBagPageRoute<void>(builder: (_) => const OfficialWebPage()),
+    );
+  }
+
   Future<void> _openModelSettings() async {
     await Navigator.of(context).push(
       GrassBagPageRoute<void>(
         builder: (_) => SettingsPage(
           initialSection: SettingsSection.model,
-          onOpenWebUi: () {},
+          onOpenWebUi: _openWebUi,
         ),
       ),
     );
@@ -156,7 +189,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
       GrassBagPageRoute<void>(
         builder: (_) => SettingsPage(
           initialSection: SettingsSection.permissions,
-          onOpenWebUi: () {},
+          onOpenWebUi: _openWebUi,
         ),
       ),
     );
@@ -182,13 +215,15 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
       ),
     );
 
-    final media = MediaQuery.of(context);
-    final topPad = media.viewPadding.top;
-    final botPad = media.viewPadding.bottom;
-    final isWide = media.size.width >= 760;
+    final viewPad = MediaQuery.viewPaddingOf(context);
+    final topPad = viewPad.top;
+    final botPad = viewPad.bottom;
+    final isWide = MediaQuery.sizeOf(context).width >= 760;
 
     final rt = slice.nativeRuntimeStatus;
-    final localReady = rt.initialized && rt.engineState != 'error';
+    final localReady = _isAndroidDevice
+        ? (rt.initialized && rt.engineState != 'error')
+        : (slice.activeHost.isLocal && slice.activeHost.isConnectedUsable);
     final remoteConnected = !slice.activeHost.isLocal && slice.activeHost.isConnectedUsable;
     final envReady =
         localReady || remoteConnected || slice.connectionPhase == ConnectionPhase.connected;
@@ -206,20 +241,18 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
       resizeToAvoidBottomInset: true,
       body: Stack(
         children: [
-          // 1. Living Parallax Liquid Glass Ambient Mesh (pure-Canvas 120fps)
+          // 1. Living Parallax Liquid Glass Ambient Mesh (pure-Canvas 120fps via CustomPainter.repaint,
+          //    ZERO 120Hz AnimatedBuilder widget rebuilds!)
           Positioned.fill(
             child: RepaintBoundary(
-              child: AnimatedBuilder(
-                animation: _ambientCtrl,
-                builder: (context, _) => CustomPaint(
-                  painter: _OnboardingAmbientPainter(
-                    pageProgress: _pageOffset / 2.0,
-                    ambientPhase: _ambientCtrl.value * math.pi * 2.0,
-                    isDark: t.isDark,
-                    primary: t.primary,
-                    primaryHi: t.primaryHi,
-                    bg: t.bgSolid,
-                  ),
+              child: CustomPaint(
+                painter: _OnboardingAmbientPainter(
+                  pageOffset: _pageOffsetNotifier,
+                  ambient: _ambientCtrl,
+                  isDark: t.isDark,
+                  primary: t.primary,
+                  primaryHi: t.primaryHi,
+                  bg: t.bgSolid,
                 ),
               ),
             ),
@@ -288,9 +321,12 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                             ),
 
                             // Center: Morphing 3-pill step indicator
-                            _MorphingStepIndicator(
-                              pageOffset: _pageOffset,
-                              onTapStep: _goToPage,
+                            ValueListenableBuilder<double>(
+                              valueListenable: _pageOffsetNotifier,
+                              builder: (_, offset, __) => _MorphingStepIndicator(
+                                pageOffset: offset,
+                                onTapStep: _goToPage,
+                              ),
                             ),
 
                             // Right: Skip (first launch) or Close (replay)
@@ -368,18 +404,29 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                   ),
                 ),
 
-                // Bottom Pinned Action Bar
-                _buildBottomFooter(
-                  t,
-                  isWide,
-                  botPad,
-                  slice.glassTier,
-                  envReady: envReady,
-                  modelReady: modelReady,
+                // Bottom Pinned Action Bar (isolated leaf listens to viewInsets so IME opening
+                // NEVER rebuilds the full OnboardingPage & PageView!)
+                Builder(
+                  builder: (footerCtx) {
+                    if (MediaQuery.viewInsetsOf(footerCtx).bottom > 80) {
+                      return const SizedBox.shrink();
+                    }
+                    return _buildBottomFooter(
+                      t,
+                      isWide,
+                      botPad,
+                      slice.glassTier,
+                      envReady: envReady,
+                      modelReady: modelReady,
+                    );
+                  },
                 ),
               ],
             ),
           ),
+
+          // 3. Toast Feedback Overlay so all onboarding & remote-connect toasts are visible
+          const GrassBagToastOverlay(bottomOffset: 88),
         ],
       ),
       ),
@@ -449,7 +496,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       size: 108,
                       duration: const Duration(milliseconds: 1120),
                       autoPlay: !widget.isFirstLaunch,
-                      ambientFloat: true,
+                      ambientFloat: false,
                     ),
                   ],
                 ),
@@ -577,7 +624,15 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
         _bootstrapping || (runtimeProgressPct > 0 && runtimeProgressPct < 100);
     final localHasError = rt.engineState == 'error' && (rt.engineError?.isNotEmpty == true);
     final launcherDisplay =
-        rt.executorMode.startsWith('proot') ? 'PRoot 兼容模式' : 'tawcroot 高速模式';
+        rt.executorMode.startsWith('proot') ? '标准兼容内核' : '高速原生内核';
+    final localStopped = _isAndroidDevice &&
+        localReady &&
+        !rt.engineRunning &&
+        rt.engineState != 'starting' &&
+        !isBootstrappingNow;
+    final desktopLocalConnected = !_isAndroidDevice &&
+        activeHost.isLocal &&
+        activeHost.isConnectedUsable;
 
     return SingleChildScrollView(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
@@ -704,14 +759,11 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                               ),
                               if (isBootstrappingNow) ...[
                                 const SizedBox(height: 14),
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(6),
-                                  child: LinearProgressIndicator(
-                                    value: progress > 0 ? progress : null,
-                                    minHeight: 7,
-                                    backgroundColor: t.fill1,
-                                    valueColor: AlwaysStoppedAnimation<Color>(t.primary),
-                                  ),
+                                GrassBagProgressBar(
+                                  value: progress > 0 ? progress : null,
+                                  height: 7,
+                                  color: t.primary,
+                                  trackColor: t.fill1,
                                 ),
                                 const SizedBox(height: 7),
                                 Row(
@@ -743,12 +795,20 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                               if (localReady) ...[
                                 const SizedBox(height: 12),
                                 GrassBagStatusBanner(
-                                  tone: GrassBagBannerTone.ok,
-                                  icon: CupertinoIcons.checkmark_circle_fill,
-                                  title: rt.engineRunning ? '本机引擎运行正常' : '本机容器已部署完成',
+                                  tone: localStopped
+                                      ? GrassBagBannerTone.warn
+                                      : GrassBagBannerTone.ok,
+                                  icon: localStopped
+                                      ? CupertinoIcons.pause_circle_fill
+                                      : CupertinoIcons.checkmark_circle_fill,
+                                  title: rt.engineRunning
+                                      ? '本机引擎运行正常'
+                                      : (localStopped ? '本机容器已就绪（引擎未运行）' : '本机容器已部署完成'),
                                   message: rt.engineRunning
                                       ? 'DeepSeek Harness 已就绪，可以继续下一步配置模型或直接进入对话。'
-                                      : '容器环境已就绪，引擎正在后台自动拉起。',
+                                      : (localStopped
+                                          ? '容器环境已就绪，点按下方按钮即可立即拉起本机 DSH 引擎。'
+                                          : '容器环境已就绪，引擎正在后台自动拉起。'),
                                   padding: const EdgeInsets.all(11),
                                   borderRadius: 14,
                                 ),
@@ -766,6 +826,40 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   enabled: !isBootstrappingNow,
                                   onTap: isBootstrappingNow ? null : _startLocalBootstrap,
                                 ),
+                              ] else if (localStopped) ...[
+                                const SizedBox(height: 14),
+                                GrassBagPrimaryGlassButton(
+                                  label: '启动本机引擎',
+                                  icon: CupertinoIcons.play_fill,
+                                  height: 44,
+                                  tier: tier,
+                                  insideGlass: true,
+                                  onTap: () => unawaited(
+                                    ref.read(appProvider.notifier).restartLocalEngine(),
+                                  ),
+                                ),
+                              ] else if (!_isAndroidDevice) ...[
+                                const SizedBox(height: 14),
+                                if (desktopLocalConnected)
+                                  GrassBagStatusBanner(
+                                    tone: GrassBagBannerTone.ok,
+                                    icon: CupertinoIcons.checkmark_circle_fill,
+                                    title: '已连接本机 DeepSeek Harness',
+                                    message: '${activeHost.address} · ${activeHost.latency}',
+                                    padding: const EdgeInsets.all(11),
+                                    borderRadius: 14,
+                                  )
+                                else
+                                  GrassBagPrimaryGlassButton(
+                                    label: '连接本机 127.0.0.1:3080',
+                                    icon: CupertinoIcons.link,
+                                    height: 44,
+                                    tier: tier,
+                                    insideGlass: true,
+                                    onTap: () => unawaited(
+                                      ref.read(appProvider.notifier).switchHost('local'),
+                                    ),
+                                  ),
                               ],
                             ],
                           ),
@@ -856,7 +950,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                   child: Icon(
                     allReady ? CupertinoIcons.checkmark_alt : CupertinoIcons.sparkles,
                     size: 36,
-                    color: allReady ? Colors.white : t.onPrimary,
+                    color: t.onPrimary,
                   ),
                 ),
               ),
@@ -899,9 +993,13 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                           : '运行环境待配置',
                       subtitle: envReady
                           ? (activeHost.isLocal
-                              ? '本机独立 Linux 与 DSH 引擎已接入'
+                              ? (_isAndroidDevice
+                                  ? '本机独立 Linux 与 DSH 引擎已接入'
+                                  : '本机 DeepSeek Harness (${activeHost.address}) 已接入')
                               : '${activeHost.address} · ${activeHost.latency}')
-                          : '可返回上一步一键部署本机容器或连接远程电脑',
+                          : (_isAndroidDevice
+                              ? '可返回上一步一键部署本机容器或连接远程电脑'
+                              : '可返回上一步连接本机服务或配置远程主机'),
                       trailing: envReady
                           ? null
                           : GrassBagSpringTap(
@@ -944,39 +1042,53 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                     ),
                     if (!modelReady) ...[
                       const SizedBox(height: 11),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: GrassBagPrimaryGlassButton(
-                              label: '登录 DeepSeek',
-                              icon: CupertinoIcons.person_crop_circle_badge_checkmark,
-                              height: 38,
-                              tier: tier,
-                              insideGlass: true,
-                              onTap: envReady
-                                  ? () => launchDeepSeekSignInFlow(context, ref)
-                                  : () {
-                                      ref.read(appProvider.notifier).showToast(
-                                            '请先完成运行环境部署或连接远程主机',
-                                            tone: ToastTone.info,
-                                          );
-                                      _goToPage(1);
-                                    },
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: GrassBagSecondaryGlassButton(
-                              label: 'API Key / 中转',
-                              icon: CupertinoIcons.slider_horizontal_3,
-                              height: 38,
-                              tier: tier,
-                              insideGlass: true,
-                              accentForeground: true,
-                              onTap: _openModelSettings,
-                            ),
-                          ),
-                        ],
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final loginBtn = GrassBagPrimaryGlassButton(
+                            label: '登录 DeepSeek',
+                            icon: CupertinoIcons.person_crop_circle_badge_checkmark,
+                            height: 38,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            tier: tier,
+                            insideGlass: true,
+                            onTap: envReady
+                                ? () => launchDeepSeekSignInFlow(context, ref)
+                                : () {
+                                    ref.read(appProvider.notifier).showToast(
+                                          '请先完成运行环境部署或连接远程主机',
+                                          tone: ToastTone.info,
+                                        );
+                                    _goToPage(1);
+                                  },
+                          );
+                          final apiBtn = GrassBagSecondaryGlassButton(
+                            label: 'API Key / 中转',
+                            icon: CupertinoIcons.slider_horizontal_3,
+                            height: 38,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            tier: tier,
+                            insideGlass: true,
+                            accentForeground: true,
+                            onTap: _openModelSettings,
+                          );
+                          if (constraints.maxWidth < 316) {
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                loginBtn,
+                                const SizedBox(height: 8),
+                                apiBtn,
+                              ],
+                            );
+                          }
+                          return Row(
+                            children: [
+                              Expanded(child: loginBtn),
+                              const SizedBox(width: 8),
+                              Expanded(child: apiBtn),
+                            ],
+                          );
+                        },
                       ),
                     ],
 
@@ -999,7 +1111,13 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                             ),
                           ),
                           Text(
-                            '已授权 ${perms.grantedCoreCount}/6',
+                            '已授权 ${[
+                              perms.accessibilityEnabled,
+                              perms.overlayGranted,
+                              perms.batteryOptIgnored,
+                              perms.notificationsGranted,
+                              perms.allFilesGranted,
+                            ].where((e) => e).length}/5',
                             style: TextStyle(
                               fontSize: 11.5,
                               fontWeight: FontWeight.w600,
@@ -1375,17 +1493,15 @@ class _StaggeredEntrance extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final curve = CurvedAnimation(
-      parent: controller,
-      curve: Interval(start, end, curve: Curves.easeOutCubic),
-    );
+    final interval = Interval(start, end, curve: Curves.easeOutCubic);
     return AnimatedBuilder(
-      animation: curve,
+      animation: controller,
       child: child,
       builder: (context, child) {
-        final v = curve.value;
-        return Opacity(
-          opacity: v,
+        final v = interval.transform(controller.value);
+        if (v >= 0.999) return child!;
+        return FadeTransition(
+          opacity: AlwaysStoppedAnimation<double>(v),
           child: Transform.translate(
             offset: Offset(0, (1.0 - v) * 18.0),
             child: child,
@@ -1397,18 +1513,19 @@ class _StaggeredEntrance extends StatelessWidget {
 }
 
 /// Pure-Canvas ambient Liquid Glass mesh that drifts smoothly with PageView scroll + slow breath.
+/// Repaints directly via `super(repaint: ...)` with zero 120Hz widget rebuilds or throttle stutter!
 class _OnboardingAmbientPainter extends CustomPainter {
-  const _OnboardingAmbientPainter({
-    required this.pageProgress,
-    required this.ambientPhase,
+  _OnboardingAmbientPainter({
+    required this.pageOffset,
+    required this.ambient,
     required this.isDark,
     required this.primary,
     required this.primaryHi,
     required this.bg,
-  });
+  }) : super(repaint: Listenable.merge([ambient, pageOffset]));
 
-  final double pageProgress;
-  final double ambientPhase;
+  final ValueListenable<double> pageOffset;
+  final Animation<double> ambient;
   final bool isDark;
   final Color primary;
   final Color primaryHi;
@@ -1426,7 +1543,8 @@ class _OnboardingAmbientPainter extends CustomPainter {
     );
     canvas.drawRect(rect, Paint()..shader = bgGrad.createShader(rect));
 
-    final p = pageProgress.clamp(0.0, 1.0);
+    final p = (pageOffset.value / 2.0).clamp(0.0, 1.0);
+    final ambientPhase = ambient.value * math.pi * 2.0;
     final driftX = math.sin(ambientPhase) * 18.0;
     final driftY = math.cos(ambientPhase * 0.8) * 14.0;
 
@@ -1475,10 +1593,12 @@ class _OnboardingAmbientPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _OnboardingAmbientPainter oldDelegate) =>
-      (oldDelegate.pageProgress - pageProgress).abs() > 0.002 ||
-      (oldDelegate.ambientPhase - ambientPhase).abs() > 0.015 ||
+      oldDelegate.pageOffset != pageOffset ||
+      oldDelegate.ambient != ambient ||
       oldDelegate.isDark != isDark ||
-      oldDelegate.primary != primary;
+      oldDelegate.primary != primary ||
+      oldDelegate.primaryHi != primaryHi ||
+      oldDelegate.bg != bg;
 }
 
 class _OnboardingPermissionTile extends StatelessWidget {
@@ -1508,100 +1628,116 @@ class _OnboardingPermissionTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final accent = done ? t.ok : (warn ? t.err : t.primary);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
-      decoration: BoxDecoration(
-        color: t.isDark
-            ? Colors.white.withValues(alpha: done ? 0.06 : 0.04)
-            : Colors.white.withValues(alpha: done ? 0.64 : 0.48),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: done
-              ? t.ok.withValues(alpha: 0.28)
-              : (warn ? t.err.withValues(alpha: 0.35) : t.sep),
-          width: 0.7,
-        ),
-      ),
-      child: Row(
-        children: [
-          GrassBagSquircleIcon(
-            icon: done ? CupertinoIcons.checkmark_alt : icon,
-            color: accent,
-            size: 32,
-            iconSize: 15,
-            filled: done,
+    return GrassBagSpringTap(
+      onTap: onTap,
+      pressedScale: 0.985,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
+        decoration: BoxDecoration(
+          color: t.isDark
+              ? Colors.white.withValues(alpha: done ? 0.06 : 0.04)
+              : Colors.white.withValues(alpha: done ? 0.64 : 0.48),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: done
+                ? t.ok.withValues(alpha: 0.28)
+                : (warn ? t.err.withValues(alpha: 0.35) : t.sep),
+            width: 0.7,
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
               children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    color: t.text,
+                GrassBagSquircleIcon(
+                  icon: done ? CupertinoIcons.checkmark_alt : icon,
+                  color: accent,
+                  size: 32,
+                  iconSize: 15,
+                  filled: done,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: t.text,
+                        ),
+                      ),
+                      const SizedBox(height: 1.5),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 11,
+                          height: 1.32,
+                          color: t.text3,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 1.5),
-                Text(
-                  subtitle,
-                  style: TextStyle(
-                    fontSize: 11,
-                    height: 1.32,
-                    color: t.text3,
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: done ? t.okSoft : (warn ? t.errSoft : t.primarySoft),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: accent.withValues(alpha: 0.26),
+                      width: 0.6,
+                    ),
+                  ),
+                  child: Text(
+                    actionLabel,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w600,
+                      color: accent,
+                    ),
                   ),
                 ),
               ],
             ),
-          ),
-          const SizedBox(width: 8),
-          if (secondaryLabel != null && onSecondaryTap != null) ...[
-            GrassBagSpringTap(
-              onTap: onSecondaryTap!,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-                decoration: BoxDecoration(
-                  color: t.fill1,
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(color: t.sep, width: 0.6),
-                ),
-                child: Text(
-                  secondaryLabel!,
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w500,
-                    color: t.text2,
+            if (secondaryLabel != null && onSecondaryTap != null) ...[
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: GrassBagSpringTap(
+                  onTap: onSecondaryTap!,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4.5),
+                    decoration: BoxDecoration(
+                      color: t.fill1,
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(color: t.sep, width: 0.6),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(CupertinoIcons.info_circle, size: 12, color: t.text2),
+                        const SizedBox(width: 4),
+                        Text(
+                          '打开$secondaryLabel以解除受限设置',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                            color: t.text2,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(width: 5),
+            ],
           ],
-          GrassBagSpringTap(
-            onTap: onTap,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: done ? t.okSoft : (warn ? t.errSoft : t.primarySoft),
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(
-                  color: accent.withValues(alpha: 0.26),
-                  width: 0.6,
-                ),
-              ),
-              child: Text(
-                actionLabel,
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w600,
-                  color: accent,
-                ),
-              ),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }

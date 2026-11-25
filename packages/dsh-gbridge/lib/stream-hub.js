@@ -6,6 +6,28 @@ const DEFAULT_REPLAY_CAPACITY = 2000;
 const DEFAULT_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
 const DEFAULT_COALESCE_MS = 35;
 const HEARTBEAT_MS = 20000;
+const MAX_CHANNELS_PER_CLIENT = 64;
+
+function normalizeTurnEndReasonTag(rawReason, hasFailure = false) {
+  if (hasFailure) return 'error';
+  let tag = '';
+  if (typeof rawReason === 'string') {
+    tag = rawReason.trim().toLowerCase();
+  } else if (rawReason && typeof rawReason === 'object') {
+    tag = String(rawReason.kind ?? rawReason.status ?? rawReason.type ?? rawReason.reason ?? '').trim().toLowerCase();
+  }
+  if (!tag || tag === 'completed' || tag === 'ok' || tag === 'done' || tag === 'success' || tag === 'end_turn' || tag === 'stop') {
+    return 'completed';
+  }
+  if (tag.includes('emergency')) return 'emergency_stop';
+  if (tag.includes('abort') || tag.includes('cancel') || tag === 'stopped' || tag === 'interrupted') {
+    return 'stopped';
+  }
+  if (tag.includes('err') || tag.includes('fail') || tag.includes('timeout')) {
+    return 'error';
+  }
+  return tag;
+}
 
 /**
  * Plane A Multiplexed Stream Hub (`/gbridge/v1/stream`):
@@ -73,6 +95,7 @@ export class StreamHub {
     this.clients = new Map(); // clientId -> ClientState
     this.upstreamStreams = new Map(); // channel -> { subscribers: Set<clientId>, abort: AbortController }
     this.activeTurns = new Map(); // sessionId -> active server turnId (e.g. 'turn-1')
+    this.tornDownChannels = new Set(); // channels whose upstream closed after idle grace (must force client resync)
     this.pendingInteractions = new Map(); // interactionId -> { id, kind, event, eventId, gatewayClientId, sessionId, payload, createdAt }
     this.sessionAlwaysAllowed = new Map(); // sessionId -> Set<toolKey> (honors 'always' approval within the session)
 
@@ -80,9 +103,15 @@ export class StreamHub {
     this._eventsClientId = null;
     this._eventsPeer = null;
     this._eventsReconnectTimer = null;
+    this._onTurnCompleted = null;
     this._disposed = false;
     this._heartbeatTimer = setInterval(() => this._sendHeartbeats(), HEARTBEAT_MS);
     this._heartbeatTimer.unref?.();
+  }
+
+  /** Register an internal observer notified whenever a session finishes a turn/run. */
+  setOnTurnCompleted(fn) {
+    this._onTurnCompleted = typeof fn === 'function' ? fn : null;
   }
 
   /** Start background pump consuming DSH's official `$events` stream. */
@@ -162,6 +191,7 @@ export class StreamHub {
           kind: 'cordis_run',
           event: ev,
           sessionId: req.agentId ?? req.sessionId ?? null,
+          gatewayClientId: this._eventsClientId,
           gatewayPeer: this._eventsPeer,
           payload: req,
           createdAt: Date.now(),
@@ -183,6 +213,18 @@ export class StreamHub {
         if (sid) this.sessionAlwaysAllowed.delete(String(sid));
       }
       const mapped = mapHostEmitEvent(ev, args);
+      if (mapped.type === 'session.status' && Array.isArray(args) && args.length >= 2 && args[1] === false) {
+        const finishedSid = args[0] != null ? String(args[0]) : null;
+        if (finishedSid) {
+          // Defer fallback turn-end notification briefly so the authoritative `turn/end` event
+          // (carrying error/abort/completed reason) wins first and is never overwritten as 'completed'.
+          const fallbackTimer = setTimeout(() => {
+            if (this._disposed) return;
+            try { this._onTurnCompleted?.({ sessionId: finishedSid, reason: 'completed' }); } catch {}
+          }, 250);
+          fallbackTimer.unref?.();
+        }
+      }
       this.publish(mapped.channel, mapped.type, mapped.data);
       return;
     }
@@ -239,101 +281,112 @@ export class StreamHub {
 
   async respondInteraction(id, { decision, answers, outcome } = {}, signal) {
     const item = this.pendingInteractions.get(id);
-    if (!item) return null;
-    if (item.kind === 'cordis_run') {
-      const isAllow = decision === 'allow' || decision === 'approve' || decision === 'allowed-once' || decision === 'always';
-      if (this.gateway?.has('dynamicCordisRunner/resolveRequestRun')) {
-        let resolution;
-        if (isAllow) {
-          let pluginRunId = null;
-          if (this.gateway?.has('dynamicCordisRunner/runHostHalf') && item.payload?.pluginId && item.payload?.packageId) {
-            const runRes = await this.gateway.call('dynamicCordisRunner/runHostHalf', {
-              agentId: item.sessionId ?? item.payload.agentId,
-              pluginId: item.payload.pluginId,
-              packageId: item.payload.packageId,
-              mode: item.payload.mode ?? 'host',
-              requestId: id,
-              approveFutureVersions: decision === 'always',
-            }, { signal, peer: item.gatewayPeer });
-            pluginRunId = runRes?.pluginRunId ?? runRes?.id ?? null;
-          }
-          resolution = pluginRunId ? { ok: true, pluginRunId } : { ok: true, approved: true };
-        } else {
-          resolution = { ok: false, reason: 'rejected' };
-        }
-        await this.gateway.call('dynamicCordisRunner/resolveRequestRun', {
-          requestId: id,
-          resolution,
-        }, { signal, peer: item.gatewayPeer });
-      } else if (isAllow) {
-        throw new Error('host DSH does not expose dynamicCordisRunner/resolveRequestRun');
-      }
-    } else if (item.gatewayClientId && item.eventId) {
-      let wireOutcome = outcome;
-      if (!wireOutcome) {
-        if (decision === 'pass') {
-          wireOutcome = { kind: 'next' };
-        } else if (item.kind === 'approval') {
-          const d = String(decision || '').toLowerCase();
-          if (d === 'always' && item.sessionId) {
-            const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
-            if (!toolKey.startsWith('phone_')) {
-              let set = this.sessionAlwaysAllowed.get(item.sessionId);
-              if (!set) {
-                if (this.sessionAlwaysAllowed.size >= 256) {
-                  const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
-                  if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
-                }
-                set = new Set();
-                this.sessionAlwaysAllowed.set(item.sessionId, set);
-              }
-              set.add(toolKey);
+    if (!item || item._settling) return null;
+    item._settling = true;
+    try {
+      if (item.kind === 'cordis_run') {
+        const isAllow = decision === 'allow' || decision === 'approve' || decision === 'allowed-once' || decision === 'always';
+        if (this.gateway?.has('dynamicCordisRunner/resolveRequestRun')) {
+          let resolution;
+          if (isAllow) {
+            let pluginRunId = null;
+            if (this.gateway?.has('dynamicCordisRunner/runHostHalf') && item.payload?.pluginId && item.payload?.packageId) {
+              const runRes = await this.gateway.call('dynamicCordisRunner/runHostHalf', {
+                agentId: item.sessionId ?? item.payload.agentId,
+                pluginId: item.payload.pluginId,
+                packageId: item.payload.packageId,
+                mode: item.payload.mode ?? 'host',
+                requestId: id,
+                approveFutureVersions: decision === 'always',
+              }, { signal, peer: item.gatewayPeer });
+              pluginRunId = runRes?.pluginRunId ?? runRes?.id ?? null;
             }
+            resolution = pluginRunId ? { ok: true, pluginRunId } : { ok: true, approved: true };
+          } else {
+            resolution = { ok: false, reason: 'rejected' };
           }
-          const normalized = (d === 'allow' || d === 'approve' || d === 'allowed-once' || d === 'always')
-            ? 'allowed-once'
-            : (d === 'cancel' || d === 'cancelled')
-              ? 'cancelled'
-              : 'rejected';
-          wireOutcome = { kind: 'result', value: normalized };
-        } else if (item.kind === 'user_questions') {
-          const rawAns = answers !== undefined ? answers : decision;
-          let wrapped = rawAns;
-          if (Array.isArray(rawAns)) {
-            const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
-            const alreadyStructured = rawAns.every((a) => a && typeof a === 'object' && typeof a.id === 'string');
-            wrapped = {
-              answers: alreadyStructured
-                ? rawAns
-                : [{ id: String(qs[0]?.id ?? 'q-0'), selected: rawAns.map(String) }],
-            };
-          } else if (typeof rawAns === 'string') {
-            const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
-            wrapped = { answers: [{ id: String(qs[0]?.id ?? 'q-0'), selected: [rawAns], custom: rawAns }] };
-          } else if (rawAns && typeof rawAns === 'object' && !Array.isArray(rawAns.answers)) {
-            wrapped = {
-              answers: Object.entries(rawAns).map(([qid, val]) => ({
-                id: qid,
-                selected: Array.isArray(val) ? val.map(String) : [String(val)],
-              })),
-            };
-          }
-          wireOutcome = { kind: 'result', value: wrapped };
-        } else {
-          wireOutcome = { kind: 'result', value: answers !== undefined ? answers : decision };
+          await this.gateway.call('dynamicCordisRunner/resolveRequestRun', {
+            requestId: id,
+            resolution,
+          }, { signal, peer: item.gatewayPeer });
+        } else if (isAllow) {
+          throw new Error('host DSH does not expose dynamicCordisRunner/resolveRequestRun');
         }
+      } else if (item.gatewayClientId && item.eventId) {
+        let wireOutcome = outcome;
+        if (!wireOutcome) {
+          if (decision === 'pass') {
+            wireOutcome = { kind: 'next' };
+          } else if (item.kind === 'approval') {
+            const d = String(decision || '').toLowerCase();
+            if (d === 'always' && item.sessionId) {
+              const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
+              if (!toolKey.startsWith('phone_')) {
+                let set = this.sessionAlwaysAllowed.get(item.sessionId);
+                if (!set) {
+                  if (this.sessionAlwaysAllowed.size >= 256) {
+                    const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
+                    if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
+                  }
+                  set = new Set();
+                  this.sessionAlwaysAllowed.set(item.sessionId, set);
+                }
+                set.add(toolKey);
+              }
+            }
+            const normalized = (d === 'allow' || d === 'approve' || d === 'allowed-once' || d === 'always')
+              ? 'allowed-once'
+              : (d === 'cancel' || d === 'cancelled')
+                ? 'cancelled'
+                : 'rejected';
+            wireOutcome = { kind: 'result', value: normalized };
+          } else if (item.kind === 'user_questions') {
+            const dLow = typeof decision === 'string' ? decision.trim().toLowerCase() : '';
+            if (answers === undefined && (dLow === 'cancel' || dLow === 'cancelled' || dLow === 'dismiss' || dLow === 'skip')) {
+              wireOutcome = { kind: 'next' };
+            } else {
+              const rawAns = answers !== undefined ? answers : decision;
+              let wrapped = rawAns;
+              if (Array.isArray(rawAns)) {
+                const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
+                const alreadyStructured = rawAns.every((a) => a && typeof a === 'object' && typeof a.id === 'string');
+                wrapped = {
+                  answers: alreadyStructured
+                    ? rawAns
+                    : [{ id: String(qs[0]?.id ?? 'q-0'), selected: rawAns.map(String) }],
+                };
+              } else if (typeof rawAns === 'string') {
+                const qs = Array.isArray(item.payload?.questions) ? item.payload.questions : [];
+                wrapped = { answers: [{ id: String(qs[0]?.id ?? 'q-0'), selected: [rawAns], custom: rawAns }] };
+              } else if (rawAns && typeof rawAns === 'object' && !Array.isArray(rawAns.answers)) {
+                wrapped = {
+                  answers: Object.entries(rawAns).map(([qid, val]) => ({
+                    id: qid,
+                    selected: Array.isArray(val) ? val.map(String) : [String(val)],
+                  })),
+                };
+              }
+              wireOutcome = { kind: 'result', value: wrapped };
+            }
+          } else {
+            wireOutcome = { kind: 'result', value: answers !== undefined ? answers : decision };
+          }
+        }
+        await this.gateway.respondRemoteEvent(
+          item.gatewayClientId,
+          item.eventId,
+          wireOutcome,
+          signal,
+          item.gatewayPeer,
+        );
       }
-      await this.gateway.respondRemoteEvent(
-        item.gatewayClientId,
-        item.eventId,
-        wireOutcome,
-        signal,
-        item.gatewayPeer,
-      );
+      this.pendingInteractions.delete(id);
+      this.publish('host', 'interaction.resolved', { id, kind: item.kind, settledBy: 'gbridge' });
+      return { id, settled: true };
+    } catch (err) {
+      item._settling = false;
+      throw err;
     }
-    this.pendingInteractions.delete(id);
-    this.publish('host', 'interaction.resolved', { id, kind: item.kind, settledBy: 'gbridge' });
-    return { id, settled: true };
   }
 
   /** Publish a durable event into the ring buffer and deliver to subscribed clients. */
@@ -397,7 +450,7 @@ export class StreamHub {
   }
 
   /** Attach an upgraded WebSocket connection to the hub. */
-  attachClient(ws, { peer } = {}) {
+  attachClient(ws, { peer, mode = 'webServer' } = {}) {
     if (this._disposed) {
       try { ws.close(1001, 'gbridge reloading'); } catch {}
       return null;
@@ -406,6 +459,7 @@ export class StreamHub {
     const state = {
       id: connId,
       clientId: null,
+      mode,
       ws,
       peer,
       welcomed: false,
@@ -444,7 +498,23 @@ export class StreamHub {
     return connId;
   }
 
+  /** Immediately disconnect active WebSocket clients attached via a specific listener mode (e.g. 'lan' on token rotation). */
+  disconnectByMode(mode, code = 4001, reason = 'authorization revoked') {
+    let closedCount = 0;
+    for (const client of [...this.clients.values()]) {
+      if (client.mode !== mode) continue;
+      closedCount++;
+      this._detachClient(client);
+      try { client.ws.close(code, reason); } catch {}
+    }
+    return closedCount;
+  }
+
   _onClientMessage(client, msg) {
+    if (msg.op !== 'hello' && msg.op !== 'ping' && !client.welcomed) {
+      client.ws.sendJson({ op: 'error', code: 'gbridge/handshake_required', message: 'send hello before other frames' });
+      return;
+    }
     switch (msg.op) {
       case 'hello': {
         client.clientId = typeof msg.clientId === 'string' ? msg.clientId.slice(0, 128) : client.id;
@@ -454,6 +524,7 @@ export class StreamHub {
         const requestedChannels = [];
         if (Array.isArray(msg.channels)) {
           for (const ch of msg.channels) {
+            if (requestedChannels.length >= MAX_CHANNELS_PER_CLIENT) break;
             if (typeof ch === 'string' && ch.length > 0 && ch.length <= 160) {
               requestedChannels.push(ch);
             }
@@ -464,8 +535,30 @@ export class StreamHub {
 
         const oldestRingSeq = this.ring.length > 0 ? this.ring[0].seq : this.seq + 1;
         const oldestDurableSeq = this.durableRing.length > 0 ? this.durableRing[0].seq : oldestRingSeq;
-        const oldestSeq = Math.min(oldestRingSeq, oldestDurableSeq);
-        const canResume = msg.lastBootId === this.bootId &&
+        let requiresContiguousRing = false;
+        let hasTornDownChannel = false;
+        for (const ch of replayChannelSet) {
+          if (this.tornDownChannels.has(ch)) {
+            hasTornDownChannel = true;
+          }
+          if (ch.startsWith('session:')) {
+            const sid = ch.slice('session:'.length);
+            if (this.activeTurns.has(sid)) {
+              requiresContiguousRing = true;
+            }
+          } else if (ch.startsWith('terminal:') || ch.startsWith('job:')) {
+            requiresContiguousRing = true;
+          }
+        }
+        // When an active streaming turn or terminal/job delta channel is subscribed, ephemeral
+        // delta frames only live in `this.ring`; require `resumeFromSeq` to stay within
+        // `oldestRingSeq - 1` so evicted deltas return `resumed: false` and trigger a clean resync.
+        // Also force `resumed: false` when a requested channel was torn down during disconnect.
+        const oldestSeq = requiresContiguousRing
+          ? oldestRingSeq
+          : Math.min(oldestRingSeq, oldestDurableSeq);
+        const canResume = !hasTornDownChannel &&
+          msg.lastBootId === this.bootId &&
           typeof msg.resumeFromSeq === 'number' &&
           Number.isInteger(msg.resumeFromSeq) &&
           msg.resumeFromSeq >= oldestSeq - 1 &&
@@ -580,9 +673,18 @@ export class StreamHub {
   }
 
   _subscribeChannel(client, channel, opts = {}) {
-    if (client.channels.has(channel)) return;
-    client.channels.add(channel);
-    if (channel.startsWith('session:') || channel.startsWith('terminal:') || channel.startsWith('job:')) {
+    const isUpstream = channel.startsWith('session:') || channel.startsWith('terminal:') || channel.startsWith('job:');
+    if (client.channels.has(channel)) {
+      // If a previously subscribed upstream stream terminated on error/end, re-subscribing must restart it!
+      if (!isUpstream || this.upstreamStreams.has(channel)) return;
+    } else {
+      if (client.channels.size >= MAX_CHANNELS_PER_CLIENT) {
+        client.ws.sendJson({ op: 'error', code: 'gbridge/channel_limit', message: `maximum ${MAX_CHANNELS_PER_CLIENT} subscribed channels reached` });
+        return;
+      }
+      client.channels.add(channel);
+    }
+    if (isUpstream) {
       this._retainUpstreamStream(channel, client.id, client.peer, opts);
     }
   }
@@ -604,6 +706,7 @@ export class StreamHub {
   }
 
   _retainUpstreamStream(channel, clientId, peer, { minSnapshotSeq = 0 } = {}) {
+    this.tornDownChannels.delete(channel);
     let entry = this.upstreamStreams.get(channel);
     if (entry) {
       if (entry.releaseTimer) {
@@ -741,8 +844,11 @@ export class StreamHub {
           ...(activity ? { activity } : {}),
         }, { isDelta: true });
       } else if (frame?.type === 'start') {
-        const tid = frame.turn !== undefined ? `turn-${frame.turn}` : activeTid;
+        const tid = (activeTid && !activeTid.startsWith('turn-'))
+          ? activeTid
+          : (frame.turn !== undefined ? `turn-${frame.turn}` : activeTid);
         if (tid) this.activeTurns.set(targetId, tid);
+        this.normalizer?.observeStreamChunk(targetId, { type: 'step/start' });
         this.publish(channel, 'turn.delta', {
           sessionId: targetId,
           ...(tid ? { turnId: tid } : {}),
@@ -789,7 +895,8 @@ export class StreamHub {
       const ev = item.event;
       const eventSeq = typeof ev.seq === 'number' ? ev.seq : undefined;
       if (ev.type === 'turn/start' || ev.type === 'turn_start') {
-        const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : `turn-${ev.seq ?? Date.now()}`);
+        const turnId = ev.data?.turnId ||
+          (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : (ev.id || `turn-${ev.seq ?? Date.now()}`));
         this.activeTurns.set(targetId, turnId);
         this.publish(channel, 'turn.start', {
           sessionId: targetId,
@@ -799,11 +906,18 @@ export class StreamHub {
         });
         return;
       }
-      if (ev.type === 'turn/end') {
+      if (ev.type === 'turn/end' || ev.type === 'turn_end') {
         const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : this.activeTurns.get(targetId));
         this.activeTurns.delete(targetId);
         this.normalizer?.clearSessionStat(targetId);
         const fail = extractFailureInfo(ev.data?.reason, ev.data ?? ev);
+        try {
+          this._onTurnCompleted?.({
+            sessionId: targetId,
+            turnId,
+            reason: normalizeTurnEndReasonTag(ev.data?.reason, Boolean(fail)),
+          });
+        } catch {}
         this.publish(channel, 'turn.completed', {
           sessionId: targetId,
           ...(turnId ? { turnId } : {}),
@@ -833,12 +947,19 @@ export class StreamHub {
       });
       return;
     }
-    if (kind === 'turn/end' || item?.event?.type === 'turn/end') {
+    if (kind === 'turn/end' || kind === 'turn_end' || item?.event?.type === 'turn/end' || item?.event?.type === 'turn_end') {
       const evData = item?.event?.data ?? item?.data ?? item;
       const turnId = evData?.turnId || (evData?.turn !== undefined ? `turn-${evData.turn}` : this.activeTurns.get(targetId));
       this.activeTurns.delete(targetId);
       this.normalizer?.clearSessionStat(targetId);
       const fail = extractFailureInfo(evData?.reason, evData);
+      try {
+        this._onTurnCompleted?.({
+          sessionId: targetId,
+          turnId,
+          reason: normalizeTurnEndReasonTag(evData?.reason, Boolean(fail)),
+        });
+      } catch {}
       this.publish(channel, 'turn.completed', {
         sessionId: targetId,
         ...(turnId ? { turnId } : {}),
@@ -859,6 +980,11 @@ export class StreamHub {
         if (this.upstreamStreams.get(channel) !== entry || entry.subscribers.size > 0) return;
         this.upstreamStreams.delete(channel);
         this.latestSnapshots.delete(channel);
+        this.tornDownChannels.add(channel);
+        if (this.tornDownChannels.size > 512) {
+          const oldest = this.tornDownChannels.values().next().value;
+          if (oldest !== undefined) this.tornDownChannels.delete(oldest);
+        }
         if (channel.startsWith('session:')) {
           const sid = channel.slice(8);
           this.activeTurns.delete(sid);
@@ -975,6 +1101,7 @@ export class StreamHub {
     this.pendingInteractions.clear();
     this.sessionAlwaysAllowed.clear();
     this.activeTurns.clear();
+    this.tornDownChannels.clear();
     this.ring.length = 0;
     this.durableRing.length = 0;
     this.latestSnapshots.clear();

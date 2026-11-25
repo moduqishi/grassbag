@@ -33,13 +33,17 @@ class PhoneControlDaemon(
     private val onEvent: (String, Map<String, Any?>) -> Unit
 ) {
     private val running = AtomicBoolean(false)
-    private val pool = Executors.newCachedThreadPool()
+    @Volatile
+    private var pool: java.util.concurrent.ExecutorService = Executors.newCachedThreadPool()
     private var boundSocket: LocalSocket? = null
     private var serverSocket: LocalServerSocket? = null
 
     fun start(): Boolean {
         if (running.getAndSet(true)) return true
         return try {
+            if (pool.isShutdown || pool.isTerminated) {
+                pool = Executors.newCachedThreadPool()
+            }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
             val bindSocket = LocalSocket()
@@ -67,6 +71,7 @@ class PhoneControlDaemon(
         serverSocket = null
         try { boundSocket?.close() } catch (_: Throwable) {}
         boundSocket = null
+        runCatching { pool.shutdownNow() }
         try { if (socketFile.exists()) socketFile.delete() } catch (_: Throwable) {}
     }
 
@@ -99,32 +104,102 @@ class PhoneControlDaemon(
                     writeJson(out, 401, JSONObject().put("error", JSONObject().put("message", "unauthorized")))
                     return
                 }
-                val body = if (req.body.isBlank()) JSONObject() else JSONObject(req.body)
+                val body = try {
+                    if (req.body.isBlank()) JSONObject() else JSONObject(req.body)
+                } catch (_: org.json.JSONException) {
+                    writeJson(out, 400, JSONObject().put("error", JSONObject().put("message", "invalid_json")))
+                    return
+                }
                 when (req.path) {
                     "/v1/turn-end" -> {
                         val sid = body.optString("sessionId").ifBlank { null }
-                        val endedPhoneTurn = SafetyGate.endTurn(sid)
-                        if (endedPhoneTurn && !SafetyGate.hasActiveTurn()) {
-                            PhoneOverlayController.getInstance(context).dismissAll()
+                        val tid = body.optString("turnId").ifBlank { null }
+                        val reason = body.optString("reason", "completed").ifBlank { "completed" }
+                        val summary = body.optString("summary", "").trim()
+                        val endedPhoneTurn = SafetyGate.endTurn(sid, tid)
+                        val overlay = PhoneOverlayController.getInstance(context)
+                        val shouldFinalize = endedPhoneTurn || overlay.isHudSessionActive()
+                        val isStopped = SafetyGate.isNonSuccessTurnEndReason(reason)
+                        val shouldAutoReturn = shouldFinalize && !isStopped && SafetyGate.isAutoReturnEnabled()
+                        val stepsCount = overlay.currentStepCount()
+                        val lastApp = overlay.currentAppLabel()
+                        if (shouldFinalize && !SafetyGate.hasActiveTurn()) {
+                            overlay.showCompletionAndReturn(
+                                summary = summary,
+                                reason = reason,
+                                autoReturn = shouldAutoReturn
+                            )
                         }
                         onEvent("phone_turn_end", mapOf(
                             "sessionId" to (sid ?: ""),
-                            "reason" to body.optString("reason", "completed")
+                            "reason" to reason,
+                            "summary" to summary,
+                            "autoReturn" to shouldAutoReturn,
+                            "stepsCount" to stepsCount,
+                            "appLabel" to lastApp
                         ))
-                        writeJson(out, 200, JSONObject().put("ok", true))
+                        writeJson(out, 200, JSONObject().put("ok", true).put("autoReturn", shouldAutoReturn))
                     }
                     "/v1/tool" -> {
                         val tool = body.optString("tool")
                         val args = body.optJSONObject("args") ?: JSONObject()
                         val caller = body.optJSONObject("caller")
-                        val userApproved = body.optBoolean("userApproved", false)
+                        // Never accept client-supplied `userApproved` from socket callers; native overlay owns confirmation.
+                        val userApproved = false
                         val permissionPreset = body.optString("permissionPreset", "").ifBlank { null }
                         val turnId = if (caller == null || caller.isNull("turnId")) null else caller.optString("turnId").ifBlank { null }
                         val sessionId = if (caller == null || caller.isNull("sessionId")) null else caller.optString("sessionId").ifBlank { null }
 
-                        // If user tapped 暂停 on the floating HUD, wait smoothly until 继续 or 急停!
+                        // If user tapped 暂停 on the floating HUD, wait smoothly (up to 3 min) until 继续 or 急停!
+                        val wasPaused = SafetyGate.isPaused()
+                        val hadActiveTurnBeforePause = wasPaused && SafetyGate.isTurnActiveForSession(sessionId, turnId)
+                        val pauseDeadlineMs = System.currentTimeMillis() + 180_000L
                         while (SafetyGate.isPaused() && !SafetyGate.isEmergencyStopped()) {
-                            runCatching { Thread.sleep(150L) }
+                            if (Thread.currentThread().isInterrupted || System.currentTimeMillis() >= pauseDeadlineMs) {
+                                break
+                            }
+                            try {
+                                Thread.sleep(150L)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                                break
+                            }
+                        }
+                        if (SafetyGate.isEmergencyStopped()) {
+                            writeJson(
+                                out,
+                                403,
+                                JSONObject()
+                                    .put("ok", false)
+                                    .put("blocked", true)
+                                    .put("reason", "emergency_stop_active")
+                                    .put("hint", "用户已触发急停，请立即停止后续手机操控。")
+                            )
+                            return
+                        }
+                        if (SafetyGate.isPaused()) {
+                            writeJson(
+                                out,
+                                403,
+                                JSONObject()
+                                    .put("ok", false)
+                                    .put("blocked", true)
+                                    .put("reason", "pause_timeout")
+                                    .put("hint", "操控处于暂停状态且等待已超时，请先点击继续后再重试。")
+                            )
+                            return
+                        }
+                        if (wasPaused && hadActiveTurnBeforePause && !SafetyGate.isTurnActiveForSession(sessionId, turnId)) {
+                            writeJson(
+                                out,
+                                403,
+                                JSONObject()
+                                    .put("ok", false)
+                                    .put("blocked", true)
+                                    .put("reason", "turn_ended_while_paused")
+                                    .put("hint", "暂停期间本轮对话已结束，已取消滞留操作。")
+                            )
+                            return
                         }
 
                         val res = dispatchTool(
@@ -209,18 +284,22 @@ class PhoneControlDaemon(
             }
             is SafetyGate.ActionVerdict.Allow -> {
                 SafetyGate.beginTurn(turnId, sessionId)
+                val resolvedApp = targetAppLabel ?: targetPackage
                 overlay.showOrUpdateHud(
                     actionLabel = hudActionLabel,
-                    appLabel = targetAppLabel ?: targetPackage
+                    appLabel = resolvedApp,
+                    toolName = tool
                 )
+                emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
                 return null
             }
             is SafetyGate.ActionVerdict.NeedConfirm -> {
                 SafetyGate.beginTurn(turnId, sessionId)
+                val resolvedApp = targetAppLabel ?: targetPackage
                 val decision = overlay.confirm(
                     title = "GrassBag 请求操控手机",
                     actionSummary = actionSummary,
-                    appLabel = targetAppLabel ?: targetPackage,
+                    appLabel = resolvedApp,
                     riskBadge = verdict.riskBadge,
                     allowTurnOption = verdict.allowTurnOption,
                     timeoutMs = 35_000L
@@ -230,16 +309,20 @@ class PhoneControlDaemon(
                         SafetyGate.recordAudit(tool, targetPackage ?: "screen", true, "allowed:native_overlay_once")
                         overlay.showOrUpdateHud(
                             actionLabel = hudActionLabel,
-                            appLabel = targetAppLabel ?: targetPackage
+                            appLabel = resolvedApp,
+                            toolName = tool
                         )
+                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
                         null
                     }
                     PhoneOverlayController.ConfirmDecision.ALLOW_TURN -> {
                         SafetyGate.grantTurnAllow(sessionId, turnId)
                         overlay.showOrUpdateHud(
                             actionLabel = hudActionLabel,
-                            appLabel = targetAppLabel ?: targetPackage
+                            appLabel = resolvedApp,
+                            toolName = tool
                         )
+                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
                         null
                     }
                     PhoneOverlayController.ConfirmDecision.DENY -> {
@@ -277,6 +360,26 @@ class PhoneControlDaemon(
                 }
             }
         }
+    }
+
+    private fun emitStepTelemetry(
+        tool: String,
+        actionLabel: String,
+        appLabel: String?,
+        overlay: PhoneOverlayController
+    ) {
+        onEvent(
+            "phone_step_event",
+            mapOf(
+                "active" to true,
+                "tool" to tool,
+                "action" to actionLabel,
+                "appLabel" to (appLabel ?: ""),
+                "stepCount" to overlay.currentStepCount(),
+                "paused" to SafetyGate.isPaused(),
+                "ts" to System.currentTimeMillis()
+            )
+        )
     }
 
     private fun resolveAppByNameOrPackage(rawPkg: String, rawAppName: String): Pair<String, String>? {
@@ -366,7 +469,8 @@ class PhoneControlDaemon(
             }
             "phone_wait" -> {
                 val ms = args.optLong("ms", 1000L).coerceIn(100L, 10_000L)
-                overlay.showOrUpdateHud(actionLabel = "等待界面稳定…", incrementStep = false)
+                SafetyGate.beginTurn(turnId, sessionId)
+                overlay.showOrUpdateHud(actionLabel = "等待界面稳定…", incrementStep = false, toolName = tool)
                 runCatching { Thread.sleep(ms) }
                 JSONObject().put("ok", true).put("waitedMs", ms)
             }
@@ -414,17 +518,30 @@ class PhoneControlDaemon(
             }
             "phone_tap", "phone_long_press" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
+                val blockedMultiWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                if (blockedMultiWin != null) {
+                    SafetyGate.recordAudit(tool, blockedMultiWin, false, "blocked_sensitive_package")
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
+                        .put("blockedPackage", blockedMultiWin)
+                }
+                val pkg = svc.currentForegroundPackage()
                 val nodeId = args.optString("nodeId", "").trim()
                 val cachedNode = if (nodeId.isNotEmpty()) svc.getCachedNode(nodeId) else null
+                if (cachedNode != null && !pkg.isNullOrBlank() && cachedNode.packageName.isNotBlank() && cachedNode.packageName != pkg) {
+                    return JSONObject().put("ok", false).put("reason", "stale_node_package_mismatch")
+                        .put("hint", "前台应用已切换（${cachedNode.packageName} -> $pkg），请先重新调用 phone_screen 获取最新界面元素。")
+                }
                 val x = cachedNode?.cx?.toDouble() ?: args.optDouble("x", -1.0)
                 val y = cachedNode?.cy?.toDouble() ?: args.optDouble("y", -1.0)
                 if (!x.isFinite() || !y.isFinite() || x < 0.0 || y < 0.0) {
                     return JSONObject().put("ok", false).put("reason", "valid nodeId or non-negative finite x, y coordinates are required")
                 }
-                val pkg = svc.currentForegroundPackage()
                 val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
                 val (inspectedLabel, hitsSensitive) = svc.inspectPointTarget(x.toFloat(), y.toFloat())
-                val elemLabel = cachedNode?.label ?: inspectedLabel
+                // Prefer live inspected label for UI summary, and evaluate SafetyGate sensitive keywords
+                // against BOTH live inspected label and cached label so a newly appeared sensitive button is never bypassed.
+                val elemLabel = inspectedLabel?.takeIf { it.isNotBlank() } ?: cachedNode?.label
+                val gateLabel = listOfNotNull(inspectedLabel, cachedNode?.label).distinct().joinToString(" ").ifBlank { null }
                 val isLong = tool == "phone_long_press"
                 val verb = if (isLong) "长按" else "点击"
                 val targetDesc = if (!elemLabel.isNullOrBlank()) "「$elemLabel」" else "位置 (${x.toInt()}, ${y.toInt()})"
@@ -437,18 +554,30 @@ class PhoneControlDaemon(
                     sessionId = sessionId,
                     turnId = turnId,
                     permissionPreset = permissionPreset,
-                    targetLabel = elemLabel,
+                    targetLabel = gateLabel,
                     isSensitiveTarget = hitsSensitive || (cachedNode?.sensitive == true),
                     userApproved = userApproved
                 )
                 if (denied != null) return denied
+                val postPkg = svc.currentForegroundPackage()
+                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
                 val dur = if (isLong) args.optLong("durationMs", 650L).coerceIn(400L, 1800L) else 65L
-                svc.executeTapGesture(x.toFloat(), y.toFloat(), dur).apply {
+                svc.executeTapGesture(x.toFloat(), y.toFloat(), dur, elemLabel).apply {
                     if (!elemLabel.isNullOrBlank()) put("label", elemLabel)
                 }
             }
             "phone_swipe" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
+                val blockedMultiWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                if (blockedMultiWin != null) {
+                    SafetyGate.recordAudit(tool, blockedMultiWin, false, "blocked_sensitive_package")
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
+                        .put("blockedPackage", blockedMultiWin)
+                }
                 val x1 = args.optDouble("x1", -1.0)
                 val y1 = args.optDouble("y1", -1.0)
                 val x2 = args.optDouble("x2", -1.0)
@@ -471,6 +600,12 @@ class PhoneControlDaemon(
                     userApproved = userApproved
                 )
                 if (denied != null) return denied
+                val postPkg = svc.currentForegroundPackage()
+                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
                 svc.executeSwipeGesture(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), dur)
             }
             "phone_key" -> {
@@ -501,17 +636,24 @@ class PhoneControlDaemon(
             }
             "phone_type" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
+                val blockedMultiWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                if (blockedMultiWin != null) {
+                    SafetyGate.recordAudit(tool, blockedMultiWin, false, "blocked_sensitive_package")
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
+                        .put("blockedPackage", blockedMultiWin)
+                }
                 val text = args.optString("text", "")
                 val pkg = svc.currentForegroundPackage()
                 val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
                 val (_, sensitive, fieldLabel) = svc.inspectFocusedInput()
                 val preview = if (text.length > 48) text.take(48) + "…" else text
+                val submit = args.optBoolean("submit", false)
                 val denied = gateAndConfirm(
                     tool = tool,
                     targetPackage = pkg,
                     targetAppLabel = appLabel,
                     actionSummary = "在「$appLabel」中输入：\"$preview\"",
-                    hudActionLabel = "输入文本",
+                    hudActionLabel = "输入「${if (text.length > 14) text.take(14) + "…" else text}」",
                     sessionId = sessionId,
                     turnId = turnId,
                     permissionPreset = permissionPreset,
@@ -520,7 +662,14 @@ class PhoneControlDaemon(
                     userApproved = userApproved
                 )
                 if (denied != null) return denied
-                svc.executeType(text)
+                val postPkg = svc.currentForegroundPackage()
+                val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
+                val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                if (SafetyGate.isEmergencyStopped() || SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
+                }
+                overlay.showTypeFx(preview)
+                svc.executeType(text, submit = submit)
             }
             "phone_open" -> {
                 val rawPkg = args.optString("package", "").trim()
@@ -586,7 +735,23 @@ class PhoneControlDaemon(
                 }
             }
             "phone_intent" -> {
-                val kind = args.optString("kind", "")
+                val kind = args.optString("kind", "").trim()
+                val supportedKinds = setOf("alarm", "timer", "share", "navigation", "calendar")
+                if (kind !in supportedKinds) {
+                    return JSONObject()
+                        .put("ok", false)
+                        .put("reason", "unsupported_intent_kind")
+                        .put("hint", "不支持的系统快捷动作类型：$kind（支持 alarm / timer / share / navigation / calendar）")
+                }
+                if (kind == "navigation") {
+                    val dest = args.optString("query", args.optString("destination", "")).trim()
+                    if (dest.isEmpty()) {
+                        return JSONObject()
+                            .put("ok", false)
+                            .put("reason", "destination_required")
+                            .put("hint", "地图导航需要提供目的地 query 或 destination 参数。")
+                    }
+                }
                 val summary = when (kind) {
                     "alarm" -> "设置闹钟 ${args.optInt("hour", 8)}:${args.optInt("minute", 0).toString().padStart(2, '0')}"
                     "timer" -> "启动计时器 ${args.optInt("seconds", 60)} 秒"
@@ -671,6 +836,7 @@ class PhoneControlDaemon(
             }
             "phone_handoff" -> {
                 val message = args.optString("message", "请手动完成当前敏感步骤，完成后点击继续")
+                SafetyGate.beginTurn(turnId, sessionId)
                 onEvent("phone_handoff", mapOf("message" to message))
                 val svc = GrassBagAccessibilityService.current()
                 val appLabel = svc?.resolveAppLabel(svc.currentForegroundPackage())
@@ -686,9 +852,32 @@ class PhoneControlDaemon(
                         JSONObject().put("ok", false).put("reason", "handoff_timeout")
                     }
                     PhoneOverlayController.HandoffDecision.UNAVAILABLE -> {
-                        JSONObject().put("ok", true).put("handedOff", true).put("message", message)
+                        JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "overlay_unavailable")
+                            .put("hint", "无法显示人工接管悬浮卡片。请先在「设置 → 权限管理」开启无障碍服务或悬浮窗权限后重试。")
                     }
                 }
+            }
+            "phone_return_app" -> {
+                val summary = args.optString("summary", "").trim()
+                val steps = overlay.currentStepCount()
+                SafetyGate.endTurn(sessionId)
+                overlay.showCompletionAndReturn(
+                    summary = summary,
+                    reason = "completed",
+                    autoReturn = true
+                )
+                onEvent("phone_turn_end", mapOf(
+                    "sessionId" to (sessionId ?: ""),
+                    "reason" to "completed",
+                    "summary" to summary,
+                    "autoReturn" to true,
+                    "stepsCount" to steps,
+                    "appLabel" to overlay.currentAppLabel()
+                ))
+                JSONObject().put("ok", true).put("returned", true)
             }
             "phone_shell" -> {
                 JSONObject().put("ok", false).put("reason", "unsupported_shizuku_not_integrated")

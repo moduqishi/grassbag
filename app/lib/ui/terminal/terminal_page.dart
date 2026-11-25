@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, kIsWeb;
@@ -29,11 +30,15 @@ class TerminalPage extends ConsumerStatefulWidget {
   ConsumerState<TerminalPage> createState() => _TerminalPageState();
 }
 
-class _TerminalPageState extends ConsumerState<TerminalPage> {
+class _TerminalPageState extends ConsumerState<TerminalPage>
+    with SingleTickerProviderStateMixin {
   static int _tabSeq = 0;
 
   final List<_LocalTermTab> _tabs = [];
+  late final AnimationController _tabPulseCtrl;
+  late final Animation<double> _tabPulseOpacity;
   int _activeIndex = 0;
+  int _tabLabelSeq = 1;
   _ModLatch _ctrl = _ModLatch.off;
   _ModLatch _alt = _ModLatch.off;
   double _fontSize = 12.5;
@@ -95,9 +100,22 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     _scrollTabToBottomAndFocus(tab);
   }
 
-  void _closeTabAt(int idx) {
+  Future<void> _closeTabAt(int idx) async {
     if (_tabs.length <= 1 || idx < 0 || idx >= _tabs.length) return;
     final closing = _tabs[idx];
+    if (!closing.exited && closing.backend != _TermBackend.simulated) {
+      final ok = await showGrassBagConfirmDialog(
+        context,
+        title: '关闭终端「${closing.title}」？',
+        message: '关闭后该标签内正在运行的 Shell 进程将立即终止。',
+        confirmLabel: '关闭终端',
+        isDestructive: true,
+      );
+      if (!ok || !mounted) return;
+      final currentIdx = _tabs.indexOf(closing);
+      if (currentIdx < 0 || _tabs.length <= 1) return;
+      idx = currentIdx;
+    }
     setState(() {
       _tabs.removeAt(idx);
       if (_activeIndex >= _tabs.length) {
@@ -105,6 +123,8 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       } else if (idx < _activeIndex) {
         _activeIndex = (_activeIndex - 1).clamp(0, _tabs.length - 1);
       }
+      _ctrl = _ModLatch.off;
+      _alt = _ModLatch.off;
     });
     _teardownTabs([closing], deferResourceDispose: true);
     _focusTab(_activeIndex);
@@ -255,6 +275,9 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     final oldTabs = List<_LocalTermTab>.of(_tabs);
     _tabs.clear();
     _activeIndex = 0;
+    _tabLabelSeq = 1;
+    _ctrl = _ModLatch.off;
+    _alt = _ModLatch.off;
     unawaited(_wsSub?.cancel());
     _wsSub = null;
     _attachedClient = null;
@@ -310,11 +333,23 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
   @override
   void initState() {
     super.initState();
+    _tabPulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 120),
+      value: 1.0,
+    );
+    _tabPulseOpacity = Tween<double>(begin: 0.72, end: 1.0).animate(
+      CurvedAnimation(parent: _tabPulseCtrl, curve: Curves.easeOutCubic),
+    );
     _initTabsForActiveHost();
   }
 
   @override
   void dispose() {
+    _tabPulseCtrl.dispose();
+    _ptyFlushTimer?.cancel();
+    _ptyFlushTimer = null;
+    _ptyBuffers.clear();
     unawaited(_nativeSub?.cancel());
     unawaited(_wsSub?.cancel());
     _teardownTabs(List<_LocalTermTab>.of(_tabs));
@@ -342,6 +377,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       for (final t in _tabs) {
         if (t.id == id && t.backend == _TermBackend.androidLocal) {
           t.isLocalPty = isPty;
+          t.localModeLocked = true;
           break;
         }
       }
@@ -380,16 +416,20 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
 
     if (type == 'term.snapshot') {
       final screen = data?['data']?.toString() ?? data?['screen']?.toString() ?? '';
+      if (target.exited && mounted) {
+        setState(() => target!.exited = false);
+      }
       if (screen.isNotEmpty) {
         _flushPtyBuffers();
         target.terminal.write('\x1b[2J\x1b[H$screen');
       }
       return;
     }
-    if (type == 'term.exit' || type == 'terminal.exit') {
+    if (type == 'term.exit' || type == 'terminal.exit' || type == 'terminal.stream_end') {
       _flushPtyBuffers();
-      final code = data?['exitCode'] ?? data?['code'] ?? 0;
-      target.terminal.write('\r\n\x1b[90m[远端 PTY 已退出 code=$code]\x1b[0m\r\n');
+      final code = data?['exitCode'] ?? data?['code'];
+      final exitNote = code != null ? '[远端 PTY 已退出 code=$code]' : '[远端 PTY 流已结束]';
+      target.terminal.write('\r\n\x1b[90m$exitNote\x1b[0m\r\n');
       if (!target.exited) {
         setState(() => target!.exited = true);
       }
@@ -407,12 +447,36 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
 
     final chunk = data?['data']?.toString() ?? data?['chunk']?.toString() ?? '';
     if (chunk.isNotEmpty) {
+      if (target.exited && mounted) {
+        setState(() => target!.exited = false);
+      }
       _enqueuePtyChunk(target, chunk);
+    }
+  }
+
+  void _closeIfLeakedRemotePty(
+    GbridgeClient client,
+    Map<String, dynamic>? res,
+    String? fallbackSid,
+  ) {
+    if (res == null) return;
+    final termObj = res['terminal'];
+    final remoteId =
+        (termObj is Map ? (termObj['id'] ?? termObj['terminalId']) : res['id'])?.toString() ?? '';
+    final resolvedSid =
+        (termObj is Map ? termObj['sessionId']?.toString() : null) ?? fallbackSid;
+    if (remoteId.isNotEmpty) {
+      unawaited(
+        client
+            .closeTerminal(remoteId, sessionId: resolvedSid)
+            .catchError((_) => const <String, dynamic>{}),
+      );
     }
   }
 
   Future<void> _attachRemotePty(_LocalTermTab tab, GbridgeClient client) async {
     tab.ownerClient = client;
+    tab.attaching = true;
     _ensureWsSubscription(client);
     final appState = ref.read(appProvider);
     tab.terminal.write('\x1b[90m正在连接「${appState.activeHost.name}」实时 PTY…\x1b[0m\r\n');
@@ -436,6 +500,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         }
       }
       if (!mounted || tab.closed || !identical(ref.read(appProvider.notifier).liveClient, client)) {
+        _closeIfLeakedRemotePty(client, res, sid);
         return;
       }
       if (res == null) {
@@ -465,6 +530,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         }
       }
       if (!mounted || tab.closed || !identical(ref.read(appProvider.notifier).liveClient, client)) {
+        _closeIfLeakedRemotePty(client, res, sid);
         return;
       }
       if (res == null) {
@@ -489,11 +555,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       final resolvedSid = (termObj is Map ? termObj['sessionId']?.toString() : null) ?? sid;
       if (remoteId.isNotEmpty) {
         if (!mounted || tab.closed || !identical(ref.read(appProvider.notifier).liveClient, client)) {
-          unawaited(
-            client
-                .closeTerminal(remoteId, sessionId: resolvedSid)
-                .catchError((_) => const <String, dynamic>{}),
-          );
+          _closeIfLeakedRemotePty(client, res, resolvedSid);
           return;
         }
         tab.remoteTermId = remoteId;
@@ -501,7 +563,15 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         tab.wsChannel = (resolvedSid != null && resolvedSid.isNotEmpty)
             ? 'terminal:$resolvedSid:$remoteId'
             : 'terminal:$remoteId';
+        tab.attaching = false;
+        if (tab.exited && mounted) {
+          setState(() => tab.exited = false);
+        } else {
+          tab.exited = false;
+        }
         client.stream.subscribe(tab.wsChannel!);
+        tab.sentCols = tab.lastCols;
+        tab.sentRows = tab.lastRows;
         client.stream.sendTerminalResize(remoteId, tab.lastCols, tab.lastRows);
         tab.terminal.write('\x1b[32m✓ 已接入「${appState.activeHost.name}」真实 PTY ($remoteId)\x1b[0m\r\n');
         return;
@@ -510,6 +580,8 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       if (mounted && !tab.closed) {
         tab.terminal.write('\x1b[31m创建远端 PTY 失败：$e\x1b[0m\r\n');
       }
+    } finally {
+      tab.attaching = false;
     }
     if (!mounted || tab.closed) return;
     // NEVER fall back to Android local shell when connected to a REMOTE host!
@@ -544,8 +616,12 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       return;
     }
     tab.backend = _TermBackend.androidLocal;
-    tab.isLocalPty = res['isPty'] == true;
+    if (!tab.localModeLocked) {
+      tab.isLocalPty = res['isPty'] == true;
+    }
     if (tab.isLocalPty) {
+      tab.sentCols = tab.lastCols;
+      tab.sentRows = tab.lastRows;
       unawaited(GrassBagNativeBridge.instance.resizeLocalShell(tab.id, tab.lastCols, tab.lastRows));
     }
     final hasUbuntu = ref.read(appProvider).nativeRuntimeStatus.containerExtracted;
@@ -623,15 +699,17 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         tab.resizeDebounce = Timer(const Duration(milliseconds: 120), () {
           if (!mounted || tab.closed) return;
           if (tab.sentCols == tab.lastCols && tab.sentRows == tab.lastRows) return;
-          tab.sentCols = tab.lastCols;
-          tab.sentRows = tab.lastRows;
           final live = ref.read(appProvider.notifier).liveClient;
           if (tab.backend == _TermBackend.remoteWs &&
               tab.remoteTermId != null &&
               live != null &&
               identical(live, tab.ownerClient)) {
+            tab.sentCols = tab.lastCols;
+            tab.sentRows = tab.lastRows;
             live.stream.sendTerminalResize(tab.remoteTermId!, tab.lastCols, tab.lastRows);
           } else if (tab.backend == _TermBackend.androidLocal && tab.isLocalPty) {
+            tab.sentCols = tab.lastCols;
+            tab.sentRows = tab.lastRows;
             unawaited(
               GrassBagNativeBridge.instance.resizeLocalShell(tab.id, tab.lastCols, tab.lastRows),
             );
@@ -643,6 +721,9 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
         final data = _applyLatchesToInput(rawData);
         final live = ref.read(appProvider.notifier).liveClient;
         if (tab.backend == _TermBackend.remoteWs) {
+          if (tab.attaching) {
+            return;
+          }
           if (tab.remoteTermId != null &&
               live != null &&
               identical(live, tab.ownerClient)) {
@@ -653,58 +734,67 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
           }
           return;
         }
-        if (tab.backend == _TermBackend.androidLocal) {
-          if (tab.isLocalPty) {
-            unawaited(GrassBagNativeBridge.instance.writeLocalShell(tab.id, data));
-            return;
-          }
-          // Local Android non-PTY pipe echoes typed input locally and forwards real SIGINT on ^C!
-          if (data == '\r' || data == '\n') {
+        if (tab.backend == _TermBackend.androidLocal && tab.isLocalPty) {
+          unawaited(GrassBagNativeBridge.instance.writeLocalShell(tab.id, data));
+          return;
+        }
+        // Line-buffered mode (Android non-PTY pipe or simulated fallback):
+        // handles multi-line pastes, strips ANSI CSI sequences, supports ^C/^D, and
+        // erases wide CJK / emoji grapheme clusters accurately!
+        final isAndroidPipe = tab.backend == _TermBackend.androidLocal;
+        final cleaned = data
+            .replaceAll('\r\n', '\n')
+            .replaceAll('\r', '\n')
+            .replaceAll(_ansiEscapeRe, '');
+        if (cleaned.isEmpty) return;
+
+        for (final cluster in cleaned.characters) {
+          if (cluster == '\n') {
             final line = buf.toString();
             buf.clear();
             tab.terminal.write('\r\n');
-            unawaited(GrassBagNativeBridge.instance.writeLocalShell(tab.id, '$line\n'));
-          } else if (data == '\x7f' || data == '\b') {
+            if (isAndroidPipe) {
+              unawaited(GrassBagNativeBridge.instance.writeLocalShell(tab.id, '$line\n'));
+            } else {
+              final cmd = line.trim();
+              if (cmd.isNotEmpty) {
+                _runSimulatedCommand(tab.terminal, cwd, cmd);
+              }
+              tab.terminal.write('\x1b[32m$cwd ❯\x1b[0m ');
+            }
+          } else if (cluster == '\x7f' || cluster == '\b') {
             if (buf.isNotEmpty) {
-              final cur = buf.toString();
+              final chars = buf.toString().characters;
+              final removed = chars.last;
               buf
                 ..clear()
-                ..write(cur.substring(0, cur.length - 1));
-              tab.terminal.write('\b \b');
+                ..write(chars.skipLast(1).toString());
+              final w = _displayWidthOfGrapheme(removed);
+              tab.terminal.write(w >= 2 ? '\b\b  \b\b' : '\b \b');
             }
-          } else if (data == '\x03') {
+          } else if (cluster == '\x03') {
             buf.clear();
-            tab.terminal.write('^C\r\n');
-            unawaited(GrassBagNativeBridge.instance.signalLocalShell(tab.id, 'SIGINT'));
+            if (isAndroidPipe) {
+              tab.terminal.write('^C\r\n');
+              unawaited(GrassBagNativeBridge.instance.signalLocalShell(tab.id, 'SIGINT'));
+            } else {
+              tab.terminal.write('^C\r\n\x1b[32m$cwd ❯\x1b[0m ');
+            }
+          } else if (cluster == '\x04') {
+            if (buf.isEmpty) {
+              if (isAndroidPipe) {
+                tab.terminal.write('^D\r\n');
+                unawaited(GrassBagNativeBridge.instance.writeLocalShell(tab.id, 'exit\n'));
+              } else {
+                tab.terminal.write('^D\r\n\x1b[32m$cwd ❯\x1b[0m ');
+              }
+            }
+          } else if (cluster == '\x1b') {
+            // Ignore bare Esc in line-buffered mode so cursor never jumps over prompt.
           } else {
-            buf.write(data);
-            tab.terminal.write(data);
+            buf.write(cluster);
+            tab.terminal.write(cluster);
           }
-          return;
-        }
-        // Simulated / disconnected fallback
-        if (data == '\r' || data == '\n') {
-          final cmd = buf.toString().trim();
-          buf.clear();
-          tab.terminal.write('\r\n');
-          if (cmd.isNotEmpty) {
-            _runSimulatedCommand(tab.terminal, cwd, cmd);
-          }
-          tab.terminal.write('\x1b[32m$cwd ❯\x1b[0m ');
-        } else if (data == '\x7f' || data == '\b') {
-          if (buf.isNotEmpty) {
-            final cur = buf.toString();
-            buf
-              ..clear()
-              ..write(cur.substring(0, cur.length - 1));
-            tab.terminal.write('\b \b');
-          }
-        } else if (data == '\x03') {
-          buf.clear();
-          tab.terminal.write('^C\r\n\x1b[32m$cwd ❯\x1b[0m ');
-        } else {
-          buf.write(data);
-          tab.terminal.write(data);
         }
       },
     );
@@ -735,7 +825,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
   }
 
   void _addTab() {
-    final n = _tabs.length + 1;
+    final n = ++_tabLabelSeq;
     final live = ref.read(appProvider.notifier).liveClient;
     final native = GrassBagNativeBridge.instance;
     final appState = ref.read(appProvider);
@@ -814,6 +904,10 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       return;
     }
 
+    if (key == 'hide_kb') {
+      FocusManager.instance.primaryFocus?.unfocus();
+      return;
+    }
     if (key == 'copy') {
       unawaited(_copySelection());
       return;
@@ -951,6 +1045,64 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     );
   }
 
+  static final RegExp _ansiEscapeRe = RegExp(r'\x1b\[[0-9;?]*[ -/]*[@-~]');
+
+  static int _displayWidthOfGrapheme(String grapheme) {
+    if (grapheme.isEmpty) return 0;
+    final cp = grapheme.runes.first;
+    // East Asian Wide / Fullwidth / CJK / Emoji ranges render 2 cells wide in terminal.
+    if ((cp >= 0x1100 && cp <= 0x115F) ||
+        (cp >= 0x2E80 && cp <= 0xA4CF) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE10 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) ||
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+        cp >= 0x1F300) {
+      return 2;
+    }
+    return 1;
+  }
+
+  TerminalTheme? _cachedTerminalTheme;
+  (GrassBagAccent, Color, Color)? _cachedTerminalThemeKey;
+
+  TerminalTheme _resolveTerminalTheme(GrassBagTokens t) {
+    final key = (t.accent, t.codeBg, t.codeFg);
+    if (_cachedTerminalTheme != null && _cachedTerminalThemeKey == key) {
+      return _cachedTerminalTheme!;
+    }
+    final darkAccent = GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi;
+    final built = TerminalTheme(
+      cursor: darkAccent,
+      selection: darkAccent.withValues(alpha: 0.35),
+      foreground: t.codeFg,
+      background: t.codeBg,
+      black: const Color(0xFF1A2026),
+      red: const Color(0xFFE69089),
+      green: const Color(0xFF5DD199),
+      yellow: const Color(0xFFEDB060),
+      blue: const Color(0xFF8CB9D7),
+      magenta: const Color(0xFFB8ABD2),
+      cyan: const Color(0xFF72C6D8),
+      white: const Color(0xFFE5EBF0),
+      brightBlack: const Color(0xFF6B7D8C),
+      brightRed: const Color(0xFFF3A7A1),
+      brightGreen: const Color(0xFF7CE0AF),
+      brightYellow: const Color(0xFFF4C582),
+      brightBlue: const Color(0xFFA8D0EC),
+      brightMagenta: const Color(0xFFCEC3E5),
+      brightCyan: const Color(0xFF93DBE9),
+      brightWhite: const Color(0xFFFFFFFF),
+      searchHitBackground: const Color(0x66EDB060),
+      searchHitBackgroundCurrent: const Color(0xAAEDB060),
+      searchHitForeground: Colors.black,
+    );
+    _cachedTerminalThemeKey = key;
+    _cachedTerminalTheme = built;
+    return built;
+  }
+
   @override
   Widget build(BuildContext context) {
     ref.listen<String>(appProvider.select((s) => s.activeHostId), (prev, next) {
@@ -963,12 +1115,24 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
       if (next == ConnectionPhase.connected) {
         final active = _tabs[_activeIndex];
         final appState = ref.read(appProvider);
-        if (!appState.activeHost.isLocal &&
-            active.backend == _TermBackend.simulated &&
-            ref.read(appProvider.notifier).liveClient != null) {
-          _restartActiveTab();
+        final live = ref.read(appProvider.notifier).liveClient;
+        final isAndroidLocal =
+            GrassBagNativeBridge.instance.isAndroidNative && appState.activeHost.isLocal;
+        if (live != null) {
+          _ensureWsSubscription(live);
         }
-      } else if (prev == ConnectionPhase.connected && next != ConnectionPhase.connected) {
+        if (!isAndroidLocal && live != null) {
+          if (active.backend == _TermBackend.simulated) {
+            _restartActiveTab();
+          } else if (active.backend == _TermBackend.remoteWs &&
+              !active.attaching &&
+              !identical(active.ownerClient, live)) {
+            _restartActiveTab();
+          }
+        }
+      } else if (next == ConnectionPhase.disconnected ||
+          next == ConnectionPhase.error ||
+          next == ConnectionPhase.needsAuth) {
         var changed = false;
         for (final t in _tabs) {
           if (t.backend == _TermBackend.remoteWs && !t.exited) {
@@ -1001,10 +1165,24 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
           ('Esc', 'esc'),
           ('Tab', 'tab'),
           ('^C', 'ctrl_c'),
+          (
+            switch (_ctrl) {
+              _ModLatch.off => 'Ctrl',
+              _ModLatch.once => 'Ctrl•',
+              _ModLatch.locked => 'CTRL',
+            },
+            'ctrl',
+          ),
+          (
+            switch (_alt) {
+              _ModLatch.off => 'Alt',
+              _ModLatch.once => 'Alt•',
+              _ModLatch.locked => 'ALT',
+            },
+            'alt',
+          ),
           ('^D', 'ctrl_d'),
           ('^Z', 'ctrl_z'),
-          ('Ctrl', 'ctrl'),
-          ('Alt', 'alt'),
           ('←', 'left'),
           ('↑', 'up'),
           ('↓', 'down'),
@@ -1020,6 +1198,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
     return GrassBagGlassPage(
       child: Scaffold(
         backgroundColor: Colors.transparent,
+        resizeToAvoidBottomInset: false,
         body: Stack(
           children: [
             Column(
@@ -1106,12 +1285,19 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                         child: GrassBagSpringTap(
                           onTap: () {
                             if (_activeIndex == idx) return;
-                            setState(() => _activeIndex = idx);
+                            setState(() {
+                              _activeIndex = idx;
+                              _ctrl = _ModLatch.off;
+                              _alt = _ModLatch.off;
+                            });
+                            _tabPulseCtrl.forward(from: 0.0);
                             _focusTab(idx);
                           },
                           pressedScale: 0.94,
                           haptic: true,
-                          child: Container(
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeOutCubic,
                             padding: EdgeInsets.fromLTRB(
                               13,
                               4,
@@ -1137,24 +1323,33 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                     color: active ? t.primary : t.text2,
                                   ),
                                 ),
-                                if (canCloseInline) ...[
-                                  const SizedBox(width: 4),
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () => _closeTabAt(idx),
-                                    child: SizedBox(
-                                      width: 28,
-                                      height: 28,
-                                      child: Center(
-                                        child: Icon(
-                                          CupertinoIcons.xmark,
-                                          size: 12.5,
-                                          color: t.primary,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
+                                AnimatedSize(
+                                  duration: const Duration(milliseconds: 170),
+                                  curve: Curves.easeOutCubic,
+                                  child: canCloseInline
+                                      ? Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            const SizedBox(width: 4),
+                                            GestureDetector(
+                                              behavior: HitTestBehavior.opaque,
+                                              onTap: () => _closeTabAt(idx),
+                                              child: SizedBox(
+                                                width: 28,
+                                                height: 28,
+                                                child: Center(
+                                                  child: Icon(
+                                                    CupertinoIcons.xmark,
+                                                    size: 12.5,
+                                                    color: t.primary,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        )
+                                      : const SizedBox.shrink(),
+                                ),
                               ],
                             ),
                           ),
@@ -1186,14 +1381,21 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                               child: Padding(
                                 padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
                                 child: RepaintBoundary(
-                                  child: MediaQuery.removePadding(
-                                    context: context,
-                                    removeTop: true,
-                                    removeBottom: true,
+                                  // Aspect-isolated MediaQuery avoids subscribing to `viewInsets`
+                                  // (unlike `MediaQuery.removePadding`), eliminating 120Hz IME rebuild storms!
+                                  child: MediaQuery(
+                                    data: MediaQueryData(
+                                      size: MediaQuery.sizeOf(context),
+                                      devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
+                                      textScaler: MediaQuery.textScalerOf(context),
+                                      platformBrightness: MediaQuery.platformBrightnessOf(context),
+                                    ),
                                     // Keep all open tabs mounted via IndexedStack so switching tabs
                                     // preserves scrollback offset, text selection & soft-keyboard focus!
-                                    child: IndexedStack(
-                                      index: _activeIndex,
+                                    child: FadeTransition(
+                                      opacity: _tabPulseOpacity,
+                                      child: IndexedStack(
+                                        index: _activeIndex,
                                       children: [
                                         for (var idx = 0; idx < _tabs.length; idx++)
                                           () {
@@ -1207,62 +1409,33 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                                   controller: item.terminalController,
                                                   scrollController: item.scrollController,
                                                   focusNode: item.focusNode,
-                                            onSecondaryTapDown: (details, _) {
-                                              _openMoreSheet(anchor: details.globalPosition);
-                                            },
-                                            deleteDetection: !kIsWeb &&
-                                                (defaultTargetPlatform == TargetPlatform.android ||
-                                                    defaultTargetPlatform == TargetPlatform.iOS),
-                                            keyboardType: TextInputType.visiblePassword,
-                                            textStyle: TerminalStyle(
-                                              fontSize: _fontSize,
-                                              fontFamily: kIsWeb ? 'Menlo' : 'monospace',
-                                              fontFamilyFallback: const [
-                                                'SF Mono',
-                                                'Monaco',
-                                                'Consolas',
-                                                'Liberation Mono',
-                                                'Courier New',
-                                                'monospace',
-                                              ],
-                                            ),
-                                            theme: () {
-                                              final darkAccent = GrassBagTokens.resolve(
-                                                t.accent,
-                                                Brightness.dark,
-                                              ).primaryHi;
-                                              return TerminalTheme(
-                                                cursor: darkAccent,
-                                                selection: darkAccent.withValues(alpha: 0.35),
-                                                foreground: t.codeFg,
-                                                background: t.codeBg,
-                                                black: const Color(0xFF1A2026),
-                                                red: const Color(0xFFE69089),
-                                                green: const Color(0xFF5DD199),
-                                                yellow: const Color(0xFFEDB060),
-                                                blue: const Color(0xFF8CB9D7),
-                                                magenta: const Color(0xFFB8ABD2),
-                                                cyan: const Color(0xFF72C6D8),
-                                                white: const Color(0xFFE5EBF0),
-                                                brightBlack: const Color(0xFF6B7D8C),
-                                                brightRed: const Color(0xFFF3A7A1),
-                                                brightGreen: const Color(0xFF7CE0AF),
-                                                brightYellow: const Color(0xFFF4C582),
-                                                brightBlue: const Color(0xFFA8D0EC),
-                                                brightMagenta: const Color(0xFFCEC3E5),
-                                                brightCyan: const Color(0xFF93DBE9),
-                                                brightWhite: const Color(0xFFFFFFFF),
-                                                searchHitBackground: const Color(0x66EDB060),
-                                                searchHitBackgroundCurrent: const Color(0xAAEDB060),
-                                                searchHitForeground: Colors.black,
-                                              );
-                                            }(),
-                                            autofocus: false,
-                                          ),
+                                                  onSecondaryTapDown: (details, _) {
+                                                    _openMoreSheet(anchor: details.globalPosition);
+                                                  },
+                                                  deleteDetection: !kIsWeb &&
+                                                      (defaultTargetPlatform == TargetPlatform.android ||
+                                                          defaultTargetPlatform == TargetPlatform.iOS),
+                                                  keyboardType: TextInputType.text,
+                                                  textStyle: TerminalStyle(
+                                                    fontSize: _fontSize,
+                                                    fontFamily: kIsWeb ? 'Menlo' : 'monospace',
+                                                    fontFamilyFallback: const [
+                                                      'SF Mono',
+                                                      'Monaco',
+                                                      'Consolas',
+                                                      'Liberation Mono',
+                                                      'Courier New',
+                                                      'monospace',
+                                                    ],
+                                                  ),
+                                                  theme: _resolveTerminalTheme(t),
+                                                  autofocus: false,
+                                                ),
                                               ),
                                             );
                                           }(),
                                       ],
+                                    ),
                                     ),
                                   ),
                                 ),
@@ -1285,59 +1458,105 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                                         ),
                                       ),
                                     ),
-                                    child: ListView.separated(
-                                      scrollDirection: Axis.horizontal,
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 10,
-                                        vertical: 6,
-                                      ),
-                                      itemCount: extraKeys.length,
-                                      separatorBuilder: (_, __) => const SizedBox(width: 6),
-                                      itemBuilder: (_, i) {
-                                        final k = extraKeys[i];
-                                        final latch = k.$2 == 'ctrl'
-                                            ? _ctrl
-                                            : (k.$2 == 'alt' ? _alt : _ModLatch.off);
-                                        final isActive = latch != _ModLatch.off ||
-                                            k.$2 == 'copy';
-                                        final darkAccent = GrassBagTokens.resolve(
-                                          t.accent,
-                                          Brightness.dark,
-                                        ).primaryHi;
-                                        return GrassBagSpringTap(
-                                          onTap: () => _sendExtraKey(k.$2),
-                                          pressedScale: 0.90,
-                                          haptic: true,
-                                          child: Container(
-                                            constraints: const BoxConstraints(minWidth: 40),
-                                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                                            alignment: Alignment.center,
-                                            decoration: ShapeDecoration(
-                                              color: isActive
-                                                  ? darkAccent.withValues(alpha: 0.24)
-                                                  : Colors.white.withValues(alpha: 0.085),
-                                              shape: RoundedSuperellipseBorder(
-                                                borderRadius: BorderRadius.circular(10),
-                                                side: latch == _ModLatch.locked
-                                                    ? BorderSide(color: darkAccent, width: 1.0)
-                                                    : BorderSide(
+                                    child: Row(
+                                      children: [
+                                        Expanded(
+                                          child: ListView.separated(
+                                            scrollDirection: Axis.horizontal,
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                            itemCount: extraKeys.length,
+                                            separatorBuilder: (_, __) => const SizedBox(width: 6),
+                                            itemBuilder: (_, i) {
+                                              final k = extraKeys[i];
+                                              final latch = k.$2 == 'ctrl'
+                                                  ? _ctrl
+                                                  : (k.$2 == 'alt' ? _alt : _ModLatch.off);
+                                              final isActive = latch != _ModLatch.off ||
+                                                  k.$2 == 'copy';
+                                              final darkAccent = GrassBagTokens.resolve(
+                                                t.accent,
+                                                Brightness.dark,
+                                              ).primaryHi;
+                                              return GrassBagSpringTap(
+                                                onTap: () => _sendExtraKey(k.$2),
+                                                pressedScale: 0.90,
+                                                haptic: true,
+                                                child: Container(
+                                                  constraints: const BoxConstraints(minWidth: 40),
+                                                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                                                  alignment: Alignment.center,
+                                                  decoration: ShapeDecoration(
+                                                    color: latch == _ModLatch.locked
+                                                        ? darkAccent.withValues(alpha: 0.36)
+                                                        : (isActive
+                                                            ? darkAccent.withValues(alpha: 0.22)
+                                                            : Colors.white.withValues(alpha: 0.085)),
+                                                    shape: RoundedSuperellipseBorder(
+                                                      borderRadius: BorderRadius.circular(10),
+                                                      side: latch == _ModLatch.locked
+                                                          ? BorderSide(color: darkAccent, width: 1.2)
+                                                          : (latch == _ModLatch.once
+                                                              ? BorderSide(
+                                                                  color: darkAccent.withValues(alpha: 0.55),
+                                                                  width: 0.8,
+                                                                )
+                                                              : BorderSide(
+                                                                  color: Colors.white.withValues(alpha: 0.07),
+                                                                  width: 0.5,
+                                                                )),
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    k.$1,
+                                                    style: TextStyle(
+                                                      fontFamily: 'monospace',
+                                                      fontSize: 11.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: isActive ? darkAccent : t.codeFg,
+                                                    ),
+                                                  ),
+                                                ),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                        if (!kIsWeb &&
+                                            (defaultTargetPlatform == TargetPlatform.android ||
+                                                defaultTargetPlatform == TargetPlatform.iOS))
+                                          Padding(
+                                            padding: const EdgeInsets.fromLTRB(4, 6, 8, 6),
+                                            child: Tooltip(
+                                              message: '收起键盘',
+                                              child: GrassBagSpringTap(
+                                                onTap: () => _sendExtraKey('hide_kb'),
+                                                pressedScale: 0.90,
+                                                haptic: true,
+                                                child: Container(
+                                                  width: 38,
+                                                  alignment: Alignment.center,
+                                                  decoration: ShapeDecoration(
+                                                    color: Colors.white.withValues(alpha: 0.085),
+                                                    shape: RoundedSuperellipseBorder(
+                                                      borderRadius: BorderRadius.circular(10),
+                                                      side: BorderSide(
                                                         color: Colors.white.withValues(alpha: 0.07),
                                                         width: 0.5,
                                                       ),
-                                              ),
-                                            ),
-                                            child: Text(
-                                              k.$1,
-                                              style: TextStyle(
-                                                fontFamily: 'monospace',
-                                                fontSize: 11.5,
-                                                fontWeight: FontWeight.w600,
-                                                color: isActive ? darkAccent : t.codeFg,
+                                                    ),
+                                                  ),
+                                                  child: Icon(
+                                                    CupertinoIcons.keyboard_chevron_compact_down,
+                                                    size: 16,
+                                                    color: t.codeFg,
+                                                  ),
+                                                ),
                                               ),
                                             ),
                                           ),
-                                        );
-                                      },
+                                      ],
                                     ),
                                   );
                                 },
@@ -1350,7 +1569,10 @@ class _TerminalPageState extends ConsumerState<TerminalPage> {
                 ),
               ],
             ),
-            const GrassBagToastOverlay(bottomOffset: 28),
+            GrassBagToastOverlay(
+              bottomOffset: restingBottomMargin + 56.0,
+              includeKeyboardInset: true,
+            ),
           ],
         ),
       ),
@@ -1380,8 +1602,10 @@ class _LocalTermTab {
   _TermBackend backend;
   GbridgeClient? ownerClient;
   bool isLocalPty = false;
+  bool localModeLocked = false;
   bool closed = false;
   bool exited = false;
+  bool attaching = false;
   int lastCols = 80;
   int lastRows = 24;
   int sentCols = -1;
@@ -1417,9 +1641,10 @@ class _TerminalKeyboardMargin extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final kbOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
+    final kbInset = MediaQuery.viewInsetsOf(context).bottom;
+    final bottom = math.max(restingBottomMargin, kbInset + 6.0);
     return Padding(
-      padding: EdgeInsets.fromLTRB(12, 0, 12, kbOpen ? 4.0 : restingBottomMargin),
+      padding: EdgeInsets.fromLTRB(12, 0, 12, bottom),
       child: child,
     );
   }

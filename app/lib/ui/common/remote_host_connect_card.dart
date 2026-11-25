@@ -29,6 +29,9 @@ class RemoteHostConnectCard extends ConsumerStatefulWidget {
     this.showHeader = true,
     this.initiallyShowGuide = false,
     this.autoScanLan = true,
+    this.embeddedInSheet = false,
+    this.initialInput,
+    this.initialDiagnosis,
   });
 
   /// Official 1-line CLI command installing `dsh-gbridge.tgz` via China GitHub mirror (zero port conflict!).
@@ -59,6 +62,15 @@ class RemoteHostConnectCard extends ConsumerStatefulWidget {
 
   /// Whether to automatically trigger a lightweight LAN scan when this card opens.
   final bool autoScanLan;
+
+  /// When rendered inside a modal sheet, omits the redundant outer GrassBagCard chrome.
+  final bool embeddedInSheet;
+
+  /// Optional prefilled URL/token/pair string (e.g. forwarded from a failed QR quick-connect).
+  final String? initialInput;
+
+  /// Optional prefilled diagnosis from a failed QR quick-connect so user sees exact remediation.
+  final RemoteHostDiagnosis? initialDiagnosis;
 
   @override
   ConsumerState<RemoteHostConnectCard> createState() => _RemoteHostConnectCardState();
@@ -120,6 +132,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     _addrCtrl.text = parsed.address;
     if (parsed.token != null && parsed.token!.isNotEmpty) {
       _tokenCtrl.text = parsed.token!;
+    } else if (addrChanged) {
+      _tokenCtrl.clear();
     }
     if (_nameCtrl.text.trim().isEmpty && parsed.suggestedName != null) {
       _nameCtrl.text = parsed.suggestedName!;
@@ -142,7 +156,28 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
   void initState() {
     super.initState();
     _showGuide = widget.initiallyShowGuide;
-    if (widget.autoScanLan && GrassBagNativeBridge.instance.isPluginVerified) {
+    if (widget.initialInput != null && widget.initialInput!.trim().isNotEmpty) {
+      final parsed = parseRemoteHostInput(widget.initialInput!.trim());
+      if (parsed != null) {
+        _addrCtrl.text = parsed.address;
+        if (parsed.token != null && parsed.token!.isNotEmpty) {
+          _tokenCtrl.text = parsed.token!;
+        }
+        if (parsed.suggestedName != null && parsed.suggestedName!.isNotEmpty) {
+          _nameCtrl.text = parsed.suggestedName!;
+        }
+      } else {
+        _addrCtrl.text = widget.initialInput!.trim();
+      }
+    }
+    if (widget.initialDiagnosis != null) {
+      _diagnosis = widget.initialDiagnosis;
+    }
+    final isLiveApp = WidgetsBinding.instance is WidgetsFlutterBinding;
+    final canAutoScan = !kIsWeb &&
+        (GrassBagNativeBridge.instance.isPluginVerified ||
+            (GrassBagNativeBridge.instance.isAndroidNative && isLiveApp));
+    if (widget.autoScanLan && canAutoScan) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         final state = ref.read(appProvider);
@@ -397,12 +432,9 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     final ctrl = ref.read(appProvider.notifier);
     final diag = _diagnosis;
 
-    return GrassBagCard(
-      borderRadius: 24,
-      padding: const EdgeInsets.all(15),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
+    final body = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
           if (widget.showHeader) ...[
             Row(
               children: [
@@ -438,35 +470,16 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             const SizedBox(height: 12),
           ],
 
-          // Quick-Action Top Pair Bar: 1-tap QR Scan + Smart Clipboard Paste
+          // Quick-Action Top Bar: 1-tap QR Scan (single unified Paste inside input + single Guide toggle below!)
           if (_supportsQrScan) ...[
-            Row(
-              children: [
-                Expanded(
-                  child: GrassBagPrimaryGlassButton(
-                    label: '扫码连接',
-                    icon: CupertinoIcons.qrcode_viewfinder,
-                    height: 40,
-                    tier: slice.glassTier,
-                    insideGlass: true,
-                    enabled: !_connecting,
-                    onTap: _connecting ? null : _scanQrCode,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: GrassBagSecondaryGlassButton(
-                    label: '智能粘贴链接',
-                    icon: CupertinoIcons.doc_on_clipboard,
-                    height: 40,
-                    tier: slice.glassTier,
-                    insideGlass: true,
-                    accentForeground: true,
-                    enabled: !_connecting,
-                    onTap: _connecting ? null : _pasteFromClipboard,
-                  ),
-                ),
-              ],
+            GrassBagPrimaryGlassButton(
+              label: '扫码连接',
+              icon: CupertinoIcons.qrcode_viewfinder,
+              height: 40,
+              tier: slice.glassTier,
+              insideGlass: true,
+              enabled: !_connecting,
+              onTap: _connecting ? null : _scanQrCode,
             ),
             const SizedBox(height: 11),
           ],
@@ -503,35 +516,68 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             textInputAction: TextInputAction.done,
             fontSize: 13,
             padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-            suffix: Padding(
-              padding: const EdgeInsets.only(right: 5),
-              child: GrassBagSpringTap(
-                onTap: () {
-                  if (!_connecting) _pasteFromClipboard();
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(CupertinoIcons.doc_on_clipboard, size: 12.5, color: t.primary),
-                      const SizedBox(width: 4),
-                      Text(
-                        '粘贴',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                          color: t.primary,
-                        ),
+            suffix: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _addrCtrl,
+              builder: (_, val, __) {
+                if (val.text.isNotEmpty) {
+                  return GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      _addrCtrl.clear();
+                      _tokenCtrl.clear();
+                      if (_diagnosis != null ||
+                          _capturedCookie != null ||
+                          _selectedLanAddr != null) {
+                        setState(() {
+                          _capturedCookie = null;
+                          _selectedLanAddr = null;
+                          _diagnosis = null;
+                        });
+                      } else {
+                        setState(() {});
+                      }
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(5),
+                      child: Icon(
+                        CupertinoIcons.xmark_circle_fill,
+                        size: 16,
+                        color: t.text3,
                       ),
-                    ],
+                    ),
+                  );
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(right: 5),
+                  child: GrassBagSpringTap(
+                    onTap: () {
+                      if (!_connecting) _pasteFromClipboard();
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: t.primarySoft,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(CupertinoIcons.doc_on_clipboard, size: 12.5, color: t.primary),
+                          const SizedBox(width: 4),
+                          Text(
+                            '粘贴',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: t.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
-                ),
-              ),
+                );
+              },
             ),
             onChanged: (_) {
               if (_diagnosis != null || _capturedCookie != null || _selectedLanAddr != null) {
@@ -800,6 +846,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                                   label: '复制加速包地址',
                                   icon: CupertinoIcons.link,
                                   height: 36,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10),
                                   tier: slice.glassTier,
                                   insideGlass: true,
                                   accentForeground: true,
@@ -818,8 +865,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                                   label: '复制 AI 安装指令',
                                   icon: CupertinoIcons.sparkles,
                                   height: 36,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10),
                                   tier: slice.glassTier,
                                   insideGlass: true,
+                                  accentForeground: true,
                                   onTap: () {
                                     Clipboard.setData(
                                       const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
@@ -831,7 +880,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                               ),
                             ],
                           ),
-                          const SizedBox(height: 7),
+                          const SizedBox(height: 9),
                           Text(
                             '官方插件直接复用运行中的 DSH 实例：dsh web 共享原端口不另开服务，桌面端自动避让冲突端口并支持实时切换。',
                             style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
@@ -874,7 +923,12 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 : const SizedBox.shrink(),
           ),
         ],
-      ),
+      );
+    if (widget.embeddedInSheet) return body;
+    return GrassBagCard(
+      borderRadius: 24,
+      padding: const EdgeInsets.all(15),
+      child: body,
     );
   }
 
@@ -909,7 +963,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 height: 34,
                 tier: tier,
                 insideGlass: true,
-                onTap: _openInAppWebLogin,
+                enabled: !_connecting,
+                onTap: _connecting ? null : _openInAppWebLogin,
               ),
             ),
             const SizedBox(width: 8),
@@ -920,7 +975,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 height: 34,
                 tier: tier,
                 insideGlass: true,
-                onTap: _pasteFromClipboard,
+                enabled: !_connecting,
+                onTap: _connecting ? null : _pasteFromClipboard,
               ),
             ),
           ] else ...[
@@ -931,7 +987,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 height: 34,
                 tier: tier,
                 insideGlass: true,
-                onTap: _pasteFromClipboard,
+                enabled: !_connecting,
+                onTap: _connecting ? null : _pasteFromClipboard,
               ),
             ),
             if (_supportsInAppWebLogin) ...[
@@ -943,7 +1000,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                   height: 34,
                   tier: tier,
                   insideGlass: true,
-                  onTap: _openInAppWebLogin,
+                  enabled: !_connecting,
+                  onTap: _connecting ? null : _openInAppWebLogin,
                 ),
               ),
             ],
@@ -958,10 +1016,13 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
         height: 34,
         tier: tier,
         insideGlass: true,
-        onTap: () {
-          setState(() => _allowBadCerts = true);
-          _connectNow();
-        },
+        enabled: !_connecting,
+        onTap: _connecting
+            ? null
+            : () {
+                setState(() => _allowBadCerts = true);
+                _connectNow();
+              },
       );
     }
     if (diag.suggestedCommand != null && diag.suggestedCommand!.isNotEmpty) {

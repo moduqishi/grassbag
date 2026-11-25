@@ -155,16 +155,18 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                     child: GrassBagSecondaryGlassButton(
                       label: '1. 打开应用信息',
                       icon: CupertinoIcons.info_circle,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
                       tier: tier,
                       insideGlass: true,
                       onTap: () => native.openPermissionSettings('app_details'),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 8),
                   Expanded(
                     child: GrassBagPrimaryGlassButton(
                       label: '2. 前往无障碍',
                       icon: CupertinoIcons.hand_draw_fill,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
                       tier: tier,
                       insideGlass: true,
                       onTap: () => native.openPermissionSettings('accessibility'),
@@ -194,7 +196,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
     showGrassBagSheet<void>(
       context,
       title: '关于 Shizuku 增强通道',
-      subtitle: '进阶可选能力，日常操控手机无需安装',
+      subtitle: '后续版本预留能力，当前版本暂未集成',
       bodyBuilder: (ctx) {
         final t = GrassBagTokens.of(ctx);
         return Column(
@@ -202,7 +204,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(
-              'GrassBag 已内置标准无障碍通道，可完成日常绝大多数屏幕识别、点击、滑动与输入操作。只有在部分系统界面限制无障碍截图或需要高权限调试命令时，才需安装并启动 Shizuku。',
+              'GrassBag 当前完全通过内置标准无障碍通道完成屏幕识别、点击、滑动与输入操作，暂未集成 Shizuku 调用能力，日常操控手机无需安装或启动 Shizuku。',
               style: TextStyle(fontSize: 13, height: 1.5, color: t.text2),
             ),
             const SizedBox(height: 14),
@@ -267,6 +269,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
 
     final grantedCount = perms.grantedCoreCount;
     final needsRetoggle = perms.accessibilityNeedsRetoggle;
+    final coreReady = perms.accessibilityEnabled && perms.batteryOptIgnored && !needsRetoggle;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -278,12 +281,14 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
           child: Row(
             children: [
               GrassBagSquircleIcon(
-                icon: grantedCount >= 4
-                    ? CupertinoIcons.checkmark_shield_fill
-                    : CupertinoIcons.shield_lefthalf_fill,
+                icon: needsRetoggle
+                    ? CupertinoIcons.exclamationmark_shield_fill
+                    : (coreReady
+                        ? CupertinoIcons.checkmark_shield_fill
+                        : CupertinoIcons.shield_lefthalf_fill),
                 color: needsRetoggle
                     ? t.err
-                    : (grantedCount >= 4 ? t.ok : t.primary),
+                    : (coreReady ? t.ok : t.primary),
                 size: 44,
                 iconSize: 21,
                 filled: true,
@@ -460,18 +465,19 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
               ),
               onTap: () => native.openPermissionSettings('overlay'),
             ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.question_circle_fill,
-                color: t.text2,
-                size: 34,
-                iconSize: 16,
+            if (perms.sdkInt >= 33 || perms.sdkInt == 0)
+              GrassBagListTile(
+                leading: GrassBagSquircleIcon(
+                  icon: CupertinoIcons.question_circle_fill,
+                  color: t.text2,
+                  size: 34,
+                  iconSize: 16,
+                ),
+                title: const Text('Android 13+ 受限设置解锁指南'),
+                subtitle: const Text('解决无障碍灰显、无法开启或开启后不生效问题'),
+                showChevron: true,
+                onTap: () => _showRestrictedSettingsGuide(context, tier),
               ),
-              title: const Text('Android 13+ 受限设置解锁指南'),
-              subtitle: const Text('解决无障碍灰显、无法开启或开启后不生效问题'),
-              showChevron: true,
-              onTap: () => _showRestrictedSettingsGuide(context, tier),
-            ),
             GrassBagListTile(
               leading: GrassBagSquircleIcon(
                 icon: CupertinoIcons.bolt_circle_fill,
@@ -481,20 +487,16 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
               ),
               title: const Text('Shizuku 增强通道（可选）'),
               subtitle: Text(
-                perms.shizukuInstalled ? '已检测到本机安装 Shizuku' : '按需开启 · 无障碍已满足绝大多数操控',
+                perms.shizukuInstalled
+                    ? '已检测到 Shizuku（当前版本暂未集成，默认使用无障碍通道）'
+                    : '暂未集成 · 当前版本仅需开启无障碍服务即可操控手机',
               ),
               trailing: _PermBadge(
-                label: perms.shizukuInstalled ? '已安装' : '可选',
-                bg: perms.shizukuInstalled ? t.okSoft : t.fill1,
-                fg: perms.shizukuInstalled ? t.ok : t.text3,
+                label: '暂未集成',
+                bg: t.fill1,
+                fg: t.text3,
               ),
-              onTap: () {
-                if (perms.shizukuInstalled) {
-                  native.openPermissionSettings('shizuku');
-                } else {
-                  _showShizukuInfoSheet(context, tier);
-                }
-              },
+              onTap: () => _showShizukuInfoSheet(context, tier),
             ),
           ],
         ),

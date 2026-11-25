@@ -1070,6 +1070,15 @@ class ContainerToolkitItem {
       );
 }
 
+/// Fine-grained lifecycle stage of an in-flight user message before the first token arrives.
+enum SendStage {
+  idle,
+  creatingSession,
+  uploadingAttachments,
+  sending,
+  awaitingFirstToken,
+}
+
 /// Pending user prompt queued while the agent is streaming (`session/updateQueue`).
 @immutable
 class QueuedMessageItem {
@@ -1077,11 +1086,39 @@ class QueuedMessageItem {
     required this.id,
     required this.text,
     required this.mode, // queue | steer
+    this.serverAcked = false,
   });
 
   final String id;
   final String text;
   final String mode;
+  final bool serverAcked;
+
+  QueuedMessageItem copyWith({
+    String? id,
+    String? text,
+    String? mode,
+    bool? serverAcked,
+  }) =>
+      QueuedMessageItem(
+        id: id ?? this.id,
+        text: text ?? this.text,
+        mode: mode ?? this.mode,
+        serverAcked: serverAcked ?? this.serverAcked,
+      );
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is QueuedMessageItem &&
+        other.id == id &&
+        other.text == text &&
+        other.mode == mode &&
+        other.serverAcked == serverAcked;
+  }
+
+  @override
+  int get hashCode => Object.hash(id, text, mode, serverAcked);
 }
 
 /// Real reasoning effort option from DSH `session/modelCatalog`.
@@ -1422,7 +1459,7 @@ class SessionTelemetry {
   }
 
   int get remainingContextTokens =>
-      contextWindow > pressureTokens ? contextWindow - pressureTokens : 0;
+      pressureTokens > 0 && contextWindow > pressureTokens ? contextWindow - pressureTokens : 0;
 
   bool get hasAnyData =>
       totalTokens > 0 ||

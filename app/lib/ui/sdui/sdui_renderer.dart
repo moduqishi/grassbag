@@ -23,15 +23,26 @@ class SduiNodeRenderer extends StatelessWidget {
     required this.tier,
     required this.onAction,
     this.onCopied,
+    this.depth = 0,
   });
+
+  static const int maxDepth = 24;
 
   final Map<String, dynamic> node;
   final GrassBagGlassTier tier;
   final SduiActionCallback onAction;
   final ValueChanged<String>? onCopied;
+  final int depth;
 
   @override
   Widget build(BuildContext context) {
+    if (depth > maxDepth) {
+      final t = GrassBagTokens.of(context);
+      return Text(
+        '（嵌套层级超过上限，已省略渲染）',
+        style: TextStyle(fontSize: 12, color: t.text3),
+      );
+    }
     final type = node['type']?.toString() ?? 'text';
     return switch (type) {
       'column' => _buildColumn(context),
@@ -41,12 +52,14 @@ class SduiNodeRenderer extends StatelessWidget {
           tier: tier,
           onAction: onAction,
           onCopied: onCopied,
+          depth: depth,
         ),
       'tabs' => _SduiTabsNode(
           node: node,
           tier: tier,
           onAction: onAction,
           onCopied: onCopied,
+          depth: depth,
         ),
       'metric' => _buildMetric(context),
       'kv_list' => _buildKvList(context),
@@ -59,18 +72,31 @@ class SduiNodeRenderer extends StatelessWidget {
       'actions' => _buildActions(context),
       'button' => _buildSingleAction(context, node),
       'alert' => _buildAlert(context),
-      'markdown' || 'text' || _ => _buildText(context),
+      'markdown' => _buildMarkdown(context),
+      'text' || _ => _buildText(context),
     };
   }
 
-  List<Map<String, dynamic>> _children() {
-    final raw = node['children'];
+  static List<Map<String, dynamic>> _mapList(Object? raw) {
     if (raw is! List) return const [];
-    return raw.whereType<Map<String, dynamic>>().toList(growable: false);
+    return [
+      for (final item in raw)
+        if (item is Map) Map<String, dynamic>.from(item),
+    ];
   }
 
+  static Map<String, dynamic> _mapOrEmpty(Object? raw) =>
+      raw is Map ? Map<String, dynamic>.from(raw) : const {};
+
+  static double _parseFiniteDouble(Object? raw, {double fallback = 0.0}) {
+    final v = raw is num ? raw.toDouble() : double.tryParse(raw?.toString().trim() ?? '');
+    return (v != null && v.isFinite) ? v : fallback;
+  }
+
+  List<Map<String, dynamic>> _children() => _mapList(node['children']);
+
   Widget _buildColumn(BuildContext context) {
-    final gap = (node['gap'] as num?)?.toDouble() ?? 10.0;
+    final gap = _parseFiniteDouble(node['gap'], fallback: 10.0).clamp(0.0, 64.0).toDouble();
     final items = _children();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -83,6 +109,7 @@ class SduiNodeRenderer extends StatelessWidget {
             tier: tier,
             onAction: onAction,
             onCopied: onCopied,
+            depth: depth + 1,
           ),
         ],
       ],
@@ -90,7 +117,7 @@ class SduiNodeRenderer extends StatelessWidget {
   }
 
   Widget _buildRow(BuildContext context) {
-    final gap = (node['gap'] as num?)?.toDouble() ?? 10.0;
+    final gap = _parseFiniteDouble(node['gap'], fallback: 10.0).clamp(0.0, 64.0).toDouble();
     final items = _children();
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -103,6 +130,7 @@ class SduiNodeRenderer extends StatelessWidget {
               tier: tier,
               onAction: onAction,
               onCopied: onCopied,
+              depth: depth + 1,
             ),
           ),
         ],
@@ -118,6 +146,114 @@ class SduiNodeRenderer extends StatelessWidget {
         'muted' => t.text3,
         _ => t.text,
       };
+
+  Widget _buildMarkdown(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final raw = node['value']?.toString() ?? '';
+    final tone = _toneColor(t, node['tone']?.toString());
+    final lines = raw.split('\n');
+    final inlineRe = RegExp(r'(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))');
+
+    List<InlineSpan> parseInline(String text, TextStyle base) {
+      final spans = <InlineSpan>[];
+      var cursor = 0;
+      for (final m in inlineRe.allMatches(text)) {
+        if (m.start > cursor) {
+          spans.add(TextSpan(text: text.substring(cursor, m.start)));
+        }
+        final tok = m.group(0)!;
+        if (tok.startsWith('**') && tok.endsWith('**') && tok.length > 4) {
+          spans.add(
+            TextSpan(
+              text: tok.substring(2, tok.length - 2),
+              style: base.copyWith(fontWeight: FontWeight.w700),
+            ),
+          );
+        } else if (tok.startsWith('`') && tok.endsWith('`') && tok.length > 2) {
+          spans.add(
+            TextSpan(
+              text: tok.substring(1, tok.length - 1),
+              style: base.copyWith(
+                fontFamily: 'monospace',
+                fontSize: (base.fontSize ?? 14.0) - 1.0,
+                backgroundColor: t.fill1,
+              ),
+            ),
+          );
+        } else if (tok.startsWith('[')) {
+          final sep = tok.indexOf('](');
+          final label = sep > 1 ? tok.substring(1, sep) : tok;
+          spans.add(
+            TextSpan(
+              text: label,
+              style: base.copyWith(color: t.primary, fontWeight: FontWeight.w500),
+            ),
+          );
+        } else {
+          spans.add(TextSpan(text: tok));
+        }
+        cursor = m.end;
+      }
+      if (cursor < text.length) {
+        spans.add(TextSpan(text: text.substring(cursor)));
+      }
+      return spans;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (final rawLine in lines)
+          if (rawLine.trim().isEmpty)
+            const SizedBox(height: 6)
+          else
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: () {
+                final trimmed = rawLine.trim();
+                if (trimmed.startsWith('### ')) {
+                  return Text(
+                    trimmed.substring(4).trim(),
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: tone),
+                  );
+                }
+                if (trimmed.startsWith('## ')) {
+                  return Text(
+                    trimmed.substring(3).trim(),
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700, color: tone),
+                  );
+                }
+                if (trimmed.startsWith('# ')) {
+                  return Text(
+                    trimmed.substring(2).trim(),
+                    style: TextStyle(fontSize: 16.5, fontWeight: FontWeight.w700, color: tone),
+                  );
+                }
+                final isBullet = trimmed.startsWith('- ') || trimmed.startsWith('* ');
+                final body = isBullet ? trimmed.substring(2).trim() : trimmed;
+                final baseStyle = TextStyle(fontSize: 14, height: 1.48, color: tone);
+                final rich = Text.rich(TextSpan(style: baseStyle, children: parseInline(body, baseStyle)));
+                if (!isBullet) return rich;
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.only(top: 7, right: 7),
+                      child: Container(
+                        width: 4.5,
+                        height: 4.5,
+                        decoration: BoxDecoration(color: t.primary, shape: BoxShape.circle),
+                      ),
+                    ),
+                    Expanded(child: rich),
+                  ],
+                );
+              }(),
+            ),
+      ],
+    );
+  }
 
   Widget _buildText(BuildContext context) {
     final t = GrassBagTokens.of(context);
@@ -172,7 +308,7 @@ class SduiNodeRenderer extends StatelessWidget {
 
   Widget _buildKvList(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final raw = (node['items'] as List<dynamic>?)?.whereType<Map<String, dynamic>>().toList() ?? const [];
+    final raw = _mapList(node['items']);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -234,9 +370,10 @@ class SduiNodeRenderer extends StatelessWidget {
 
   Widget _buildProgress(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final val = (node['value'] as num?)?.toDouble() ?? 0.0;
-    final maxVal = (node['max'] as num?)?.toDouble() ?? 100.0;
-    final ratio = maxVal <= 0 ? 0.0 : (val / maxVal).clamp(0.0, 1.0);
+    final val = _parseFiniteDouble(node['value']);
+    final maxVal = _parseFiniteDouble(node['max'], fallback: 100.0);
+    final rawRatio = maxVal <= 0 ? 0.0 : val / maxVal;
+    final ratio = rawRatio.isFinite ? rawRatio.clamp(0.0, 1.0).toDouble() : 0.0;
     final label = node['label']?.toString();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -277,13 +414,19 @@ class SduiNodeRenderer extends StatelessWidget {
 
   Widget _buildTable(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final cols = (node['columns'] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? const [];
-    final rows = (node['rows'] as List<dynamic>?)
-            ?.whereType<List<dynamic>>()
+    final rawCols = node['columns'];
+    final cols = rawCols is List ? rawCols.map((e) => e.toString()).toList() : const <String>[];
+    final rawRows = node['rows'];
+    final rows = rawRows is List
+        ? rawRows
+            .whereType<List<dynamic>>()
             .map((r) => r.map((c) => c.toString()).toList())
-            .toList() ??
-        const [];
-    final colCount = cols.isNotEmpty ? cols.length : (rows.isNotEmpty ? rows.first.length : 0);
+            .toList()
+        : const <List<String>>[];
+    final colCount = cols.isNotEmpty
+        ? cols.length
+        : rows.fold<int>(0, (m, r) => math.max(m, r.length));
+    if (colCount == 0) return const SizedBox.shrink();
     final tableBody = Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -292,13 +435,13 @@ class SduiNodeRenderer extends StatelessWidget {
             padding: const EdgeInsets.only(bottom: 8),
             child: Row(
               children: [
-                for (var i = 0; i < cols.length; i++)
+                for (var i = 0; i < colCount; i++)
                   Expanded(
                     flex: i == 0 ? 16 : 9,
                     child: Padding(
                       padding: const EdgeInsets.only(right: 6),
                       child: Text(
-                        cols[i],
+                        i < cols.length ? cols[i] : '',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text3),
@@ -314,13 +457,13 @@ class SduiNodeRenderer extends StatelessWidget {
             padding: const EdgeInsets.symmetric(vertical: 8),
             child: Row(
               children: [
-                for (var i = 0; i < row.length; i++)
+                for (var i = 0; i < colCount; i++)
                   Expanded(
                     flex: i == 0 ? 16 : 9,
                     child: Padding(
                       padding: const EdgeInsets.only(right: 6),
                       child: Text(
-                        row[i],
+                        i < row.length ? row[i] : '',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -352,25 +495,59 @@ class SduiNodeRenderer extends StatelessWidget {
   Widget _buildChart(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final chartType = node['chartType']?.toString() ?? 'bar';
-    final series = (node['series'] as List<dynamic>?)?.whereType<Map<String, dynamic>>().toList() ?? const [];
-    final points = series.isEmpty
-        ? const <Map<String, dynamic>>[]
-        : ((series.first['points'] as List<dynamic>?)?.whereType<Map<String, dynamic>>().toList() ?? const []);
-    if (points.isEmpty) return const SizedBox.shrink();
+    final rawSeries = _mapList(node['series']);
+    final parsedSeries = <({String name, List<Map<String, dynamic>> points})>[
+      for (final s in rawSeries)
+        if (_mapList(s['points']).isNotEmpty)
+          (name: s['name']?.toString() ?? '', points: _mapList(s['points'])),
+    ];
+    if (parsedSeries.isEmpty) return const SizedBox.shrink();
+    final palette = <Color>[t.primary, t.ok, t.warn, t.dusk];
 
-    return SizedBox(
-      height: 148,
-      child: CustomPaint(
-        painter: _SduiChartPainter(
-          chartType: chartType,
-          points: points,
-          barColor: t.primary,
-          secondaryColor: t.dusk,
-          labelColor: t.text3,
-          gridColor: t.sep,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (parsedSeries.length > 1) ...[
+          Wrap(
+            spacing: 12,
+            runSpacing: 4,
+            children: [
+              for (var i = 0; i < parsedSeries.length; i++)
+                if (parsedSeries[i].name.isNotEmpty)
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: palette[i % palette.length],
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Text(parsedSeries[i].name, style: TextStyle(fontSize: 11, color: t.text2)),
+                    ],
+                  ),
+            ],
+          ),
+          const SizedBox(height: 6),
+        ],
+        SizedBox(
+          height: 148,
+          child: CustomPaint(
+            painter: _SduiChartPainter(
+              chartType: chartType,
+              seriesList: [for (final s in parsedSeries) s.points],
+              palette: palette,
+              labelColor: t.text3,
+              gridColor: t.sep,
+            ),
+            child: const SizedBox.expand(),
+          ),
         ),
-        child: const SizedBox.expand(),
-      ),
+      ],
     );
   }
 
@@ -509,8 +686,8 @@ class SduiNodeRenderer extends StatelessWidget {
   }
 
   Widget _buildSchemaForm(BuildContext context) {
-    final schema = (node['schema'] as Map<String, dynamic>?) ?? const {};
-    final values = (node['values'] as Map<String, dynamic>?) ?? const {};
+    final schema = _mapOrEmpty(node['schema']);
+    final values = _mapOrEmpty(node['values']);
     final submitId = node['submitActionId']?.toString() ?? 'submit';
     return SchemasteryForm(
       schema: schema,
@@ -521,7 +698,7 @@ class SduiNodeRenderer extends StatelessWidget {
   }
 
   Widget _buildActions(BuildContext context) {
-    final items = (node['items'] as List<dynamic>?)?.whereType<Map<String, dynamic>>().toList() ?? const [];
+    final items = _mapList(node['items']);
     return Wrap(
       spacing: 8,
       runSpacing: 8,
@@ -537,8 +714,8 @@ class SduiNodeRenderer extends StatelessWidget {
     final label = item['label']?.toString() ?? id;
     final style = (item['style'] ?? item['variant'])?.toString() ?? 'secondary';
     final confirmText = item['confirmText']?.toString().trim();
-    final payload = item['payload'] is Map<String, dynamic>
-        ? item['payload'] as Map<String, dynamic>
+    final payload = item['payload'] is Map
+        ? Map<String, dynamic>.from(item['payload'] as Map)
         : null;
     return _SduiActionButton(
       actionId: id,
@@ -653,12 +830,14 @@ class _SduiCardSection extends StatefulWidget {
     required this.tier,
     required this.onAction,
     this.onCopied,
+    required this.depth,
   });
 
   final Map<String, dynamic> node;
   final GrassBagGlassTier tier;
   final SduiActionCallback onAction;
   final ValueChanged<String>? onCopied;
+  final int depth;
 
   @override
   State<_SduiCardSection> createState() => _SduiCardSectionState();
@@ -689,10 +868,7 @@ class _SduiCardSectionState extends State<_SduiCardSection> {
     final title = widget.node['title']?.toString();
     final subtitle = widget.node['subtitle']?.toString();
     final collapsible = widget.node['collapsible'] == true;
-    final children = (widget.node['children'] as List<dynamic>?)
-            ?.whereType<Map<String, dynamic>>()
-            .toList(growable: false) ??
-        const [];
+    final children = SduiNodeRenderer._mapList(widget.node['children']);
 
     return GrassBagCard(
       borderRadius: 22,
@@ -746,6 +922,7 @@ class _SduiCardSectionState extends State<_SduiCardSection> {
                           tier: widget.tier,
                           onAction: widget.onAction,
                           onCopied: widget.onCopied,
+                          depth: widget.depth + 1,
                         ),
                       ],
                     ],
@@ -764,12 +941,14 @@ class _SduiTabsNode extends StatefulWidget {
     required this.tier,
     required this.onAction,
     this.onCopied,
+    required this.depth,
   });
 
   final Map<String, dynamic> node;
   final GrassBagGlassTier tier;
   final SduiActionCallback onAction;
   final ValueChanged<String>? onCopied;
+  final int depth;
 
   @override
   State<_SduiTabsNode> createState() => _SduiTabsNodeState();
@@ -780,13 +959,11 @@ class _SduiTabsNodeState extends State<_SduiTabsNode> {
 
   @override
   Widget build(BuildContext context) {
-    final items = (widget.node['items'] as List<dynamic>?)
-            ?.whereType<Map<String, dynamic>>()
-            .toList(growable: false) ??
-        const [];
+    final items = SduiNodeRenderer._mapList(widget.node['items']);
     if (items.isEmpty) return const SizedBox.shrink();
     final safeIdx = _idx.clamp(0, items.length - 1);
-    final child = items[safeIdx]['child'];
+    final rawChild = items[safeIdx]['child'];
+    final child = rawChild is Map ? Map<String, dynamic>.from(rawChild) : null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
@@ -798,13 +975,14 @@ class _SduiTabsNodeState extends State<_SduiTabsNode> {
           onSelected: (i) => setState(() => _idx = i),
         ),
         const SizedBox(height: 12),
-        if (child is Map<String, dynamic>)
+        if (child != null)
           SduiNodeRenderer(
             key: ValueKey('sdui-tab-$safeIdx'),
             node: child,
             tier: widget.tier,
             onAction: widget.onAction,
             onCopied: widget.onCopied,
+            depth: widget.depth + 1,
           ),
       ],
     );
@@ -814,25 +992,30 @@ class _SduiTabsNodeState extends State<_SduiTabsNode> {
 class _SduiChartPainter extends CustomPainter {
   const _SduiChartPainter({
     required this.chartType,
-    required this.points,
-    required this.barColor,
-    required this.secondaryColor,
+    required this.seriesList,
+    required this.palette,
     required this.labelColor,
     required this.gridColor,
   });
 
   final String chartType;
-  final List<Map<String, dynamic>> points;
-  final Color barColor;
-  final Color secondaryColor;
+  final List<List<Map<String, dynamic>>> seriesList;
+  final List<Color> palette;
   final Color labelColor;
   final Color gridColor;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final maxY = points
-        .map((p) => (p['y'] as num?)?.toDouble() ?? 0.0)
-        .fold<double>(1.0, math.max);
+    if (seriesList.isEmpty || size.width <= 0 || size.height <= 0) return;
+    final count = seriesList.fold<int>(0, (m, pts) => math.max(m, pts.length));
+    if (count == 0) return;
+    var maxY = 1.0;
+    for (final pts in seriesList) {
+      for (final p in pts) {
+        final v = SduiNodeRenderer._parseFiniteDouble(p['y']);
+        if (v > maxY) maxY = v;
+      }
+    }
     final plotBottom = size.height - 22;
     final plotTop = 8.0;
     final plotH = math.max(20.0, plotBottom - plotTop);
@@ -844,70 +1027,94 @@ class _SduiChartPainter extends CustomPainter {
     canvas.drawLine(Offset(0, plotBottom), Offset(size.width, plotBottom), gridPaint);
     canvas.drawLine(Offset(0, plotTop + plotH * 0.5), Offset(size.width, plotTop + plotH * 0.5), gridPaint);
 
-    final count = points.length;
     final slotW = size.width / count;
 
     if (chartType == 'line') {
-      final path = Path();
-      final linePaint = Paint()
-        ..color = barColor
-        ..strokeWidth = 2.4
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round;
-      for (var i = 0; i < count; i++) {
-        final y = math.max(0.0, (points[i]['y'] as num?)?.toDouble() ?? 0.0);
-        final cx = slotW * (i + 0.5);
-        final cy = plotBottom - (y / maxY) * plotH;
-        if (i == 0) {
-          path.moveTo(cx, cy);
-        } else {
-          path.lineTo(cx, cy);
+      for (var sIdx = 0; sIdx < seriesList.length; sIdx++) {
+        final pts = seriesList[sIdx];
+        final color = palette[sIdx % palette.length];
+        final path = Path();
+        final linePaint = Paint()
+          ..color = color
+          ..strokeWidth = 2.4
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round;
+        for (var i = 0; i < pts.length; i++) {
+          final y = math.max(0.0, SduiNodeRenderer._parseFiniteDouble(pts[i]['y']));
+          final cx = slotW * (i + 0.5);
+          final cy = plotBottom - (y / maxY) * plotH;
+          if (i == 0) {
+            path.moveTo(cx, cy);
+          } else {
+            path.lineTo(cx, cy);
+          }
+          canvas.drawCircle(Offset(cx, cy), pts.length > 24 ? 2.2 : 3.2, Paint()..color = color);
         }
-        canvas.drawCircle(Offset(cx, cy), 3.4, Paint()..color = barColor);
+        canvas.drawPath(path, linePaint);
       }
-      canvas.drawPath(path, linePaint);
     } else {
-      final barW = (slotW * 0.52).clamp(10.0, 28.0);
-      for (var i = 0; i < count; i++) {
-        final y = math.max(0.0, (points[i]['y'] as num?)?.toDouble() ?? 0.0);
-        final h = math.max(4.0, (y / maxY) * plotH);
-        final left = slotW * (i + 0.5) - barW / 2;
-        final rrect = RRect.fromRectAndCorners(
-          Rect.fromLTWH(left, plotBottom - h, barW, h),
-          topLeft: const Radius.circular(6),
-          topRight: const Radius.circular(6),
-        );
-        canvas.drawRRect(
-          rrect,
-          Paint()
-            ..shader = LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [barColor, barColor.withValues(alpha: 0.55)],
-            ).createShader(rrect.outerRect),
-        );
+      final sCount = seriesList.length;
+      final groupW = math.min(slotW * 0.72, sCount * 28.0);
+      final singleBarW = (groupW / sCount).clamp(2.5, math.max(2.5, math.min(28.0, slotW * 0.62)));
+      for (var sIdx = 0; sIdx < sCount; sIdx++) {
+        final pts = seriesList[sIdx];
+        final color = palette[sIdx % palette.length];
+        for (var i = 0; i < pts.length; i++) {
+          final y = math.max(0.0, SduiNodeRenderer._parseFiniteDouble(pts[i]['y']));
+          if (y <= 0) continue;
+          final h = math.max(2.0, (y / maxY) * plotH);
+          final groupLeft = slotW * (i + 0.5) - (singleBarW * sCount) / 2;
+          final left = groupLeft + sIdx * singleBarW;
+          final radius = Radius.circular(math.min(6.0, singleBarW / 2));
+          final rrect = RRect.fromRectAndCorners(
+            Rect.fromLTWH(left, plotBottom - h, math.max(1.5, singleBarW - (sCount > 1 ? 1.5 : 0.0)), h),
+            topLeft: radius,
+            topRight: radius,
+          );
+          canvas.drawRRect(
+            rrect,
+            Paint()
+              ..shader = LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [color, color.withValues(alpha: 0.55)],
+              ).createShader(rrect.outerRect),
+          );
+        }
       }
     }
 
-    // X-axis labels
-    for (var i = 0; i < count; i++) {
-      final lbl = points[i]['x']?.toString() ?? '';
+    // X-axis labels (automatically thinned on dense series + collision-checked so
+    // rightmost adjacent ticks never collide)
+    final primaryPoints = seriesList.first;
+    final maxLabels = math.max(2, (size.width / 46.0).floor());
+    final labelStep = math.max(1, (count / maxLabels).ceil());
+    final lastIdx = primaryPoints.length - 1;
+    var lastPaintedRight = double.negativeInfinity;
+    for (var i = 0; i < primaryPoints.length; i++) {
+      if (i != 0 && i != lastIdx && i % labelStep != 0) continue;
+      final lbl = primaryPoints[i]['x']?.toString() ?? '';
+      if (lbl.isEmpty) continue;
       final tp = TextPainter(
         text: TextSpan(text: lbl, style: TextStyle(fontSize: 10.5, color: labelColor)),
         textDirection: TextDirection.ltr,
         maxLines: 1,
         ellipsis: '…',
-      )..layout(maxWidth: math.max(12.0, slotW - 4.0));
-      tp.paint(canvas, Offset(slotW * (i + 0.5) - tp.width / 2, plotBottom + 5));
+      )..layout(maxWidth: math.max(18.0, slotW * labelStep - 4.0));
+      final dx = (slotW * (i + 0.5) - tp.width / 2)
+          .clamp(0.0, math.max(0.0, size.width - tp.width))
+          .toDouble();
+      if (dx < lastPaintedRight + 4.0) continue;
+      tp.paint(canvas, Offset(dx, plotBottom + 5));
+      lastPaintedRight = dx + tp.width;
     }
   }
 
   @override
   bool shouldRepaint(covariant _SduiChartPainter old) =>
       old.chartType != chartType ||
-      old.points != points ||
-      old.barColor != barColor ||
-      old.secondaryColor != secondaryColor ||
+      old.seriesList != seriesList ||
+      old.palette != palette ||
       old.labelColor != labelColor ||
       old.gridColor != gridColor;
 }

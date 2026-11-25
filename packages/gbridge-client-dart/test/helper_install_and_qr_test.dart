@@ -181,4 +181,59 @@ void main() {
       expect(res.capabilities, isNull);
     });
   });
+
+  group('Transient HTTP 503 gbridge/reloading automatic retry', () {
+    test('retries HTTP 503 gbridge/reloading and resolves once Cordis finishes reload', () async {
+      var attempts = 0;
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+
+      server.listen((req) async {
+        if (req.uri.path == '/gbridge/v1/capabilities') {
+          attempts++;
+          if (attempts <= 2) {
+            req.response
+              ..statusCode = 503
+              ..headers.contentType = ContentType.json
+              ..write(jsonEncode({
+                'error': {
+                  'code': 'gbridge/reloading',
+                  'message': 'Cordis profile reload in progress',
+                },
+              }));
+            await req.response.close();
+            return;
+          }
+          req.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({
+              'v': 1,
+              'bridgeVersion': '0.2.0',
+              'dshVersion': '0.2.2-rc.5',
+              'bootId': 'boot-after-reload',
+              'host': {'name': 'AndroidLocal', 'platform': 'linux', 'arch': 'arm64'},
+              'transport': {'wsPath': '/gbridge/v1/stream'},
+              'domains': {'chat': {'ok': true}, 'models': {'ok': true}},
+              'endpointsCount': 40,
+            }));
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final client = GbridgeClient(
+        HostEndpoint.http(baseUri: Uri.parse('http://127.0.0.1:${server.port}')),
+        autoReconnect: false,
+      );
+      addTearDown(client.dispose);
+
+      final caps = await client.getCapabilities();
+      expect(attempts, 3);
+      expect(caps.bootId, 'boot-after-reload');
+      expect(caps.bridgeVersion, '0.2.0');
+    });
+  });
 }

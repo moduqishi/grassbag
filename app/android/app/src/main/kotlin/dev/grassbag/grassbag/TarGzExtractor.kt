@@ -147,17 +147,24 @@ object TarGzExtractor {
                     }
 
                     val targetFile = File(canonicalRoot, effectiveName)
-                    fun verifyParentContained(file: File) {
+                    fun verifyParentContained(file: File, requireDirExists: Boolean = false) {
                         val parent = file.parentFile ?: return
                         val parentRawPath = parent.path
-                        if (verifiedParents.contains(parentRawPath)) return
+                        if (verifiedParents.contains(parentRawPath) && (!requireDirExists || parent.isDirectory)) {
+                            return
+                        }
+                        if (requireDirExists && !parent.isDirectory) {
+                            parent.mkdirs()
+                        }
                         val parentCanon = parent.canonicalFile
                         if (parentCanon.path != canonicalRoot.path &&
                             !parentCanon.path.startsWith(rootPrefix)
                         ) {
                             throw IOException("Tar entry parent escapes destination: $effectiveName")
                         }
-                        verifiedParents.add(parentRawPath)
+                        if (parent.isDirectory) {
+                            verifiedParents.add(parentRawPath)
+                        }
                     }
                     verifyParentContained(targetFile)
 
@@ -175,8 +182,7 @@ object TarGzExtractor {
                             skipFully(tar, size)
                         }
                         '2' -> {
-                            targetFile.parentFile?.mkdirs()
-                            verifyParentContained(targetFile)
+                            verifyParentContained(targetFile, requireDirExists = true)
                             removeEntry(targetFile)
                             Os.symlink(effectiveLink, targetFile.absolutePath)
                             val symPath = targetFile.path
@@ -189,8 +195,7 @@ object TarGzExtractor {
                             val linkRel = sanitizeRelativePath(effectiveLink)
                             if (linkRel != null) {
                                 val linkTarget = File(canonicalRoot, linkRel)
-                                targetFile.parentFile?.mkdirs()
-                                verifyParentContained(targetFile)
+                                verifyParentContained(targetFile, requireDirExists = true)
                                 removeEntry(targetFile)
                                 if (linkTarget.exists()) {
                                     val srcLstat = runCatching { Os.lstat(linkTarget.absolutePath) }.getOrNull()
@@ -206,11 +211,7 @@ object TarGzExtractor {
                             skipFully(tar, size)
                         }
                         '0', '\u0000' -> {
-                            val parent = targetFile.parentFile
-                            if (parent != null && !verifiedParents.contains(parent.path)) {
-                                parent.mkdirs()
-                                verifyParentContained(targetFile)
-                            }
+                            verifyParentContained(targetFile, requireDirExists = true)
                             // On fresh empty target dirs, skip ~60k Os.lstat ENOENT throws unless
                             // a symlink was previously created at this path in the same archive.
                             if (!freshDir || createdSymlinks.contains(targetFile.path)) {
@@ -349,7 +350,12 @@ object TarGzExtractor {
         return map
     }
 
+    private const val MAX_METADATA_PAYLOAD_BYTES = 1024L * 1024L // 1 MiB safety cap for PAX/GNU headers
+
     private fun readPayloadBytes(ins: InputStream, size: Long): ByteArray {
+        if (size < 0 || size > MAX_METADATA_PAYLOAD_BYTES) {
+            throw IOException("Tar metadata payload size out of bounds: $size")
+        }
         val out = ByteArrayOutputStream(size.toInt().coerceIn(0, 65536))
         val buf = ByteArray(4096)
         var rem = size

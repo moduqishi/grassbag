@@ -69,31 +69,214 @@ class VanillaDshNormalizer {
     return first.length > maxChars ? '${first.substring(0, maxChars - 1)}…' : first;
   }
 
+  static Map<String, dynamic>? _tryParseJsonObject(Object? val) {
+    if (val is Map) {
+      return Map<String, dynamic>.from(val);
+    }
+    if (val is! String) return null;
+    final trimmed = val.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {}
+    return null;
+  }
+
+  static const _phoneKeyLabels = <String, String>{
+    'back': '返回键',
+    'home': '主屏键',
+    'recents': '最近任务',
+    'enter': '回车键',
+    'notifications': '通知栏',
+    'quick_settings': '快捷设置',
+  };
+
+  static String _extractToolTarget(
+    String tool,
+    Object? args,
+    Map<String, dynamic>? parsedOut,
+  ) {
+    final n = tool.toLowerCase();
+    final a = args is Map ? args : const <dynamic, dynamic>{};
+    if (n.startsWith('phone_')) {
+      switch (n) {
+        case 'phone_open':
+          final app = a['appName'] ??
+              a['app'] ??
+              parsedOut?['opened'] ??
+              parsedOut?['label'] ??
+              a['package'] ??
+              a['packageName'] ??
+              a['url'] ??
+              parsedOut?['package'];
+          return app is String ? previewLine(app, maxChars: 60) : '';
+        case 'phone_tap':
+        case 'phone_long_press':
+          final lbl = a['label'] ?? a['text'] ?? a['desc'] ?? a['description'] ?? parsedOut?['label'];
+          if (lbl is String && lbl.trim().isNotEmpty) return previewLine(lbl, maxChars: 50);
+          if (a['nodeId'] != null && a['nodeId'].toString().trim().isNotEmpty) {
+            return '元素 ${a['nodeId']}';
+          }
+          if (a['x'] != null && a['y'] != null) return '(${a['x']}, ${a['y']})';
+          return '';
+        case 'phone_swipe':
+          const dirMap = {'up': '向上滑动', 'down': '向下滑动', 'left': '向左滑动', 'right': '向右滑动'};
+          final dir = a['direction']?.toString().toLowerCase() ?? '';
+          if (dirMap.containsKey(dir)) return dirMap[dir]!;
+          if (a['x1'] != null && a['y1'] != null && a['x2'] != null && a['y2'] != null) {
+            return '(${a['x1']},${a['y1']}) → (${a['x2']},${a['y2']})';
+          }
+          return '滑动屏幕';
+        case 'phone_type':
+          final txt = a['text'] ?? a['value'] ?? a['input'];
+          return (txt is String && txt.trim().isNotEmpty)
+              ? '「${previewLine(txt, maxChars: 40)}」'
+              : '';
+        case 'phone_key':
+          final rawKey = (a['action'] ?? a['key'] ?? '').toString();
+          return _phoneKeyLabels[rawKey.toLowerCase()] ?? previewLine(rawKey, maxChars: 40);
+        case 'phone_intent':
+          final kind = a['kind'] ?? a['target'] ?? a['action'] ?? a['uri'] ?? a['url'];
+          return kind is String ? previewLine(kind, maxChars: 60) : '';
+        case 'phone_wait':
+          if (a['ms'] is num) {
+            final ms = a['ms'] as num;
+            return ms >= 1000 ? '${(ms / 1000).toStringAsFixed(1)}s' : '${ms.round()}ms';
+          }
+          if (a['seconds'] is num) return '${a['seconds']}s';
+          return '等待界面稳定';
+        case 'phone_handoff':
+          final msg = a['message'] ?? a['reason'] ?? a['prompt'];
+          return (msg is String && msg.trim().isNotEmpty)
+              ? previewLine(msg, maxChars: 60)
+              : '等待人工确认';
+        case 'phone_return_app':
+          final sum = a['summary'] ?? a['reason'] ?? a['message'];
+          return (sum is String && sum.trim().isNotEmpty)
+              ? previewLine(sum, maxChars: 60)
+              : '回到 GrassBag';
+        case 'phone_screen':
+          final lbl = parsedOut?['appLabel'] ??
+              parsedOut?['appName'] ??
+              parsedOut?['package'] ??
+              parsedOut?['packageName'];
+          return (lbl is String && lbl.trim().isNotEmpty)
+              ? previewLine(lbl, maxChars: 50)
+              : '读取当前界面';
+        case 'phone_screenshot':
+          return '截取当前屏幕';
+        case 'phone_apps':
+          final q = a['query'];
+          return (q is String && q.trim().isNotEmpty)
+              ? '搜索「${previewLine(q, maxChars: 40)}」'
+              : '已安装应用列表';
+      }
+    }
+    final candidate = a['command'] ??
+        a['cmd'] ??
+        a['file_path'] ??
+        a['filePath'] ??
+        a['path'] ??
+        a['pattern'] ??
+        a['glob'] ??
+        a['regex'] ??
+        a['query'] ??
+        a['url'] ??
+        a['description'] ??
+        a['title'] ??
+        a['name'] ??
+        a['target'];
+    return candidate is String ? previewLine(candidate, maxChars: 100) : '';
+  }
+
+  static String _summarizeHumanToolOutput(
+    String tool,
+    String outStr,
+    Map<String, dynamic>? parsedOut,
+  ) {
+    if (parsedOut == null) return previewLine(outStr, maxChars: 220);
+    if (parsedOut['ok'] == false || parsedOut['blocked'] == true || parsedOut['error'] != null) {
+      final hint = parsedOut['hint'];
+      if (hint is String && hint.trim().isNotEmpty) {
+        return previewLine(hint, maxChars: 180);
+      }
+      final err = parsedOut['error'];
+      final errText = err is String
+          ? err
+          : (err is Map
+              ? (err['message'] ?? err['detail'] ?? '执行失败')
+              : (parsedOut['message'] ?? parsedOut['reason'] ?? '执行失败'));
+      return previewLine(errText.toString(), maxChars: 180);
+    }
+    final n = tool.toLowerCase();
+    if (n.startsWith('phone_')) {
+      if (n == 'phone_open') {
+        final opened = parsedOut['opened'] ?? parsedOut['label'] ?? parsedOut['appName'];
+        if (opened != null && opened.toString().trim().isNotEmpty) {
+          return '已打开 ${previewLine(opened.toString(), maxChars: 40)}';
+        }
+        return parsedOut['ok'] == true ? '已打开应用' : '';
+      }
+      if (n == 'phone_screenshot') {
+        if (parsedOut['width'] != null && parsedOut['height'] != null) {
+          return '${parsedOut['width']}×${parsedOut['height']}';
+        }
+        return parsedOut['ok'] == true ? '截屏完成' : '';
+      }
+      if (n == 'phone_screen') {
+        final app = (parsedOut['appLabel'] ??
+                parsedOut['appName'] ??
+                parsedOut['package'] ??
+                parsedOut['packageName'] ??
+                '')
+            .toString();
+        final elements = parsedOut['elements'];
+        final nodes = parsedOut['nodes'];
+        final count = elements is List
+            ? elements.length
+            : (nodes is List
+                ? nodes.length
+                : (parsedOut['count'] is num
+                    ? (parsedOut['count'] as num).round()
+                    : (parsedOut['nodeCount'] is num
+                        ? (parsedOut['nodeCount'] as num).round()
+                        : null)));
+        if (app.isNotEmpty && count != null) return '${previewLine(app, maxChars: 32)} · $count 元素';
+        if (app.isNotEmpty) return previewLine(app, maxChars: 40);
+        if (count != null) return '$count 个元素';
+        return parsedOut['ok'] == true ? '已读取界面' : '';
+      }
+      if (n == 'phone_apps') {
+        final apps = parsedOut['apps'];
+        final count = apps is List ? apps.length : (parsedOut['count'] is num ? (parsedOut['count'] as num).round() : null);
+        return count != null ? '$count 个应用' : (parsedOut['ok'] == true ? '已列出' : '');
+      }
+      if (n == 'phone_return_app') {
+        return parsedOut['ok'] == true ? '已返回应用' : '';
+      }
+      final msg = parsedOut['message'] ?? parsedOut['summary'] ?? parsedOut['status'];
+      if (msg is String && msg.trim().isNotEmpty) return previewLine(msg, maxChars: 60);
+      return parsedOut['ok'] == true ? '已完成' : '';
+    }
+    final msg = parsedOut['summary'] ?? parsedOut['message'];
+    if (msg is String && msg.trim().isNotEmpty) return previewLine(msg, maxChars: 160);
+    return '';
+  }
+
   static ({String title, String summary, bool hasFullOutput}) summarizeTool(
     Object? name,
     Object? args, [
     Object? output,
   ]) {
     final tool = (name?.toString().isNotEmpty == true) ? name.toString() : 'tool';
-    var target = '';
-    if (args is Map) {
-      final candidate = args['command'] ??
-          args['cmd'] ??
-          args['file_path'] ??
-          args['path'] ??
-          args['pattern'] ??
-          args['query'] ??
-          args['url'] ??
-          args['description'];
-      if (candidate is String) {
-        target = previewLine(candidate, maxChars: 100);
-      }
-    }
-    final title = target.isNotEmpty ? '$tool · $target' : tool;
     final outStr = output is String
         ? output
         : (output != null ? _safeJsonPreview(output, 400) : '');
-    final summary = previewLine(outStr, maxChars: 220);
+    final parsedOut = _tryParseJsonObject(output);
+    final target = _extractToolTarget(tool, args, parsedOut);
+    final title = target.isNotEmpty ? '$tool · $target' : tool;
+    final summary = _summarizeHumanToolOutput(tool, outStr, parsedOut);
     return (title: title, summary: summary, hasFullOutput: outStr.isNotEmpty);
   }
 
@@ -150,8 +333,16 @@ class VanillaDshNormalizer {
   void cacheToolOutput(String sessionId, String callId, Map<String, dynamic> record) {
     if (sessionId.isEmpty || callId.isEmpty) return;
     final key = '$sessionId:$callId';
-    _toolOutputs.remove(key);
-    final normalized = Map<String, dynamic>.from(record);
+    final prev = _toolOutputs.remove(key);
+    final normalized = (prev != null &&
+            record['output'] == null &&
+            record['status'] == 'running' &&
+            (prev['output'] != null || prev['status'] != 'running'))
+        ? <String, dynamic>{
+            ...prev,
+            if (prev['args'] == null && record['args'] != null) 'args': record['args'],
+          }
+        : Map<String, dynamic>.from(record);
     final out = normalized['output'];
     if (out is String && out.length > 512 * 1024) {
       normalized['output'] = '${out.substring(0, 512 * 1024)}\n…[已截断，原始长度 ${out.length} 字符]';
@@ -181,6 +372,7 @@ class VanillaDshNormalizer {
     final turns = <Map<String, dynamic>>[];
     Map<String, dynamic>? current;
     final toolIndex = <String, Map<String, dynamic>>{};
+    final toolStartTimes = <String, int>{};
 
     void promotePreToolNarration(Map<String, dynamic> turn, int seq) {
       final text = turn['assistantText'] as String? ?? '';
@@ -264,6 +456,31 @@ class VanillaDshNormalizer {
             }
             if (b['name'] != null) att['name'] = b['name'];
             if (b['mediaType'] != null) att['mimeType'] = b['mediaType'];
+            if (b['mimeType'] != null) att['mimeType'] = b['mimeType'];
+            if (b['data'] is String && (b['data'] as String).isNotEmpty) {
+              att['data'] = b['data'];
+            }
+            if (b['base64'] is String && (b['base64'] as String).isNotEmpty) {
+              att['base64'] = b['base64'];
+            }
+            if (b['url'] is String && (b['url'] as String).isNotEmpty) {
+              att['url'] = b['url'];
+            }
+            if (b['uri'] is String && (b['uri'] as String).isNotEmpty) {
+              att['uri'] = b['uri'];
+            }
+            if (b['image'] is String && (b['image'] as String).isNotEmpty) {
+              att['data'] = b['image'];
+            }
+            if (b['source'] is Map) {
+              final src = b['source'] as Map;
+              if (src['data'] is String && (src['data'] as String).isNotEmpty) {
+                att['data'] = src['data'];
+              }
+              if (src['media_type'] != null) {
+                att['mimeType'] ??= src['media_type'];
+              }
+            }
             contentAttachments.add(att);
           }
         }
@@ -335,6 +552,9 @@ class VanillaDshNormalizer {
           } catch (_) {}
         }
         final sum = summarizeTool(data['name'], parsedArgs);
+        if (ev['time'] is num && !toolStartTimes.containsKey(callId)) {
+          toolStartTimes[callId] = (ev['time'] as num).toInt();
+        }
         if (!toolIndex.containsKey(callId)) {
           final step = <String, dynamic>{
             'kind': 'tool',
@@ -397,6 +617,9 @@ class VanillaDshNormalizer {
                 } catch (_) {}
               }
               final sum = summarizeTool(b['name'], bArgs);
+              if (ev['time'] is num && !toolStartTimes.containsKey(callId)) {
+                toolStartTimes[callId] = (ev['time'] as num).toInt();
+              }
               if (!toolIndex.containsKey(callId)) {
                 final step = <String, dynamic>{
                   'kind': 'tool',
@@ -410,13 +633,17 @@ class VanillaDshNormalizer {
                 steps.add(step);
                 toolIndex[callId] = step;
               }
-              cacheToolOutput(sessionId, callId, {
-                'callId': callId,
-                'name': (b['name'] ?? 'tool').toString(),
-                'args': bArgs,
-                'output': null,
-                'status': 'running',
-              });
+              final existingCached = getToolOutput(sessionId, callId);
+              if (existingCached == null ||
+                  (existingCached['output'] == null && existingCached['status'] == 'running')) {
+                cacheToolOutput(sessionId, callId, {
+                  'callId': callId,
+                  'name': (b['name'] ?? 'tool').toString(),
+                  'args': bArgs,
+                  'output': existingCached?['output'],
+                  'status': existingCached?['status'] ?? 'running',
+                });
+              }
             } else if (bType == 'text') {
               final chunk = (b['text'] ?? '').toString();
               if (chunk.isNotEmpty) {
@@ -464,9 +691,14 @@ class VanillaDshNormalizer {
             .toString();
         final rawOut = msg['content'] ?? data['output'] ?? data['result'] ?? data['content'] ?? '';
         final output = rawOut is List ? _extractText({'content': rawOut}) : rawOut;
+        final parsedOut = _tryParseJsonObject(output);
         final rawErr = data['error'];
         final hasTruthyErr = rawErr != null && rawErr != false && !(rawErr is String && rawErr.trim().isEmpty);
-        final isError = hasTruthyErr || msg['isError'] == true || data['isError'] == true;
+        final isError = hasTruthyErr ||
+            msg['isError'] == true ||
+            data['isError'] == true ||
+            parsedOut?['ok'] == false ||
+            parsedOut?['blocked'] == true;
         final prev = getToolOutput(sessionId, callId);
         final existing = toolIndex[callId];
         final toolName = existing?['name']?.toString() ??
@@ -478,13 +710,33 @@ class VanillaDshNormalizer {
             sum.hasFullOutput || (isError && output.toString().trim().isNotEmpty);
         if (existing != null) {
           existing['status'] = isError ? 'error' : 'ok';
+          final canUpgradeTitle = sum.title.isNotEmpty &&
+              sum.title != toolName &&
+              (existing['title'] == null ||
+                  existing['title'] == toolName ||
+                  (toolName.toLowerCase().startsWith('phone_') && sum.title != existing['title']));
+          if (canUpgradeTitle) {
+            existing['title'] = sum.title;
+          }
           if (sum.summary.isNotEmpty) existing['summary'] = sum.summary;
           existing['hasFullOutput'] = effectiveHasFull;
-          if (data['durationMs'] is num) existing['durationMs'] = data['durationMs'];
+          final startedAt = toolStartTimes[callId];
+          final inferredDur = data['durationMs'] is num
+              ? data['durationMs']
+              : (ev['time'] is num && startedAt != null && (ev['time'] as num).toInt() >= startedAt
+                  ? (ev['time'] as num).toInt() - startedAt
+                  : null);
+          if (inferredDur is num) existing['durationMs'] = inferredDur;
           if (data['subagentSessionId'] is String) {
             existing['subagentSessionId'] = data['subagentSessionId'];
           }
         } else {
+          final startedAt = toolStartTimes[callId];
+          final inferredDur = data['durationMs'] is num
+              ? data['durationMs']
+              : (ev['time'] is num && startedAt != null && (ev['time'] as num).toInt() >= startedAt
+                  ? (ev['time'] as num).toInt() - startedAt
+                  : null);
           final step = <String, dynamic>{
             'kind': 'tool',
             'callId': callId,
@@ -493,6 +745,7 @@ class VanillaDshNormalizer {
             'status': isError ? 'error' : 'ok',
             'summary': sum.summary,
             'hasFullOutput': effectiveHasFull,
+            if (inferredDur is num) 'durationMs': inferredDur,
           };
           steps.add(step);
           toolIndex[callId] = step;
@@ -563,12 +816,16 @@ class VanillaDshNormalizer {
         }
         if (data['usage'] is Map) {
           final u = _asStringMap(data['usage'] as Map);
+          final prevUsage = turn['usage'] is Map ? _asStringMap(turn['usage'] as Map) : null;
+          final nextDur = u['durationMs'] != null
+              ? _numInt(u['durationMs'])
+              : (prevUsage?['durationMs'] is num ? (prevUsage!['durationMs'] as num).toInt() : null);
           turn['usage'] = {
             'inputTokens': _numInt(u['uncachedInputTokens'] ?? u['inputTokens'] ?? u['promptTokens']),
             'outputTokens': _numInt(u['outputTokens'] ?? u['completionTokens']),
             if (u['cacheReadTokens'] != null) 'cacheReadTokens': _numInt(u['cacheReadTokens']),
             if (u['cacheWriteTokens'] != null) 'cacheWriteTokens': _numInt(u['cacheWriteTokens']),
-            if (u['durationMs'] != null) 'durationMs': _numInt(u['durationMs']),
+            if (nextDur != null) 'durationMs': nextDur,
           };
         }
         if (data['deliverables'] is List) {
@@ -599,31 +856,78 @@ class VanillaDshNormalizer {
     if (stat == null || ctype == 'turn/start' || ctype == 'snapshot') {
       stat = _SessionStreamStat(startedAt: now);
       _turnStats[sessionId] = stat;
+    } else if (ctype == 'step/start') {
+      stat.activeDecodeMs = 0;
+      stat.lastDecodeAt = 0;
+      stat.estTokens = 0.0;
+      stat.target = null;
+      if (stat.phase == 'tool') stat.phase = 'thinking';
     }
-    var deltaLen = 0;
-    if (chunk['texts'] is List) {
-      for (final s in chunk['texts'] as List) {
-        deltaLen += (s?.toString().length ?? 0);
+    String extractText() {
+      if (chunk['texts'] is List) {
+        final buf = StringBuffer();
+        for (final s in chunk['texts'] as List) {
+          if (s != null) buf.write(s.toString());
+        }
+        return buf.toString();
       }
-    } else {
-      deltaLen = (chunk['text'] ?? chunk['delta'] ?? '').toString().length;
+      return (chunk['text'] ?? chunk['delta'] ?? '').toString();
     }
+
+    double estimateTokens(String text) {
+      if (text.isEmpty) return 0.0;
+      var cjk = 0;
+      var other = 0;
+      for (var i = 0; i < text.length; i++) {
+        if (text.codeUnitAt(i) >= 0x2E80) {
+          cjk += 1;
+        } else {
+          other += 1;
+        }
+      }
+      return cjk / 1.5 + other / 3.8;
+    }
+
+    void recordDecode(String text) {
+      final tok = estimateTokens(text);
+      if (tok <= 0) return;
+      if (stat!.lastDecodeAt > 0) {
+        final dt = now - stat.lastDecodeAt;
+        if (dt > 0 && dt <= 1500) {
+          stat.activeDecodeMs += dt > 600 ? 600 : dt;
+        }
+      }
+      stat.lastDecodeAt = now;
+      stat.estTokens += tok;
+    }
+
     final kind = chunk['kind']?.toString() ?? '';
     if (ctype == 'reasoning-delta' || ctype == 'reasoning-chunks' || kind == 'reasoning') {
+      if (stat.phase == 'tool') {
+        stat.activeDecodeMs = 0;
+        stat.lastDecodeAt = 0;
+        stat.estTokens = 0.0;
+        stat.target = null;
+      }
       stat.phase = 'thinking';
-      stat.outputChars += deltaLen;
+      recordDecode(extractText());
     } else if (ctype == 'text-delta' || ctype == 'text-chunks' || kind == 'text') {
+      if (stat.phase == 'tool') {
+        stat.activeDecodeMs = 0;
+        stat.lastDecodeAt = 0;
+        stat.estTokens = 0.0;
+        stat.target = null;
+      }
       stat.phase = 'streaming';
-      stat.outputChars += deltaLen;
+      recordDecode(extractText());
     } else if (ctype == 'tool-call-delta' || ctype == 'tool-call-chunks' || kind == 'tool-call') {
       stat.phase = 'tool';
+      stat.lastDecodeAt = 0;
       if (chunk['name'] != null) stat.target = chunk['name'].toString();
-      stat.outputChars += deltaLen;
     }
     final elapsedMs = (now - stat.startedAt).clamp(1, 1 << 30);
-    final estTokens = stat.outputChars / 3.5;
-    final tps = elapsedMs >= 200
-        ? ((estTokens * 10000) / elapsedMs).round() / 10.0
+    final tps = (stat.phase != 'tool' && stat.activeDecodeMs >= 200 && stat.estTokens >= 1.0)
+        ? ((stat.estTokens * 10000) / stat.activeDecodeMs).round() / 10.0
         : null;
     return {
       'phase': stat.phase,
@@ -740,7 +1044,9 @@ class VanillaDshNormalizer {
 class _SessionStreamStat {
   _SessionStreamStat({required this.startedAt});
   final int startedAt;
-  int outputChars = 0;
+  int activeDecodeMs = 0;
+  int lastDecodeAt = 0;
+  double estTokens = 0.0;
   String phase = 'thinking';
   String? target;
 }

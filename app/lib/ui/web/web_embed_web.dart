@@ -76,9 +76,13 @@ void disposeWebIframe(String viewType) {
 
 bool openUrlInNewTab(String url) {
   try {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return false;
+    }
     // Do NOT pass 'noopener' in windowFeatures because HTML spec mandates returning `null`
     // even when the popup succeeds; instead clear `win.opener = null` after opening.
-    final win = _window.callMethod<JSObject?>('open'.toJS, url.toJS, '_blank'.toJS);
+    final win = _window.callMethod<JSObject?>('open'.toJS, uri.toString().toJS, '_blank'.toJS);
     if (win != null) {
       try {
         win.setProperty('opener'.toJS, null);
@@ -225,7 +229,11 @@ bool downloadWebTextFile(String filename, String content) {
     a.setProperty('href'.toJS, href);
     a.setProperty('download'.toJS, filename.toJS);
     a.callMethod<JSAny?>('click'.toJS);
-    urlApi.callMethod<JSAny?>('revokeObjectURL'.toJS, href);
+    Timer(const Duration(seconds: 5), () {
+      try {
+        urlApi.callMethod<JSAny?>('revokeObjectURL'.toJS, href);
+      } catch (_) {}
+    });
     return true;
   } catch (_) {
     return false;

@@ -31,6 +31,7 @@ export function renderPairingDashboardHtml(snapshot, { apiPath = '/api/gbridge/p
     --text2: #475569;
     --text3: #64748b;
     --accent: #0f766e;
+    --accent-fg: #ffffff;
     --accent-soft: rgba(15,118,110,0.11);
     --ok: #15803d;
     --ok-soft: rgba(21,128,61,0.12);
@@ -46,6 +47,7 @@ export function renderPairingDashboardHtml(snapshot, { apiPath = '/api/gbridge/p
       --text2: #cbd5e1;
       --text3: #94a3b8;
       --accent: #2dd4bf;
+      --accent-fg: #042f2e;
       --accent-soft: rgba(45,212,191,0.14);
       --ok: #4ade80;
       --ok-soft: rgba(74,222,128,0.14);
@@ -117,7 +119,7 @@ export function renderPairingDashboardHtml(snapshot, { apiPath = '/api/gbridge/p
     border: 1px solid var(--stroke); background: transparent; color: var(--text);
     border-radius: 11px; padding: 8px 13px; font-size: 12.5px; font-weight: 600; cursor: pointer;
   }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
   .btn:disabled { opacity: 0.5; cursor: default; }
   .toast { margin-top: 10px; font-size: 12px; color: var(--accent); min-height: 18px; }
   .meta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--stroke); font-size: 12px; color: var(--text3); }
@@ -160,6 +162,7 @@ export function renderPairingDashboardHtml(snapshot, { apiPath = '/api/gbridge/p
           <button class="btn" id="copy-token-btn">复制令牌</button>
           <button class="btn" id="rotate-btn">重置令牌</button>
           <button class="btn" id="toggle-lan-btn" style="display:none">开启局域网桥接</button>
+          <button class="btn" id="refresh-btn">刷新状态</button>
         </div>
         <div class="toast" id="toast"></div>
       </div>
@@ -171,12 +174,46 @@ export function renderPairingDashboardHtml(snapshot, { apiPath = '/api/gbridge/p
 const API_PATH = ${JSON.stringify(apiPath)};
 let state = ${safeJson};
 let selectedIdx = 0;
+let busy = false;
 
 function showToast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => { el.textContent = ''; }, 2600);
+  showToast._t = setTimeout(() => { el.textContent = ''; }, 2800);
+}
+
+async function copyTextSafe(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {}
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', 'true');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.top = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Boolean(ok);
+  } catch {
+    return false;
+  }
+}
+
+function setBusyState(nextBusy) {
+  busy = nextBusy;
+  for (const id of ['rotate-btn', 'toggle-lan-btn', 'refresh-btn']) {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = nextBusy;
+  }
 }
 
 function renderQrSvg(qr) {
@@ -224,7 +261,8 @@ function render() {
     toggleBtn.style.display = 'none';
   }
 
-  document.getElementById('rotate-btn').style.display = state.hasBridgeToken ? 'inline-block' : 'none';
+  const canRotate = state.canRotateToken !== undefined ? Boolean(state.canRotateToken) : state.mode === 'lan-bridge';
+  document.getElementById('rotate-btn').style.display = canRotate ? 'inline-block' : 'none';
   document.getElementById('copy-token-btn').style.display = state.token ? 'inline-block' : 'none';
 
   document.getElementById('meta-bar').innerHTML =
@@ -233,28 +271,66 @@ function render() {
     '<span>协议：<strong>/gbridge/v1</strong></span>';
 }
 
+async function parseSafeJson(res) {
+  const text = await res.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+async function refreshState(silent = false) {
+  if (busy) return;
+  if (!silent) setBusyState(true);
+  try {
+    const res = await fetch(API_PATH, {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    const data = await parseSafeJson(res);
+    if (!res.ok) throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
+    if (data && typeof data === 'object') {
+      state = data;
+      render();
+    }
+  } catch (e) {
+    if (!silent) showToast('刷新失败：' + (e && e.message ? e.message : String(e)));
+  } finally {
+    if (!silent) setBusyState(false);
+  }
+}
+
 async function callAction(payload) {
-  const res = await fetch(API_PATH, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    credentials: 'same-origin',
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
-  state = data;
-  render();
+  if (busy) return;
+  setBusyState(true);
+  try {
+    const res = await fetch(API_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    });
+    const data = await parseSafeJson(res);
+    if (!res.ok) throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
+    if (data && typeof data === 'object') {
+      state = data;
+      render();
+    }
+  } finally {
+    setBusyState(false);
+  }
 }
 
 document.getElementById('copy-url-btn').onclick = async () => {
   const eps = state.endpoints || [];
   const active = eps[selectedIdx];
   if (!active) return showToast('暂无可复制的配对链接');
-  try { await navigator.clipboard.writeText(active.url); showToast('已复制配对链接'); } catch { showToast('复制失败，请手动选中复制'); }
+  const ok = await copyTextSafe(active.url);
+  showToast(ok ? '已复制配对链接' : '复制失败，请手动选中复制');
 };
 document.getElementById('copy-token-btn').onclick = async () => {
   if (!state.token) return showToast('当前复用 DSH 登录态，无需单独令牌');
-  try { await navigator.clipboard.writeText(state.token); showToast('已复制连接令牌'); } catch { showToast('复制失败'); }
+  const ok = await copyTextSafe(state.token);
+  showToast(ok ? '已复制连接令牌' : '复制失败，请手动选中复制');
 };
 document.getElementById('rotate-btn').onclick = async () => {
   try { await callAction({ action: 'rotateToken' }); showToast('已重置令牌，旧设备需重新扫码授权'); } catch (e) { showToast('重置失败：' + e.message); }
@@ -263,11 +339,20 @@ document.getElementById('toggle-lan-btn').onclick = async () => {
   try {
     const next = !(state.lan && state.lan.enabled);
     await callAction({ action: 'setLanEnabled', enabled: next });
-    showToast(next ? '已开启零冲突局域网桥接' : '已暂停局域网桥接');
+    showToast(next ? '已开启零冲突局域网桥接' : '已暂停局域网桥接（如需恢复请从电脑端面板重新开启）');
   } catch (e) {
     showToast('操作失败：' + e.message);
   }
 };
+document.getElementById('refresh-btn').onclick = async () => {
+  await refreshState(false);
+};
+
+setInterval(() => {
+  if (!document.hidden && !busy) {
+    void refreshState(true);
+  }
+}, 10000);
 
 render();
 </script>

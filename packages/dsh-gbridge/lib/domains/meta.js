@@ -236,22 +236,38 @@ export function registerMetaDomain(router, { ctx, gateway, hub, sdui, bridgeVers
     }
     const connection = ctx.get?.('connection');
     // On Android UDS (`mode === 'uds'`), Host header is synthetic `localhost` (port 80) — always use webServer origin!
-    const rawXfProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    // Only trust X-Forwarded-* headers when DSH explicitly allows remote reverse-proxy authorities,
+    // and strictly validate host[:port] syntax to prevent host-header injection leaking DSH launch tokens.
+    const strictHostRe = /^(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+)(:\d{1,5})?$/;
+    const trustForwarded = Boolean(connection?.allowsRemoteAuthorities);
+    const rawXfProto = trustForwarded ? String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() : '';
     const xfProto = rawXfProto === 'http' || rawXfProto === 'https' ? rawXfProto : '';
-    const xfHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
-    const reqHost = xfHost || String(req.headers.host || '').trim();
+    const rawXfHost = trustForwarded ? String(req.headers['x-forwarded-host'] || '').split(',')[0].trim() : '';
+    const rawHostHeader = String(req.headers.host || '').trim();
+    const candidateHost = (rawXfHost && strictHostRe.test(rawXfHost))
+      ? rawXfHost
+      : (rawHostHeader && strictHostRe.test(rawHostHeader) ? rawHostHeader : '');
     let baseUrl;
-    if (mode !== 'uds' && reqHost && !reqHost.includes('gbridge.local')) {
+    if (mode !== 'uds' && candidateHost && !candidateHost.includes('gbridge.local')) {
       const proto = xfProto || (req.socket?.encrypted ? 'https' : 'http');
-      baseUrl = `${proto}://${reqHost}`;
-    } else if (typeof webServer.getOrigin === 'function') {
-      baseUrl = webServer.getOrigin();
-    } else {
-      const rawHost = webServer.host || '127.0.0.1';
-      const normalizedHost = rawHost === '0.0.0.0' || rawHost === '::'
-        ? '127.0.0.1'
-        : (rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost);
-      baseUrl = `http://${normalizedHost}:${webServer.port}`;
+      const constructed = `${proto}://${candidateHost}`;
+      try {
+        const parsed = new URL(constructed);
+        if (!parsed.username && !parsed.password && parsed.pathname === '/' && parsed.host.toLowerCase() === candidateHost.toLowerCase()) {
+          baseUrl = `${parsed.protocol}//${parsed.host}`;
+        }
+      } catch {}
+    }
+    if (!baseUrl) {
+      if (typeof webServer.getOrigin === 'function') {
+        baseUrl = webServer.getOrigin();
+      } else {
+        const rawHost = webServer.host || '127.0.0.1';
+        const normalizedHost = rawHost === '0.0.0.0' || rawHost === '::'
+          ? '127.0.0.1'
+          : (rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost);
+        baseUrl = `http://${normalizedHost}:${webServer.port}`;
+      }
     }
     let authenticatedUrl = typeof connection?.authenticatedUrl === 'function'
       ? connection.authenticatedUrl(baseUrl)

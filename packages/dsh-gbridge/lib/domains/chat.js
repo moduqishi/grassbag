@@ -164,13 +164,16 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
         );
       }
       if (typeof body.permission === 'string' && body.permission.trim() && gateway.has('commands/execute')) {
-        postOps.push(
-          gateway.call('commands/execute', {
-            agentId: createdId,
-            line: `/permission ${body.permission.trim()}`,
-            submittedAttachments: [],
-          }, { peer }).catch(() => {}),
-        );
+        const permPreset = body.permission.trim();
+        if (/^[a-zA-Z0-9_-]{1,64}$/.test(permPreset)) {
+          postOps.push(
+            gateway.call('commands/execute', {
+              agentId: createdId,
+              line: `/permission ${permPreset}`,
+              submittedAttachments: [],
+            }, { peer }).catch(() => {}),
+          );
+        }
       }
       if (typeof body.model === 'string' && body.model.trim() && typeof body.provider === 'string' && body.provider.trim() && gateway.has('session/selectModel')) {
         postOps.push(
@@ -199,7 +202,8 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
 
   router.get('/sessions/search', async (_req, res, { searchParams, peer }) => {
     const q = (searchParams.get('q') || '').trim();
-    const limit = Math.max(1, Math.min(100, Number(searchParams.get('limit') || 30)));
+    const rawLimit = Number(searchParams.get('limit') || 30);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.round(rawLimit))) : 30;
     if (!q) {
       sendJson(res, 200, { v: 1, results: [] });
       return;
@@ -222,19 +226,25 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       : (Array.isArray(raw?.items) ? raw.items : (Array.isArray(raw?.sessions) ? raw.sessions : []));
     const needle = q.toLowerCase();
     const results = list
-      .filter((s) => {
-        const title = String(sanitizeSessionTitle(s?.title, s?.cwd) || '').toLowerCase();
-        const cwd = String(s?.cwd || '').toLowerCase();
-        const sid = String(s?.sessionId ?? s?.id ?? '').toLowerCase();
+      .map((s) => {
+        const proj = s?.projections?.values ?? {};
+        const rawTitle = proj.title ?? s?.title;
+        const rawCwd = proj.workingDirectory ?? s?.workingDirectory ?? s?.cwd ?? '';
+        const cleanTitle = sanitizeSessionTitle(rawTitle, rawCwd) || '历史对话';
+        return {
+          sessionId: s?.sessionId ?? s?.id,
+          title: cleanTitle,
+          cwd: rawCwd,
+          updatedAt: s?.updatedAt ?? s?.createdAt ?? null,
+        };
+      })
+      .filter((item) => {
+        const title = String(item.title || '').toLowerCase();
+        const cwd = String(item.cwd || '').toLowerCase();
+        const sid = String(item.sessionId || '').toLowerCase();
         return title.includes(needle) || cwd.includes(needle) || sid.includes(needle);
       })
-      .slice(0, limit)
-      .map((s) => ({
-        sessionId: s?.sessionId ?? s?.id,
-        title: sanitizeSessionTitle(s?.title, s?.cwd) || '历史对话',
-        cwd: s?.cwd ?? '',
-        updatedAt: s?.updatedAt ?? s?.createdAt ?? null,
-      }));
+      .slice(0, limit);
     sendJson(res, 200, { v: 1, results, fallback: true });
   }, { domain: 'chat' });
 
@@ -260,7 +270,8 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
 
   // Normalized paginated turns for mobile ChatList
   router.get('/sessions/:id/turns', async (_req, res, { params, searchParams, peer }) => {
-    const limit = Math.max(1, Math.min(200, Number(searchParams.get('limit') || 40)));
+    const rawLimit = Number(searchParams.get('limit') || 40);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(200, Math.round(rawLimit))) : 40;
     const before = searchParams.get('before') || undefined;
     const isModernPage = usesAddressEnvelope(gateway, 'session/page');
     const args = isModernPage
@@ -393,7 +404,7 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       promptArgs = {
         requestId: body.clientRequestId || body.requestId || randomUUID(),
         sessionId: params.id,
-        mode: mode === 'steer' ? 'steer' : 'queue',
+        mode: (mode === 'steer' || mode === 'interrupt') ? 'steer' : 'queue',
         content,
         ...(body.clientTimeZone ? { clientTimeZone: body.clientTimeZone } : {}),
       };
@@ -506,8 +517,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
         includeDescendants: searchParams.get('includeDescendants') !== 'false',
       }, { peer });
       if (Buffer.isBuffer(result) || result instanceof Uint8Array) {
+        const safeId = String(params.id || 'session').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
         sendBinary(res, 200, result, 'application/zip', {
-          'content-disposition': `attachment; filename="dsh-session-${params.id}.zip"`,
+          'content-disposition': `attachment; filename="dsh-session-${safeId}.zip"`,
         });
         return;
       }
@@ -560,8 +572,8 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
   router.put('/sessions/:id/permission', async (req, res, { params, peer }) => {
     const body = await readJsonBody(req);
     const preset = String(body.preset ?? body.permission ?? body.id ?? '').trim();
-    if (!preset) {
-      throw new GbridgeError(400, 'gbridge/validation_error', 'permission preset is required');
+    if (!preset || !/^[a-zA-Z0-9_-]{1,64}$/.test(preset)) {
+      throw new GbridgeError(400, 'gbridge/validation_error', 'permission preset must be alphanumeric/hyphen/underscore');
     }
     if (gateway.has('commands/execute')) {
       const result = await gateway.call('commands/execute', {
@@ -626,7 +638,7 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
     const body = await readJsonBody(req);
     const messageId = String(body.messageId ?? body.turnId ?? '').trim();
     let ifVersion = body.ifVersion;
-    if (!ifVersion && gateway.has('messageFeedback/list')) {
+    if ((ifVersion === undefined || ifVersion === null || ifVersion === '') && gateway.has('messageFeedback/list')) {
       const list = await gateway.call('messageFeedback/list', { sessionId: params.id }, { peer });
       const items = Array.isArray(list) ? list : (list?.items ?? list?.records ?? []);
       const existing = items.find((it) => String(it?.messageId ?? '') === messageId);

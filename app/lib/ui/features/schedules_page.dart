@@ -19,18 +19,137 @@ final RegExp _cronMonthRe = RegExp(
   caseSensitive: false,
 );
 final RegExp _cronDowRe = RegExp(
-  r'^(?:\*|\?|\d|SUN|MON|TUE|WED|THU|FRI|SAT|L)(?:[,\-/#](?:\*|\?|\d|SUN|MON|TUE|WED|THU|FRI|SAT|L))*$',
+  r'^(?:\*|\?|\dL?|(?:SUN|MON|TUE|WED|THU|FRI|SAT)L?|L)(?:[,\-/#](?:\*|\?|\dL?|(?:SUN|MON|TUE|WED|THU|FRI|SAT)L?|L))*$',
   caseSensitive: false,
 );
+
+bool _cronFieldNumbersInRange(
+  String field,
+  int minVal,
+  int maxVal, {
+  Set<String> allowedNames = const {},
+  bool allowQuestion = false,
+  bool allowDomModifiers = false,
+  bool allowDowModifiers = false,
+}) {
+  bool isAtomValid(String raw) {
+    if (raw.isEmpty) return false;
+    final n = int.tryParse(raw);
+    if (n != null) return n >= minVal && n <= maxVal;
+    final upper = raw.toUpperCase();
+    if (allowedNames.contains(upper)) return true;
+    if (allowDomModifiers) {
+      if (upper == 'L' || upper == 'LW') return true;
+      if (upper.endsWith('W') && upper.length >= 2) {
+        final d = int.tryParse(upper.substring(0, upper.length - 1));
+        return d != null && d >= minVal && d <= maxVal;
+      }
+    }
+    if (allowDowModifiers) {
+      if (upper == 'L') return true;
+      if (upper.endsWith('L') && upper.length >= 2) {
+        final baseDow = upper.substring(0, upper.length - 1);
+        final d = int.tryParse(baseDow);
+        return (d != null && d >= minVal && d <= maxVal) || allowedNames.contains(baseDow);
+      }
+      final hashIdx = upper.indexOf('#');
+      if (hashIdx > 0 && upper.indexOf('#', hashIdx + 1) < 0) {
+        final dowPart = upper.substring(0, hashIdx);
+        final dow = int.tryParse(dowPart);
+        final dowOk = (dow != null && dow >= minVal && dow <= maxVal) || allowedNames.contains(dowPart);
+        final nth = int.tryParse(upper.substring(hashIdx + 1));
+        return dowOk && nth != null && nth >= 1 && nth <= 5;
+      }
+    }
+    return false;
+  }
+
+  for (final part in field.split(',')) {
+    if (part.isEmpty) return false;
+    final slashIdx = part.indexOf('/');
+    if (slashIdx >= 0 && part.indexOf('/', slashIdx + 1) >= 0) return false;
+    final base = slashIdx >= 0 ? part.substring(0, slashIdx) : part;
+    if (slashIdx >= 0) {
+      final step = int.tryParse(part.substring(slashIdx + 1));
+      if (step == null || step <= 0 || step > maxVal) return false;
+    }
+    if (base.isEmpty) return false;
+    if (base == '*') continue;
+    if (base == '?') {
+      if (!allowQuestion || slashIdx >= 0) return false;
+      continue;
+    }
+    if (base.contains('*')) return false;
+    final dashIdx = base.indexOf('-');
+    if (dashIdx >= 0) {
+      if (base.indexOf('-', dashIdx + 1) >= 0) return false;
+      final aStr = base.substring(0, dashIdx);
+      final bStr = base.substring(dashIdx + 1);
+      if (!isAtomValid(aStr) || !isAtomValid(bStr)) return false;
+      final a = int.tryParse(aStr);
+      final b = int.tryParse(bStr);
+      if (a != null && b != null && a > b) return false;
+    } else {
+      if (!isAtomValid(base)) return false;
+    }
+  }
+  return true;
+}
+
+const Set<String> _cronMonthNames = {
+  'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+  'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+};
+const Set<String> _cronDowNames = {
+  'SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT',
+};
 
 bool isValidCron5Field(String cron) {
   final fields = cron.trim().split(_cronWsRe);
   if (fields.length != 5) return false;
-  return _cronMinHourRe.hasMatch(fields[0]) &&
-      _cronMinHourRe.hasMatch(fields[1]) &&
-      _cronDomRe.hasMatch(fields[2]) &&
-      _cronMonthRe.hasMatch(fields[3]) &&
-      _cronDowRe.hasMatch(fields[4]);
+  if (!_cronMinHourRe.hasMatch(fields[0]) ||
+      !_cronMinHourRe.hasMatch(fields[1]) ||
+      !_cronDomRe.hasMatch(fields[2]) ||
+      !_cronMonthRe.hasMatch(fields[3]) ||
+      !_cronDowRe.hasMatch(fields[4])) {
+    return false;
+  }
+  return _cronFieldNumbersInRange(fields[0], 0, 59) &&
+      _cronFieldNumbersInRange(fields[1], 0, 23) &&
+      _cronFieldNumbersInRange(fields[2], 1, 31, allowQuestion: true, allowDomModifiers: true) &&
+      _cronFieldNumbersInRange(fields[3], 1, 12, allowedNames: _cronMonthNames) &&
+      _cronFieldNumbersInRange(
+        fields[4],
+        0,
+        7,
+        allowedNames: _cronDowNames,
+        allowQuestion: true,
+        allowDowModifiers: true,
+      );
+}
+
+String _localizeScheduleKind(String kind) {
+  switch (kind.toLowerCase()) {
+    case 'cron':
+      return 'Cron 计划';
+    case 'interval':
+    case 'every':
+      return '固定间隔';
+    case 'once':
+    case 'at':
+    case 'one-shot':
+      return '单次计划';
+    default:
+      return kind.isEmpty ? '自定义计划' : kind;
+  }
+}
+
+String _localizeHistoryLine(String raw) {
+  return raw
+      .replaceAll(RegExp(r'\b(succeeded|success|ok)\b', caseSensitive: false), '成功')
+      .replaceAll(RegExp(r'\b(failed|error)\b', caseSensitive: false), '失败')
+      .replaceAll(RegExp(r'\b(skipped)\b', caseSensitive: false), '已跳过')
+      .replaceAll(RegExp(r'\b(running)\b', caseSensitive: false), '执行中');
 }
 
 /// Translates a standard 5-field Cron expression into a readable Chinese schedule preview.
@@ -110,12 +229,22 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
   final Set<String> _expandedHistory = {};
   final Set<String> _runningIds = {};
   final Set<String> _loadingHistoryIds = {};
+  bool _initialLoading = false;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(ref.read(appProvider.notifier).refreshSchedules(silent: true));
+    if (ref.read(appProvider).schedules.isEmpty &&
+        ref.read(appProvider).connectionPhase == ConnectionPhase.connected) {
+      _initialLoading = true;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      try {
+        await ref.read(appProvider.notifier).refreshSchedules(silent: true);
+      } finally {
+        if (mounted && _initialLoading) setState(() => _initialLoading = false);
+      }
     });
   }
 
@@ -178,153 +307,189 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
               child: Center(
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
-                  child: ListView(
-                    physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-                    padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
-                    children: [
-                      if (state.connectionPhase != ConnectionPhase.connected) ...[
-                        GrassBagStatusBanner(
-                          tone: GrassBagBannerTone.warn,
-                          icon: CupertinoIcons.wifi_exclamationmark,
-                          title: '未连接到 DSH 主机',
-                          message: '定时任务由已连接的 DSH 引擎持久化与调度，恢复连接后自动同步。',
-                          borderRadius: 18,
-                          padding: const EdgeInsets.all(12),
-                          trailing: GrassBagSecondaryGlassButton(
-                            label: '重试连接',
-                            height: 30,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            tier: state.glassTier,
-                            insideGlass: true,
-                            accentForeground: true,
-                            onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                      GrassBagSegmentedControl(
-                        labels: [
-                          '全部 (${state.schedules.length})',
-                          '运行中 (${state.activeScheduleCount})',
-                          '已暂停 ($pausedCount)',
-                          if (endedCount > 0) '已结束 ($endedCount)',
-                        ],
-                        selectedIndex: safeFilterIdx,
-                        tier: state.glassTier,
-                        onSelected: (i) => setState(() => _filterIdx = i),
-                      ),
-                      if (endedCount > 0) ...[
-                        const SizedBox(height: 10),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: GrassBagSecondaryGlassButton(
-                            label: '清理 $endedCount 条已结束任务',
-                            icon: CupertinoIcons.trash,
-                            height: 32,
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            tier: state.glassTier,
-                            insideGlass: true,
-                            onTap: () async {
-                              final ok = await showGrassBagConfirmDialog(
-                                context,
-                                title: '清理已结束任务',
-                                message: '确定移除全部 $endedCount 条已结束的一次性/过期定时任务吗？',
-                                confirmLabel: '清理',
-                                isDestructive: true,
-                              );
-                              if (ok) unawaited(ctrl.pruneInactiveSchedules());
-                            },
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 14),
-                      if (items.isEmpty)
-                        GrassBagCard(
-                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 30),
-                          child: Column(
-                            children: [
-                              Icon(CupertinoIcons.clock, size: 32, color: t.text3),
-                              const SizedBox(height: 10),
-                              Text(
-                                _filterIdx == 0 ? '暂无定时任务' : '当前筛选下暂无定时任务',
-                                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2),
+                  child: RefreshIndicator.adaptive(
+                    edgeOffset: topPad + 64,
+                    onRefresh: () => ctrl.refreshSchedules(silent: true),
+                    child: CustomScrollView(
+                      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                      slivers: [
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          sliver: SliverMainAxisGroup(
+                            slivers: [
+                              SliverToBoxAdapter(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                                  children: [
+                                    if (state.connectionPhase != ConnectionPhase.connected) ...[
+                                      GrassBagStatusBanner(
+                                        tone: GrassBagBannerTone.warn,
+                                        icon: CupertinoIcons.wifi_exclamationmark,
+                                        title: '未连接到 DSH 主机',
+                                        message: '定时任务由已连接的 DSH 引擎持久化与调度，恢复连接后自动同步。',
+                                        borderRadius: 18,
+                                        padding: const EdgeInsets.all(12),
+                                        trailing: GrassBagSecondaryGlassButton(
+                                          label: '重试连接',
+                                          height: 30,
+                                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                                          tier: state.glassTier,
+                                          insideGlass: true,
+                                          accentForeground: true,
+                                          onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 12),
+                                    ],
+                                    GrassBagSegmentedControl(
+                                      labels: [
+                                        '全部 (${state.schedules.length})',
+                                        '运行中 (${state.activeScheduleCount})',
+                                        '已暂停 ($pausedCount)',
+                                        if (endedCount > 0) '已结束 ($endedCount)',
+                                      ],
+                                      selectedIndex: safeFilterIdx,
+                                      tier: state.glassTier,
+                                      onSelected: (i) => setState(() => _filterIdx = i),
+                                    ),
+                                    if (endedCount > 0) ...[
+                                      const SizedBox(height: 10),
+                                      Align(
+                                        alignment: Alignment.centerRight,
+                                        child: GrassBagSecondaryGlassButton(
+                                          label: '清理 $endedCount 条已结束任务',
+                                          icon: CupertinoIcons.trash,
+                                          height: 32,
+                                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                                          tier: state.glassTier,
+                                          insideGlass: true,
+                                          onTap: () async {
+                                            final ok = await showGrassBagConfirmDialog(
+                                              context,
+                                              title: '清理已结束任务',
+                                              message: '确定移除全部 $endedCount 条已结束的一次性/过期定时任务吗？',
+                                              confirmLabel: '清理',
+                                              isDestructive: true,
+                                            );
+                                            if (ok) unawaited(ctrl.pruneInactiveSchedules());
+                                          },
+                                        ),
+                                      ),
+                                    ],
+                                    const SizedBox(height: 14),
+                                  ],
+                                ),
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '创建按 Cron 计划唤醒助手的自动巡检或汇报任务',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(fontSize: 12, color: t.text3),
-                              ),
-                              const SizedBox(height: 14),
-                              GrassBagSecondaryGlassButton(
-                                label: _filterIdx == 0 ? '新建定时任务' : '显示全部任务',
-                                icon: _filterIdx == 0 ? CupertinoIcons.add : CupertinoIcons.list_bullet,
-                                tier: state.glassTier,
-                                insideGlass: true,
-                                accentForeground: true,
-                                onTap: () {
-                                  if (_filterIdx != 0) {
-                                    setState(() => _filterIdx = 0);
-                                  } else {
-                                    _openCreateSheet(context);
-                                  }
-                                },
-                              ),
+                              if (items.isEmpty && _initialLoading)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(vertical: 34),
+                                    child: Center(
+                                      child: CupertinoActivityIndicator(radius: 11, color: t.primary),
+                                    ),
+                                  ),
+                                )
+                              else if (items.isEmpty)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 30),
+                                    child: Column(
+                                      children: [
+                                        Icon(CupertinoIcons.clock, size: 32, color: t.text3),
+                                        const SizedBox(height: 10),
+                                        Text(
+                                          safeFilterIdx == 0 ? '暂无定时任务' : '当前筛选下暂无定时任务',
+                                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          '创建按 Cron 计划唤醒助手的自动巡检或汇报任务',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(fontSize: 12, color: t.text3),
+                                        ),
+                                        const SizedBox(height: 14),
+                                        GrassBagSecondaryGlassButton(
+                                          label: safeFilterIdx == 0 ? '新建定时任务' : '显示全部任务',
+                                          icon: safeFilterIdx == 0 ? CupertinoIcons.add : CupertinoIcons.list_bullet,
+                                          tier: state.glassTier,
+                                          insideGlass: true,
+                                          accentForeground: true,
+                                          onTap: () {
+                                            if (safeFilterIdx != 0) {
+                                              setState(() => _filterIdx = 0);
+                                            } else {
+                                              _openCreateSheet(context);
+                                            }
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                )
+                              else
+                                SliverList.builder(
+                                  itemCount: items.length,
+                                  itemBuilder: (_, idx) {
+                                    final item = items[idx];
+                                    return Padding(
+                                      padding: const EdgeInsets.only(bottom: 12),
+                                      child: RepaintBoundary(
+                                        child: _ScheduleCard(
+                                          item: item,
+                                          tier: state.glassTier,
+                                          historyExpanded: _expandedHistory.contains(item.id),
+                                          runningNow: _runningIds.contains(item.id),
+                                          loadingHistory: _loadingHistoryIds.contains(item.id),
+                                          onToggleEnabled: () => ctrl.toggleSchedule(item.id),
+                                          onEdit: () => _openCreateSheet(context, existing: item),
+                                          onRunNow: () async {
+                                            if (_runningIds.contains(item.id)) return;
+                                            setState(() => _runningIds.add(item.id));
+                                            try {
+                                              await ctrl.runScheduleNow(item.id);
+                                            } finally {
+                                              if (mounted) setState(() => _runningIds.remove(item.id));
+                                            }
+                                          },
+                                          onToggleHistory: () async {
+                                            var expanding = false;
+                                            setState(() {
+                                              if (_expandedHistory.add(item.id)) {
+                                                expanding = true;
+                                                _loadingHistoryIds.add(item.id);
+                                              } else {
+                                                _expandedHistory.remove(item.id);
+                                                _loadingHistoryIds.remove(item.id);
+                                              }
+                                            });
+                                            if (expanding) {
+                                              try {
+                                                await ctrl.loadScheduleHistory(item.id);
+                                              } finally {
+                                                if (mounted) setState(() => _loadingHistoryIds.remove(item.id));
+                                              }
+                                            }
+                                          },
+                                          onDelete: () async {
+                                            final ok = await showGrassBagConfirmDialog(
+                                              context,
+                                              title: '删除定时任务',
+                                              message: '确定移除「${item.name}」吗？该计划将不再自动执行。',
+                                              confirmLabel: '删除',
+                                              isDestructive: true,
+                                            );
+                                            if (ok) ctrl.deleteSchedule(item.id);
+                                          },
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
                             ],
                           ),
-                        )
-                      else
-                        for (final item in items) ...[
-                          _ScheduleCard(
-                            item: item,
-                            tier: state.glassTier,
-                            historyExpanded: _expandedHistory.contains(item.id),
-                            runningNow: _runningIds.contains(item.id),
-                            loadingHistory: _loadingHistoryIds.contains(item.id),
-                            onToggleEnabled: () => ctrl.toggleSchedule(item.id),
-                            onEdit: () => _openCreateSheet(context, existing: item),
-                            onRunNow: () async {
-                              if (_runningIds.contains(item.id)) return;
-                              setState(() => _runningIds.add(item.id));
-                              try {
-                                await ctrl.runScheduleNow(item.id);
-                              } finally {
-                                if (mounted) setState(() => _runningIds.remove(item.id));
-                              }
-                            },
-                            onToggleHistory: () async {
-                              var expanding = false;
-                              setState(() {
-                                if (_expandedHistory.add(item.id)) {
-                                  expanding = true;
-                                  _loadingHistoryIds.add(item.id);
-                                } else {
-                                  _expandedHistory.remove(item.id);
-                                  _loadingHistoryIds.remove(item.id);
-                                }
-                              });
-                              if (expanding) {
-                                try {
-                                  await ctrl.loadScheduleHistory(item.id);
-                                } finally {
-                                  if (mounted) setState(() => _loadingHistoryIds.remove(item.id));
-                                }
-                              }
-                            },
-                            onDelete: () async {
-                              final ok = await showGrassBagConfirmDialog(
-                                context,
-                                title: '删除定时任务',
-                                message: '确定移除「${item.name}」吗？该计划将不再自动执行。',
-                                confirmLabel: '删除',
-                                isDestructive: true,
-                              );
-                              if (ok) ctrl.deleteSchedule(item.id);
-                            },
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                    ],
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -428,33 +593,37 @@ class _ScheduleCard extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 2),
-                    Row(
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        Flexible(
-                          child: Text(
-                            '${item.humanSchedule.trim().isNotEmpty ? item.humanSchedule : describeCronZh(item.cronExpr)} · ${item.timezone}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
-                          ),
+                        Text(
+                          '${item.humanSchedule.trim().isNotEmpty ? item.humanSchedule : describeCronZh(item.cronExpr)} · ${item.timezone}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
                         ),
-                        const SizedBox(width: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: t.fill1,
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                            item.cronExpr,
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w500,
-                              color: t.text3,
+                        if (item.cronExpr.trim().isNotEmpty)
+                          Container(
+                            constraints: const BoxConstraints(maxWidth: 132),
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: t.fill1,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Text(
+                              item.cronExpr,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontFamily: 'monospace',
+                                fontWeight: FontWeight.w500,
+                                color: t.text3,
+                              ),
                             ),
                           ),
-                        ),
                       ],
                     ),
                   ],
@@ -495,12 +664,14 @@ class _ScheduleCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            alignment: WrapAlignment.spaceBetween,
-            children: [
+          SizedBox(
+            width: double.infinity,
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              alignment: WrapAlignment.spaceBetween,
+              children: [
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -571,27 +742,27 @@ class _ScheduleCard extends StatelessWidget {
                     child: GrassBagSpringTap(
                       onTap: onEdit,
                       child: SizedBox(
-                        width: 34,
-                        height: 34,
-                        child: Center(child: Icon(CupertinoIcons.pencil, size: 15, color: t.text2)),
+                        width: 40,
+                        height: 40,
+                        child: Center(child: Icon(CupertinoIcons.pencil, size: 15.5, color: t.text2)),
                       ),
                     ),
                   ),
-                  const SizedBox(width: 2),
                   Tooltip(
                     message: '删除定时任务',
                     child: GrassBagSpringTap(
                       onTap: onDelete,
                       child: SizedBox(
-                        width: 34,
-                        height: 34,
-                        child: Center(child: Icon(CupertinoIcons.trash, size: 15, color: t.text3)),
+                        width: 40,
+                        height: 40,
+                        child: Center(child: Icon(CupertinoIcons.trash, size: 15.5, color: t.text3)),
                       ),
                     ),
                   ),
                 ],
               ),
             ],
+          ),
           ),
           AnimatedSize(
             duration: const Duration(milliseconds: 180),
@@ -642,7 +813,7 @@ class _ScheduleCard extends StatelessWidget {
                                                 const SizedBox(width: 6),
                                                 Expanded(
                                                   child: Text(
-                                                    h,
+                                                    _localizeHistoryLine(h),
                                                     style: TextStyle(fontSize: 12, color: t.text2),
                                                   ),
                                                 ),
@@ -838,7 +1009,9 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
           controller: _nameCtrl,
           insideGlass: true,
           textInputAction: TextInputAction.next,
-          onSubmitted: (_) => _cronFocus.requestFocus(),
+          onSubmitted: (_) => _keepExistingNonCronTiming
+              ? _promptFocus.requestFocus()
+              : _cronFocus.requestFocus(),
           onChanged: (_) {
             if (_err != null) setState(() => _err = null);
           },
@@ -854,7 +1027,8 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
             tone: GrassBagBannerTone.info,
             borderRadius: 14,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            message: '当前保留原计划：${widget.existing!.humanSchedule} (${widget.existing!.kind})',
+            message:
+                '当前保留原计划：${widget.existing!.humanSchedule}（${_localizeScheduleKind(widget.existing!.kind)}）',
             trailing: GrassBagSecondaryGlassButton(
               label: '改为 Cron',
               height: 28,

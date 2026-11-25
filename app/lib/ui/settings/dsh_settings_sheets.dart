@@ -241,8 +241,11 @@ class _SearchableProviderCredentialsBodyState
                         ? piAiNs.value['providers'] as Map
                         : const {};
                     final piCfg = providersMap[p.id] is Map ? providersMap[p.id] as Map : null;
-                    final proto = piCfg?['api']?.toString() ??
-                        (p.description.contains('-') ? p.description : null);
+                    final proto = resolveProviderApiProtocol(
+                      explicit: piCfg?['api']?.toString() ?? p.description,
+                      providerId: p.id,
+                      baseUrl: p.baseUrl,
+                    );
                     Navigator.of(context).pop();
                     Future<void>.delayed(const Duration(milliseconds: 180), () {
                       if (!navCtx.mounted) return;

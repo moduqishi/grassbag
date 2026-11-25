@@ -32,6 +32,13 @@ class VanillaDshAdapter {
   static const Duration _microCacheTtl = Duration(milliseconds: 2500);
   final Map<String, ({DateTime expiresAt, dynamic value})> _readCache = {};
   final Map<String, Future<dynamic>> _inFlightReads = {};
+  final Map<String, int> _cacheGen = {};
+
+  void _invalidateCacheKey(String key) {
+    _cacheGen[key] = (_cacheGen[key] ?? 0) + 1;
+    _readCache.remove(key);
+    _inFlightReads.remove(key);
+  }
 
   Future<T> _cachedRead<T>(String key, Future<T> Function() loader) {
     final now = DateTime.now();
@@ -43,8 +50,11 @@ class VanillaDshAdapter {
     if (existing != null) {
       return existing.then((v) => v as T);
     }
+    final gen = _cacheGen[key] ?? 0;
     final future = loader().then<dynamic>((val) {
-      _readCache[key] = (expiresAt: DateTime.now().add(_microCacheTtl), value: val);
+      if ((_cacheGen[key] ?? 0) == gen) {
+        _readCache[key] = (expiresAt: DateTime.now().add(_microCacheTtl), value: val);
+      }
       return val;
     });
     _inFlightReads[key] = future;
@@ -61,12 +71,15 @@ class VanillaDshAdapter {
         method == 'session/create' ||
         method == 'session/rename' ||
         method == 'session/delete') {
-      _readCache.remove('workspace/follow');
+      _invalidateCacheKey('workspace/follow');
     }
     if (method.startsWith('settings/') && method != 'settings/describe') {
-      _readCache.remove('settings/describe');
-      _readCache.remove('llm/listProviders');
-      _readCache.remove('llm/listConfigurableProviders');
+      _invalidateCacheKey('settings/describe');
+      _invalidateCacheKey('llm/listProviders');
+      _invalidateCacheKey('llm/listConfigurableProviders');
+    }
+    if (method == 'session/selectModel' || method == 'session/create') {
+      _invalidateCacheKey('settings/describe');
     }
     if ((method.startsWith('llm/') &&
             method != 'llm/listProviders' &&
@@ -75,11 +88,11 @@ class VanillaDshAdapter {
         method.startsWith('deepseek') ||
         method.startsWith('plugin') ||
         method == 'agentPresets/select') {
-      _readCache.remove('settings/describe');
-      _readCache.remove('llm/listProviders');
-      _readCache.remove('llm/listConfigurableProviders');
-      _readCache.remove('agentPresets/list');
-      _readCache.remove('permissionPresets/catalog');
+      _invalidateCacheKey('settings/describe');
+      _invalidateCacheKey('llm/listProviders');
+      _invalidateCacheKey('llm/listConfigurableProviders');
+      _invalidateCacheKey('agentPresets/list');
+      _invalidateCacheKey('permissionPresets/catalog');
     }
   }
 
@@ -200,12 +213,16 @@ class VanillaDshAdapter {
   Future<WebTicket> createWebTicket({String? sessionId}) async {
     final base = transport.endpoint.baseUri;
     final token = transport.endpoint.token;
+    final sid = sessionId?.trim();
     final url = base == null
         ? '/'
         : base
             .replace(
               queryParameters: (token != null && token.isNotEmpty)
                   ? {'token': token}
+                  : null,
+              fragment: (sid != null && sid.isNotEmpty)
+                  ? '/sessions/${Uri.encodeComponent(sid)}'
                   : null,
             )
             .toString();
@@ -289,22 +306,32 @@ class VanillaDshAdapter {
     final m = _asMap(raw);
     final sid = (m['sessionId'] ?? m['id'] ?? '').toString();
     if (sid.isNotEmpty) {
+      final setupFutures = <Future<Object?>>[];
       if (title != null && title.trim().isNotEmpty) {
-        await rpc('session/rename', {
-          'request': {'sessionId': sid, 'title': title.trim()},
-        }).catchError((_) => null);
+        setupFutures.add(
+          rpc('session/rename', {
+            'request': {'sessionId': sid, 'title': title.trim()},
+          }).catchError((_) => null),
+        );
       }
       if (permission != null && permission.trim().isNotEmpty) {
-        await executeSlashCommand(sid, command: '/permission ${permission.trim()}')
-            .catchError((_) => const <String, dynamic>{});
+        setupFutures.add(
+          executeSlashCommand(sid, command: '/permission ${permission.trim()}')
+              .catchError((_) => const <String, dynamic>{}),
+        );
       }
       if (provider != null && provider.isNotEmpty && model != null && model.isNotEmpty) {
-        await selectModel(sid, {
-          'provider': provider,
-          'model': model,
-          if (reasoningEffort != null && reasoningEffort.isNotEmpty)
-            'reasoningEffort': reasoningEffort,
-        }).catchError((_) => const <String, dynamic>{});
+        setupFutures.add(
+          selectModel(sid, {
+            'provider': provider,
+            'model': model,
+            if (reasoningEffort != null && reasoningEffort.isNotEmpty)
+              'reasoningEffort': reasoningEffort,
+          }).catchError((_) => const <String, dynamic>{}),
+        );
+      }
+      if (setupFutures.isNotEmpty) {
+        await Future.wait<Object?>(setupFutures);
       }
     }
     return SessionSummary.fromJson({
@@ -356,10 +383,10 @@ class VanillaDshAdapter {
   }
 
   Future<Map<String, dynamic>> deleteSession(String sessionId) async {
-    // Stock DSH uses archive for session removal in workspace controller.
+    // Stock DSH uses archive for session removal in workspace controller; never swallow errors!
     final res = await rpc('workspace/archiveSession', {
       'request': {'sessionId': sessionId},
-    }).catchError((_) => null);
+    });
     return {'v': 1, 'ok': true, 'archived': true, if (res != null) 'result': res};
   }
 
@@ -433,9 +460,33 @@ class VanillaDshAdapter {
   }
 
   Future<Map<String, dynamic>> getToolOutput(String sessionId, String callId) async {
-    final cached = normalizer.getToolOutput(sessionId, callId);
+    var cached = normalizer.getToolOutput(sessionId, callId);
+    if (cached == null) {
+      try {
+        await getSessionTurns(sessionId, limit: 80, withProjections: false);
+        cached = normalizer.getToolOutput(sessionId, callId);
+      } catch (_) {}
+    }
     if (cached != null) return {'v': 1, 'tool': cached, ...cached};
     return {'v': 1, 'callId': callId, 'output': null};
+  }
+
+  static Map<String, dynamic> _cleanAttachmentForWire(Map<String, dynamic> att) {
+    final cleaned = <String, dynamic>{};
+    for (final entry in att.entries) {
+      if (entry.key == 'localBytes' ||
+          entry.key == 'localPath' ||
+          entry.key == 'preview' ||
+          entry.key == 'bytes') {
+        continue;
+      }
+      if (entry.value is Map) {
+        cleaned[entry.key] = _cleanAttachmentForWire(Map<String, dynamic>.from(entry.value as Map));
+      } else {
+        cleaned[entry.key] = entry.value;
+      }
+    }
+    return cleaned;
   }
 
   Future<Map<String, dynamic>> sendMessage(
@@ -447,20 +498,64 @@ class VanillaDshAdapter {
     String? clientRequestId,
   }) async {
     final content = <Map<String, dynamic>>[];
+    const allowedImageMimes = {'image/png', 'image/jpeg', 'image/webp', 'image/gif'};
+    final attachmentNotes = <String>[];
     if (attachments != null) {
-      for (final att in attachments) {
-        final type = att['type']?.toString() ?? '';
-        if (type == 'image' || type == 'file') {
-          content.add(att);
-        } else if (att['receiptId'] != null) {
-          content.add({'type': 'file', 'receiptId': att['receiptId'], if (att['name'] != null) 'name': att['name']});
-        } else if (att['attachmentId'] != null) {
-          content.add({'type': 'image', 'attachment': att});
+      for (final rawAtt in attachments) {
+        final att = _cleanAttachmentForWire(rawAtt);
+        var mime = (att['mediaType'] ?? att['mimeType'] ?? '').toString().toLowerCase();
+        if (mime == 'image/jpg') mime = 'image/jpeg';
+        final name = (att['name'] ?? att['filename'] ?? 'attachment').toString();
+        final inlineData = att['data'] is String && (att['data'] as String).isNotEmpty
+            ? att['data'] as String
+            : null;
+        final rawReceipt = att['receiptId']?.toString();
+        final rawAttId = att['attachmentId']?.toString();
+        final receiptId = (rawReceipt != null && rawReceipt.isNotEmpty)
+            ? rawReceipt
+            : (rawAttId != null && rawAttId.isNotEmpty && !rawAttId.startsWith('att-')
+                ? rawAttId
+                : null);
+        if (inlineData != null && allowedImageMimes.contains(mime)) {
+          content.add({
+            'type': 'image',
+            'mediaType': mime,
+            'data': inlineData,
+            'name': name,
+          });
+        } else if (receiptId != null) {
+          content.add({
+            'type': 'file',
+            'receiptId': receiptId,
+          });
+        } else if (rawAttId != null && rawAttId.isNotEmpty) {
+          content.add({'type': 'image', 'attachment': {'attachmentId': rawAttId, 'name': name}});
+        } else if (name.isNotEmpty) {
+          attachmentNotes.add('[附件: $name${mime.isNotEmpty ? ' ($mime)' : ''}]');
         }
       }
     }
-    if (text.isNotEmpty) {
-      content.add({'type': 'text', 'text': text});
+    final refLines = <String>[];
+    if (references != null && references.isNotEmpty) {
+      for (final ref in references) {
+        final kind = (ref['kind'] ?? ref['type'] ?? 'file').toString();
+        final rawPath = (ref['path'] ?? ref['relativePath'] ?? ref['sessionId'] ?? ref['id'] ?? '').toString().trim();
+        if (rawPath.isEmpty) continue;
+        final cleanRef = kind == 'session' ? rawPath.replaceFirst(RegExp(r'^session:'), '') : rawPath;
+        final token = kind == 'session' ? '@session:$cleanRef' : '@$cleanRef';
+        if (!text.contains(token) && !text.contains('@file:$cleanRef')) {
+          refLines.add(kind == 'session' ? '@session:$cleanRef' : '@file:$cleanRef');
+        }
+      }
+    }
+    final parts = <String>[
+      if (refLines.isNotEmpty) refLines.join('\n'),
+      if (text.isNotEmpty) text,
+      if (attachmentNotes.isNotEmpty) attachmentNotes.join('\n'),
+    ];
+    final combinedText = parts.join('\n\n');
+    if (combinedText.isNotEmpty) {
+      content.add({'type': 'text', 'text': combinedText});
     }
     if (mode == 'interrupt') {
       await cancelSession(sessionId).catchError((_) => const <String, dynamic>{});
@@ -493,7 +588,16 @@ class VanillaDshAdapter {
         'delete' => 'remove',
         _ => rawAction,
       };
-      normalized['action'] = {'kind': kind};
+      if (kind == 'edit') {
+        final rawText = (normalized.remove('text') ?? normalized['content'])?.toString();
+        final rawContent = normalized.remove('content');
+        final contentList = rawContent is List
+            ? rawContent
+            : (rawText != null ? <Map<String, dynamic>>[{'type': 'text', 'text': rawText}] : const <dynamic>[]);
+        normalized['action'] = {'kind': 'edit', 'content': contentList};
+      } else {
+        normalized['action'] = {'kind': kind};
+      }
     }
     final res = await rpc('session/updateQueue', {
       'request': {'sessionId': sessionId, ...normalized},
@@ -662,13 +766,24 @@ class VanillaDshAdapter {
     String? comment,
     String? ifVersion,
   }) async {
+    String? resolvedVersion = ifVersion;
+    if (resolvedVersion == null) {
+      final list = await listMessageFeedback(sessionId);
+      final items = _asList(list['items'] ?? list['records']);
+      for (final it in items.whereType<Map>()) {
+        if (it['messageId']?.toString() == messageId && it['version'] != null) {
+          resolvedVersion = it['version'].toString();
+          break;
+        }
+      }
+    }
     final res = await rpc('messageFeedback/put', {
       'request': {
         'sessionId': sessionId,
         'messageId': messageId,
         'rating': rating == 'up' ? 'positive' : (rating == 'down' ? 'negative' : rating),
         if (comment != null) 'note': comment,
-        if (ifVersion != null) 'ifVersion': ifVersion,
+        'ifVersion': resolvedVersion,
       },
     });
     return {'v': 1, 'result': res};
@@ -679,11 +794,25 @@ class VanillaDshAdapter {
     required String messageId,
     String? ifVersion,
   }) async {
+    String? resolvedVersion = ifVersion;
+    if (resolvedVersion == null) {
+      final list = await listMessageFeedback(sessionId);
+      final items = _asList(list['items'] ?? list['records']);
+      for (final it in items.whereType<Map>()) {
+        if (it['messageId']?.toString() == messageId && it['version'] != null) {
+          resolvedVersion = it['version'].toString();
+          break;
+        }
+      }
+      if (resolvedVersion == null) {
+        return const {'v': 1, 'absent': true};
+      }
+    }
     final res = await rpc('messageFeedback/delete', {
       'request': {
         'sessionId': sessionId,
         'messageId': messageId,
-        if (ifVersion != null) 'ifVersion': ifVersion,
+        'ifVersion': resolvedVersion,
       },
     });
     return {'v': 1, 'result': res};
@@ -748,22 +877,49 @@ class VanillaDshAdapter {
     if (outcome != null) {
       effectiveOutcome = outcome;
     } else if (pending.kind == 'user_questions') {
-      final rawVal = answers ?? decision;
-      Object? formattedVal = rawVal;
-      if (rawVal is List) {
-        formattedVal = {'answers': rawVal};
-      } else if (rawVal is Map && !rawVal.containsKey('answers')) {
-        formattedVal = {
-          'answers': [
-            for (final entry in rawVal.entries)
-              {
-                'id': entry.key.toString(),
-                'selected': entry.value is List ? entry.value : [entry.value.toString()],
-              },
-          ],
-        };
+      final dLow = decision?.toString().trim().toLowerCase() ?? '';
+      if (answers == null &&
+          (dLow == 'cancel' || dLow == 'cancelled' || dLow == 'dismiss' || dLow == 'skip')) {
+        effectiveOutcome = const {'kind': 'next'};
+      } else {
+        final rawVal = answers ?? decision;
+        final qs = pending.payload['questions'] is List
+            ? pending.payload['questions'] as List
+            : const <dynamic>[];
+        final firstQId = qs.isNotEmpty && qs.first is Map && (qs.first as Map)['id'] != null
+            ? (qs.first as Map)['id'].toString()
+            : 'q-0';
+        Object? formattedVal = rawVal;
+        if (rawVal is List) {
+          final structured = rawVal.every((a) => a is Map && a['id'] is String);
+          formattedVal = {
+            'answers': structured
+                ? rawVal
+                : [
+                    {'id': firstQId, 'selected': rawVal.map((e) => e.toString()).toList()},
+                  ],
+          };
+        } else if (rawVal is String) {
+          formattedVal = {
+            'answers': [
+              {'id': firstQId, 'selected': [rawVal], 'custom': rawVal},
+            ],
+          };
+        } else if (rawVal is Map && !rawVal.containsKey('answers')) {
+          formattedVal = {
+            'answers': [
+              for (final entry in rawVal.entries)
+                {
+                  'id': entry.key.toString(),
+                  'selected': entry.value is List
+                      ? (entry.value as List).map((e) => e.toString()).toList()
+                      : [entry.value.toString()],
+                },
+            ],
+          };
+        }
+        effectiveOutcome = {'kind': 'result', 'value': formattedVal};
       }
-      effectiveOutcome = {'kind': 'result', 'value': formattedVal};
     } else if (pending.kind == 'approval') {
       final d = decision?.toString().toLowerCase() ?? 'deny';
       final mapped = (d == 'allow' || d == 'approve' || d == 'allowed-once' || d == 'always')
@@ -771,6 +927,9 @@ class VanillaDshAdapter {
           : (d == 'cancel' || d == 'cancelled')
               ? 'cancelled'
               : 'rejected';
+      if (d == 'always') {
+        mux.rememberSessionAlwaysAllowed(pending.sessionId, pending.payload);
+      }
       effectiveOutcome = {'kind': 'result', 'value': mapped};
     } else {
       effectiveOutcome = {'kind': 'result', 'value': decision ?? answers};
@@ -904,11 +1063,18 @@ class VanillaDshAdapter {
     return {'v': 1, 'path': res?.toString() ?? path};
   }
 
-  Future<Map<String, dynamic>> getWorkspaceFileTree(String workspaceId, {String? path}) async {
+  Future<Map<String, dynamic>> getWorkspaceFileTree(
+    String workspaceId, {
+    String? path,
+    String? sessionId,
+  }) async {
     final res = await rpc('workspaceFiles/list', {
-      'workspaceFileScopeId': workspaceId,
+      'workspaceFileScopeId': (sessionId != null && sessionId.isNotEmpty) ? sessionId : workspaceId,
       'path': path ?? '',
     });
+    if (res is List) {
+      return {'v': 1, 'entries': res, 'files': res};
+    }
     return {'v': 1, ..._asMap(res)};
   }
 
@@ -936,7 +1102,33 @@ class VanillaDshAdapter {
     String path, {
     String? sessionId,
   }) async {
-    return transport.requestBytes('GET', '/api/file', query: {'path': path});
+    final scopeId = (sessionId != null && sessionId.isNotEmpty)
+        ? sessionId
+        : (workspaceId.isNotEmpty && !workspaceId.startsWith('/') ? workspaceId : null);
+    if (scopeId != null) {
+      try {
+        final raw = await rpc('workspaceFiles/readBytes', {
+          'workspaceFileScopeId': scopeId,
+          'path': path,
+          'options': const <String, dynamic>{},
+        });
+        if (raw is Uint8List) return raw;
+        if (raw is List) return Uint8List.fromList(raw.whereType<int>().toList(growable: false));
+        final m = _asMap(raw);
+        final data = m['data'] ?? m['bytes'] ?? m['base64'];
+        if (data is Uint8List) return data;
+        if (data is List) return Uint8List.fromList(data.whereType<int>().toList(growable: false));
+        if (data is String && data.isNotEmpty) {
+          return base64Decode(data);
+        }
+      } catch (_) {}
+    }
+    var resolvedPath = path;
+    if (!path.startsWith('/') && workspaceId.startsWith('/')) {
+      final base = workspaceId.endsWith('/') ? workspaceId.substring(0, workspaceId.length - 1) : workspaceId;
+      resolvedPath = '$base/$path';
+    }
+    return transport.requestBytes('GET', '/api/file', query: {'path': resolvedPath});
   }
 
   Future<Map<String, dynamic>> getWorkspaceFileChanges(
@@ -968,15 +1160,17 @@ class VanillaDshAdapter {
     String? sessionId,
     String contentType = 'application/octet-stream',
   }) async {
-    final isImage = contentType.toLowerCase().startsWith('image/');
+    const inlineImageMimes = {'image/png', 'image/jpeg', 'image/webp', 'image/gif'};
+    final normMime = contentType.toLowerCase() == 'image/jpg' ? 'image/jpeg' : contentType.toLowerCase();
+    final isUploadableImage = inlineImageMimes.contains(normMime);
     return transport.requestBytes(
       'POST',
       '/api/session/uploadFileBinary',
       query: {
         if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
         'name': filename,
-        // Stock DSH routes requests WITH `mediaType` exclusively to `uploadImageStream()`.
-        if (isImage) 'mediaType': contentType,
+        // Stock DSH routes requests WITH `mediaType` exclusively to `uploadImageStream()` (which expects PNG/JPEG/WebP/GIF).
+        if (isUploadableImage) 'mediaType': normMime,
       },
       bodyBytes: bytes,
       contentType: 'application/octet-stream',
@@ -999,7 +1193,18 @@ class VanillaDshAdapter {
     int? cols,
     int? rows,
   }) async {
-    final agentId = sessionId ?? 'default';
+    String? agentId = (sessionId != null && sessionId.isNotEmpty) ? sessionId : null;
+    if (agentId == null) {
+      final sessions = await listSessions().catchError((_) => const <SessionSummary>[]);
+      if (sessions.isNotEmpty) agentId = sessions.first.id;
+    }
+    if (agentId == null || agentId.isEmpty) {
+      throw const GbridgeException(
+        status: 400,
+        code: 'gbridge/validation_error',
+        message: 'sessionId is required to create a terminal when no session exists',
+      );
+    }
     final id = 'term-${DateTime.now().millisecondsSinceEpoch}';
     final res = await rpc('terminal/create', {
       'agentId': agentId,
@@ -1025,7 +1230,7 @@ class VanillaDshAdapter {
 
   Future<Map<String, dynamic>> closeTerminal(String terminalId, {String? sessionId}) async {
     await rpc('terminal/close', {
-      'agentId': sessionId ?? 'default',
+      if (sessionId != null && sessionId.isNotEmpty) 'agentId': sessionId,
       'id': terminalId,
     });
     return const {'v': 1, 'ok': true};
@@ -1039,11 +1244,21 @@ class VanillaDshAdapter {
     int? rows,
     bool? retain,
   }) async {
+    final hasSid = sessionId != null && sessionId.isNotEmpty;
     if (title != null && title.isNotEmpty) {
       await rpc('terminal/rename', {
-        'agentId': (sessionId != null && sessionId.isNotEmpty) ? sessionId : 'default',
+        if (hasSid) 'agentId': sessionId,
         'id': terminalId,
         'title': title,
+      }).catchError((_) => null);
+    }
+    if (cols != null && rows != null && cols > 0 && rows > 0) {
+      await rpc('terminal/resize', {
+        if (hasSid) 'agentId': sessionId,
+        'id': terminalId,
+        'terminalId': terminalId,
+        'cols': cols,
+        'rows': rows,
       }).catchError((_) => null);
     }
     return const {'v': 1, 'ok': true};
@@ -1123,14 +1338,46 @@ class VanillaDshAdapter {
   }
 
   Future<Map<String, dynamic>> selectPreset(Map<String, dynamic> body) async {
-    final res = await rpc('agentPresets/select', {
-      'agentId': (body['agentId'] ?? body['sessionId'] ?? '').toString(),
-      'agentPreset': (body['agentPreset'] ?? body['presetId'] ?? body['id'] ?? '').toString(),
-    });
-    return {'v': 1, 'result': res};
+    final presetId = (body['agentPreset'] ?? body['presetId'] ?? body['id'] ?? '').toString().trim();
+    final sid = (body['agentId'] ?? body['sessionId'] ?? '').toString().trim();
+    if (sid.isEmpty) {
+      final res = await patchSettings({
+        'ns': 'agent-preset-registry',
+        'patch': {'selectedDefault': presetId},
+      });
+      return {'v': 1, 'scope': 'global', 'result': res};
+    }
+    try {
+      final res = await rpc('agentPresets/select', {
+        'agentId': sid,
+        'agentPreset': presetId,
+      });
+      return {'v': 1, 'scope': 'session', 'result': res};
+    } on GbridgeException catch (e) {
+      if (e.code.contains('locked') || e.message.toLowerCase().contains('locked')) {
+        final res = await patchSettings({
+          'ns': 'agent-preset-registry',
+          'patch': {'selectedDefault': presetId},
+        });
+        return {'v': 1, 'scope': 'global', 'lockedSession': true, 'result': res};
+      }
+      rethrow;
+    }
   }
 
-  Future<Map<String, dynamic>> getSettingsSchema() async {
+  Future<Map<String, dynamic>> getSettingsSchema({bool forceFresh = false}) async {
+    if (forceFresh) {
+      _invalidateCacheKey('settings/describe');
+      final gen = _cacheGen['settings/describe'] ?? 0;
+      final desc = await rpc('settings/describe', const {});
+      if ((_cacheGen['settings/describe'] ?? 0) == gen) {
+        _readCache['settings/describe'] = (
+          expiresAt: DateTime.now().add(_microCacheTtl),
+          value: desc,
+        );
+      }
+      return {'v': 1, 'description': desc};
+    }
     final desc = await _cachedRead<dynamic>(
       'settings/describe',
       () => rpc('settings/describe', const {}),
@@ -1305,28 +1552,53 @@ class VanillaDshAdapter {
   Future<Map<String, dynamic>> patchSettings(Map<String, dynamic> patch) async {
     final ns = patch['ns']?.toString();
     if (ns != null && ns.isNotEmpty) {
-      if (patch['section'] is Map) {
-        final res = await rpc('settings/replace', {
+      Future<Map<String, dynamic>> runOnce(Object? expectedRev) async {
+        if (patch['section'] is Map) {
+          final res = await rpc('settings/replace', {
+            'ns': ns,
+            'section': _asMap(patch['section']),
+            if (expectedRev != null) 'expectedRevision': expectedRev,
+          });
+          return {'v': 1, 'result': res};
+        }
+        if (patch['ops'] is List) {
+          final res = await rpc('settings/mutate', {
+            'ns': ns,
+            'ops': patch['ops'],
+            if (expectedRev != null) 'expectedRevision': expectedRev,
+          });
+          return {'v': 1, 'result': res};
+        }
+        final res = await rpc('settings/update', {
           'ns': ns,
-          'section': _asMap(patch['section']),
-          if (patch['expectedRevision'] != null) 'expectedRevision': patch['expectedRevision'],
+          'patch': _asMap(patch['patch'] ?? patch['value']),
+          if (expectedRev != null) 'expectedRevision': expectedRev,
         });
         return {'v': 1, 'result': res};
       }
-      if (patch['ops'] is List) {
-        final res = await rpc('settings/mutate', {
-          'ns': ns,
-          'ops': patch['ops'],
-          if (patch['expectedRevision'] != null) 'expectedRevision': patch['expectedRevision'],
-        });
-        return {'v': 1, 'result': res};
+
+      try {
+        return await runOnce(patch['expectedRevision']);
+      } on GbridgeException catch (e) {
+        final isConflict = e.status == 409 ||
+            e.code.contains('conflict') ||
+            e.message.toLowerCase().contains('changed since it was read');
+        // Never silently clobber full-section `settings/replace` 409 conflicts with a stale payload;
+        // only auto-retry partial `settings/mutate` and `settings/update` operations.
+        if (!isConflict || patch['expectedRevision'] == null || patch['section'] is Map) rethrow;
+        _invalidateCacheKey('settings/describe');
+        int? latestRev;
+        try {
+          final desc = _asMap(await rpc('settings/describe', const {}));
+          for (final item in _asList(desc['namespaces'])) {
+            if (item is Map && item['ns']?.toString() == ns && item['revision'] is num) {
+              latestRev = (item['revision'] as num).toInt();
+              break;
+            }
+          }
+        } catch (_) {}
+        return await runOnce(latestRev);
       }
-      final res = await rpc('settings/update', {
-        'ns': ns,
-        'patch': _asMap(patch['patch'] ?? patch['value']),
-        if (patch['expectedRevision'] != null) 'expectedRevision': patch['expectedRevision'],
-      });
-      return {'v': 1, 'result': res};
     }
     // Flat `{ namespace: patchMap }` map.
     final results = <String, dynamic>{};
@@ -1448,16 +1720,47 @@ class VanillaDshAdapter {
     if (action == 'cancelSignIn') {
       payload = {'attemptId': body['attemptId']};
     } else if (action == 'startSignIn') {
-      final port = transport.endpoint.baseUri?.port ?? 3080;
+      final base = transport.endpoint.baseUri;
+      final isLoopback = base != null &&
+          (base.host == '127.0.0.1' || base.host == 'localhost' || base.host == '::1');
+      final port = base != null && base.hasPort ? base.port : 3080;
+      // DSH's dsh-deepseek-account strictly requires an HTTP loopback callbackOrigin.
+      final defaultOrigin = isLoopback
+          ? 'http://${base.host == '::1' ? '[::1]' : base.host}:$port'
+          : 'http://127.0.0.1:$port';
       payload = {
         'client': meta,
-        'callbackOrigin': body['callbackOrigin']?.toString() ?? 'http://127.0.0.1:$port',
+        'callbackOrigin': body['callbackOrigin']?.toString() ?? defaultOrigin,
         'loginSource': body['loginSource'] == 'desktop' ? 'desktop' : 'web',
       };
     } else {
       payload = {'client': meta};
     }
     final res = await rpc('account/$action', payload);
+    if (action == 'startSignIn') {
+      var resMap = _asMap(res);
+      var authorizeUrl = resMap['authorizeUrl']?.toString();
+      if (authorizeUrl == null || authorizeUrl.isEmpty) {
+        // Poll account/getState briefly until authorizeUrl is ready (mirrors dsh-gbridge system.js).
+        for (var i = 0; i < 8; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 220));
+          final st = _asMap(await rpc('account/getState', const {}).catchError((_) => null));
+          final pending = _asMap(st['attempt'] ?? st['pendingSignIn'] ?? st['signIn'] ?? st);
+          final phase = pending['phase']?.toString().toLowerCase() ?? '';
+          final url = pending['authorizeUrl']?.toString();
+          if (url != null && url.isNotEmpty) {
+            authorizeUrl = url;
+            resMap = {...resMap, ...pending, 'authorizeUrl': url};
+            break;
+          }
+          if (phase == 'failed' || phase == 'error' || phase == 'cancelled' || phase == 'expired') {
+            resMap = {...resMap, ...pending};
+            break;
+          }
+        }
+      }
+      return {'v': 1, 'result': resMap.isEmpty ? res : resMap};
+    }
     return {'v': 1, 'result': res};
   }
 
@@ -1515,7 +1818,20 @@ class VanillaDshAdapter {
   }
 
   Future<Map<String, dynamic>> updatePluginBundle(String name, {String version = 'latest'}) async {
-    final res = await rpc('pluginManager/updateBundle', {'name': name, 'version': version});
+    var targetVersion = version;
+    if (targetVersion == 'latest' || targetVersion.isEmpty) {
+      try {
+        final versions = _asList(await rpc('pluginManager/listVersions', {'name': name}));
+        for (final v in versions) {
+          final vs = v is String ? v : (v is Map ? v['version']?.toString() : null);
+          if (vs != null && vs.isNotEmpty) {
+            targetVersion = vs;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+    final res = await rpc('pluginManager/updateBundle', {'name': name, 'version': targetVersion});
     return {'v': 1, 'result': res};
   }
 
@@ -1574,21 +1890,29 @@ class VanillaDshAdapter {
     }
     final tz = (body['timeZone'] ?? body['timezone'] ?? 'Asia/Shanghai').toString().trim();
     final effectiveTz = tz.isEmpty ? 'Asia/Shanghai' : tz;
-    final cron = (body['cronExpr'] ?? body['cron'])?.toString().trim();
-    if (cron != null && cron.isNotEmpty) {
-      return {
-        'kind': 'cron',
-        'cron': cron,
-        'timeZone': effectiveTz,
-      };
-    }
     final everySec = body['everySeconds'] ?? body['every_seconds'];
     if (everySec is num && everySec > 0) {
-      return {'kind': 'every', 'everySeconds': everySec.toInt()};
+      final clamped = everySec.toInt() < 60 ? 60 : everySec.toInt();
+      return {'kind': 'every', 'every_seconds': clamped};
+    }
+    final afterSec = body['afterSeconds'] ?? body['after_seconds'];
+    if (afterSec is num && afterSec > 0) {
+      final clamped = afterSec.toInt() < 10 ? 10 : afterSec.toInt();
+      return {'kind': 'after', 'after_seconds': clamped};
     }
     final dailyTime = body['dailyTime']?.toString().trim();
     if (dailyTime != null && dailyTime.isNotEmpty) {
-      return {'kind': 'daily', 'time': dailyTime, 'timeZone': effectiveTz};
+      return {
+        'kind': 'daily',
+        'daily': {'time': dailyTime, 'time_zone': effectiveTz},
+      };
+    }
+    final cron = (body['cronExpr'] ?? body['cron'] ?? body['expression'])?.toString().trim();
+    if (cron != null && cron.isNotEmpty) {
+      return {
+        'kind': 'cron',
+        'cron': {'expression': cron, 'time_zone': effectiveTz},
+      };
     }
     return null;
   }
@@ -1716,8 +2040,11 @@ class VanillaDshAdapter {
     return {'v': 1, 'result': res};
   }
 
-  Future<Map<String, dynamic>> interruptSubagent(String subagentId) async {
-    final res = await rpc('subagents/interruptByUser', {'childSessionId': subagentId});
+  Future<Map<String, dynamic>> interruptSubagent(String subagentId, {String? parentSessionId}) async {
+    final res = await rpc('subagents/interruptByUser', {
+      'childSessionId': subagentId,
+      if (parentSessionId != null && parentSessionId.isNotEmpty) 'parentSessionId': parentSessionId,
+    });
     return {'v': 1, 'result': res};
   }
 
@@ -1758,8 +2085,10 @@ class VanillaDshAdapter {
     if (sessionId != null && sessionId.isNotEmpty) {
       try {
         final page = await rpc('session/page', {
-          'address': {'kind': 'session', 'sessionId': sessionId},
-          'maxMessages': 120,
+          'request': {
+            'address': {'kind': 'session', 'sessionId': sessionId},
+            'maxMessages': 120,
+          },
         });
         final records = page is List ? page : _asList(_asMap(page)['records'] ?? _asMap(page)['events']);
         for (final raw in records) {

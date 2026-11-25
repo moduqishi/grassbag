@@ -121,6 +121,46 @@ class NativeRuntimeStatus {
   final String deviceAbi;
   final int sdkInt;
 
+  NativeRuntimeStatus copyWith({
+    String? configuredExecutorMode,
+  }) {
+    return NativeRuntimeStatus(
+      initialized: initialized,
+      containerExtracted: containerExtracted,
+      slotExtracted: slotExtracted,
+      engineState: engineState,
+      engineRunning: engineRunning,
+      engineError: engineError,
+      activeSlot: activeSlot,
+      lkgSlot: lkgSlot,
+      canRollback: canRollback,
+      dshVersion: dshVersion,
+      dshPrevVersion: dshPrevVersion,
+      bridgeVersion: bridgeVersion,
+      containerVersion: containerVersion,
+      executorMode: executorMode,
+      configuredExecutorMode: configuredExecutorMode ?? this.configuredExecutorMode,
+      hasTawcroot: hasTawcroot,
+      hasProot: hasProot,
+      hasBundledAssets: hasBundledAssets,
+      homePath: homePath,
+      homeSizeKb: homeSizeKb,
+      bridgeSocketPath: bridgeSocketPath,
+      bridgeHttpUrl: bridgeHttpUrl,
+      dshWebUrl: dshWebUrl,
+      bridgeToken: bridgeToken,
+      phoneSocketPath: phoneSocketPath,
+      droidSocketPath: droidSocketPath,
+      udsReady: udsReady,
+      bridgeReady: bridgeReady,
+      sdcardMounted: sdcardMounted,
+      useSystemProxy: useSystemProxy,
+      installedToolkits: installedToolkits,
+      deviceAbi: deviceAbi,
+      sdkInt: sdkInt,
+    );
+  }
+
   @override
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
@@ -475,8 +515,18 @@ class GrassBagNativeBridge {
 
   Future<Map<String, dynamic>> rollbackLkg() => _safeInvokeMap('runtime.rollback');
 
-  Future<void> setExecutorMode(String mode) async {
-    await _safeInvoke<Object?>('runtime.setExecutor', {'mode': mode});
+  Future<NativeRuntimeStatus?> setExecutorMode(String mode) async {
+    final res = await _safeInvoke<Object?>('runtime.setExecutor', {'mode': mode});
+    if (res is Map) {
+      final statusMap = res['status'];
+      if (statusMap is Map) {
+        return NativeRuntimeStatus.fromMap(statusMap);
+      }
+      if (res.containsKey('configuredExecutorMode')) {
+        return NativeRuntimeStatus.fromMap(res);
+      }
+    }
+    return null;
   }
 
   Future<void> setSdcardMounted(bool enabled) async {
@@ -575,6 +625,39 @@ class GrassBagNativeBridge {
     return (await _safeInvoke<bool>('safety.setConfirmHighRisk', {'enabled': enabled})) == true;
   }
 
+  Future<bool> setSafetyAutoReturn(bool enabled) async {
+    return (await _safeInvoke<bool>('safety.setAutoReturn', {'enabled': enabled})) == true;
+  }
+
+  Future<bool> setSafetyShowEdgeAurora(bool enabled) async {
+    return (await _safeInvoke<bool>('safety.setShowEdgeAurora', {'enabled': enabled})) == true;
+  }
+
+  Future<bool> setSafetyShowGestureFx(bool enabled) async {
+    return (await _safeInvoke<bool>('safety.setShowGestureFx', {'enabled': enabled})) == true;
+  }
+
+  Future<bool> setPhonePaused(bool paused) async {
+    return (await _safeInvoke<bool>('safety.setPaused', {'paused': paused})) == true;
+  }
+
+  Future<bool> returnToGrassBagApp() async {
+    return (await _safeInvoke<bool>('safety.returnToApp')) == true;
+  }
+
+  Future<bool> notifyPhoneTurnDone({
+    String? sessionId,
+    String reason = 'completed',
+    String summary = '',
+  }) async {
+    return (await _safeInvoke<bool>('safety.notifyTurnDone', {
+          if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+          'reason': reason,
+          if (summary.isNotEmpty) 'summary': summary,
+        })) ==
+        true;
+  }
+
   Future<void> triggerEmergencyStop() async {
     await _safeInvoke<bool>('safety.emergencyStop');
   }
@@ -583,12 +666,16 @@ class GrassBagNativeBridge {
     return (await _safeInvoke<bool>('safety.resetStop')) == true;
   }
 
-  Future<bool> previewPhoneOverlay() async {
-    return (await _safeInvoke<bool>('safety.previewOverlay')) == true;
+  Future<bool> previewPhoneOverlay({String mode = 'interactive'}) async {
+    return (await _safeInvoke<bool>('safety.previewOverlay', {'mode': mode})) == true;
   }
 
-  Future<void> syncThemeMode(bool isDark) async {
-    await _safeInvoke<bool>('app.syncThemeMode', {'isDark': isDark});
+  Future<void> syncThemeMode(bool isDark, {int? accentPrimary, int? accentHi}) async {
+    await _safeInvoke<bool>('app.syncThemeMode', {
+      'isDark': isDark,
+      if (accentPrimary != null) 'accentPrimary': accentPrimary,
+      if (accentHi != null) 'accentHi': accentHi,
+    });
   }
 
   // Background Keepalive Service & Alert Notifications
@@ -626,13 +713,20 @@ class GrassBagNativeBridge {
   }
 
   // Native File / Gallery / Camera Pickers & Share
-  Uint8List _safeBase64Decode(String b64) {
-    if (b64.isEmpty) return Uint8List(0);
+  static Uint8List _decodeBase64Isolate(String b64) {
     try {
       return base64Decode(b64);
     } catch (_) {
       return Uint8List(0);
     }
+  }
+
+  Future<Uint8List> _safeBase64DecodeAsync(String b64) async {
+    if (b64.isEmpty) return Uint8List(0);
+    if (b64.length > 64 * 1024) {
+      return compute(_decodeBase64Isolate, b64);
+    }
+    return _decodeBase64Isolate(b64);
   }
 
   Future<PickedAttachment?> pickAttachment({String mime = '*/*'}) async {
@@ -651,7 +745,7 @@ class GrassBagNativeBridge {
     final rawBytes = res['bytes'];
     final bytes = rawBytes is Uint8List
         ? rawBytes
-        : _safeBase64Decode(res['base64']?.toString() ?? '');
+        : await _safeBase64DecodeAsync(res['base64']?.toString() ?? '');
     return PickedAttachment(
       name: res['name']?.toString() ?? 'file',
       mimeType: res['mimeType']?.toString() ?? 'application/octet-stream',
@@ -676,7 +770,7 @@ class GrassBagNativeBridge {
     final rawBytes = res['bytes'];
     final bytes = rawBytes is Uint8List
         ? rawBytes
-        : _safeBase64Decode(res['base64']?.toString() ?? '');
+        : await _safeBase64DecodeAsync(res['base64']?.toString() ?? '');
     return PickedAttachment(
       name: res['name']?.toString() ?? 'photo.jpg',
       mimeType: res['mimeType']?.toString() ?? 'image/jpeg',
@@ -735,6 +829,10 @@ class GrassBagNativeBridge {
           'cookieHeader': cookieHeader,
         })) ==
         true;
+  }
+
+  Future<bool> clearWebViewCookies() async {
+    return (await _safeInvoke<bool>('webview.clearCookies')) == true;
   }
 
   Future<AppPackageVersion?> getAppVersion() async {

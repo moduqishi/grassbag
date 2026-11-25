@@ -187,16 +187,29 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     final bareHost = _extractHostOnly(hostPart);
     final isLocalOrIp = _isLocalOrIpHost(bareHost);
     final scheme = (isLocalOrIp || hasPort) ? 'http' : 'https';
-    // Bracket bare IPv6 literals (e.g. `::1` or `fd7a:115c::1`) before forming a URI authority.
-    final isBareIpv6 = !hostPart.startsWith('[') && hostPart.indexOf(':') != hostPart.lastIndexOf(':');
+    // Bracket bare IPv6 literals (e.g. `::1` or `fd7a:115c::1`) before forming a URI authority,
+    // stripping any `user:pass@` prefix so credentials with a colon aren't misread as IPv6.
+    final authorityHost = hostPart.contains('@')
+        ? hostPart.substring(hostPart.lastIndexOf('@') + 1)
+        : hostPart;
+    final isBareIpv6 = !authorityHost.startsWith('[') &&
+        authorityHost.indexOf(':') != authorityHost.lastIndexOf(':');
     final rest = withScheme.substring(hostPart.length);
-    withScheme = isBareIpv6 ? '$scheme://[$hostPart]$rest' : '$scheme://$withScheme';
+    if (isBareIpv6) {
+      final userPrefix = hostPart.contains('@')
+          ? hostPart.substring(0, hostPart.lastIndexOf('@') + 1)
+          : '';
+      withScheme = '$scheme://$userPrefix[$authorityHost]$rest';
+    } else {
+      withScheme = '$scheme://$withScheme';
+    }
   }
 
   var parsed = Uri.tryParse(withScheme);
   if (parsed == null ||
       (parsed.scheme != 'http' && parsed.scheme != 'https') ||
-      parsed.host.isEmpty) {
+      parsed.host.isEmpty ||
+      (parsed.hasPort && (parsed.port < 1 || parsed.port > 65535))) {
     return null;
   }
 

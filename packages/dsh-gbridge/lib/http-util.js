@@ -73,7 +73,18 @@ export function applyLoopbackCors(req, res) {
   if (!isLoopbackOrigin(origin)) return false;
   res.setHeader('access-control-allow-origin', origin);
   res.setHeader('vary', 'Origin');
-  res.setHeader('access-control-allow-credentials', 'true');
+  // Only expose credentialed cookies to exact same-origin requests; cross-port localhost
+  // frontends must authenticate via `Authorization: Bearer` to prevent cross-port CSRF.
+  let sameHost = false;
+  const hostHeader = String(req.headers?.host || '').trim().toLowerCase();
+  if (hostHeader) {
+    try {
+      sameHost = new URL(origin).host.toLowerCase() === hostHeader;
+    } catch {}
+  }
+  if (sameHost) {
+    res.setHeader('access-control-allow-credentials', 'true');
+  }
   res.setHeader('access-control-allow-headers', 'Authorization, Content-Type');
   res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   return true;
@@ -320,8 +331,7 @@ export function admitRequest(req, { mode, ctx, bearerToken, lanPort } = {}) {
       if (originHeader && hostHeader) {
         try {
           const originHost = new URL(originHeader).host.toLowerCase();
-          const isLoopback = (h) => /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(h);
-          if (originHost !== hostHeader && !(isLoopback(originHost) && isLoopback(hostHeader))) {
+          if (originHost !== hostHeader) {
             return {
               ok: false,
               status: 403,

@@ -27,9 +27,32 @@ Future<void> main() async {
   final preloaded = results[0];
   if (preloaded is Map<String, dynamic>) {
     GrassBagController.preloadedInitialPrefs = preloaded;
-    if (preloaded['isDark'] is bool) {
-      unawaited(GrassBagNativeBridge.instance.syncThemeMode(preloaded['isDark'] as bool));
-    }
+    final savedDark = preloaded['isDark'] is bool ? preloaded['isDark'] as bool : false;
+    final accentName = preloaded['accent']?.toString();
+    final savedAccent = GrassBagAccent.values.firstWhere(
+      (a) => a.name == accentName,
+      orElse: () => GrassBagAccent.teal,
+    );
+    final resolved = GrassBagTokens.resolve(
+      savedAccent,
+      savedDark ? Brightness.dark : Brightness.light,
+    );
+    unawaited(
+      GrassBagNativeBridge.instance.syncThemeMode(
+        savedDark,
+        accentPrimary: resolved.primary.toARGB32(),
+        accentHi: resolved.primaryHi.toARGB32(),
+      ),
+    );
+  } else {
+    final resolved = GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light);
+    unawaited(
+      GrassBagNativeBridge.instance.syncThemeMode(
+        false,
+        accentPrimary: resolved.primary.toARGB32(),
+        accentHi: resolved.primaryHi.toARGB32(),
+      ),
+    );
   }
   final preloadedHosts = results[1];
   if (preloadedHosts is List<Map<String, dynamic>>) {

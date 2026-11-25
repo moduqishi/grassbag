@@ -10,6 +10,26 @@ import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
 
+class _JobListSig {
+  const _JobListSig(this.jobs);
+  final List<BackgroundJobRecord> jobs;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    if (other is! _JobListSig || other.jobs.length != jobs.length) return false;
+    for (var i = 0; i < jobs.length; i++) {
+      if (jobs[i].id != other.jobs[i].id || jobs[i].status != other.jobs[i].status) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => jobs.length;
+}
+
 class JobsPage extends ConsumerStatefulWidget {
   const JobsPage({super.key});
 
@@ -22,15 +42,24 @@ class _JobsPageState extends ConsumerState<JobsPage> {
   final Set<String> _collapsedIds = {};
   final Map<String, String?> _subscribedJobs = {};
   late final GrassBagController _ctrl;
+  bool _initialLoading = false;
 
   @override
   void initState() {
     super.initState();
     _ctrl = ref.read(appProvider.notifier);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    if (ref.read(appProvider).jobs.isEmpty &&
+        ref.read(appProvider).connectionPhase == ConnectionPhase.connected) {
+      _initialLoading = true;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      unawaited(_ctrl.refreshJobs(silent: true));
-      _reconcileRunningSubscriptions(ref.read(appProvider).jobs);
+      try {
+        await _ctrl.refreshJobs(silent: true);
+      } finally {
+        if (mounted && _initialLoading) setState(() => _initialLoading = false);
+      }
+      if (mounted) _reconcileRunningSubscriptions(ref.read(appProvider).jobs);
     });
   }
 
@@ -44,7 +73,9 @@ class _JobsPageState extends ConsumerState<JobsPage> {
   }
 
   void _reconcileRunningSubscriptions(List<BackgroundJobRecord> jobs) {
-    final running = jobs.where((j) => j.status == 'running').toList(growable: false);
+    final running = jobs
+        .where((j) => j.status.toLowerCase() == 'running')
+        .toList(growable: false);
     final runningIds = <String>{};
     for (final job in running) {
       runningIds.add(job.id);
@@ -60,7 +91,7 @@ class _JobsPageState extends ConsumerState<JobsPage> {
   }
 
   void _syncJobSubscription(BackgroundJobRecord job, bool expanded) {
-    if (expanded && job.status == 'running') {
+    if (expanded && job.status.toLowerCase() == 'running') {
       if (!_subscribedJobs.containsKey(job.id)) {
         _subscribedJobs[job.id] = job.sessionId;
         _ctrl.subscribeJobStream(job.id, sessionId: job.sessionId);
@@ -93,15 +124,25 @@ class _JobsPageState extends ConsumerState<JobsPage> {
         unawaited(_ctrl.refreshJobs(silent: true));
       }
     });
+    ref.listen<ConnectionPhase>(appProvider.select((s) => s.connectionPhase), (prev, next) {
+      if (prev != ConnectionPhase.connected && next == ConnectionPhase.connected && mounted) {
+        // After a reconnect the underlying client changed, so clear stale subscription
+        // tracking and re-subscribe all visible running jobs on the new connection.
+        _subscribedJobs.clear();
+        unawaited(_ctrl.refreshJobs(silent: true).then((_) {
+          if (mounted) _reconcileRunningSubscriptions(ref.read(appProvider).jobs);
+        }));
+      }
+    });
     ref.listen<List<BackgroundJobRecord>>(appProvider.select((s) => s.jobs), (prev, next) {
       if (mounted) _reconcileRunningSubscriptions(next);
     });
-    // Watch ONLY job IDs & statuses at page root so high-frequency `outputLines` appends
-    // in one running job NEVER rebuild sibling job cards or the page header!
+    // Watch ONLY job IDs & statuses via zero-allocation value equality so high-frequency
+    // `outputLines` appends NEVER allocate strings or rebuild sibling job cards!
     ref.watch(
       appProvider.select(
         (s) => (
-          jobSig: s.jobs.map((j) => '${j.id}:${j.status}').join('|'),
+          jobSig: _JobListSig(s.jobs),
           glassTier: s.glassTier,
           connectionPhase: s.connectionPhase,
         ),
@@ -130,132 +171,175 @@ class _JobsPageState extends ConsumerState<JobsPage> {
               child: Center(
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
-                  child: ListView(
-                    physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-                    padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
-                    children: [
-                      if (state.connectionPhase != ConnectionPhase.connected) ...[
-                        GrassBagStatusBanner(
-                          tone: GrassBagBannerTone.warn,
-                          icon: CupertinoIcons.wifi_exclamationmark,
-                          title: '未连接到 DSH 主机',
-                          message: '后台任务运行在已连接的 DSH 主机上，恢复连接后自动同步日志与进程状态。',
-                          borderRadius: 18,
-                          padding: const EdgeInsets.all(12),
-                          trailing: GrassBagSecondaryGlassButton(
-                            label: '重试连接',
-                            height: 30,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            tier: state.glassTier,
-                            insideGlass: true,
-                            accentForeground: true,
-                            onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                      if (running.isNotEmpty) ...[
-                        _SectionLabel('运行中 (${running.length})'),
-                        const SizedBox(height: 8),
-                        for (final job in running) ...[
-                          Builder(
-                            builder: (_) {
-                              final isExp = _expandedIds.contains(job.id) ||
-                                  (running.length == 1 && !_collapsedIds.contains(job.id));
-                              return _IsolatedJobCard(
-                                key: ValueKey('job-${job.id}'),
-                                jobId: job.id,
-                                expanded: isExp,
-                                onToggle: () {
-                                  final nextExp = !isExp;
-                                  setState(() {
-                                    if (nextExp) {
-                                      _expandedIds.add(job.id);
-                                      _collapsedIds.remove(job.id);
-                                    } else {
-                                      _expandedIds.remove(job.id);
-                                      _collapsedIds.add(job.id);
-                                    }
-                                  });
-                                  _syncJobSubscription(job, nextExp);
-                                },
-                                onKill: (liveJob) async {
-                                  final ok = await showGrassBagConfirmDialog(
-                                    context,
-                                    title: '终止后台任务',
-                                    message: '确定强制终止「${liveJob.command}」吗？',
-                                    confirmLabel: '确认终止',
-                                    isDestructive: true,
-                                  );
-                                  if (ok) {
-                                    unawaited(ctrl.killJob(liveJob.id));
-                                  }
-                                },
-                              );
-                            },
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                      ],
-                      if (finished.isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        _SectionLabel('已完成 / 已终止 (${finished.length})'),
-                        const SizedBox(height: 8),
-                        for (final job in finished) ...[
-                          _IsolatedJobCard(
-                            key: ValueKey('job-${job.id}'),
-                            jobId: job.id,
-                            expanded: _expandedIds.contains(job.id),
-                            onToggle: () => setState(() {
-                              if (!_expandedIds.add(job.id)) _expandedIds.remove(job.id);
-                            }),
-                            onKill: null,
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                      ],
-                      if (state.jobs.isEmpty)
-                        GrassBagCard(
-                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 30),
-                          child: Column(
-                            children: [
-                              Icon(CupertinoIcons.bolt_horizontal_circle, size: 32, color: t.text3),
-                              const SizedBox(height: 10),
-                              Text('暂无后台任务', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2)),
-                              const SizedBox(height: 4),
-                              Text(
-                                '适合持续监听日志、运行开发服务器或长耗时测试任务',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(fontSize: 12, color: t.text3),
-                              ),
-                              const SizedBox(height: 14),
-                              Wrap(
-                                spacing: 10,
-                                runSpacing: 8,
-                                alignment: WrapAlignment.center,
-                                children: [
-                                  GrassBagPrimaryGlassButton(
-                                    label: '启动一条后台命令',
-                                    icon: CupertinoIcons.play_fill,
-                                    tier: state.glassTier,
-                                    insideGlass: true,
-                                    height: 38,
-                                    onTap: () => _openLaunchSheet(context),
+                  child: RefreshIndicator.adaptive(
+                    edgeOffset: topPad + 64,
+                    onRefresh: () => ctrl.refreshJobs(silent: true),
+                    child: CustomScrollView(
+                      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                      slivers: [
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          sliver: SliverMainAxisGroup(
+                            slivers: [
+                              if (state.connectionPhase != ConnectionPhase.connected)
+                                SliverToBoxAdapter(
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(bottom: 12),
+                                    child: GrassBagStatusBanner(
+                                      tone: GrassBagBannerTone.warn,
+                                      icon: CupertinoIcons.wifi_exclamationmark,
+                                      title: '未连接到 DSH 主机',
+                                      message: '后台任务运行在已连接的 DSH 主机上，恢复连接后自动同步日志与进程状态。',
+                                      borderRadius: 18,
+                                      padding: const EdgeInsets.all(12),
+                                      trailing: GrassBagSecondaryGlassButton(
+                                        label: '重试连接',
+                                        height: 30,
+                                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                                        tier: state.glassTier,
+                                        insideGlass: true,
+                                        accentForeground: true,
+                                        onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
+                                      ),
+                                    ),
                                   ),
-                                  GrassBagSecondaryGlassButton(
-                                    label: '刷新任务',
-                                    icon: CupertinoIcons.refresh,
-                                    tier: state.glassTier,
-                                    insideGlass: true,
-                                    height: 38,
-                                    onTap: () => unawaited(ctrl.refreshJobs()),
+                                ),
+                              if (running.isNotEmpty) ...[
+                                SliverToBoxAdapter(
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: _SectionLabel('运行中 (${running.length})'),
                                   ),
-                                ],
-                              ),
+                                ),
+                                SliverList.builder(
+                                  itemCount: running.length,
+                                  itemBuilder: (_, idx) {
+                                    final job = running[idx];
+                                    final isExp = _expandedIds.contains(job.id) ||
+                                        (running.length == 1 && !_collapsedIds.contains(job.id));
+                                    return Padding(
+                                      padding: const EdgeInsets.only(bottom: 12),
+                                      child: RepaintBoundary(
+                                        child: _IsolatedJobCard(
+                                          key: ValueKey('job-${job.id}'),
+                                          jobId: job.id,
+                                          expanded: isExp,
+                                          onToggle: () {
+                                            final nextExp = !isExp;
+                                            setState(() {
+                                              if (nextExp) {
+                                                _expandedIds.add(job.id);
+                                                _collapsedIds.remove(job.id);
+                                              } else {
+                                                _expandedIds.remove(job.id);
+                                                _collapsedIds.add(job.id);
+                                              }
+                                            });
+                                            _syncJobSubscription(job, nextExp);
+                                          },
+                                          onKill: (liveJob) async {
+                                            final ok = await showGrassBagConfirmDialog(
+                                              context,
+                                              title: '终止后台任务',
+                                              message: '确定强制终止「${liveJob.command}」吗？',
+                                              confirmLabel: '确认终止',
+                                              isDestructive: true,
+                                            );
+                                            if (ok) {
+                                              unawaited(ctrl.killJob(liveJob.id));
+                                            }
+                                          },
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ],
+                              if (finished.isNotEmpty) ...[
+                                SliverToBoxAdapter(
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(top: 4, bottom: 8),
+                                    child: _SectionLabel('已完成 / 已终止 (${finished.length})'),
+                                  ),
+                                ),
+                                SliverList.builder(
+                                  itemCount: finished.length,
+                                  itemBuilder: (_, idx) {
+                                    final job = finished[idx];
+                                    return Padding(
+                                      padding: const EdgeInsets.only(bottom: 12),
+                                      child: RepaintBoundary(
+                                        child: _IsolatedJobCard(
+                                          key: ValueKey('job-${job.id}'),
+                                          jobId: job.id,
+                                          expanded: _expandedIds.contains(job.id),
+                                          onToggle: () => setState(() {
+                                            if (!_expandedIds.add(job.id)) _expandedIds.remove(job.id);
+                                          }),
+                                          onKill: null,
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ],
+                              if (state.jobs.isEmpty && _initialLoading)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(vertical: 34),
+                                    child: Center(
+                                      child: CupertinoActivityIndicator(radius: 11, color: t.primary),
+                                    ),
+                                  ),
+                                )
+                              else if (state.jobs.isEmpty)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 30),
+                                    child: Column(
+                                      children: [
+                                        Icon(CupertinoIcons.bolt_horizontal_circle, size: 32, color: t.text3),
+                                        const SizedBox(height: 10),
+                                        Text('暂无后台任务', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2)),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          '适合持续监听日志、运行开发服务器或长耗时测试任务',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(fontSize: 12, color: t.text3),
+                                        ),
+                                        const SizedBox(height: 14),
+                                        Wrap(
+                                          spacing: 10,
+                                          runSpacing: 8,
+                                          alignment: WrapAlignment.center,
+                                          children: [
+                                            GrassBagPrimaryGlassButton(
+                                              label: '启动一条后台命令',
+                                              icon: CupertinoIcons.play_fill,
+                                              tier: state.glassTier,
+                                              insideGlass: true,
+                                              height: 38,
+                                              onTap: () => _openLaunchSheet(context),
+                                            ),
+                                            GrassBagSecondaryGlassButton(
+                                              label: '刷新任务',
+                                              icon: CupertinoIcons.refresh,
+                                              tier: state.glassTier,
+                                              insideGlass: true,
+                                              height: 38,
+                                              onTap: () => unawaited(ctrl.refreshJobs()),
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
                             ],
                           ),
                         ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -439,7 +523,10 @@ class _JobCard extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 10),
-          Row(
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               GrassBagSpringTap(
                 onTap: onToggle,
@@ -466,8 +553,7 @@ class _JobCard extends StatelessWidget {
                   ),
                 ),
               ),
-              if (expanded && job.outputLines.isNotEmpty) ...[
-                const SizedBox(width: 6),
+              if (expanded && job.outputLines.isNotEmpty)
                 GrassBagSpringTap(
                   onTap: () {
                     Clipboard.setData(ClipboardData(text: job.outputLines.join('\n')));
@@ -494,8 +580,6 @@ class _JobCard extends StatelessWidget {
                     ),
                   ),
                 ),
-              ],
-              const Spacer(),
               if (onKill != null)
                 GrassBagSpringTap(
                   onTap: onKill!,
@@ -548,17 +632,30 @@ class _JobLogConsole extends StatefulWidget {
 
 class _JobLogConsoleState extends State<_JobLogConsole> {
   final ScrollController _ctrl = ScrollController();
+  bool _scrolledUp = false;
+  bool _programmaticJump = false;
+  double _lastObservedPixels = 0.0;
 
   @override
   void initState() {
     super.initState();
+    _ctrl.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToTailIfNearBottom(force: true));
+  }
+
+  void _onScroll() {
+    if (!mounted || !_ctrl.hasClients || _programmaticJump) return;
+    final pos = _ctrl.position;
+    if ((pos.pixels - _lastObservedPixels).abs() < 0.5) return;
+    _lastObservedPixels = pos.pixels;
+    final away = (pos.maxScrollExtent - pos.pixels) > 56.0;
+    if (away != _scrolledUp) setState(() => _scrolledUp = away);
   }
 
   @override
   void didUpdateWidget(covariant _JobLogConsole oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.lines.length != widget.lines.length) {
+    if (!identical(oldWidget.lines, widget.lines)) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToTailIfNearBottom(force: false));
     }
   }
@@ -566,13 +663,21 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
   void _jumpToTailIfNearBottom({required bool force}) {
     if (!mounted || !_ctrl.hasClients) return;
     final pos = _ctrl.position;
-    if (force || (pos.maxScrollExtent - pos.pixels) <= 48.0) {
-      _ctrl.jumpTo(pos.maxScrollExtent);
+    if (force || !_scrolledUp) {
+      _programmaticJump = true;
+      try {
+        _ctrl.jumpTo(pos.maxScrollExtent);
+        _lastObservedPixels = _ctrl.position.pixels;
+      } finally {
+        _programmaticJump = false;
+      }
+      if (_scrolledUp) setState(() => _scrolledUp = false);
     }
   }
 
   @override
   void dispose() {
+    _ctrl.removeListener(_onScroll);
     _ctrl.dispose();
     super.dispose();
   }
@@ -585,7 +690,7 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
     final tailOffset = total > maxTailLines ? total - maxTailLines : 0;
     final visibleCount = total - tailOffset;
     final viewportHeight =
-        visibleCount == 0 ? 44.0 : (visibleCount * 17.5 + 24.0).clamp(64.0, 260.0);
+        visibleCount == 0 ? 44.0 : (visibleCount * 17.5 + 24.0 + (tailOffset > 0 ? 22.0 : 0.0)).clamp(64.0, 260.0);
     return ClipRSuperellipse(
       borderRadius: BorderRadius.circular(14),
       child: Container(
@@ -612,24 +717,76 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                   ),
                 ),
               )
-            : RepaintBoundary(
-                child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: ListView.builder(
-                    controller: _ctrl,
-                    addAutomaticKeepAlives: false,
-                    itemCount: visibleCount,
-                    itemBuilder: (_, idx) => Text(
-                      widget.lines[tailOffset + idx],
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        height: 1.48,
-                        fontFamily: 'monospace',
-                        color: Color(0xFFDDE3EA),
+            : Stack(
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (tailOffset > 0)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(
+                            '… 已省略早期 $tailOffset 行，仅展示最新 $maxTailLines 行（复制可获取完整日志）',
+                            style: const TextStyle(
+                              fontSize: 10.5,
+                              color: Color(0xFF94A3B8),
+                            ),
+                          ),
+                        ),
+                      Expanded(
+                        child: RepaintBoundary(
+                          child: SelectionArea(
+                            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                            child: ListView.builder(
+                              controller: _ctrl,
+                              addAutomaticKeepAlives: false,
+                              itemCount: visibleCount,
+                              itemBuilder: (_, idx) => Text(
+                                widget.lines[tailOffset + idx],
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  height: 1.48,
+                                  fontFamily: 'monospace',
+                                  color: Color(0xFFDDE3EA),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_scrolledUp)
+                    Positioned(
+                      right: 2,
+                      bottom: 2,
+                      child: GrassBagSpringTap(
+                        onTap: () => _jumpToTailIfNearBottom(force: true),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: t.primary.withValues(alpha: 0.90),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.arrow_down, size: 11, color: t.onPrimary),
+                              const SizedBox(width: 3),
+                              Text(
+                                '最新输出',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.onPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                ),
+                ],
               ),
       ),
     );
@@ -653,6 +810,7 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
 
   final _cmdCtrl = TextEditingController();
   String? _err;
+  bool _submitting = false;
 
   @override
   void dispose() {
@@ -660,14 +818,32 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
     super.dispose();
   }
 
-  void _submit() {
+  Future<void> _submit() async {
+    if (_submitting) return;
     final text = _cmdCtrl.text.trim();
     if (text.isEmpty) {
       setState(() => _err = '请输入要在后台运行的命令');
       return;
     }
-    ref.read(appProvider.notifier).launchQuickJob(text);
-    Navigator.of(context).pop();
+    if (ref.read(appProvider).connectionPhase != ConnectionPhase.connected) {
+      setState(() => _err = '当前未连接到 DSH 主机，请先恢复连接后再启动');
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _err = null;
+    });
+    try {
+      final ok = await ref.read(appProvider.notifier).launchQuickJob(text);
+      if (!mounted) return;
+      if (ok) {
+        Navigator.of(context).pop();
+      } else {
+        setState(() => _err = '启动后台命令失败，请检查命令或主机连接状态');
+      }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
   }
 
   @override
@@ -678,6 +854,7 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
         (s) => (
           glassTier: s.glassTier,
           activeWorkspace: s.activeWorkspace,
+          activeWorkspaceDisplayName: s.activeWorkspaceDisplayName,
           workspaces: s.workspaces,
         ),
       ),
@@ -688,7 +865,9 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
         .firstOrNull;
     final displayCwd = matchedWs?.path.isNotEmpty == true
         ? matchedWs!.path
-        : (watched.activeWorkspace.isNotEmpty ? watched.activeWorkspace : '默认工作目录');
+        : (watched.activeWorkspaceDisplayName.isNotEmpty
+            ? watched.activeWorkspaceDisplayName
+            : '默认工作目录');
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -774,10 +953,11 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
             const SizedBox(width: 10),
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '后台启动',
+                label: _submitting ? '正在启动…' : '后台启动',
                 tier: tier,
                 insideGlass: true,
-                onTap: _submit,
+                enabled: !_submitting,
+                onTap: _submitting ? null : _submit,
               ),
             ),
           ],

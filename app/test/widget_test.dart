@@ -111,7 +111,7 @@ void main() {
 
       expect(find.text(msg), findsWidgets);
       expect(find.textContaining('尚未连接到运行中的 DSH 引擎'), findsOneWidget);
-      expect(find.byType(ListView), findsOneWidget);
+      expect(find.byType(CustomScrollView), findsOneWidget);
     },
   );
 
@@ -541,7 +541,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('执行失败 · provider/rate_limit'), findsOneWidget);
+    expect(find.text('请求过于频繁（限流）'), findsOneWidget);
     expect(find.textContaining('HTTP 429'), findsOneWidget);
 
     await tester.tap(find.text('重新发送'));
@@ -954,8 +954,8 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // Find the main vertical chat ListView
-    final listFinder = find.byType(ListView).last;
+    // Find the main vertical chat CustomScrollView
+    final listFinder = find.byType(CustomScrollView).last;
     final scrollState = tester.state<ScrollableState>(
       find.descendant(of: listFinder, matching: find.byType(Scrollable)).first,
     );
@@ -2048,8 +2048,9 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Crystal-clear Liquid Glass optics: spherical lens, zero frost/ambientRim/rimShade,
-      //    low-haze refraction blur, luminous dual-lobe rimLight, and subtle edge prism CA!
+      // 3) Authentic Apple iOS 26/27 Liquid Glass optics: spherical lens with zero CA on
+      //    zero-frost floating chrome (avoids shader `isClearIndicator` dark rim burn in Light Mode)
+      //    and paraxial fast-path iOS 27 frost bokeh (blur == 0.0) on modal sheets!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
@@ -2060,18 +2061,16 @@ void main() {
         expect(surf.lensModel, GlassLensModel.spherical);
         expect(surf.frost, 0.0);
         expect(surf.ambientRim, 0.0);
-        expect(surf.rimShade, 0.0);
         expect(surf.rimLight, greaterThan(0.5));
-        expect(surf.chromaticAberration, greaterThan(0.0));
-        expect(surf.blur, lessThanOrEqualTo(2.0));
-        expect(surf.whitenStrength, 0.0);
-        expect(sheet.lensModel, GlassLensModel.spherical);
-        expect(sheet.frost, 0.0);
-        expect(sheet.rimShade, 0.0);
+        expect(surf.chromaticAberration, 0.0);
+        expect(surf.blur, inInclusiveRange(3.0, 5.5));
+        expect(surf.lightIntensity, lessThanOrEqualTo(0.3));
+        expect(sheet.lensModel, GlassLensModel.paraxial);
+        expect(sheet.blur, 0.0);
+        expect(sheet.frost, greaterThanOrEqualTo(12.0));
+        expect(sheet.frostOpacity, 1.0);
         expect(sheet.rimLight, greaterThan(0.5));
-        expect(sheet.blur, greaterThan(surf.blur));
-        expect(sheet.blur, lessThanOrEqualTo(5.0));
-        expect(sheet.whitenStrength, lessThanOrEqualTo(0.08));
+        expect(sheet.chromaticAberration, 0.0);
       }
 
       // 4) RemoteHostConnectCard shows Desktop GUI (免命令) 1-click prompt + concrete-IP CLI tab (zero 0.0.0.0)
@@ -2236,7 +2235,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.textContaining('Price is \$5 to \$10 today', findRichText: true), findsOneWidget);
-      expect(find.text('E = mc^2'), findsOneWidget);
+      expect(find.text('E = mc²'), findsOneWidget);
       expect(find.textContaining('Bold Docs', findRichText: true), findsOneWidget);
       expect(find.text('换行'), findsOneWidget);
       expect(find.text('48 行'), findsOneWidget);
@@ -2268,6 +2267,10 @@ void main() {
       expect(find.textContaining('#2'), findsOneWidget);
       expect(find.byIcon(CupertinoIcons.xmark), findsOneWidget);
       await tester.tap(find.byIcon(CupertinoIcons.xmark));
+      await tester.pumpAndSettle();
+      // Active PTY tab asks for confirmation before terminating the shell process.
+      expect(find.text('关闭终端'), findsOneWidget);
+      await tester.tap(find.text('关闭终端'));
       await tester.pumpAndSettle();
       expect(find.textContaining('#2'), findsNothing);
 
@@ -2317,26 +2320,31 @@ void main() {
   testWidgets(
     'v12 regression: Liquid Glass optics calibration, nested italic+bold, streaming code stability, fractional slider & Cron weekdays',
     (tester) async {
-      // 1) Crystal-clear Liquid Glass calibration: zero ambientRim/rimShade, matched low-haze blur, pure achromatic glassColor
+      // 1) Authentic Apple iOS 26/27 Liquid Glass calibration: spherical lens on zero-frost chrome
+      //    (zero CA, zero ambientRim, clean achromatic tint) and paraxial fast-path frost bokeh on sheets.
       for (final brightness in Brightness.values) {
         final t = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
         final norm = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: false);
         final elev = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: true);
         final sheet = GrassBagGlassConfig.sheetSettings(t, GrassBagGlassTier.liquid);
-        expect(norm.chromaticAberration, greaterThan(0.0));
-        expect(elev.chromaticAberration, greaterThan(0.0));
-        expect(sheet.chromaticAberration, greaterThan(0.0));
+        expect(norm.lensModel, GlassLensModel.spherical);
+        expect(elev.lensModel, GlassLensModel.spherical);
+        expect(sheet.lensModel, GlassLensModel.paraxial);
+        expect(norm.chromaticAberration, 0.0);
+        expect(elev.chromaticAberration, 0.0);
+        expect(sheet.chromaticAberration, 0.0);
         expect(norm.ambientRim, 0.0);
         expect(norm.rimLight, greaterThan(0.5));
-        expect(norm.rimShade, 0.0);
         expect(sheet.ambientRim, 0.0);
         expect(sheet.rimLight, greaterThan(0.5));
-        expect(sheet.rimShade, 0.0);
-        expect(norm.blur, 1.5);
-        expect(elev.blur, 1.5);
-        expect(norm.glassColor.r, closeTo(1.0, 0.01));
-        expect(norm.glassColor.g, closeTo(1.0, 0.01));
-        expect(norm.glassColor.b, closeTo(1.0, 0.01));
+        expect(sheet.blur, 0.0);
+        expect(sheet.frost, greaterThanOrEqualTo(12.0));
+        expect(sheet.frostOpacity, 1.0);
+        expect(norm.blur, inInclusiveRange(3.0, 5.5));
+        expect(elev.blur, inInclusiveRange(3.0, 5.5));
+        expect(norm.glassColor.r, closeTo(1.0, 0.02));
+        expect(norm.glassColor.g, closeTo(1.0, 0.02));
+        expect(norm.glassColor.b, closeTo(1.0, 0.02));
       }
 
       // 2) Named weekday/month Cron validation

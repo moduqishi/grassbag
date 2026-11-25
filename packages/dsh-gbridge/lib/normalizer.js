@@ -48,20 +48,174 @@ export function previewLine(text, maxChars = 160) {
   return first.length > maxChars ? `${first.slice(0, maxChars - 1)}…` : first;
 }
 
+function tryParseJsonObject(val) {
+  if (val && typeof val === 'object' && !Array.isArray(val)) return val;
+  if (typeof val !== 'string') return null;
+  const trimmed = val.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const PHONE_KEY_LABELS = {
+  back: '返回键',
+  home: '主屏键',
+  recents: '最近任务',
+  enter: '回车键',
+  notifications: '通知栏',
+  quick_settings: '快捷设置',
+};
+
+function extractToolTarget(tool, args, parsedOut) {
+  const n = tool.toLowerCase();
+  const a = args && typeof args === 'object' ? args : {};
+  if (n.startsWith('phone_')) {
+    switch (n) {
+      case 'phone_open': {
+        const app = a.appName ?? a.app ?? parsedOut?.opened ?? parsedOut?.label ?? a.package ?? a.packageName ?? a.url ?? parsedOut?.package;
+        return typeof app === 'string' ? previewLine(app, 60) : '';
+      }
+      case 'phone_tap':
+      case 'phone_long_press': {
+        const lbl = a.label ?? a.text ?? a.desc ?? a.description ?? parsedOut?.label;
+        if (typeof lbl === 'string' && lbl.trim()) return previewLine(lbl, 50);
+        if (a.nodeId !== undefined && a.nodeId !== null && String(a.nodeId).trim()) {
+          return `元素 ${a.nodeId}`;
+        }
+        if (a.x !== undefined && a.y !== undefined) return `(${a.x}, ${a.y})`;
+        return '';
+      }
+      case 'phone_swipe': {
+        const dirMap = { up: '向上滑动', down: '向下滑动', left: '向左滑动', right: '向右滑动' };
+        if (typeof a.direction === 'string' && dirMap[a.direction.toLowerCase()]) {
+          return dirMap[a.direction.toLowerCase()];
+        }
+        if (a.x1 !== undefined && a.y1 !== undefined && a.x2 !== undefined && a.y2 !== undefined) {
+          return `(${a.x1},${a.y1}) → (${a.x2},${a.y2})`;
+        }
+        return '滑动屏幕';
+      }
+      case 'phone_type': {
+        const txt = a.text ?? a.value ?? a.input;
+        return typeof txt === 'string' && txt.trim() ? `「${previewLine(txt, 40)}」` : '';
+      }
+      case 'phone_key': {
+        const key = String(a.action ?? a.key ?? '').toLowerCase();
+        return PHONE_KEY_LABELS[key] || previewLine(String(a.action ?? a.key ?? ''), 40);
+      }
+      case 'phone_intent': {
+        const kind = a.kind ?? a.target ?? a.action ?? a.uri ?? a.url;
+        return typeof kind === 'string' ? previewLine(kind, 60) : '';
+      }
+      case 'phone_wait': {
+        if (typeof a.ms === 'number') return a.ms >= 1000 ? `${(a.ms / 1000).toFixed(1)}s` : `${a.ms}ms`;
+        if (typeof a.seconds === 'number') return `${a.seconds}s`;
+        return '等待界面稳定';
+      }
+      case 'phone_handoff': {
+        const msg = a.message ?? a.reason ?? a.prompt;
+        return typeof msg === 'string' && msg.trim() ? previewLine(msg, 60) : '等待人工确认';
+      }
+      case 'phone_return_app': {
+        const sum = a.summary ?? a.reason ?? a.message;
+        return typeof sum === 'string' && sum.trim() ? previewLine(sum, 60) : '回到 GrassBag';
+      }
+      case 'phone_screen': {
+        const lbl = parsedOut?.appLabel ?? parsedOut?.appName ?? parsedOut?.package ?? parsedOut?.packageName;
+        return typeof lbl === 'string' && lbl.trim() ? previewLine(lbl, 50) : '读取当前界面';
+      }
+      case 'phone_screenshot':
+        return '截取当前屏幕';
+      case 'phone_apps':
+        return typeof a.query === 'string' && a.query.trim()
+          ? `搜索「${previewLine(a.query, 40)}」`
+          : '已安装应用列表';
+      default:
+        break;
+    }
+  }
+  const candidate = a.command ??
+    a.cmd ??
+    a.file_path ??
+    a.filePath ??
+    a.path ??
+    a.pattern ??
+    a.glob ??
+    a.regex ??
+    a.query ??
+    a.url ??
+    a.description ??
+    a.title ??
+    a.name ??
+    a.target;
+  return typeof candidate === 'string' ? previewLine(candidate, 100) : '';
+}
+
+function summarizeHumanToolOutput(tool, outStr, parsedOut) {
+  if (!parsedOut) return previewLine(outStr, 220);
+  if (parsedOut.ok === false || parsedOut.blocked === true || parsedOut.error) {
+    const errText = typeof parsedOut.hint === 'string' && parsedOut.hint.trim()
+      ? parsedOut.hint
+      : (typeof parsedOut.error === 'string'
+        ? parsedOut.error
+        : (parsedOut.error?.message ?? parsedOut.message ?? parsedOut.reason ?? '执行失败'));
+    return previewLine(String(errText), 180);
+  }
+  const n = tool.toLowerCase();
+  if (n.startsWith('phone_')) {
+    if (n === 'phone_open') {
+      const opened = parsedOut.opened ?? parsedOut.label ?? parsedOut.appName;
+      return opened ? `已打开 ${previewLine(String(opened), 40)}` : (parsedOut.ok ? '已打开应用' : '');
+    }
+    if (n === 'phone_screenshot') {
+      if (parsedOut.width && parsedOut.height) return `${parsedOut.width}×${parsedOut.height}`;
+      return parsedOut.ok ? '截屏完成' : '';
+    }
+    if (n === 'phone_screen') {
+      const app = parsedOut.appLabel ?? parsedOut.appName ?? parsedOut.package ?? parsedOut.packageName ?? '';
+      const count = Array.isArray(parsedOut.elements)
+        ? parsedOut.elements.length
+        : (Array.isArray(parsedOut.nodes)
+          ? parsedOut.nodes.length
+          : (typeof parsedOut.count === 'number'
+            ? parsedOut.count
+            : (typeof parsedOut.nodeCount === 'number' ? parsedOut.nodeCount : null)));
+      if (app && count !== null) return `${previewLine(String(app), 32)} · ${count} 元素`;
+      if (app) return previewLine(String(app), 40);
+      if (count !== null) return `${count} 个元素`;
+      return parsedOut.ok ? '已读取界面' : '';
+    }
+    if (n === 'phone_apps') {
+      const count = Array.isArray(parsedOut.apps) ? parsedOut.apps.length : (typeof parsedOut.count === 'number' ? parsedOut.count : null);
+      return count !== null ? `${count} 个应用` : (parsedOut.ok ? '已列出' : '');
+    }
+    if (n === 'phone_return_app') {
+      return parsedOut.ok ? '已返回应用' : '';
+    }
+    const msg = parsedOut.message ?? parsedOut.summary ?? parsedOut.status;
+    if (typeof msg === 'string' && msg.trim()) return previewLine(msg, 60);
+    return parsedOut.ok ? '已完成' : '';
+  }
+  const msg = parsedOut.summary ?? parsedOut.message;
+  if (typeof msg === 'string' && msg.trim()) return previewLine(msg, 160);
+  return '';
+}
+
 export function summarizeTool(name, args, output) {
   const tool = String(name || 'tool');
-  let target = '';
-  if (args && typeof args === 'object') {
-    const candidate = args.command ?? args.cmd ?? args.file_path ?? args.path ?? args.pattern ?? args.query ?? args.url ?? args.description;
-    if (typeof candidate === 'string') target = previewLine(candidate, 100);
-  }
-  const title = target ? `${tool} · ${target}` : tool;
   const outStr = typeof output === 'string'
     ? output
     : output !== undefined && output !== null
       ? safeJsonPreview(output, 400)
       : '';
-  const summary = previewLine(outStr, 220);
+  const parsedOut = tryParseJsonObject(output);
+  const target = extractToolTarget(tool, args, parsedOut);
+  const title = target ? `${tool} · ${target}` : tool;
+  const summary = summarizeHumanToolOutput(tool, outStr, parsedOut);
   return { title, summary, hasFullOutput: outStr.length > 0 };
 }
 
@@ -157,15 +311,28 @@ export class SessionNormalizer {
     if (!sessionId || !callId) return;
     const key = `${sessionId}:${callId}`;
     const prevEntry = this.toolOutputs.get(key);
+    let normalizedRecord = record;
+    if (
+      prevEntry &&
+      record &&
+      record.output == null &&
+      record.status === 'running' &&
+      (prevEntry.record?.output != null || prevEntry.record?.status !== 'running')
+    ) {
+      // Never wipe an already-completed or populated tool output with a replayed/late tool_call placeholder.
+      normalizedRecord = {
+        ...prevEntry.record,
+        args: prevEntry.record?.args ?? record.args,
+      };
+    }
     if (prevEntry) {
       this.toolOutputBytes -= prevEntry.bytes;
       this.toolOutputs.delete(key);
     }
-    let normalizedRecord = record;
-    if (record && typeof record.output === 'string' && record.output.length > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
+    if (normalizedRecord && typeof normalizedRecord.output === 'string' && normalizedRecord.output.length > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
       normalizedRecord = {
-        ...record,
-        output: `${record.output.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${record.output.length} 字符]`,
+        ...normalizedRecord,
+        output: `${normalizedRecord.output.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${normalizedRecord.output.length} 字符]`,
         truncated: true,
       };
     }
@@ -204,6 +371,7 @@ export class SessionNormalizer {
     const turns = [];
     let current = null;
     const toolIndex = new Map();
+    const toolStartTimes = new Map();
 
     const promotePreToolNarration = (turn, seq) => {
       if (!turn || typeof turn.assistantText !== 'string') return;
@@ -274,6 +442,15 @@ export class SessionNormalizer {
                 ...(b.attachment && typeof b.attachment === 'object' ? b.attachment : {}),
                 ...(b.name ? { name: b.name } : {}),
                 ...(b.mediaType ? { mimeType: b.mediaType } : {}),
+                ...(b.mimeType ? { mimeType: b.mimeType } : {}),
+                ...(typeof b.data === 'string' && b.data ? { data: b.data } : {}),
+                ...(typeof b.base64 === 'string' && b.base64 ? { base64: b.base64 } : {}),
+                ...(typeof b.url === 'string' && b.url ? { url: b.url } : {}),
+                ...(typeof b.uri === 'string' && b.uri ? { uri: b.uri } : {}),
+                ...(typeof b.image === 'string' && b.image ? { data: b.image } : {}),
+                ...(b.source && typeof b.source === 'object' && typeof b.source.data === 'string'
+                  ? { data: b.source.data, ...(b.source.media_type ? { mimeType: b.source.media_type } : {}) }
+                  : {}),
               }))
           : [];
         const mergedAttachments = Array.isArray(msg?.attachments) && msg.attachments.length > 0
@@ -332,6 +509,9 @@ export class SessionNormalizer {
         }
         const { title, summary } = summarizeTool(data?.name, parsedArgs);
         const existing = toolIndex.get(callId);
+        if (typeof ev.time === 'number' && !toolStartTimes.has(callId)) {
+          toolStartTimes.set(callId, ev.time);
+        }
         if (!existing) {
           const step = {
             kind: 'tool',
@@ -384,6 +564,9 @@ export class SessionNormalizer {
                 try { bArgs = JSON.parse(bArgs); } catch {}
               }
               const { title, summary } = summarizeTool(b.name, bArgs);
+              if (typeof ev.time === 'number' && !toolStartTimes.has(callId)) {
+                toolStartTimes.set(callId, ev.time);
+              }
               if (!toolIndex.has(callId)) {
                 const step = {
                   kind: 'tool',
@@ -397,13 +580,16 @@ export class SessionNormalizer {
                 turn.steps.push(step);
                 toolIndex.set(callId, step);
               }
-              this.cacheToolOutput(sessionId, callId, {
-                callId,
-                name: String(b.name || 'tool'),
-                args: bArgs,
-                output: null,
-                status: 'running',
-              });
+              const existingCached = this.getToolOutput(sessionId, callId);
+              if (!existingCached || (existingCached.output == null && existingCached.status === 'running')) {
+                this.cacheToolOutput(sessionId, callId, {
+                  callId,
+                  name: String(b.name || 'tool'),
+                  args: bArgs,
+                  output: existingCached?.output ?? null,
+                  status: existingCached?.status ?? 'running',
+                });
+              }
             } else if (b.type === 'text') {
               const chunk = String(b.text ?? '');
               if (chunk) {
@@ -462,7 +648,14 @@ export class SessionNormalizer {
         );
         const rawOut = msg?.content ?? data?.output ?? data?.result ?? data?.content ?? '';
         const output = Array.isArray(rawOut) ? extractText({ content: rawOut }) : rawOut;
-        const isError = Boolean(data?.error || msg?.isError || data?.isError);
+        const parsedOut = tryParseJsonObject(output);
+        const isError = Boolean(
+          data?.error ||
+          msg?.isError ||
+          data?.isError ||
+          parsedOut?.ok === false ||
+          parsedOut?.blocked === true,
+        );
         const prev = this.getToolOutput(sessionId, callId);
         const existing = toolIndex.get(callId);
         const toolName = existing?.name || prev?.name || String(msg?.name || data?.name || 'tool');
@@ -471,11 +664,31 @@ export class SessionNormalizer {
         const effectiveHasFull = hasFullOutput || (isError && String(output || '').trim().length > 0);
         if (existing) {
           existing.status = isError ? 'error' : 'ok';
+          const canUpgradeTitle = title &&
+            title !== toolName &&
+            (!existing.title ||
+              existing.title === toolName ||
+              (toolName.toLowerCase().startsWith('phone_') && title !== existing.title));
+          if (canUpgradeTitle) {
+            existing.title = title;
+          }
           if (summary) existing.summary = summary;
           existing.hasFullOutput = effectiveHasFull;
-          if (typeof data?.durationMs === 'number') existing.durationMs = data.durationMs;
+          const startedAt = toolStartTimes.get(callId);
+          const inferredDur = typeof data?.durationMs === 'number'
+            ? data.durationMs
+            : (typeof ev.time === 'number' && typeof startedAt === 'number' && ev.time >= startedAt
+                ? Math.round(ev.time - startedAt)
+                : undefined);
+          if (typeof inferredDur === 'number') existing.durationMs = inferredDur;
           if (typeof data?.subagentSessionId === 'string') existing.subagentSessionId = data.subagentSessionId;
         } else {
+          const startedAt = toolStartTimes.get(callId);
+          const inferredDur = typeof data?.durationMs === 'number'
+            ? data.durationMs
+            : (typeof ev.time === 'number' && typeof startedAt === 'number' && ev.time >= startedAt
+                ? Math.round(ev.time - startedAt)
+                : undefined);
           const step = {
             kind: 'tool',
             callId,
@@ -484,6 +697,7 @@ export class SessionNormalizer {
             status: isError ? 'error' : 'ok',
             summary,
             hasFullOutput: effectiveHasFull,
+            ...(typeof inferredDur === 'number' ? { durationMs: inferredDur } : {}),
           };
           turn.steps.push(step);
           toolIndex.set(callId, step);
@@ -536,12 +750,14 @@ export class SessionNormalizer {
           }
         }
         if (data?.usage && typeof data.usage === 'object') {
+          const prevDur = turn.usage?.durationMs;
+          const nextDur = data.usage.durationMs !== undefined ? Number(data.usage.durationMs) : prevDur;
           turn.usage = {
             inputTokens: Number(data.usage.uncachedInputTokens ?? data.usage.inputTokens ?? data.usage.promptTokens ?? 0),
             outputTokens: Number(data.usage.outputTokens ?? data.usage.completionTokens ?? 0),
             ...(data.usage.cacheReadTokens !== undefined ? { cacheReadTokens: Number(data.usage.cacheReadTokens) } : {}),
             ...(data.usage.cacheWriteTokens !== undefined ? { cacheWriteTokens: Number(data.usage.cacheWriteTokens) } : {}),
-            ...(data.usage.durationMs !== undefined ? { durationMs: Number(data.usage.durationMs) } : {}),
+            ...(nextDur !== undefined ? { durationMs: nextDur } : {}),
           };
         }
         if (Array.isArray(data?.deliverables)) {
@@ -562,33 +778,84 @@ export class SessionNormalizer {
 
   /**
    * Compute live Dock Stack activity telemetry from an incremental stream chunk.
+   * Uses CJK-aware token estimation and pauses/resets decode timing across tool
+   * execution & idle gaps so live `tps` reflects real LLM decode speed.
    */
   observeStreamChunk(sessionId, chunk) {
     let stat = this.turnStats.get(sessionId);
     const now = Date.now();
-    if (!stat || chunk?.type === 'turn/start' || chunk?.type === 'snapshot') {
-      stat = { startedAt: now, outputChars: 0, phase: 'thinking', target: undefined };
-      this.turnStats.set(sessionId, stat);
-    }
-    const chunkTextLen = () => {
-      if (Array.isArray(chunk?.texts)) return chunk.texts.reduce((a, s) => a + String(s ?? '').length, 0);
-      return String(chunk?.text ?? chunk?.delta ?? '').length;
-    };
     const ctype = String(chunk?.type || '');
+    if (!stat || ctype === 'turn/start' || ctype === 'snapshot') {
+      stat = {
+        startedAt: now,
+        activeDecodeMs: 0,
+        lastDecodeAt: 0,
+        estTokens: 0,
+        phase: 'thinking',
+        target: undefined,
+      };
+      this.turnStats.set(sessionId, stat);
+    } else if (ctype === 'step/start') {
+      stat.activeDecodeMs = 0;
+      stat.lastDecodeAt = 0;
+      stat.estTokens = 0;
+      stat.target = undefined;
+      if (stat.phase === 'tool') stat.phase = 'thinking';
+    }
+    const chunkText = () => {
+      if (Array.isArray(chunk?.texts)) return chunk.texts.map((s) => String(s ?? '')).join('');
+      return String(chunk?.text ?? chunk?.delta ?? '');
+    };
+    const estimateTokens = (text) => {
+      if (!text) return 0;
+      let cjk = 0;
+      let other = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) >= 0x2e80) cjk += 1;
+        else other += 1;
+      }
+      return cjk / 1.5 + other / 3.8;
+    };
+    const recordDecode = (text) => {
+      const tok = estimateTokens(text);
+      if (tok <= 0) return;
+      if (stat.lastDecodeAt > 0) {
+        const dt = now - stat.lastDecodeAt;
+        // Ignore multi-second pauses (e.g. tool execution or brief stall) so decode speed stays honest.
+        if (dt > 0 && dt <= 1500) {
+          stat.activeDecodeMs += Math.min(dt, 600);
+        }
+      }
+      stat.lastDecodeAt = now;
+      stat.estTokens += tok;
+    };
     if (ctype === 'reasoning-delta' || ctype === 'reasoning-chunks' || chunk?.kind === 'reasoning') {
+      if (stat.phase === 'tool') {
+        stat.activeDecodeMs = 0;
+        stat.lastDecodeAt = 0;
+        stat.estTokens = 0;
+        stat.target = undefined;
+      }
       stat.phase = 'thinking';
-      stat.outputChars += chunkTextLen();
+      recordDecode(chunkText());
     } else if (ctype === 'text-delta' || ctype === 'text-chunks' || chunk?.kind === 'text') {
+      if (stat.phase === 'tool') {
+        stat.activeDecodeMs = 0;
+        stat.lastDecodeAt = 0;
+        stat.estTokens = 0;
+        stat.target = undefined;
+      }
       stat.phase = 'streaming';
-      stat.outputChars += chunkTextLen();
+      recordDecode(chunkText());
     } else if (ctype === 'tool-call-delta' || ctype === 'tool-call-chunks' || chunk?.kind === 'tool-call') {
       stat.phase = 'tool';
+      stat.lastDecodeAt = 0;
       if (chunk?.name) stat.target = String(chunk.name);
-      stat.outputChars += chunkTextLen();
     }
     const elapsedMs = Math.max(1, now - stat.startedAt);
-    const estTokens = stat.outputChars / 3.5;
-    const tps = elapsedMs >= 200 ? Number(((estTokens * 1000) / elapsedMs).toFixed(1)) : undefined;
+    const tps = (stat.phase !== 'tool' && stat.activeDecodeMs >= 200 && stat.estTokens >= 1)
+      ? Number(((stat.estTokens * 1000) / stat.activeDecodeMs).toFixed(1))
+      : undefined;
     return {
       phase: stat.phase,
       ...(stat.target ? { target: stat.target } : {}),

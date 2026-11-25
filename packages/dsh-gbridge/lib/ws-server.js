@@ -11,6 +11,12 @@ const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
 
+function isValidWireCloseCode(code) {
+  if (!Number.isInteger(code)) return false;
+  if (code >= 3000 && code <= 4999) return true;
+  return (code >= 1000 && code <= 1014) && code !== 1004 && code !== 1005 && code !== 1006;
+}
+
 function buildFrame(opcode, payloadBuf) {
   const payload = Buffer.isBuffer(payloadBuf) ? payloadBuf : Buffer.from(payloadBuf);
   const len = payload.length;
@@ -101,10 +107,11 @@ export class GbridgeWsConnection extends EventEmitter {
 
   close(code = 1000, reason = '') {
     if (this.closed) return;
+    const validCode = isValidWireCloseCode(code) ? code : 1000;
     let reasonBuf = Buffer.from(String(reason), 'utf8');
     if (reasonBuf.length > 123) reasonBuf = reasonBuf.subarray(0, 123);
     const body = Buffer.allocUnsafe(2 + reasonBuf.length);
-    body.writeUInt16BE(code, 0);
+    body.writeUInt16BE(validCode, 0);
     reasonBuf.copy(body, 2);
     try {
       if (!this.socket.destroyed) {
@@ -118,7 +125,7 @@ export class GbridgeWsConnection extends EventEmitter {
         killer.unref?.();
       }
     } catch {}
-    this._markClosed(code, reason);
+    this._markClosed(validCode, reason);
   }
 
   terminate() {
@@ -183,9 +190,15 @@ export class GbridgeWsConnection extends EventEmitter {
       for (let i = 0; i < payloadLen; i++) {
         payload[i] = maskedData[i] ^ maskKey[i & 3];
       }
-      this._buffer = frameTotal === this._buffer.length
-        ? Buffer.alloc(0)
-        : this._buffer.subarray(frameTotal);
+      if (frameTotal === this._buffer.length) {
+        this._buffer = Buffer.alloc(0);
+      } else {
+        const rem = this._buffer.subarray(frameTotal);
+        // Copy out small remainder when the backing slab is large so parsed buffers can be GC'd.
+        this._buffer = (this._buffer.buffer.byteLength > 65536 && rem.length * 4 < this._buffer.buffer.byteLength)
+          ? Buffer.from(rem)
+          : rem;
+      }
 
       this._handleFrame(fin, opcode, payload);
     }
@@ -198,7 +211,12 @@ export class GbridgeWsConnection extends EventEmitter {
         return;
       }
       if (opcode === OP_CLOSE) {
-        const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1000;
+        if (payload.length === 1) {
+          this.close(1002, 'invalid close payload');
+          return;
+        }
+        const rawCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1000;
+        const code = isValidWireCloseCode(rawCode) ? rawCode : 1002;
         const reason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
         this.close(code, reason);
       } else if (opcode === OP_PING) {

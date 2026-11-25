@@ -152,10 +152,11 @@ test('zero-patch phone tools bridge forwards caller sessionId/turnId and turn/en
   });
 
   assert.equal(phone.active, true);
-  assert.equal(phone.registered, 12);
+  assert.equal(phone.registered, 13);
   assert.ok(registeredTools.has('phone_screen'));
   assert.ok(registeredTools.has('phone_apps'));
   assert.ok(registeredTools.has('phone_screenshot'));
+  assert.ok(registeredTools.has('phone_return_app'));
   assert.equal(registeredTools.has('phone_shell'), false);
 
   const result = await registeredTools.get('phone_screen').execute(
@@ -172,6 +173,20 @@ test('zero-patch phone tools bridge forwards caller sessionId/turnId and turn/en
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(received[1].path, '/v1/turn-end');
   assert.equal(received[1].body.sessionId, 'sess-42');
+
+  // Duplicate StreamHub notifyTurnEnd for the same session is cleanly deduplicated
+  assert.equal(phone.notifyTurnEnd('sess-42', 'completed'), false);
+
+  // Fresh phone session ended via StreamHub fallback (without ctx.on session/event) still forwards /v1/turn-end!
+  await registeredTools.get('phone_return_app').execute(
+    { summary: '已完成计算器演示' },
+    { agent: { session: { id: 'sess-99' } }, turnId: 'turn-9' },
+  );
+  assert.equal(phone.notifyTurnEnd('sess-99', 'completed', '已完成计算器演示'), true);
+  await new Promise((r) => setTimeout(r, 60));
+  const lastTurnEnd = received.filter((r) => r.path === '/v1/turn-end').at(-1);
+  assert.equal(lastTurnEnd.body.sessionId, 'sess-99');
+  assert.equal(lastTurnEnd.body.summary, '已完成计算器演示');
 });
 
 test('chat domain sanitizes corrupt titles and system domain localizes web providers', async (t) => {
@@ -605,4 +620,361 @@ test('Security & robustness: workspace root confinement, >64 credentials batchin
     request: { toolName: 'phone_tap', sessionId: 'sess-phone-1' },
   });
   assert.equal(core.hub.pendingInteractions.has('ev-phone-2'), true);
+});
+
+test('PATCH /settings auto-recovers stale expectedRevision on settings/mutate & settings/update while preserving 409 on replace', async (t) => {
+  const calls = [];
+  let rev = 3;
+  const supported = new Set(['settings/mutate', 'settings/update', 'settings/replace']);
+  const gw = {
+    claimsEndpoint: (ep) => supported.has(ep),
+    collectSrcClaims: () => [...supported],
+    operatorPeer: () => ({ id: 'op' }),
+    async dispatchRpc(endpoint, payload) {
+      const args = payload.args || {};
+      calls.push({ endpoint, args });
+      if (args.expectedRevision !== undefined && args.expectedRevision !== rev) {
+        return {
+          ok: false,
+          error: {
+            code: 'settings/conflict',
+            message: `settings namespace "${args.ns}" changed since it was read (expected revision ${args.expectedRevision}, now ${rev})`,
+            details: { ns: args.ns, expected: args.expectedRevision, actual: rev },
+          },
+        };
+      }
+      rev += 1;
+      return { ok: true, value: { ns: args.ns, revision: rev, value: { model: 'deepseek-reasoner' } } };
+    },
+  };
+  const ctx = {
+    get: (k) => ({
+      typertGateway: gw,
+      typert: { local: { list: () => [] } },
+      connection: { admit: () => ({ peer: { id: 'op' } }) },
+      webServer: { host: '127.0.0.1', port: 3080 },
+    })[k],
+    logger: { warn: () => {} },
+  };
+  const core = createGbridgeCore(ctx, { bootId: 'boot-settings-conflict' });
+  const server = createServer((req, res) => core.handleHttp(req, res, { mode: 'webServer' }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  t.after(() => { core.dispose(); server.closeAllConnections?.(); server.close(); });
+
+  // 1. Stale expectedRevision on settings/mutate -> automatically retries without expectedRevision -> 200 OK
+  const mutateRes = await jsonReq(port, '/settings', {
+    method: 'PATCH',
+    body: {
+      ns: 'agent-default-model',
+      ops: [{ op: 'set', path: ['reasoningEffort'], value: 'high' }],
+      expectedRevision: 2,
+    },
+  });
+  assert.equal(mutateRes.status, 200);
+  assert.equal(mutateRes.json.conflictRecovered, true);
+  assert.equal(mutateRes.json.result.revision, 4);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].args.expectedRevision, 2);
+  assert.equal(calls[1].args.expectedRevision, undefined);
+
+  // 2. Stale expectedRevision on settings/replace -> preserves 409 conflict semantics
+  const replaceRes = await jsonReq(port, '/settings', {
+    method: 'PATCH',
+    body: {
+      ns: 'llm-pi-ai',
+      section: { providers: {} },
+      expectedRevision: 1,
+    },
+  });
+  assert.equal(replaceRes.status, 409);
+  assert.equal(replaceRes.json.error.details.upstreamCode, 'settings/conflict');
+});
+
+test('SessionNormalizer humanizes phone_* tool titles & summaries instead of raw JSON', () => {
+  const norm = new SessionNormalizer();
+  const turns = norm.normalizeEvents('s-phone-human', [
+    { seq: 1, type: 'turn/start', turnId: 't1', data: { turnId: 't1' } },
+    { seq: 2, type: 'message', turnId: 't1', data: { role: 'user', content: '打开时钟并截屏' } },
+    {
+      seq: 3,
+      type: 'tool/call',
+      turnId: 't1',
+      data: { callId: 'c1', name: 'phone_open', arguments: { appName: '时钟' } },
+    },
+    {
+      seq: 4,
+      type: 'tool/result',
+      turnId: 't1',
+      data: { callId: 'c1', name: 'phone_open', output: '{"ok":true,"package":"com.android.deskclock","opened":"时钟"}' },
+    },
+    {
+      seq: 5,
+      type: 'tool/call',
+      turnId: 't1',
+      data: { callId: 'c2', name: 'phone_screenshot', arguments: {} },
+    },
+    {
+      seq: 6,
+      type: 'tool/result',
+      turnId: 't1',
+      data: { callId: 'c2', name: 'phone_screenshot', output: '{"ok":true,"width":1080,"height":2400}' },
+    },
+    {
+      seq: 7,
+      type: 'tool/call',
+      turnId: 't1',
+      data: { callId: 'c3', name: 'phone_return_app', arguments: { summary: '已完成查看' } },
+    },
+    {
+      seq: 8,
+      type: 'tool/result',
+      turnId: 't1',
+      data: { callId: 'c3', name: 'phone_return_app', output: '{"ok":true}' },
+    },
+    { seq: 9, type: 'turn/end', turnId: 't1', data: { turnId: 't1', reason: { kind: 'completed' } } },
+  ]);
+  assert.equal(turns.length, 1);
+  const [s1, s2, s3] = turns[0].steps;
+  assert.equal(s1.title, 'phone_open · 时钟');
+  assert.equal(s1.summary, '已打开 时钟');
+  assert.ok(!s1.summary.startsWith('{'));
+  assert.equal(s2.title, 'phone_screenshot · 截取当前屏幕');
+  assert.equal(s2.summary, '1080×2400');
+  assert.equal(s3.title, 'phone_return_app · 已完成查看');
+  assert.equal(s3.summary, '已返回应用');
+});
+
+test('v28 regression: normalizer keeps cached tool output, workspace honors explicit idParam, StreamHub cancels user_questions with next', async () => {
+  const norm = new SessionNormalizer();
+  norm.normalizeEvents('s-cache', [
+    { seq: 1, type: 'turn/start', turnId: 't1', data: { turnId: 't1' } },
+    { seq: 2, type: 'tool/call', turnId: 't1', data: { callId: 'c1', name: 'bash', arguments: { command: 'ls' } } },
+    { seq: 3, type: 'tool/result', turnId: 't1', data: { callId: 'c1', name: 'bash', output: 'README.md\npackage.json' } },
+    // Duplicate/replayed tool/call must NOT clobber already-cached tool output with null!
+    { seq: 4, type: 'tool/call', turnId: 't1', data: { callId: 'c1', name: 'bash', arguments: { command: 'ls' } } },
+  ]);
+  const cached = norm.getToolOutput('s-cache', 'c1');
+  assert.equal(cached?.output, 'README.md\npackage.json');
+  assert.equal(cached?.status, 'ok');
+
+  // StreamHub: user_questions cancel decision maps to `{ kind: 'next' }`
+  const { StreamHub } = await import('../lib/stream-hub.js');
+  const settled = [];
+  const hub = new StreamHub({
+    bootId: 'boot-v28',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: norm,
+    gateway: {
+      respondRemoteEvent: async (clientId, eventId, outcome) => {
+        settled.push({ clientId, eventId, outcome });
+      },
+    },
+  });
+  hub.pendingInteractions.set('iq-1', {
+    id: 'iq-1',
+    kind: 'user_questions',
+    event: 'ui/ask-user-questions',
+    eventId: 'ev-1',
+    gatewayClientId: 'gc-1',
+    sessionId: 's-q',
+    payload: {},
+  });
+  const res = await hub.respondInteraction('iq-1', { decision: 'cancel' });
+  assert.equal(res.settled, true);
+  assert.deepEqual(settled[0]?.outcome, { kind: 'next' });
+  hub.dispose();
+});
+
+test('v32 send & reply generation: CJK liveTps, tool-phase suppression, durationMs fallback, interrupt->steer & tornDownChannels', async (t) => {
+  const norm = new SessionNormalizer();
+  const baseTs = 1700000000000;
+
+  // 1. Tool duration fallback (`ev.time`) & turn/end durationMs preservation
+  const turns = norm.normalizeEvents('s-v32', [
+    { seq: 1, id: 'ev-turn-1', type: 'turn/start', time: baseTs, data: {} },
+    { seq: 2, type: 'user/message', turnId: 'ev-turn-1', time: baseTs + 5, data: { text: '检查状态' } },
+    { seq: 3, type: 'tool/call', turnId: 'ev-turn-1', time: baseTs + 100, data: { callId: 'c1', name: 'bash', arguments: { command: 'ls' } } },
+    { seq: 4, type: 'tool/result', turnId: 'ev-turn-1', time: baseTs + 650, data: { callId: 'c1', name: 'bash', output: 'ok' } },
+    { seq: 5, type: 'assistant/message', turnId: 'ev-turn-1', time: baseTs + 900, data: { text: '检查完成', usage: { inputTokens: 100, outputTokens: 20, durationMs: 800 } } },
+    { seq: 6, type: 'turn/end', turnId: 'ev-turn-1', time: baseTs + 920, data: { usage: { inputTokens: 100, outputTokens: 20 } } },
+  ]);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].turnId, 'ev-turn-1');
+  const toolStep = turns[0].steps.find((s) => s.kind === 'tool');
+  assert.equal(toolStep?.durationMs, 550);
+  assert.equal(turns[0].usage?.durationMs, 800);
+
+  // 2. DSH 0.2.2-rc.5 content envelope sends `mode: 'interrupt'` with `session/cancel` + `mode: 'steer'`
+  const dispatched = [];
+  const dshSupported = new Set(['session/list', 'session/listEvents', 'session/cancel', 'session/prompt']);
+  const gw = {
+    claimsEndpoint: (ep) => dshSupported.has(ep),
+    collectSrcClaims: () => [...dshSupported],
+    operatorPeer: () => ({ id: 'op' }),
+    async dispatchRpc(endpoint, payload) {
+      dispatched.push({ endpoint, args: payload.args });
+      return { ok: true, value: { ok: true } };
+    },
+  };
+  const core = createGbridgeCore({
+    get: (k) => ({
+      typertGateway: gw,
+      typert: {
+        local: {
+          list: () => [],
+          get: (ep) => (ep === 'session/prompt'
+            ? { parameters: [{ wire: 'request', codec: { jsonSchema: { properties: { requestId: {}, content: {} } } } }] }
+            : null),
+        },
+      },
+      connection: { admit: () => ({ peer: { id: 'op' } }) },
+      webServer: { host: '127.0.0.1', port: 3080 },
+    })[k],
+    logger: { warn: () => {} },
+  }, { bootId: 'boot-v32-chat' });
+  const srv = createServer((req, res) => core.handleHttp(req, res, { mode: 'webServer' }));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { core.dispose(); srv.closeAllConnections?.(); srv.close(); });
+  const sendRes = await jsonReq(srv.address().port, '/sessions/s-v32/messages', {
+    method: 'POST',
+    body: { text: '立刻改做 B', mode: 'interrupt', clientRequestId: 'req-v32' },
+  });
+  assert.equal(sendRes.status, 200);
+  assert.equal(dispatched[0]?.endpoint, 'session/cancel');
+  assert.equal(dispatched[1]?.endpoint, 'session/prompt');
+  assert.equal(dispatched[1]?.args?.request?.mode, 'steer');
+
+  // 3. CJK-aware rolling liveTps + tool-phase suppression + step/start reset
+  norm.observeStreamChunk('s-tps', { type: 'turn/start' });
+  norm.observeStreamChunk('s-tps', { type: 'text-delta', delta: '这是一段用于测试中文流式吞吐量估算的示例输出文本。' });
+  await new Promise((r) => setTimeout(r, 240));
+  const snapChinese = norm.observeStreamChunk('s-tps', { type: 'text-delta', delta: '继续输出第二段流畅的中文内容以确保速度准确。' });
+  assert.equal(snapChinese.phase, 'streaming');
+  assert.ok(snapChinese.tps != null && snapChinese.tps > 20, `expected CJK tps > 20, got ${snapChinese.tps}`);
+
+  const snapTool = norm.observeStreamChunk('s-tps', { type: 'tool-call-delta', name: 'bash' });
+  assert.equal(snapTool.phase, 'tool');
+  assert.equal(snapTool.tps, undefined);
+
+  norm.observeStreamChunk('s-tps', { type: 'step/start' });
+  const snapPostTool = norm.observeStreamChunk('s-tps', { type: 'text-delta', delta: '工具执行完毕后重新开始输出。' });
+  assert.equal(snapPostTool.phase, 'streaming');
+  assert.equal(snapPostTool.tps, undefined);
+
+  // 4. StreamHub tornDownChannels forces `resumed: false` on reconnect hello
+  const { StreamHub } = await import('../lib/stream-hub.js');
+  const hub = new StreamHub({
+    bootId: 'boot-v32',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: norm,
+    gateway: { has: () => false },
+  });
+  hub.seq = 10;
+  hub.tornDownChannels.add('session:s-v32');
+  const sentFrames = [];
+  const fakeWs = {
+    on() {},
+    sendJson(obj) { sentFrames.push(obj); },
+    sendText(raw) { sentFrames.push(JSON.parse(raw)); },
+    close() {},
+  };
+  const connId = hub.attachClient(fakeWs);
+  hub._onClientMessage(hub.clients.get(connId), {
+    op: 'hello',
+    channels: ['session:s-v32'],
+    resumeFromSeq: 5,
+  });
+  const welcome = sentFrames.find((f) => f.op === 'welcome');
+  assert.equal(welcome?.resumed, false);
+  hub.dispose();
+});
+
+test('v33 regression: StreamHub handles turn_end, bounds tornDownChannels & clears on dispose, and /sessions/search fallback reads projections.values', async (t) => {
+  const norm = new SessionNormalizer();
+  const { StreamHub } = await import('../lib/stream-hub.js');
+  const hub = new StreamHub({
+    bootId: 'boot-v33',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: norm,
+    gateway: { has: () => false },
+  });
+
+  // 1. tornDownChannels bounded to 512 FIFO entries & cleared on dispose()
+  for (let i = 0; i < 600; i++) {
+    const ch = `job:j-${i}`;
+    hub.upstreamStreams.set(ch, {
+      subscribers: new Set(['c1']),
+      abort: new AbortController(),
+      teardownTimer: null,
+    });
+    hub._releaseUpstreamStream(ch, 'c1');
+  }
+  assert.equal(hub.tornDownChannels.size, 512);
+  assert.equal(hub.tornDownChannels.has('job:j-0'), false);
+  assert.equal(hub.tornDownChannels.has('job:j-599'), true);
+
+  // 2. turn_end variant emits turn.completed alongside turn/end
+  const published = [];
+  hub.publish = (channel, type, data) => {
+    published.push({ channel, type, data });
+    return { seq: published.length };
+  };
+  hub._forwardUpstreamStreamItem('session', 's-v33-end', 'session:s-v33-end', {
+    type: 'event',
+    event: { seq: 12, type: 'turn_end', turnId: 't-v33', data: { reason: { kind: 'completed' } } },
+  });
+  assert.ok(
+    published.some((e) => e.channel === 'session:s-v33-end' && e.type === 'turn.completed'),
+    'expected turn_end event to emit turn.completed',
+  );
+  hub.dispose();
+  assert.equal(hub.tornDownChannels.size, 0);
+
+  // 3. /sessions/search fallback reads nested projections.values.title & workingDirectory
+  const dshSupported = new Set(['session/list']);
+  const gw = {
+    claimsEndpoint: (ep) => dshSupported.has(ep),
+    collectSrcClaims: () => [...dshSupported],
+    operatorPeer: () => ({ id: 'op' }),
+    async dispatchRpc(endpoint) {
+      if (endpoint === 'session/list') {
+        return {
+          ok: true,
+          value: {
+            items: [
+              {
+                id: 's-proj-1',
+                workingDirectory: '/Users/dev/grassbag-mobile',
+                projections: { values: { title: '部署安卓内核修复' } },
+              },
+            ],
+          },
+        };
+      }
+      return { ok: false, error: 'unsupported' };
+    },
+  };
+  const core = createGbridgeCore({
+    get: (k) => ({
+      typertGateway: gw,
+      typert: { local: { list: () => [], get: () => null } },
+      connection: { admit: () => ({ peer: { id: 'op' } }) },
+      webServer: { host: '127.0.0.1', port: 3080 },
+    })[k],
+    logger: { warn: () => {} },
+  }, { bootId: 'boot-v33-search' });
+  const srv = createServer((req, res) => core.handleHttp(req, res, { mode: 'webServer' }));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { core.dispose(); srv.closeAllConnections?.(); srv.close(); });
+
+  const byTitle = await jsonReq(srv.address().port, '/sessions/search?q=' + encodeURIComponent('安卓内核'));
+  assert.equal(byTitle.status, 200);
+  assert.equal(byTitle.json.results.length, 1);
+  assert.equal(byTitle.json.results[0].sessionId, 's-proj-1');
+  assert.equal(byTitle.json.results[0].title, '部署安卓内核修复');
+
+  const byCwd = await jsonReq(srv.address().port, '/sessions/search?q=grassbag-mobile');
+  assert.equal(byCwd.status, 200);
+  assert.equal(byCwd.json.results.length, 1);
 });

@@ -6,6 +6,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_theme.dart';
 import '../shell/grassbag_shell.dart';
@@ -27,6 +28,7 @@ class GrassBagAnimatedLogo extends StatefulWidget {
     this.duration = const Duration(milliseconds: 1320),
     this.autoPlay = true,
     this.ambientFloat = true,
+    this.paused = false,
     this.onAssembled,
   });
 
@@ -34,6 +36,7 @@ class GrassBagAnimatedLogo extends StatefulWidget {
   final Duration duration;
   final bool autoPlay;
   final bool ambientFloat;
+  final bool paused;
   final VoidCallback? onAssembled;
 
   @override
@@ -45,6 +48,18 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
   late final AnimationController _assembleCtrl;
   late final AnimationController _ambientCtrl;
   bool _notifiedAssembled = false;
+
+  void _syncAmbient() {
+    final shouldRepeat =
+        widget.ambientFloat && !widget.paused && _assembleCtrl.isCompleted;
+    if (shouldRepeat) {
+      if (!_ambientCtrl.isAnimating) {
+        _ambientCtrl.repeat();
+      }
+    } else if (_ambientCtrl.isAnimating) {
+      _ambientCtrl.stop();
+    }
+  }
 
   @override
   void initState() {
@@ -62,9 +77,7 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
       if (status == AnimationStatus.completed && !_notifiedAssembled) {
         _notifiedAssembled = true;
         widget.onAssembled?.call();
-        if (widget.ambientFloat && mounted) {
-          _ambientCtrl.repeat();
-        }
+        if (mounted) _syncAmbient();
       }
     });
     if (widget.autoPlay) {
@@ -75,8 +88,17 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
           _assembleCtrl.forward();
         }
       });
-    } else if (widget.ambientFloat) {
-      _ambientCtrl.repeat();
+    } else {
+      _syncAmbient();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant GrassBagAnimatedLogo oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.paused != widget.paused ||
+        oldWidget.ambientFloat != widget.ambientFloat) {
+      _syncAmbient();
     }
   }
 
@@ -90,30 +112,21 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
+    // Drive repaint directly on CustomPainter via `repaint: Listenable.merge(...)`
+    // -> ZERO 120Hz AnimatedBuilder widget rebuilds!
     return RepaintBoundary(
-      child: AnimatedBuilder(
-        animation: Listenable.merge([_assembleCtrl, _ambientCtrl]),
-        builder: (context, _) {
-          final amb = _ambientCtrl.value * math.pi * 2.0;
-          final floatDy = widget.ambientFloat && _assembleCtrl.isCompleted
-              ? math.sin(amb) * 2.6
-              : 0.0;
-          return Transform.translate(
-            offset: Offset(0, floatDy),
-            child: SizedBox.square(
-              dimension: widget.size,
-              child: CustomPaint(
-                painter: _GrassBagKineticLogoPainter(
-                  progress: _assembleCtrl.value,
-                  ambientPhase: amb,
-                  hi: t.primaryHi,
-                  lo: t.primary,
-                  isDark: t.isDark,
-                ),
-              ),
-            ),
-          );
-        },
+      child: SizedBox.square(
+        dimension: widget.size,
+        child: CustomPaint(
+          painter: _GrassBagKineticLogoPainter(
+            assemble: _assembleCtrl,
+            ambient: _ambientCtrl,
+            ambientFloat: widget.ambientFloat,
+            hi: t.primaryHi,
+            lo: t.primary,
+            isDark: t.isDark,
+          ),
+        ),
       ),
     );
   }
@@ -121,18 +134,26 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
 
 class _GrassBagKineticLogoPainter extends CustomPainter {
   _GrassBagKineticLogoPainter({
-    required this.progress,
-    required this.ambientPhase,
+    required this.assemble,
+    required this.ambient,
+    required this.ambientFloat,
     required this.hi,
     required this.lo,
     required this.isDark,
-  });
+  })  : _gradientShader = LinearGradient(
+          begin: const Alignment(-0.72, -0.88),
+          end: const Alignment(0.72, 0.88),
+          colors: [hi, lo],
+        ).createShader(const Rect.fromLTWH(0, 0, 64, 64)),
+        super(repaint: Listenable.merge([assemble, ambient]));
 
-  final double progress;
-  final double ambientPhase;
+  final Animation<double> assemble;
+  final Animation<double> ambient;
+  final bool ambientFloat;
   final Color hi;
   final Color lo;
   final bool isDark;
+  final Shader _gradientShader;
 
   static final Path _bodyPath = _buildBodyPath();
   static final Path _leftLeafPath = _buildLeftLeafPath();
@@ -218,15 +239,16 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final p = progress.clamp(0.0, 1.0);
+    final p = assemble.value.clamp(0.0, 1.0);
+    final ambientPhase = ambient.value * math.pi * 2.0;
+    final floatDy = ambientFloat && p >= 0.995 ? math.sin(ambientPhase) * 2.6 : 0.0;
     canvas.save();
+    if (floatDy != 0.0) {
+      canvas.translate(0, floatDy);
+    }
     canvas.scale(size.width / 64.0, size.height / 64.0);
 
-    final gradientShader = LinearGradient(
-      begin: const Alignment(-0.72, -0.88),
-      end: const Alignment(0.72, 0.88),
-      colors: [hi, lo],
-    ).createShader(const Rect.fromLTWH(0, 0, 64, 64));
+    final gradientShader = _gradientShader;
 
     // 1. Soft breathing ambient liquid halo + expanding lens ring
     final haloIn = _seg(p, 0.0, 0.45, Curves.easeOut);
@@ -348,40 +370,14 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
     final collarT = _seg(p, 0.58, 0.78, Curves.easeOutCubic);
     final eyePopT = _seg(p, 0.66, 0.84, Curves.easeOutBack);
     if (fillT > 0.0) {
-      // Build dynamic true-cutout path for collar cinch + elastic eyes so background halo
-      // shines genuinely through them with zero brightness snap when assembly finishes!
-      Path activeBodyShape = _bodyPath;
-      if (collarT > 0.0 || eyePopT > 0.0) {
-        final cutouts = Path();
-        if (collarT > 0.0) {
-          final collarClip = Path()..addRect(Rect.fromLTWH(19.0, 18.0, 26.0 * collarT, 11.0));
-          cutouts.addPath(Path.combine(PathOperation.intersect, _collarPath, collarClip), Offset.zero);
-        }
-        if (eyePopT > 0.0) {
-          double blinkScaleY = 1.0;
-          if (p > 0.86 && p < 0.96) {
-            final bt = (p - 0.86) / 0.10;
-            blinkScaleY = 1.0 - math.sin(bt * math.pi) * 0.84;
-          }
-          final sy = (eyePopT.clamp(0.0, 1.15) * blinkScaleY).clamp(0.08, 1.2);
-          final sx = eyePopT.clamp(0.0, 1.05);
-          final w = 4.4 * sx;
-          final h = 7.4 * sy;
-          final r = math.min(w, h) * 0.5;
-          for (final cx in const [27.8, 38.6]) {
-            cutouts.addRRect(
-              RRect.fromRectAndRadius(
-                Rect.fromCenter(center: Offset(cx, 37.9), width: w, height: h),
-                Radius.circular(r),
-              ),
-            );
-          }
-        }
-        activeBodyShape = Path.combine(PathOperation.difference, _bodyPath, cutouts);
+      final hasCutouts = collarT > 0.0 || eyePopT > 0.0;
+      // Use a tiny local 48×46 saveLayer + BlendMode.dstOut instead of per-frame CPU
+      // Path.combine boolean tessellation — silky 120fps on Android during collar/eye reveal!
+      if (hasCutouts) {
+        canvas.saveLayer(const Rect.fromLTWH(8, 14, 48, 46), Paint());
       }
-
       canvas.save();
-      canvas.clipPath(activeBodyShape);
+      canvas.clipPath(_bodyPath);
       final surfaceY = 59.0 - fillT * 43.0; // rises from y=59 -> y=16
       final waveAmp = math.sin(fillT * math.pi) * 2.8;
       final wavePhase = fillT * math.pi * 4.5;
@@ -417,6 +413,38 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
         );
       }
       canvas.restore();
+
+      if (hasCutouts) {
+        final erasePaint = Paint()..blendMode = BlendMode.dstOut;
+        if (collarT > 0.0) {
+          canvas.save();
+          canvas.clipRect(Rect.fromLTWH(19.0, 18.0, 26.0 * collarT, 11.0));
+          canvas.drawPath(_collarPath, erasePaint);
+          canvas.restore();
+        }
+        if (eyePopT > 0.0) {
+          double blinkScaleY = 1.0;
+          if (p > 0.86 && p < 0.96) {
+            final bt = (p - 0.86) / 0.10;
+            blinkScaleY = 1.0 - math.sin(bt * math.pi) * 0.84;
+          }
+          final sy = (eyePopT.clamp(0.0, 1.15) * blinkScaleY).clamp(0.08, 1.2);
+          final sx = eyePopT.clamp(0.0, 1.05);
+          final w = 4.4 * sx;
+          final h = 7.4 * sy;
+          final r = math.min(w, h) * 0.5;
+          for (final cx in const [27.8, 38.6]) {
+            canvas.drawRRect(
+              RRect.fromRectAndRadius(
+                Rect.fromCenter(center: Offset(cx, 37.9), width: w, height: h),
+                Radius.circular(r),
+              ),
+              erasePaint,
+            );
+          }
+        }
+        canvas.restore();
+      }
     }
 
     // 5. Twin Sprout Leaves Spring Unfurl from crown knot (0.40 -> 0.78)
@@ -511,8 +539,9 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _GrassBagKineticLogoPainter oldDelegate) =>
-      oldDelegate.progress != progress ||
-      oldDelegate.ambientPhase != ambientPhase ||
+      oldDelegate.assemble != assemble ||
+      oldDelegate.ambient != ambient ||
+      oldDelegate.ambientFloat != ambientFloat ||
       oldDelegate.hi != hi ||
       oldDelegate.lo != lo ||
       oldDelegate.isDark != isDark;
@@ -543,8 +572,12 @@ enum _GateStage {
   ready,
 }
 
-class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
+class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
+    with SingleTickerProviderStateMixin {
   late _GateStage _stage;
+  late final AnimationController _exitCtrl;
+  late final CurvedAnimation _exitCurve;
+  _GateStage? _pendingExitStage;
   bool _shellMounted = false;
   bool _exitingSplash = false;
   bool _logoAssembled = false;
@@ -557,6 +590,23 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
   @override
   void initState() {
     super.initState();
+    _exitCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 360),
+    )..addStatusListener((status) {
+        if (status == AnimationStatus.completed && mounted && _exitingSplash) {
+          final target = _pendingExitStage ?? _GateStage.ready;
+          _pendingExitStage = null;
+          setState(() {
+            _stage = target;
+            _exitingSplash = false;
+          });
+        }
+      });
+    _exitCurve = CurvedAnimation(
+      parent: _exitCtrl,
+      curve: Curves.easeOutCubic,
+    );
     final initial = ref.read(appProvider);
     final isReturning = initial.onboardingCompleted ||
         initial.nativeRuntimeStatus.initialized ||
@@ -579,17 +629,23 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       // Allow impatient returning users to tap through after 1.15s once logo is nearly complete
+      // (never unlock manual skip during first-launch onboarding beat).
       _skipUnlockTimer = Timer(const Duration(milliseconds: 1150), () {
-        if (mounted) setState(() => _allowManualSkip = true);
+        if (mounted && !_isOnboardingDecisionPending() && !_shouldShowOnboarding()) {
+          setState(() => _allowManualSkip = true);
+        }
       });
       // Safety fallback: ensure shell mounts only for returning users, and hold splash gracefully
-      // up to 4.6s while container startup + model/DeepSeek auth hydration settle so Home NEVER flashes!
+      // up to 3.6s while container startup + model/DeepSeek auth hydration settle so Home NEVER flashes!
       _shellMountTimer = Timer(const Duration(milliseconds: 1400), () {
-        if (mounted && !_shellMounted && !_shouldShowOnboarding()) {
+        if (mounted &&
+            !_shellMounted &&
+            !_isOnboardingDecisionPending() &&
+            !_shouldShowOnboarding()) {
           setState(() => _shellMounted = true);
         }
       });
-      _maxHoldTimer = Timer(const Duration(milliseconds: 4600), () {
+      _maxHoldTimer = Timer(const Duration(milliseconds: 3600), () {
         _beginSplashExit();
       });
     });
@@ -601,7 +657,17 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
     _skipUnlockTimer?.cancel();
     _maxHoldTimer?.cancel();
     _dismissTimer?.cancel();
+    _exitCurve.dispose();
+    _exitCtrl.dispose();
     super.dispose();
+  }
+
+  bool _isOnboardingDecisionPending() {
+    final s = ref.read(appProvider);
+    if (!GrassBagNativeBridge.instance.isAndroidNative) return false;
+    if (s.onboardingCompleted || s.nativeRuntimeStatus.initialized) return false;
+    if (s.hosts.any((h) => !h.isLocal)) return false;
+    return !s.nativeStatusHydrated;
   }
 
   bool _shouldShowOnboarding() {
@@ -615,7 +681,16 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
   /// True once initial host startup, DSH namespaces, and DeepSeek auth/models have settled
   /// enough to enter Home cleanly without flashing intermediate "connecting / configure model" cards.
   bool _isStartupHydrationSettled(GrassBagAppState s) {
-    if (s.connectionPhase == ConnectionPhase.connecting) return false;
+    if (GrassBagNativeBridge.instance.isAndroidNative &&
+        s.activeHost.isLocal &&
+        !s.nativeStatusHydrated) {
+      return false;
+    }
+    if (s.connectionPhase == ConnectionPhase.connecting ||
+        s.connectionPhase == ConnectionPhase.reconnecting ||
+        s.connectionPhase == ConnectionPhase.bootstrapping) {
+      return false;
+    }
     if (s.activeHost.isLocal && s.nativeRuntimeStatus.engineState == 'starting') return false;
     if (s.hydratingDomains) return false;
     if (s.connectionPhase == ConnectionPhase.connected) {
@@ -632,6 +707,10 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
     _logoAssembled = true;
     // On first launch, mount OnboardingPage DIRECTLY under the splash (NEVER mount GrassBagShell!)
     // so the splash cross-dissolves seamlessly into Onboarding with ZERO home-screen flash!
+    // Note: `_beginSplashExit()` re-evaluates `_shouldShowOnboarding()` after the 220ms beat
+    // (total ~1.5s from launch), giving Android's parallel `refreshNativeStatus()` plenty of
+    // headroom to report `initialized == true` for upgrading users while never stalling if
+    // the native channel is unavailable (e.g., headless tests or OEM binder error).
     if (_shouldShowOnboarding()) {
       _dismissTimer?.cancel();
       _dismissTimer = Timer(const Duration(milliseconds: 220), _beginSplashExit);
@@ -663,6 +742,7 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
         ctrl.completeOnboarding();
       }
     }
+    _pendingExitStage = goOnboarding ? _GateStage.onboarding : _GateStage.ready;
     setState(() {
       if (goOnboarding) {
         _stage = _GateStage.onboarding;
@@ -671,34 +751,38 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
       }
       _exitingSplash = true;
     });
-    _dismissTimer = Timer(const Duration(milliseconds: 380), () {
-      if (!mounted) return;
-      setState(() {
-        _stage = goOnboarding ? _GateStage.onboarding : _GateStage.ready;
-        _exitingSplash = false;
-      });
-    });
+    _exitCtrl.forward(from: 0.0);
   }
 
   @override
   Widget build(BuildContext context) {
     // Watch startup readiness while splash is visible so we dissolve right when engine + models + auth settle!
     if (_stage == _GateStage.splash) {
-      ref.listen<(ConnectionPhase, String, bool)>(
+      ref.listen<(ConnectionPhase, String, bool, bool, bool)>(
         appProvider.select(
           (s) => (
             s.connectionPhase,
             s.nativeRuntimeStatus.engineState,
-            !s.hydratingDomains &&
-                (s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn),
+            s.nativeStatusHydrated,
+            s.hydratingDomains,
+            s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn,
           ),
         ),
         (prev, next) {
-          if (_logoAssembled &&
-              !_exitingSplash &&
-              !_shouldShowOnboarding() &&
-              _isStartupHydrationSettled(ref.read(appProvider))) {
-            _dismissTimer?.cancel();
+          if (!_logoAssembled || _exitingSplash) return;
+          if (_shouldShowOnboarding()) {
+            return;
+          }
+          // Returning user status just hydrated (e.g. initialized container on upgrade):
+          // cancel any pending onboarding exit timer and mount GrassBagShell instead!
+          _dismissTimer?.cancel();
+          if (!_shellMounted) {
+            setState(() {
+              _shellMounted = true;
+              _allowManualSkip = true;
+            });
+          }
+          if (_isStartupHydrationSettled(ref.read(appProvider))) {
             _dismissTimer = Timer(const Duration(milliseconds: 180), _beginSplashExit);
           }
         },
@@ -710,34 +794,49 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
 
     return Stack(
       children: [
-        // Main shell mounts ONLY for returning users (or after onboarding completes)
-        if (_shellMounted) const GrassBagShell(),
+        // Main shell mounts ONLY for returning users (or after onboarding completes);
+        // mute all tickers while completely covered by the opaque brand splash!
+        if (_shellMounted)
+          TickerMode(
+            enabled: !showSplash,
+            child: GrassBagShell(isSplashCovered: showSplash),
+          ),
 
         // Full-screen First-Launch Onboarding Experience (mounted BEFORE splash fades out -> zero flash!)
         if (showOnboarding)
           Positioned.fill(
-            child: OnboardingPage(
-              isFirstLaunch: true,
-              onFinished: () {
-                if (!mounted) return;
-                setState(() {
-                  _shellMounted = true;
-                  _stage = _GateStage.ready;
-                });
-              },
+            child: TickerMode(
+              enabled: !showSplash,
+              child: OnboardingPage(
+                isFirstLaunch: true,
+                onFinished: () {
+                  _dismissTimer?.cancel();
+                  _exitCtrl.stop();
+                  if (!mounted) return;
+                  setState(() {
+                    _shellMounted = true;
+                    _stage = _GateStage.ready;
+                    _exitingSplash = false;
+                  });
+                },
+              ),
             ),
           ),
 
         // Subsequent-launch (and first-launch opening beat) Kinetic Logo Assembly Splash
         if (showSplash)
           Positioned.fill(
-            child: IgnorePointer(
-              ignoring: _exitingSplash,
-              child: _GrassBagSplashLayer(
-                exiting: _exitingSplash,
-                allowTapSkip: _allowManualSkip,
-                onLogoAssembled: _onLogoAssembled,
-                onTapSkip: _beginSplashExit,
+            child: PopScope(
+              canPop: false,
+              child: IgnorePointer(
+                ignoring: _exitingSplash,
+                child: _GrassBagSplashLayer(
+                  exiting: _exitingSplash,
+                  exitProgress: _exitCurve,
+                  allowTapSkip: _allowManualSkip,
+                  onLogoAssembled: _onLogoAssembled,
+                  onTapSkip: _beginSplashExit,
+                ),
               ),
             ),
           ),
@@ -749,12 +848,14 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate> {
 class _GrassBagSplashLayer extends ConsumerWidget {
   const _GrassBagSplashLayer({
     required this.exiting,
+    required this.exitProgress,
     required this.allowTapSkip,
     required this.onLogoAssembled,
     required this.onTapSkip,
   });
 
   final bool exiting;
+  final Animation<double> exitProgress;
   final bool allowTapSkip;
   final VoidCallback onLogoAssembled;
   final VoidCallback onTapSkip;
@@ -769,6 +870,8 @@ class _GrassBagSplashLayer extends ConsumerWidget {
           isLocal: s.activeHost.isLocal,
           hostName: s.activeHost.name,
           onboardingDone: s.onboardingCompleted,
+          initialized: s.nativeRuntimeStatus.initialized,
+          hasRemoteHosts: s.hosts.any((h) => !h.isLocal),
           progressPct: s.runtimeProgressPct,
           hydrated: !s.hydratingDomains &&
               (s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn),
@@ -778,7 +881,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
 
     final String statusText;
     final bool statusReady;
-    if (!slice.onboardingDone) {
+    if (!slice.onboardingDone && !slice.initialized && !slice.hasRemoteHosts) {
       statusText = '把 DeepSeek Harness 装进口袋';
       statusReady = false;
     } else if (slice.phase == ConnectionPhase.connected && slice.hydrated) {
@@ -793,32 +896,41 @@ class _GrassBagSplashLayer extends ConsumerWidget {
     } else if (slice.phase == ConnectionPhase.connecting) {
       statusText = slice.isLocal ? '正在唤醒本机容器与 DSH 核心…' : '正在连接 ${slice.hostName}…';
       statusReady = false;
+    } else if (slice.phase == ConnectionPhase.reconnecting) {
+      statusText = '正在重新连接 ${slice.hostName}…';
+      statusReady = false;
+    } else if (slice.phase == ConnectionPhase.bootstrapping) {
+      statusText = '正在初始化本机运行环境…';
+      statusReady = false;
+    } else if (slice.phase == ConnectionPhase.needsAuth) {
+      statusText = '已连通 ${slice.hostName} · 待授权';
+      statusReady = false;
+    } else if (slice.phase == ConnectionPhase.error) {
+      statusText = '正在进入工作台（可稍后检查连接）…';
+      statusReady = false;
     } else {
       statusText = '正在准备你的工作台…';
       statusReady = false;
     }
+
+    final fadeOutAnim = Tween<double>(begin: 1.0, end: 0.0).animate(exitProgress);
+    final scaleOutAnim = Tween<double>(begin: 1.0, end: 1.04).animate(exitProgress);
 
     return Material(
       type: MaterialType.transparency,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: allowTapSkip ? onTapSkip : null,
-        child: AnimatedOpacity(
-          opacity: exiting ? 0.0 : 1.0,
-          duration: const Duration(milliseconds: 360),
-          curve: Curves.easeOutCubic,
-          child: AnimatedScale(
-            scale: exiting ? 1.04 : 1.0,
-            duration: const Duration(milliseconds: 380),
-            curve: Curves.easeOutCubic,
+        child: FadeTransition(
+          opacity: fadeOutAnim,
+          child: ScaleTransition(
+            scale: scaleOutAnim,
             child: DecoratedBox(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
-                colors: t.isDark
-                    ? const [Color(0xFF1C2536), Color(0xFF192130), Color(0xFF151D2B)]
-                    : const [Color(0xFFEAF3FC), Color(0xFFEDF4FB), Color(0xFFE7EFFA)],
+                colors: [t.bgTop, t.bgSolid, t.bgBottom],
               ),
             ),
             child: Stack(
@@ -866,6 +978,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                       GrassBagAnimatedLogo(
                         size: 118,
                         duration: const Duration(milliseconds: 1280),
+                        paused: exiting,
                         onAssembled: onLogoAssembled,
                       ),
                       const SizedBox(height: 18),
@@ -902,50 +1015,56 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                             child: child,
                           ),
                         ),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                          decoration: BoxDecoration(
-                            color: (t.isDark ? Colors.white : Colors.white)
-                                .withValues(alpha: t.isDark ? 0.07 : 0.72),
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: t.isDark ? 0.14 : 0.92),
-                              width: 0.7,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 24),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: t.isDark ? 0.07 : 0.72),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: t.isDark ? 0.14 : 0.92),
+                                width: 0.7,
+                              ),
+                              boxShadow: t.isDark
+                                  ? null
+                                  : const [
+                                      BoxShadow(
+                                        color: Color(0x0A000000),
+                                        blurRadius: 12,
+                                        offset: Offset(0, 3),
+                                      ),
+                                    ],
                             ),
-                            boxShadow: t.isDark
-                                ? null
-                                : const [
-                                    BoxShadow(
-                                      color: Color(0x0A000000),
-                                      blurRadius: 12,
-                                      offset: Offset(0, 3),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (statusReady)
+                                  Icon(CupertinoIcons.checkmark_circle_fill, size: 13, color: t.ok)
+                                else
+                                  SizedBox(
+                                    width: 12,
+                                    height: 12,
+                                    child: CupertinoActivityIndicator(
+                                      radius: 5.5,
+                                      color: t.primary,
                                     ),
-                                  ],
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (statusReady)
-                                Icon(CupertinoIcons.checkmark_circle_fill, size: 13, color: t.ok)
-                              else
-                                SizedBox(
-                                  width: 12,
-                                  height: 12,
-                                  child: CupertinoActivityIndicator(
-                                    radius: 5.5,
-                                    color: t.primary,
+                                  ),
+                                const SizedBox(width: 7),
+                                Flexible(
+                                  child: Text(
+                                    statusText,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w500,
+                                      color: statusReady ? t.ok : t.text2,
+                                    ),
                                   ),
                                 ),
-                              const SizedBox(width: 7),
-                              Text(
-                                statusText,
-                                style: TextStyle(
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w500,
-                                  color: statusReady ? t.ok : t.text2,
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
                       ),

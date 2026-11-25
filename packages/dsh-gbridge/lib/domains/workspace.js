@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -42,11 +42,31 @@ function expandHomePath(p) {
 function safeRealpath(p) {
   const expanded = expandHomePath(p);
   if (!expanded) return '';
+  const abs = resolve(expanded);
   try {
-    return realpathSync(expanded);
+    return realpathSync(abs);
   } catch {
-    return resolve(expanded);
+    // Walk up until the deepest existing ancestor is realpath'd so non-existent paths beneath
+    // a symlink pointing outside the workspace root cannot bypass containment checks.
+    const trailing = [];
+    let cur = abs;
+    while (true) {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      trailing.unshift(basename(cur));
+      cur = parent;
+      try {
+        const realAncestor = realpathSync(cur);
+        return join(realAncestor, ...trailing);
+      } catch {}
+    }
   }
+}
+
+function parseIntClamped(raw, fallback, min, max) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
 }
 
 function normalizeExplicitWorkspace(w) {
@@ -425,10 +445,12 @@ function resolveScheduleTiming(body) {
   }
   const tz = resolveDefaultTimeZone(body);
   if (body?.everySeconds != null || body?.every_seconds != null) {
-    return { kind: 'every', every_seconds: Math.max(60, Number(body.everySeconds ?? body.every_seconds)) };
+    const secs = parseIntClamped(body.everySeconds ?? body.every_seconds, 60, 60, 31536000);
+    return { kind: 'every', every_seconds: secs };
   }
   if (body?.afterSeconds != null || body?.after_seconds != null) {
-    return { kind: 'after', after_seconds: Math.max(10, Number(body.afterSeconds ?? body.after_seconds)) };
+    const secs = parseIntClamped(body.afterSeconds ?? body.after_seconds, 10, 10, 31536000);
+    return { kind: 'after', after_seconds: secs };
   }
   if (typeof body?.dailyTime === 'string' && body.dailyTime.trim()) {
     return { kind: 'daily', daily: { time: body.dailyTime.trim(), time_zone: tz } };
@@ -461,7 +483,7 @@ function resolveScheduleTarget(body) {
   return { kind: 'new_once' };
 }
 
-export function registerWorkspaceDomain(router, { ctx, gateway }) {
+export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid = false }) {
   const MAX_TRACKED_ENTRIES = 512;
   const terminalSessionMap = new Map();
   const jobSessionMap = new Map();
@@ -680,14 +702,43 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
     sendJson(res, 200, { v: 1, result });
   }, { domain: 'files' });
 
+  async function assertAllowedBrowsePath(targetPath, peer) {
+    const realTarget = safeRealpath(targetPath || homedir());
+    if (!realTarget) {
+      throw new GbridgeError(400, 'gbridge/validation_error', 'directory path could not be resolved');
+    }
+    const allowedRoots = [];
+    const homeReal = safeRealpath(homedir());
+    if (homeReal) allowedRoots.push(homeReal);
+    if (isLocalAndroid) {
+      for (const androidRoot of ['/sdcard', '/storage/emulated/0']) {
+        if (existsSync(androidRoot)) {
+          const r = safeRealpath(androidRoot);
+          if (r) allowedRoots.push(r);
+        }
+      }
+    }
+    const snap = await readWorkspaceRegistrySnapshot(ctx, gateway, peer).catch(() => ({ workspaces: [] }));
+    for (const w of snap.workspaces) {
+      const wReal = safeRealpath(w.path);
+      if (wReal) allowedRoots.push(wReal);
+    }
+    const isAllowed = allowedRoots.some((root) => realTarget === root || realTarget.startsWith(root + sep));
+    if (!isAllowed) {
+      throw new GbridgeError(403, 'gbridge/path_outside_workspace', 'requested directory is outside allowed roots');
+    }
+    return realTarget;
+  }
+
   router.get('/fs/browse', async (_req, res, { searchParams, peer }) => {
     const rawPath = searchParams.get('path') || undefined;
-    const expandedPath = rawPath ? expandHomePath(rawPath) : undefined;
+    const expandedPath = rawPath ? expandHomePath(rawPath) : homedir();
+    const safePath = await assertAllowedBrowsePath(expandedPath, peer);
     if (gateway.has('directoryPicker/list')) {
       try {
-        const resData = await gateway.call('directoryPicker/list', expandedPath ? { path: expandedPath } : {}, { peer });
+        const resData = await gateway.call('directoryPicker/list', { path: safePath }, { peer });
         if (Array.isArray(resData)) {
-          const curDir = resolve(expandedPath || homedir());
+          const curDir = safePath;
           const parent = dirname(curDir);
           sendJson(res, 200, {
             v: 1,
@@ -699,7 +750,7 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
           return;
         }
         if (resData && typeof resData === 'object') {
-          const curDir = String(resData.path || resolve(expandedPath || homedir()));
+          const curDir = String(resData.path || safePath);
           const parent = resData.parent !== undefined ? resData.parent : (dirname(curDir) === curDir ? null : dirname(curDir));
           const list = Array.isArray(resData.entries)
             ? resData.entries
@@ -719,25 +770,25 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
         }
       }
     }
-    sendJson(res, 200, { v: 1, ...fallbackBrowseDir(expandedPath) });
+    sendJson(res, 200, { v: 1, ...fallbackBrowseDir(safePath) });
   }, { domain: 'files' });
 
   router.post('/fs/mkdir', async (req, res, { peer }) => {
     const body = await readJsonBody(req);
     const basePath = expandHomePath(String(body.path || homedir()));
+    const safeBasePath = await assertAllowedBrowsePath(basePath, peer);
     const childName = typeof body.name === 'string' ? body.name.trim() : '';
     if (childName && (childName.includes('/') || childName.includes('\\') || childName === '..' || childName === '.')) {
       throw new GbridgeError(400, 'gbridge/validation_error', 'directory name cannot contain path separators or traversal segments');
     }
-    const fullTarget = childName ? join(basePath, childName) : basePath;
-    if (childName) {
-      assertContainedWorkspacePath(basePath, childName);
-    }
+    const fullTarget = childName
+      ? assertContainedWorkspacePath(safeBasePath, childName).fullPath
+      : safeBasePath;
     if (gateway.has('directoryPicker/createDirectory')) {
       try {
         const result = await gateway.call('directoryPicker/createDirectory', {
           ...body,
-          path: basePath,
+          path: safeBasePath,
           ...(childName ? { name: childName } : {}),
         }, { peer });
         sendJson(res, 201, { v: 1, path: fullTarget, result });
@@ -749,22 +800,26 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
   }, { domain: 'files' });
 
   async function resolveWorkspaceScope(idParam, querySessionId, peer) {
-    let sid = querySessionId || (idParam.startsWith('session-') ? idParam : null);
+    let sid = querySessionId || null;
     const requestedPath = idParam.startsWith('/') || idParam.startsWith('~') ? expandHomePath(idParam) : null;
     const requestedReal = requestedPath ? safeRealpath(requestedPath) : null;
     let dirPath = null;
     const snap = await readWorkspaceRegistrySnapshot(ctx, gateway, peer).catch(() => ({ workspaces: [] }));
-    const matched = snap.workspaces.find(
-      (w) =>
-        w.id === idParam ||
-        w.workspaceId === idParam ||
-        (sid && Array.isArray(w.sessionIds) && w.sessionIds.includes(sid)) ||
-        (requestedReal && safeRealpath(w.path) === requestedReal),
-    );
+    // Prioritize explicit workspace ID or explicit filesystem path over ambient querySessionId
+    // so browsing Workspace B while Session A is active never resolves back to Workspace A!
+    const matched =
+      snap.workspaces.find((w) => w.id === idParam || w.workspaceId === idParam) ||
+      (requestedReal ? snap.workspaces.find((w) => safeRealpath(w.path) === requestedReal) : null) ||
+      (sid ? snap.workspaces.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(sid)) : null) ||
+      snap.workspaces.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(idParam));
     if (matched) {
       if (matched.path) dirPath = matched.path;
-      if (!sid && Array.isArray(matched.sessionIds) && matched.sessionIds.length > 0) {
-        sid = matched.sessionIds[matched.sessionIds.length - 1];
+      const wsSessions = Array.isArray(matched.sessionIds) ? matched.sessionIds : [];
+      if (sid && !wsSessions.includes(sid)) {
+        // querySessionId belongs to a different workspace — bind to a session inside `matched` instead.
+        sid = wsSessions.length > 0 ? wsSessions[wsSessions.length - 1] : null;
+      } else if (!sid && wsSessions.length > 0) {
+        sid = wsSessions.includes(idParam) ? idParam : wsSessions[wsSessions.length - 1];
       }
     } else if (requestedReal) {
       // Security confinement: only permit explicit path-based scope if inside a registered workspace or user's $HOME (never `/` root!).
@@ -812,8 +867,8 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
     const path = searchParams.get('path');
     if (!path) throw new GbridgeError(400, 'gbridge/validation_error', 'query param path is required');
     const binary = searchParams.get('binary') === 'true';
-    const offset = Math.max(1, Number(searchParams.get('offset') || 1));
-    const limit = Math.max(1, Number(searchParams.get('limit') || 400));
+    const offset = parseIntClamped(searchParams.get('offset') ?? 1, 1, 1, 1000000);
+    const limit = parseIntClamped(searchParams.get('limit') ?? 400, 400, 1, 5000);
     const { sid, dirPath } = await resolveWorkspaceScope(params.id, searchParams.get('sessionId'), peer);
     const scopeId = sid || (!params.id.startsWith('/') ? params.id : null);
     const ep = binary && gateway.has('workspaceFiles/readBytes') ? 'workspaceFiles/readBytes' : 'workspaceFiles/read';
@@ -843,18 +898,32 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
       throw new GbridgeError(403, 'gbridge/workspace_not_allowed', 'requested workspace path is outside allowed roots');
     }
     const { realBase, fullPath } = assertContainedWorkspacePath(dirPath, path);
-    const st = statSync(fullPath);
+    let st;
+    try {
+      st = await stat(fullPath);
+    } catch (err) {
+      if (err?.code === 'ENOENT') {
+        throw new GbridgeError(404, 'gbridge/file_not_found', 'requested file does not exist');
+      }
+      if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+        throw new GbridgeError(403, 'gbridge/file_access_denied', 'permission denied reading file');
+      }
+      throw err;
+    }
+    if (!st.isFile()) {
+      throw new GbridgeError(400, 'gbridge/not_a_regular_file', 'requested path is not a regular file');
+    }
     if (binary) {
       if (st.size > 4 * 1024 * 1024) {
         throw new GbridgeError(413, 'gbridge/file_too_large', 'binary file exceeds 4MB preview cap');
       }
-      sendBinary(res, 200, readFileSync(fullPath));
+      sendBinary(res, 200, await readFile(fullPath));
       return;
     }
     if (st.size > 1024 * 1024) {
       throw new GbridgeError(413, 'gbridge/file_too_large', 'file exceeds 1MB preview cap');
     }
-    const rawBuf = readFileSync(fullPath);
+    const rawBuf = await readFile(fullPath);
     const sample = rawBuf.subarray(0, Math.min(rawBuf.length, 8192));
     if (sample.includes(0)) {
       sendJson(res, 200, {
@@ -1022,8 +1091,8 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
     }
     const termReq = {
       id: body.id || randomUUID(),
-      cols: Number(body.cols || 80),
-      rows: Number(body.rows || 24),
+      cols: parseIntClamped(body.cols ?? 80, 80, 10, 500),
+      rows: parseIntClamped(body.rows ?? 24, 24, 4, 200),
       ...(body.shellPath || body.shell ? { shellPath: body.shellPath ?? body.shell } : {}),
     };
     const terminal = await gateway.call('terminal/create', {
@@ -1202,7 +1271,7 @@ export function registerWorkspaceDomain(router, { ctx, gateway }) {
   }, { domain: 'schedule' });
 
   router.get('/schedules/:id/history', async (_req, res, { params, searchParams, peer }) => {
-    const limit = Math.max(1, Math.min(100, Number(searchParams.get('limit') || 20)));
+    const limit = parseIntClamped(searchParams.get('limit') ?? 20, 20, 1, 100);
     const before = searchParams.get('before') || undefined;
     const history = await gateway.call('schedule/history', {
       request: {

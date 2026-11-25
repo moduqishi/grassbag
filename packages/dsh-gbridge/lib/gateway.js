@@ -241,11 +241,13 @@ function rehydrateAttachments(value, attachments) {
       root = att.bytes;
       continue;
     }
+    const isUnsafeSeg = (s) => s === '__proto__' || s === 'constructor' || s === 'prototype';
+    if (path.some((seg) => isUnsafeSeg(String(seg)))) continue;
     if (!root || typeof root !== 'object') continue;
     let cur = root;
     for (let i = 0; i < path.length - 1; i++) {
       const seg = path[i];
-      if (cur == null || typeof cur !== 'object') {
+      if (cur == null || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, seg)) {
         cur = null;
         break;
       }

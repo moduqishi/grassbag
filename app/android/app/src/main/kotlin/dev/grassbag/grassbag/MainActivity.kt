@@ -15,6 +15,7 @@ import io.flutter.embedding.engine.FlutterEngine
 
 class MainActivity : FlutterActivity() {
     private var bridgePlugin: GrassBagBridgePlugin? = null
+    private var preDrawListener: ViewTreeObserver.OnPreDrawListener? = null
     @Volatile
     private var flutterUiReady = false
 
@@ -31,15 +32,20 @@ class MainActivity : FlutterActivity() {
         // so there is ZERO white/black SurfaceView hole-punch flash between OS splash and Flutter!
         val holdDeadlineMs = SystemClock.elapsedRealtime() + 900L
         val contentView = window.decorView
-        contentView.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+        val listener = object : ViewTreeObserver.OnPreDrawListener {
             override fun onPreDraw(): Boolean {
                 if (flutterUiReady || SystemClock.elapsedRealtime() >= holdDeadlineMs) {
-                    contentView.viewTreeObserver.removeOnPreDrawListener(this)
+                    if (contentView.viewTreeObserver.isAlive) {
+                        contentView.viewTreeObserver.removeOnPreDrawListener(this)
+                    }
+                    preDrawListener = null
                     return true
                 }
                 return false
             }
-        })
+        }
+        preDrawListener = listener
+        contentView.viewTreeObserver.addOnPreDrawListener(listener)
     }
 
     private fun applySavedLaunchSurfaceTheme() {
@@ -61,13 +67,26 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        isMainActivityResumed = true
         RuntimeController.ensureForegroundServiceIfRunning(applicationContext)
         bridgePlugin?.notifyForegroundResumed()
     }
 
+    override fun onPause() {
+        isMainActivityResumed = false
+        super.onPause()
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        bridgePlugin?.detach()
         bridgePlugin = GrassBagBridgePlugin(this).also { it.attach(flutterEngine) }
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        bridgePlugin?.detach()
+        bridgePlugin = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 
     @Deprecated("Deprecated in Java")
@@ -90,8 +109,22 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        isMainActivityResumed = false
+        preDrawListener?.let { l ->
+            val vto = window?.decorView?.viewTreeObserver
+            if (vto != null && vto.isAlive) {
+                vto.removeOnPreDrawListener(l)
+            }
+        }
+        preDrawListener = null
         bridgePlugin?.detach()
         bridgePlugin = null
         super.onDestroy()
+    }
+
+    companion object {
+        @Volatile
+        var isMainActivityResumed: Boolean = false
+            private set
     }
 }

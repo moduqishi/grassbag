@@ -41,6 +41,8 @@ Future<String> downloadAppUpdateApk(
   String destinationPath, {
   void Function(int receivedBytes, int totalBytes)? onProgress,
   bool Function()? isCancelled,
+  int? expectedSizeBytes,
+  void Function(void Function() abort)? onAbortReady,
 }) async {
   throw UnsupportedError('Web 端请直接通过浏览器下载 APK 安装包');
 }

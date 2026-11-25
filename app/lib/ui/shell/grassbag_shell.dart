@@ -2,13 +2,14 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb;
+import 'package:flutter/foundation.dart' show ValueListenable, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:gbridge_client/gbridge_client.dart' show NormalizedTurn;
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import '../../services/native_bridge.dart';
@@ -44,7 +45,12 @@ import '../web/official_web_page.dart';
 ///   * Center floating title pill HIDDEN while left sidebar is open (restored smoothly when collapsed)
 ///   * Right workbench HIDDEN by default, toggled via top-right button (zero duplicate buttons)
 class GrassBagShell extends ConsumerStatefulWidget {
-  const GrassBagShell({super.key});
+  const GrassBagShell({
+    super.key,
+    this.isSplashCovered = false,
+  });
+
+  final bool isSplashCovered;
 
   @override
   ConsumerState<GrassBagShell> createState() => _GrassBagShellState();
@@ -56,10 +62,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
 
   final _composerCtrl = TextEditingController();
   final _composerFocus = FocusNode();
-  final _scrollCtrl = ScrollController();
+  final _scrollCtrl = _ImeLockStepScrollController();
   final _plusOpenNotifier = ValueNotifier<bool>(false);
+  final _suggestionsOpenNotifier = ValueNotifier<bool>(false);
+  final _editingContextNotifier = ValueNotifier<EditingMessageContext?>(null);
+  final _drawerBackHandler = ValueNotifier<bool Function()?>(null);
   final _showScrollToBottomNotifier = ValueNotifier<bool>(false);
+  final _hasNewBelowNotifier = ValueNotifier<bool>(false);
+  final _prependedOlderCountNotifier = ValueNotifier<int>(0);
   final _composerHeightNotifier = ValueNotifier<double>(108.0);
+  DateTime? _lastBackPressedAt;
 
   late final AnimationController _drawerCtrl;
   Ticker? _streamScrollTicker;
@@ -71,6 +83,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   bool _isProgrammaticScroll = false;
   int _programmaticScrollGen = 0;
   double _lastMaxScrollExtent = 0.0;
+  double _upwardScrollAccum = 0.0;
+  final Map<String, ({double pixels, bool scrolledAway})> _savedScrollOffsetBySession =
+      <String, ({double pixels, bool scrolledAway})>{};
   final Set<String> _animatedTurnIds = <String>{};
 
   @override
@@ -92,8 +107,15 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
-      ref.read(appProvider.notifier).handleAppPaused();
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // Flush composer text immediately before persisting host contexts so rapid backgrounding
+      // within the 400ms typing debounce window NEVER loses an unsent draft!
+      ref.read(appProvider.notifier).setComposerDraftForActiveHost(_composerCtrl.text);
+      if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+        ref.read(appProvider.notifier).handleAppPaused();
+      }
     } else if (state == AppLifecycleState.resumed) {
       ref.read(appProvider.notifier).handleAppResumed();
     }
@@ -108,7 +130,12 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     _composerCtrl.dispose();
     _scrollCtrl.dispose();
     _plusOpenNotifier.dispose();
+    _suggestionsOpenNotifier.dispose();
+    _editingContextNotifier.dispose();
+    _drawerBackHandler.dispose();
     _showScrollToBottomNotifier.dispose();
+    _hasNewBelowNotifier.dispose();
+    _prependedOlderCountNotifier.dispose();
     _composerHeightNotifier.dispose();
     _drawerCtrl.dispose();
     super.dispose();
@@ -157,17 +184,29 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     }
 
     final pos = _scrollCtrl.position;
-    // Never fight the user while they are actively touching/dragging the list!
-    if (_userDraggingList) {
+    // Never fight the user while they are actively touching, dragging, or flinging the list,
+    // and never fight an active programmatic `animateTo()` glide!
+    if (_userDraggingList || _scrollCtrl.isUserDrivenScroll || _isProgrammaticScroll) {
       return;
     }
     final gap = pos.maxScrollExtent - pos.pixels;
+    if (gap <= 24.0) {
+      if (_showScrollToBottomNotifier.value) {
+        _showScrollToBottomNotifier.value = false;
+      }
+      if (_hasNewBelowNotifier.value) {
+        _hasNewBelowNotifier.value = false;
+      }
+    }
     if (gap > 0.5) {
-      final step = gap <= 2.0 ? gap : gap * (1.0 - math.exp(-16.0 * dtSec));
-      final next = (pos.pixels + step).clamp(0.0, pos.maxScrollExtent);
+      final rawStep = gap <= 2.0 ? gap : gap * (1.0 - math.exp(-16.0 * dtSec));
+      // Cap per-frame jump when catching up over a large distance so scroll stays graceful.
+      final maxFrameStep = math.max(96.0, pos.viewportDimension * 0.42) * (dtSec / 0.016);
+      final step = math.min(rawStep, maxFrameStep);
+      final next = (pos.pixels + step).clamp(pos.minScrollExtent, pos.maxScrollExtent);
       _isProgrammaticScroll = true;
       try {
-        _scrollCtrl.jumpTo(next);
+        _scrollCtrl.chaseTo(next);
       } finally {
         _isProgrammaticScroll = false;
       }
@@ -213,13 +252,20 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       spring,
       _drawerCtrl.value,
       clamped,
-      velocity.clamp(-3.5, 3.5),
+      velocity.clamp(-7.5, 7.5),
+      tolerance: const Tolerance(distance: 0.005, velocity: 0.02),
     );
     _drawerCtrl.animateWith(sim);
   }
 
+  void _dismissKeyboardAndPopovers() {
+    if (_plusOpenNotifier.value) _plusOpenNotifier.value = false;
+    if (_suggestionsOpenNotifier.value) _suggestionsOpenNotifier.value = false;
+    if (_composerFocus.hasFocus) _composerFocus.unfocus();
+  }
+
   void _openPhoneDrawer() {
-    HapticFeedback.selectionClick();
+    _dismissKeyboardAndPopovers();
     _animateDrawerTo(1.0);
   }
 
@@ -264,6 +310,22 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           .whenComplete(() {
             if (_programmaticScrollGen == gen) {
               _isProgrammaticScroll = false;
+              // Re-check true maxScrollExtent once lazy ListView/SliverList items materialize
+              // during the scroll animation so tapping scroll-to-bottom NEVER undershoots!
+              if (mounted &&
+                  !_userScrolledAway &&
+                  _scrollCtrl.hasClients &&
+                  _scrollCtrl.positions.length == 1) {
+                final pos = _scrollCtrl.position;
+                if (pos.maxScrollExtent - pos.pixels > 4.0) {
+                  _isProgrammaticScroll = true;
+                  try {
+                    _scrollCtrl.jumpTo(pos.maxScrollExtent);
+                  } finally {
+                    if (_programmaticScrollGen == gen) _isProgrammaticScroll = false;
+                  }
+                }
+              }
             }
           });
     } else {
@@ -308,38 +370,122 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   }
 
   Future<void> _handleLoadOlderTurns() async {
-    final targetSid = ref.read(appProvider).activeSessionId;
-    final hadClients = _scrollCtrl.hasClients && _scrollCtrl.positions.length == 1;
-    final oldPixels = hadClients ? _scrollCtrl.position.pixels : 0.0;
-    final oldMax = hadClients ? _scrollCtrl.position.maxScrollExtent : 0.0;
+    final startState = ref.read(appProvider);
+    final targetSid = startState.activeSessionId;
+    final prevLen = startState.turns.length;
+    // Pause streaming auto-follow so loading older history NEVER yanks the user back to bottom!
+    _userScrolledAway = true;
+    _scrollCtrl.allowImeAnchor = false;
+    _stopStreamScrollFollower();
     await ref.read(appProvider.notifier).loadOlderTurns();
-    if (!mounted || !hadClients) return;
-    if (ref.read(appProvider).activeSessionId != targetSid) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted ||
-          ref.read(appProvider).activeSessionId != targetSid ||
-          !_scrollCtrl.hasClients ||
-          _scrollCtrl.positions.length != 1) {
-        return;
-      }
-      final newMax = _scrollCtrl.position.maxScrollExtent;
-      final delta = newMax - oldMax;
-      if (delta > 1.0) {
-        _isProgrammaticScroll = true;
-        try {
-          _scrollCtrl.jumpTo((oldPixels + delta).clamp(0.0, newMax));
-        } finally {
-          _isProgrammaticScroll = false;
-        }
-      }
-    });
+    if (!mounted) return;
+    final afterState = ref.read(appProvider);
+    if (afterState.activeSessionId != targetSid) return;
+    final added = afterState.turns.length - prevLen;
+    if (added > 0) {
+      // Shift newly prepended older turns into the upward-growing sliver above `_centerKey`
+      // so the current reading position stays mathematically anchored with ZERO jump!
+      _prependedOlderCountNotifier.value = _prependedOlderCountNotifier.value + added;
+    }
   }
 
   void _prefillComposer(String text) {
     HapticFeedback.selectionClick();
-    _composerCtrl.text = text;
-    _composerCtrl.selection = TextSelection.collapsed(offset: text.length);
+    final existing = _composerCtrl.text.trim();
+    final incoming = text.trim();
+    if (existing.isNotEmpty && existing != incoming) {
+      showGrassBagSheet(
+        context,
+        title: '输入框已有草稿',
+        subtitle: '避免覆盖你正在编辑的内容',
+        preferredHeight: 200,
+        bodyBuilder: (sheetCtx) => Row(
+          children: [
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '追加到末尾',
+                height: 40,
+                tier: ref.read(appProvider).glassTier,
+                insideGlass: true,
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  final merged = '${_composerCtrl.text}\n$text';
+                  _composerCtrl.value = TextEditingValue(
+                    text: merged,
+                    selection: TextSelection.collapsed(offset: merged.length),
+                  );
+                  _composerFocus.requestFocus();
+                },
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: GrassBagPrimaryGlassButton(
+                label: '替换草稿',
+                height: 40,
+                tier: ref.read(appProvider).glassTier,
+                insideGlass: true,
+                onTap: () {
+                  Navigator.of(sheetCtx).pop();
+                  _editingContextNotifier.value = null;
+                  _composerCtrl.value = TextEditingValue(
+                    text: text,
+                    selection: TextSelection.collapsed(offset: text.length),
+                  );
+                  _composerFocus.requestFocus();
+                },
+              ),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    _editingContextNotifier.value = null;
+    _composerCtrl.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
     _composerFocus.requestFocus();
+  }
+
+  void _startEditingTurn(NormalizedTurn turn) {
+    final txt = turn.userMessage?.text ?? '';
+    if (txt.trim().isEmpty) return;
+    HapticFeedback.selectionClick();
+    final turns = ref.read(appProvider).turns;
+    final idx = turns.indexWhere(
+      (item) => item.turnId == turn.turnId || item.stableKey == turn.stableKey,
+    );
+    final forkBeforeTurnId = idx > 0 ? turns[idx - 1].turnId : null;
+    final existingEdit = _editingContextNotifier.value;
+    final stashedDraft = existingEdit != null ? existingEdit.stashedDraft : _composerCtrl.text;
+    _editingContextNotifier.value = EditingMessageContext(
+      turnId: turn.turnId,
+      originalText: txt,
+      stashedDraft: stashedDraft,
+      forkBeforeTurnId: forkBeforeTurnId,
+      references: turn.userMessage?.references ?? const [],
+    );
+    _composerCtrl.value = TextEditingValue(
+      text: txt,
+      selection: TextSelection.collapsed(offset: txt.length),
+    );
+    if (_plusOpenNotifier.value) _plusOpenNotifier.value = false;
+    _composerFocus.requestFocus();
+  }
+
+  void _cancelEditingTurn() {
+    final editCtx = _editingContextNotifier.value;
+    if (editCtx == null) return;
+    HapticFeedback.selectionClick();
+    _editingContextNotifier.value = null;
+    final restore = editCtx.stashedDraft;
+    _composerCtrl.value = TextEditingValue(
+      text: restore,
+      selection: TextSelection.collapsed(offset: restore.length),
+    );
+    ref.read(appProvider.notifier).setComposerDraftForActiveHost(restore);
   }
 
   bool _handleScrollNotification(ScrollNotification notification) {
@@ -347,50 +493,78 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final maxExtent = notification.metrics.maxScrollExtent;
     final pixels = notification.metrics.pixels;
     final distFromBottom = (maxExtent - pixels).clamp(0.0, double.infinity);
+    final wasScrolledAway = _userScrolledAway;
 
     // Detect ONLY genuine user-initiated upward scroll across touch drag, mouse wheel,
     // trackpad, and keyboard — NEVER trip `_userScrolledAway` when `maxScrollExtent`
     // grows dynamically from streaming text, expanded tool cards, or IME opening!
     if (notification is ScrollStartNotification) {
+      if (!_isProgrammaticScroll) {
+        _upwardScrollAccum = 0.0;
+      }
       if (notification.dragDetails != null) {
         _userDraggingList = true;
+        _scrollCtrl.clearPendingImeAnchor();
       }
     } else if (notification is UserScrollNotification) {
       if (notification.direction == ScrollDirection.forward && distFromBottom > 28) {
         _isProgrammaticScroll = false;
         _userScrolledAway = true;
-      } else if (distFromBottom <= 24) {
+      } else if (notification.direction == ScrollDirection.reverse && distFromBottom <= 24) {
         _userScrolledAway = false;
+        _upwardScrollAccum = 0.0;
       }
     } else if (notification is ScrollUpdateNotification) {
       final delta = notification.scrollDelta ?? 0.0;
+      if (!_isProgrammaticScroll) {
+        if (delta < 0) {
+          _upwardScrollAccum += -delta;
+        } else if (delta > 0) {
+          _upwardScrollAccum = 0.0;
+        }
+      }
       if (notification.dragDetails != null) {
         _userDraggingList = true;
+        _scrollCtrl.clearPendingImeAnchor();
       }
-      if (notification.dragDetails != null && delta < -1.0) {
+      if (notification.dragDetails != null && (delta < -0.5 || _upwardScrollAccum >= 2.5)) {
         _isProgrammaticScroll = false;
         _userScrolledAway = true;
       } else if (!_isProgrammaticScroll &&
-          delta < -1.0 &&
+          (delta < -0.5 || _upwardScrollAccum >= 3.0) &&
           maxExtent >= _lastMaxScrollExtent - 1.0 &&
           pixels <= maxExtent + 0.5 &&
           distFromBottom > 4.0) {
-        // Catches desktop mouse wheel, pointerScroll, trackpad & keyboard upward scrolls immediately
-        // while ignoring overscroll bounce-back or shrinking maxScrollExtent from collapsing content/IME!
         _userScrolledAway = true;
-      } else if (delta > 0.5 && distFromBottom <= 24) {
+      } else if (!_isProgrammaticScroll && delta > 0.5 && distFromBottom <= 24) {
         _userScrolledAway = false;
+        _upwardScrollAccum = 0.0;
       }
     } else if (notification is ScrollEndNotification) {
+      // ALWAYS clear `_userDraggingList` on ScrollEndNotification so touching the list
+      // during a programmatic animation can NEVER permanently lock auto-follow!
       _userDraggingList = false;
-      if (distFromBottom <= 24) {
-        _userScrolledAway = false;
+      if (!_isProgrammaticScroll) {
+        _upwardScrollAccum = 0.0;
+        if (distFromBottom <= 24) {
+          _userScrolledAway = false;
+        }
       }
     }
 
+    if (wasScrolledAway && !_userScrolledAway && !_isProgrammaticScroll && ref.read(appProvider).isStreaming) {
+      _ensureStreamScrollFollower(settleTailMs: 260.0);
+    }
+
+    if (distFromBottom <= 24 && _hasNewBelowNotifier.value) {
+      _hasNewBelowNotifier.value = false;
+    }
+
+    _scrollCtrl.allowImeAnchor = !_userScrolledAway && !_userDraggingList;
     _lastMaxScrollExtent = maxExtent;
 
-    final shouldShowBtn = _userScrolledAway && distFromBottom > 120;
+    final isActivelyAutoFollowing = !_userScrolledAway && (_streamScrollTicker?.isActive ?? false);
+    final shouldShowBtn = distFromBottom > 120 && !_isProgrammaticScroll && !isActivelyAutoFollowing;
     if (shouldShowBtn != _showScrollToBottomNotifier.value) {
       _showScrollToBottomNotifier.value = shouldShowBtn;
     }
@@ -409,49 +583,132 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final wasNearBottom = (prevMax - pixels).clamp(0.0, double.infinity) <= 48.0;
     _lastMaxScrollExtent = maxExtent;
 
-    final shouldShowBtn = _userScrolledAway && distFromBottom > 120;
-    if (shouldShowBtn != _showScrollToBottomNotifier.value) {
-      _showScrollToBottomNotifier.value = shouldShowBtn;
-    }
-
     // ONLY auto-follow growth while actively streaming or during the explicit send/stream settle tail!
-    // Never yank or twitch the viewport when the user manually toggles thinking/tool details on a settled turn!
+    // Run BEFORE evaluating `shouldShowBtn` so large markdown tables/code blocks never flash the
+    // scroll-to-bottom pill for 1 frame before the 120Hz follower engages!
     final streamingOrSettling =
         _streamSettleRemainingMs > 0 || ref.read(appProvider).isStreaming;
     if (grew &&
         streamingOrSettling &&
         distFromBottom > 1.5 &&
+        !_isProgrammaticScroll &&
         !_userScrolledAway &&
         !_userDraggingList &&
         (wasNearBottom || _streamSettleRemainingMs > 0)) {
       _ensureStreamScrollFollower(settleTailMs: 260.0);
+    }
+
+    final isActivelyAutoFollowing = !_userScrolledAway && (_streamScrollTicker?.isActive ?? false);
+    final shouldShowBtn = distFromBottom > 120 && !_isProgrammaticScroll && !isActivelyAutoFollowing;
+    if (shouldShowBtn != _showScrollToBottomNotifier.value) {
+      _showScrollToBottomNotifier.value = shouldShowBtn;
     }
     return false;
   }
 
   void _jumpBackToBottom() {
     HapticFeedback.selectionClick();
+    _scrollCtrl.cancelMomentumAndHold();
     _userScrolledAway = false;
+    _upwardScrollAccum = 0.0;
+    final s = ref.read(appProvider);
+    if (s.activeSessionId != null) {
+      _savedScrollOffsetBySession.remove('${s.activeHostId}::${s.activeSessionId}');
+    }
+    _scrollCtrl.allowImeAnchor = true;
     if (_showScrollToBottomNotifier.value) {
       _showScrollToBottomNotifier.value = false;
     }
-    if (ref.read(appProvider).isStreaming) {
-      // Cooperate cleanly with the 120Hz follower instead of fighting animateTo vs jumpTo!
-      _ensureStreamScrollFollower(settleTailMs: 360.0);
+    if (_hasNewBelowNotifier.value) {
+      _hasNewBelowNotifier.value = false;
+    }
+    if (s.isStreaming) {
+      final hasLargeGap = _scrollCtrl.hasClients &&
+          _scrollCtrl.positions.length == 1 &&
+          (_scrollCtrl.position.maxScrollExtent - _scrollCtrl.position.pixels) >
+              _scrollCtrl.position.viewportDimension;
+      if (hasLargeGap) {
+        // Glide gracefully across long history with easeOutCubic first, then hand off to
+        // the 120Hz critically-damped follower for live streaming tail lock!
+        _stopStreamScrollFollower();
+        final gen = ++_programmaticScrollGen;
+        _isProgrammaticScroll = true;
+        _scrollCtrl
+            .animateTo(
+              _scrollCtrl.position.maxScrollExtent,
+              duration: const Duration(milliseconds: 280),
+              curve: Curves.easeOutCubic,
+            )
+            .whenComplete(() {
+              if (_programmaticScrollGen == gen) {
+                _isProgrammaticScroll = false;
+                if (mounted && !_userScrolledAway) {
+                  _ensureStreamScrollFollower(settleTailMs: 360.0);
+                }
+              }
+            });
+      } else {
+        // Cooperate cleanly with the 120Hz follower instead of fighting animateTo vs jumpTo!
+        _ensureStreamScrollFollower(settleTailMs: 360.0);
+      }
     } else {
       _stopStreamScrollFollower();
       _performScrollToBottom(animated: true);
     }
   }
 
+  void _scheduleRestoreScrollOffset(double targetPixels) {
+    final gen = ++_programmaticScrollGen;
+    void applyPass(int remaining) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted ||
+            !_scrollCtrl.hasClients ||
+            _scrollCtrl.positions.length != 1 ||
+            _programmaticScrollGen != gen) {
+          return;
+        }
+        final pos = _scrollCtrl.position;
+        final clamped = targetPixels.clamp(pos.minScrollExtent, pos.maxScrollExtent);
+        if ((clamped - pos.pixels).abs() > 1.5) {
+          _isProgrammaticScroll = true;
+          try {
+            _scrollCtrl.jumpTo(clamped);
+          } finally {
+            if (_programmaticScrollGen == gen) _isProgrammaticScroll = false;
+          }
+        }
+        final dist = (pos.maxScrollExtent - pos.pixels).clamp(0.0, double.infinity);
+        _userScrolledAway = dist > 24.0;
+        _scrollCtrl.allowImeAnchor = !_userScrolledAway;
+        final showBtn = dist > 120.0;
+        if (showBtn != _showScrollToBottomNotifier.value) {
+          _showScrollToBottomNotifier.value = showBtn;
+        }
+        if (remaining > 1 && pos.maxScrollExtent < targetPixels - 4.0) {
+          applyPass(remaining - 1);
+        }
+      });
+    }
+
+    applyPass(3);
+  }
+
   void _onEmptySuggestionTap(String prompt) {
+    final s = ref.read(appProvider);
+    // Double-tap guard: ignore second tap once the first prompt has already transitioned off empty state.
+    if (!s.isEmptyChat || s.isStreaming) return;
     HapticFeedback.lightImpact();
     _composerFocus.unfocus();
-    final s = ref.read(appProvider);
     final ctrl = ref.read(appProvider.notifier);
     if (GrassBagNativeBridge.instance.isAndroidNative &&
         s.activeHost.isLocal &&
         !s.nativeRuntimeStatus.engineRunning) {
+      if (!s.nativeStatusHydrated ||
+          s.nativeRuntimeStatus.engineState == 'starting' ||
+          (s.runtimeProgressPct > 0 && s.runtimeProgressPct < 100)) {
+        ctrl.showToast('本机 DSH 引擎正在启动中，请稍候片刻…', tone: ToastTone.info);
+        return;
+      }
       if (!s.nativeRuntimeStatus.initialized) {
         ctrl.showToast('正在一键部署本机运行环境…', tone: ToastTone.info);
         ctrl.bootstrapLocalRuntime();
@@ -467,18 +724,16 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       return;
     }
     if (!s.isDshConnected && s.connectionPhase != ConnectionPhase.connecting) {
-      if (!s.activeHost.isLocal) {
-        showHostQuickSheet(
-          context,
-          ref,
-          onOpenHostSettings: () => _openSettings(
-            initialSection: SettingsSection.hosts,
-            hostDetailId: s.activeHostId,
-          ),
-        );
-        ctrl.showToast('当前主机尚未连接，请先重连或切换主机', tone: ToastTone.warn);
-        return;
-      }
+      showHostQuickSheet(
+        context,
+        ref,
+        onOpenHostSettings: () => _openSettings(
+          initialSection: SettingsSection.hosts,
+          hostDetailId: s.activeHostId,
+        ),
+      );
+      ctrl.showToast('当前主机尚未连接，请先重连或切换主机', tone: ToastTone.warn);
+      return;
     }
     if (s.isDshConnected &&
         s.connectionPhase == ConnectionPhase.connected &&
@@ -518,9 +773,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   }
 
   void _openSessionDetail() {
-    _composerFocus.unfocus();
+    _dismissKeyboardAndPopovers();
     if (_isTablet(context)) {
-      HapticFeedback.selectionClick();
       ref.read(appProvider.notifier).setTabletWorkbenchOpen(true);
       return;
     }
@@ -632,18 +886,75 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       }
     });
 
+    void resetScrollAnchoring() {
+      _stopStreamScrollFollower();
+      _lastMaxScrollExtent = 0.0;
+      _upwardScrollAccum = 0.0;
+      _animatedTurnIds.clear();
+      _userScrolledAway = false;
+      _userDraggingList = false;
+      _scrollCtrl.allowImeAnchor = true;
+      _scrollCtrl.clearPendingImeAnchor();
+      if (_showScrollToBottomNotifier.value) {
+        _showScrollToBottomNotifier.value = false;
+      }
+      if (_hasNewBelowNotifier.value) {
+        _hasNewBelowNotifier.value = false;
+      }
+      if (_prependedOlderCountNotifier.value != 0) {
+        _prependedOlderCountNotifier.value = 0;
+      }
+    }
+
+    // Remember per-session reading scroll offset before switching away AND immediately
+    // clear stale floating scroll-to-bottom pills so they never float over loading/error stages!
+    ref.listen<(String, String?)>(
+      appProvider.select((s) => (s.activeHostId, s.activeSessionId)),
+      (prev, next) {
+        if (prev != null && prev != next) {
+          if (prev.$2 != null && _scrollCtrl.hasClients && _scrollCtrl.positions.length == 1) {
+            final pos = _scrollCtrl.position;
+            final dist = (pos.maxScrollExtent - pos.pixels).clamp(0.0, double.infinity);
+            final key = '${prev.$1}::${prev.$2}';
+            if (_userScrolledAway && dist > 36.0 && pos.pixels > pos.minScrollExtent) {
+              if (_savedScrollOffsetBySession.length >= 30 &&
+                  !_savedScrollOffsetBySession.containsKey(key)) {
+                _savedScrollOffsetBySession.remove(_savedScrollOffsetBySession.keys.first);
+              }
+              _savedScrollOffsetBySession[key] = (pixels: pos.pixels, scrolledAway: true);
+            } else {
+              _savedScrollOffsetBySession.remove(key);
+            }
+          }
+          final isPendingPromotion = prev.$1 == next.$1 &&
+              ((prev.$2 == null && next.$2 != null && next.$2!.startsWith('pending-session-')) ||
+                  (prev.$2 != null &&
+                      prev.$2!.startsWith('pending-session-') &&
+                      next.$2 != null &&
+                      !next.$2!.startsWith('pending-session-')));
+          if (!isPendingPromotion && _editingContextNotifier.value != null) {
+            _editingContextNotifier.value = null;
+          }
+          if (_showScrollToBottomNotifier.value) {
+            _showScrollToBottomNotifier.value = false;
+          }
+          if (_hasNewBelowNotifier.value) {
+            _hasNewBelowNotifier.value = false;
+          }
+          if (_prependedOlderCountNotifier.value != 0) {
+            _prependedOlderCountNotifier.value = 0;
+          }
+        }
+      },
+    );
+
     // React to New Chat trigger -> reset scroll state & focus composer on desktop!
     // ChatComposerDock is the single owner of `_composerCtrl` draft sync (never clear saved drafts here!).
     ref.listen<int>(appProvider.select((s) => s.newChatSignal), (prev, next) {
       if (prev != null && next != prev) {
-        _stopStreamScrollFollower();
-        _lastMaxScrollExtent = 0.0;
-        _animatedTurnIds.clear();
+        resetScrollAnchoring();
         if (_plusOpenNotifier.value) _plusOpenNotifier.value = false;
-        _userScrolledAway = false;
-        if (_showScrollToBottomNotifier.value) {
-          _showScrollToBottomNotifier.value = false;
-        }
+        if (_editingContextNotifier.value != null) _editingContextNotifier.value = null;
         final isDesktop = kIsWeb ||
             defaultTargetPlatform == TargetPlatform.macOS ||
             defaultTargetPlatform == TargetPlatform.windows ||
@@ -659,62 +970,105 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     // React to active host switch -> purge cross-host turn/image caches & reset scroll state!
     ref.listen<String>(appProvider.select((s) => s.activeHostId), (prev, next) {
       if (prev != null && prev != next) {
-        _stopStreamScrollFollower();
-        _lastMaxScrollExtent = 0.0;
-        _animatedTurnIds.clear();
+        resetScrollAnchoring();
         clearTurnProcessCaches();
         if (_plusOpenNotifier.value) _plusOpenNotifier.value = false;
-        _userScrolledAway = false;
-        if (_showScrollToBottomNotifier.value) {
-          _showScrollToBottomNotifier.value = false;
-        }
+        if (_editingContextNotifier.value != null) _editingContextNotifier.value = null;
       }
     });
 
-    // Switching to another historical session -> silently anchor at the latest message
-    // via instant jumpTo (zero jarring upward whip from offset 0!).
+    // Switching to another historical session -> restore saved reading spot if previously
+    // scrolled up, otherwise silently anchor at the latest message via instant jumpTo.
     ref.listen<int>(appProvider.select((s) => s.sessionJumpSignal), (prev, next) {
       if (prev != null && next != prev) {
-        _stopStreamScrollFollower();
-        _lastMaxScrollExtent = 0.0;
-        _animatedTurnIds.clear();
-        _userScrolledAway = false;
-        if (_showScrollToBottomNotifier.value) {
-          _showScrollToBottomNotifier.value = false;
+        resetScrollAnchoring();
+        final s = ref.read(appProvider);
+        final saved = s.activeSessionId == null
+            ? null
+            : _savedScrollOffsetBySession['${s.activeHostId}::${s.activeSessionId}'];
+        if (saved != null && saved.scrolledAway && saved.pixels > 0.0) {
+          _userScrolledAway = true;
+          _scrollCtrl.allowImeAnchor = false;
+          _scheduleRestoreScrollOffset(saved.pixels);
+        } else {
+          _scheduleScrollToBottom(animated: false, settle: false);
         }
-        _scheduleScrollToBottom(animated: false, settle: false);
       }
     });
 
-    // React to every newly sent prompt -> start silky 120Hz scroll follower cleanly!
+    // React to every newly sent prompt -> halt any upward fling inertia, glide smoothly if
+    // far above bottom, and hand off cleanly to the 120Hz critically-damped scroll follower!
     ref.listen<int>(appProvider.select((s) => s.scrollSignal), (prev, next) {
       if (prev != null && next != prev) {
+        _scrollCtrl.cancelMomentumAndHold();
         _userScrolledAway = false;
+        _upwardScrollAccum = 0.0;
+        final s = ref.read(appProvider);
+        if (s.activeSessionId != null) {
+          _savedScrollOffsetBySession.remove('${s.activeHostId}::${s.activeSessionId}');
+        }
+        _scrollCtrl.allowImeAnchor = true;
         if (_showScrollToBottomNotifier.value) {
           _showScrollToBottomNotifier.value = false;
         }
-        _ensureStreamScrollFollower(settleTailMs: 360.0);
+        if (_hasNewBelowNotifier.value) {
+          _hasNewBelowNotifier.value = false;
+        }
+        final hasLargeGap = _scrollCtrl.hasClients &&
+            _scrollCtrl.positions.length == 1 &&
+            (_scrollCtrl.position.maxScrollExtent - _scrollCtrl.position.pixels) >
+                _scrollCtrl.position.viewportDimension;
+        if (hasLargeGap) {
+          _stopStreamScrollFollower();
+          final gen = ++_programmaticScrollGen;
+          _isProgrammaticScroll = true;
+          _scrollCtrl
+              .animateTo(
+                _scrollCtrl.position.maxScrollExtent,
+                duration: const Duration(milliseconds: 260),
+                curve: Curves.easeOutCubic,
+              )
+              .whenComplete(() {
+                if (_programmaticScrollGen == gen) {
+                  _isProgrammaticScroll = false;
+                  if (mounted && !_userScrolledAway) {
+                    _ensureStreamScrollFollower(settleTailMs: 360.0);
+                  }
+                }
+              });
+        } else {
+          _ensureStreamScrollFollower(settleTailMs: 360.0);
+        }
       }
     });
 
-    // React ONLY to real live streaming chunks -> keep 120Hz smooth chase alive (zero cancelled animateTo!).
+    // React ONLY to real live streaming chunks -> keep 120Hz smooth chase alive (zero cancelled animateTo!),
+    // or flag `_hasNewBelowNotifier` when the user scrolled up to read earlier messages!
     ref.listen<int>(appProvider.select((s) => s.streamTick), (prev, next) {
-      if (prev != null &&
-          next != prev &&
-          !_userScrolledAway &&
-          ref.read(appProvider).isStreaming) {
-        // Settle tail covers typewriter reveal frames between coalesced WS flushes.
-        _ensureStreamScrollFollower(settleTailMs: 280.0);
+      if (prev != null && next != prev && ref.read(appProvider).isStreaming) {
+        if (!_userScrolledAway && !_isProgrammaticScroll) {
+          _ensureStreamScrollFollower(settleTailMs: 280.0);
+        } else if (_userScrolledAway &&
+            _showScrollToBottomNotifier.value &&
+            !_hasNewBelowNotifier.value) {
+          _hasNewBelowNotifier.value = true;
+        }
       }
     });
 
-    // When streaming starts/completes -> glide smoothly through the typewriter's short
-    // completion tail and action strip mount, then stop the ticker automatically!
+    // When streaming starts/completes -> glide smoothly through the typewriter's completion
+    // tail, action strip SizeTransition, and post-turn deliverables sync, then stop automatically!
     ref.listen<bool>(appProvider.select((s) => s.isStreaming), (prev, next) {
-      if (next == true && !_userScrolledAway) {
+      if (next == true && !_userScrolledAway && !_isProgrammaticScroll) {
         _ensureStreamScrollFollower(settleTailMs: 320.0);
-      } else if (prev == true && next == false && !_userScrolledAway) {
-        _ensureStreamScrollFollower(settleTailMs: 380.0);
+      } else if (prev == true && next == false) {
+        if (!_userScrolledAway && !_isProgrammaticScroll) {
+          _ensureStreamScrollFollower(settleTailMs: 850.0);
+        } else if (_userScrolledAway &&
+            _showScrollToBottomNotifier.value &&
+            !_hasNewBelowNotifier.value) {
+          _hasNewBelowNotifier.value = true;
+        }
       }
     });
 
@@ -723,34 +1077,40 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     // ChatComposerDock, Sidebar, and collapsed Workbench experience ZERO rebuilds!
     final shellSlice = ref.watch(
       appProvider.select(
-        (s) => (
-          isEmptyChat: s.isEmptyChat,
-          activeSessionId: s.activeSessionId,
-          activeSessionTitle: s.activeSession?.title ?? '新对话',
-          hasActiveSession: s.activeSession != null,
-          hostId: s.activeHost.id,
-          hostName: s.activeHost.name,
-          hostAddress: s.activeHost.address,
-          hostIsLocal: s.activeHost.isLocal,
-          hostBridged: s.activeHost.bridged,
-          hostDirectMode: s.activeHost.directMode,
-          hostOnline: s.activeHost.online,
-          hostAllowBadCerts: s.activeHost.allowBadCertificates,
-          hostLastErrorCode: s.activeHost.lastErrorCode,
-          hostInstalling: s.activeHost.installing,
-          hostsCount: s.hosts.length,
-          connectionPhase: s.connectionPhase,
-          glassTier: s.glassTier,
-          tabletSidebarOpen: s.tabletSidebarOpen,
-          tabletWorkbenchOpen: s.tabletWorkbenchOpen,
-          nativeInitialized: s.nativeRuntimeStatus.initialized,
-          nativeEngineState: s.nativeRuntimeStatus.engineState,
-          nativeEngineError: s.nativeRuntimeStatus.engineError,
-          runtimeProgressPct: s.runtimeProgressPct,
-          runtimeProgressMsg: s.runtimeProgressMsg,
-          showAppUpdateBanner: s.showAppUpdateBanner,
-          appUpdateVersionName: s.appUpdateInfo?.versionName ?? '',
-        ),
+        (s) {
+          final host = s.activeHost;
+          final sess = s.activeSession;
+          return (
+            isEmptyChat: s.isEmptyChat,
+            activeSessionId: s.activeSessionId,
+            activeSessionTitle: sess?.title ?? '新对话',
+            hasActiveSession: sess != null,
+            hostId: host.id,
+            hostName: host.name,
+            hostAddress: host.address,
+            hostIsLocal: host.isLocal,
+            hostBridged: host.bridged,
+            hostDirectMode: host.directMode,
+            hostOnline: host.online,
+            hostAllowBadCerts: host.allowBadCertificates,
+            hostLastErrorCode: host.lastErrorCode,
+            hostInstalling: host.installing,
+            hostsCount: s.hosts.length,
+            connectionPhase: s.connectionPhase,
+            glassTier: s.glassTier,
+            tabletSidebarOpen: s.tabletSidebarOpen,
+            tabletWorkbenchOpen: s.tabletWorkbenchOpen,
+            nativeInitialized: s.nativeRuntimeStatus.initialized,
+            nativeStatusHydrated: s.nativeStatusHydrated,
+            nativeEngineState: s.nativeRuntimeStatus.engineState,
+            nativeEngineError: s.nativeRuntimeStatus.engineError,
+            runtimeProgressPct: s.runtimeProgressPct,
+            runtimeProgressMsg: s.runtimeProgressMsg,
+            showAppUpdateBanner: s.showAppUpdateBanner,
+            appUpdateVersionName: s.appUpdateInfo?.versionName ?? '',
+            phoneLiveActive: s.phoneLiveActive,
+          );
+        },
       ),
     );
     final ctrl = ref.read(appProvider.notifier);
@@ -769,16 +1129,22 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     // On tablet with left sidebar expanded: hide center title pill ONLY on empty New Chat;
     // on active conversations, show the clean floating conversation title pill so desktop
     // chats stay clearly anchored like Claude Desktop & Cursor!
+    final canDualPane = screenSize.width >= 1080;
+    final effectiveTabWorkbenchOpen =
+        shellSlice.tabletWorkbenchOpen && (canDualPane || !shellSlice.tabletSidebarOpen);
     final hideCenterTitle = isTab && shellSlice.tabletSidebarOpen && shellSlice.isEmptyChat;
     final showTopLeftBtn = !isTab || !shellSlice.tabletSidebarOpen;
-    final showTopRightBtn = !isTab || !shellSlice.tabletWorkbenchOpen;
+    final showTopRightBtn = !isTab || !effectiveTabWorkbenchOpen;
 
     final remoteUsable = shellSlice.hostOnline && (shellSlice.hostBridged || shellSlice.hostDirectMode);
+    final isHostTransientConnecting = shellSlice.connectionPhase == ConnectionPhase.connecting ||
+        shellSlice.connectionPhase == ConnectionPhase.reconnecting ||
+        shellSlice.connectionPhase == ConnectionPhase.bootstrapping;
     // Empty chat renders `_RemoteEmptyStatusBanner` inline inside `ChatEmptyState` — avoid duplicate banners!
     final showRemoteBasicBanner = !shellSlice.isEmptyChat &&
         !shellSlice.hostIsLocal &&
         !remoteUsable &&
-        shellSlice.connectionPhase != ConnectionPhase.connecting;
+        !isHostTransientConnecting;
     final showLocalDesktopErrorBanner = !shellSlice.isEmptyChat &&
         !GrassBagNativeBridge.instance.isAndroidNative &&
         shellSlice.hostIsLocal &&
@@ -787,6 +1153,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final showLocalAndroidBanner = !shellSlice.isEmptyChat &&
         GrassBagNativeBridge.instance.isAndroidNative &&
         shellSlice.hostIsLocal &&
+        shellSlice.nativeStatusHydrated &&
         (!shellSlice.nativeInitialized ||
             shellSlice.nativeEngineState == 'starting' ||
             shellSlice.nativeEngineState == 'stopped' ||
@@ -806,21 +1173,32 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final hostNeedsAuth = shellSlice.connectionPhase == ConnectionPhase.needsAuth ||
         shellSlice.hostLastErrorCode == 'needs_auth' ||
         shellSlice.hostLastErrorCode == 'html_proxy';
+    final hostIsConnecting = isHostTransientConnecting ||
+        (shellSlice.hostIsLocal &&
+            GrassBagNativeBridge.instance.isAndroidNative &&
+            (!shellSlice.nativeStatusHydrated ||
+                shellSlice.nativeEngineState == 'starting' ||
+                (shellSlice.runtimeProgressPct > 0 && shellSlice.runtimeProgressPct < 100)));
     final hostDotColor = hostHealthy
         ? t.ok
-        : (hostNeedsAuth ? t.primary : (hostHasErr ? t.err : t.warn));
+        : (hostHasErr
+            ? t.err
+            : ((hostNeedsAuth || hostIsConnecting) ? t.primary : t.text3));
     final showAppUpdatePill = shellSlice.showAppUpdateBanner &&
         shellSlice.appUpdateVersionName.isNotEmpty &&
+        !shellSlice.phoneLiveActive &&
         !showRemoteBasicBanner &&
         !showLocalAndroidBanner &&
         !showLocalDesktopErrorBanner;
     // Active chat list always reserves consistent top clearance below the floating title pill
-    // (never jumping from 18px -> 76px mid-transition when leaving Empty State!).
+    // (never jumping 46px downward 4s after launch when the floating update pill appears!).
+    final hasExtraTopBanner =
+        showRemoteBasicBanner || showLocalAndroidBanner || showLocalDesktopErrorBanner;
     final listTopPad = topPad +
         76.0 +
-        ((showRemoteBasicBanner || showLocalAndroidBanner || showLocalDesktopErrorBanner)
-            ? 70.0
-            : (showAppUpdatePill ? 46.0 : 0.0));
+        (hasExtraTopBanner ? 70.0 : 0.0) +
+        (showAppUpdatePill ? 40.0 : 0.0) +
+        (shellSlice.phoneLiveActive ? 56.0 : 0.0);
 
     final chatStage = Stack(
       children: [
@@ -829,10 +1207,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         Positioned.fill(
           child: GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onTap: () {
-              if (_plusOpenNotifier.value) _plusOpenNotifier.value = false;
-              if (_composerFocus.hasFocus) _composerFocus.unfocus();
-            },
+            onTap: _dismissKeyboardAndPopovers,
             child: _ChatCanvasArea(
               scrollCtrl: _scrollCtrl,
               listTopPad: listTopPad,
@@ -840,6 +1215,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               topPad: topPad,
               baseComposerBottom: baseComposerBottom,
               composerHeightNotifier: _composerHeightNotifier,
+              prependedOlderCountNotifier: _prependedOlderCountNotifier,
               hideCenterTitle: hideCenterTitle,
               animatedTurnIds: _animatedTurnIds,
               onScrollNotification: _handleScrollNotification,
@@ -853,6 +1229,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               ),
               onOpenTerminal: _openTerminal,
               onPrefillPrompt: _prefillComposer,
+              onEditTurn: _startEditingTurn,
             ),
           ),
         ),
@@ -862,41 +1239,43 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             child: GlassBackdropGroup(
               child: Stack(
                 children: [
-                  // Crisp status-bar-only cap (`topPad + 14dp`):
-                  // 100% solid `t.bgTop` across the OS status bar (zero text ghosting under clock/battery)
-                  // while ending right above the floating Liquid Glass header pills (`topPad + 12..56`)
-                  // so scrolled chat messages glide underneath at full contrast for true live refraction!
-                  if (topPad > 4.0)
-                    Positioned(
-                      top: 0,
-                      left: 0,
-                      right: 0,
-                      height: topPad + 14.0,
-                      child: IgnorePointer(
-                        child: Builder(
-                          builder: (_) {
-                            final capH = topPad + 14.0;
-                            final solidStop = ((topPad - 2.0) / capH).clamp(0.45, 0.85);
-                            final midStop = ((topPad + 5.0) / capH).clamp(solidStop + 0.05, 0.94);
-                            return DecoratedBox(
-                              decoration: BoxDecoration(
-                                gradient: LinearGradient(
-                                  begin: Alignment.topCenter,
-                                  end: Alignment.bottomCenter,
-                                  colors: [
-                                    t.bgTop,
-                                    t.bgTop,
-                                    t.bgTop.withValues(alpha: 0.45),
-                                    t.bgTop.withValues(alpha: 0.0),
-                                  ],
-                                  stops: [0.0, solidStop, midStop, 1.0],
-                                ),
+                  // Silky progressive top feather (`topPad + 72dp`):
+                  // Solid `t.bgTop` across the OS status bar (0% ghosting under clock/battery)
+                  // gently softening scrolled chat text behind the floating Liquid Glass header
+                  // pills so headlines & buttons stay razor-legible while preserving refraction!
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    height: topPad + 86.0,
+                    child: IgnorePointer(
+                      child: Builder(
+                        builder: (_) {
+                          final capH = topPad + 86.0;
+                          final solidStop = topPad > 0
+                              ? ((topPad + 10.0) / capH).clamp(0.22, 0.56)
+                              : 0.18;
+                          final midStop =
+                              ((topPad + 48.0) / capH).clamp(solidStop + 0.18, 0.84);
+                          return DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [
+                                  t.bgTop,
+                                  t.bgTop,
+                                  t.bgTop.withValues(alpha: t.isDark ? 0.78 : 0.80),
+                                  t.bgTop.withValues(alpha: 0.0),
+                                ],
+                                stops: [0.0, solidStop, midStop, 1.0],
                               ),
-                            );
-                          },
-                        ),
+                            ),
+                          );
+                        },
                       ),
                     ),
+                  ),
                   // Smooth bottom progressive feather behind the composer that tracks real
                   // composer height AND lifts smoothly with soft keyboard insets!
                   Positioned(
@@ -921,30 +1300,34 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                         tier: shellSlice.glassTier,
                         child: Row(
                           children: [
-                            SizedBox(
-                              width: 44,
-                              height: 44,
-                              child: showTopLeftBtn
-                                  ? GrassBagGlassCircleButton(
-                                      key: ValueKey('top-left-$isTab'),
-                                      icon: isTab
-                                          ? CupertinoIcons.sidebar_left
-                                          : CupertinoIcons.line_horizontal_3,
-                                      iconSize: 19,
-                                      useOwnLayer: false,
-                                      tooltip: isTab ? '展开侧边栏' : '打开侧边栏',
-                                      tier: shellSlice.glassTier,
-                                      onTap: () {
-                                        if (isTab) {
-                                          ctrl.setTabletSidebarOpen(true);
-                                        } else {
-                                          _openPhoneDrawer();
-                                        }
-                                      },
-                                    )
-                                  : const SizedBox.shrink(),
-                            ),
-                            const SizedBox(width: 10),
+                            if (showTopLeftBtn) ...[
+                              SizedBox(
+                                width: 44,
+                                height: 44,
+                                child: GrassBagGlassCircleButton(
+                                  key: ValueKey('top-left-$isTab'),
+                                  icon: isTab
+                                      ? CupertinoIcons.sidebar_left
+                                      : CupertinoIcons.line_horizontal_3,
+                                  iconSize: 19,
+                                  useOwnLayer: false,
+                                  tooltip: isTab ? '展开侧边栏' : '打开侧边栏',
+                                  tier: shellSlice.glassTier,
+                                  onTap: () {
+                                    _dismissKeyboardAndPopovers();
+                                    if (isTab) {
+                                      if (!canDualPane && shellSlice.tabletWorkbenchOpen) {
+                                        ctrl.setTabletWorkbenchOpen(false);
+                                      }
+                                      ctrl.setTabletSidebarOpen(true);
+                                    } else {
+                                      _openPhoneDrawer();
+                                    }
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                            ],
                             Expanded(
                               child: hideCenterTitle
                                   ? const SizedBox.shrink()
@@ -955,31 +1338,36 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                         useOwnLayer: false,
                                         padding: const EdgeInsets.symmetric(horizontal: 14),
                                         onTap: shellSlice.isEmptyChat
-                                            ? () => showHostQuickSheet(
+                                            ? () {
+                                                _dismissKeyboardAndPopovers();
+                                                showHostQuickSheet(
                                                   context,
                                                   ref,
                                                   onOpenHostSettings: () => _openSettings(
                                                     initialSection: SettingsSection.hosts,
                                                   ),
-                                                )
-                                            : _openSessionTitleAction,
+                                                );
+                                              }
+                                            : () {
+                                                _dismissKeyboardAndPopovers();
+                                                _openSessionTitleAction();
+                                              },
                                         child: AnimatedSwitcher(
                                           duration: const Duration(milliseconds: 180),
                                           child: Row(
                                             key: ValueKey(
                                               shellSlice.isEmptyChat
                                                   ? 'host:${shellSlice.hostId}:${shellSlice.hostName}'
-                                                  : '${shellSlice.hostId}:${shellSlice.activeSessionId ?? '__new__'}:${shellSlice.activeSessionTitle}',
+                                                  : '${shellSlice.hostId}:${shellSlice.activeSessionTitle}',
                                             ),
                                             mainAxisSize: MainAxisSize.min,
                                             children: [
-                                              Container(
-                                                width: 7,
-                                                height: 7,
-                                                decoration: BoxDecoration(
-                                                  color: hostDotColor,
-                                                  shape: BoxShape.circle,
-                                                ),
+                                              GrassBagStatusDot(
+                                                size: 7,
+                                                color: hostDotColor,
+                                                pulsing: !hostHealthy &&
+                                                    !hostHasErr &&
+                                                    hostIsConnecting,
                                               ),
                                               const SizedBox(width: 7),
                                               Flexible(
@@ -1007,54 +1395,60 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                               ] else if (!shellSlice.hostIsLocal ||
                                                   shellSlice.hostsCount > 1) ...[
                                                 const SizedBox(width: 7),
-                                                GestureDetector(
-                                                  behavior: HitTestBehavior.opaque,
-                                                  onTap: () => showHostQuickSheet(
-                                                    context,
-                                                    ref,
-                                                    onOpenHostSettings: () => _openSettings(
-                                                      initialSection: SettingsSection.hosts,
-                                                    ),
-                                                  ),
-                                                  child: ConstrainedBox(
-                                                    constraints: const BoxConstraints(maxWidth: 96),
-                                                    child: Container(
-                                                      padding: const EdgeInsets.symmetric(
-                                                        horizontal: 8,
-                                                        vertical: 4.5,
-                                                      ),
-                                                      decoration: BoxDecoration(
-                                                        color: shellSlice.hostIsLocal
-                                                            ? t.fill1
-                                                            : t.primarySoft,
-                                                        borderRadius: BorderRadius.circular(999),
-                                                      ),
-                                                      child: Row(
-                                                        mainAxisSize: MainAxisSize.min,
-                                                        children: [
-                                                          Flexible(
-                                                            child: Text(
-                                                              shellSlice.hostName,
-                                                              maxLines: 1,
-                                                              overflow: TextOverflow.ellipsis,
-                                                              style: TextStyle(
-                                                                fontSize: 10.5,
-                                                                fontWeight: FontWeight.w600,
-                                                                color: shellSlice.hostIsLocal
-                                                                    ? t.text2
-                                                                    : t.primary,
+                                                Flexible(
+                                                  flex: 0,
+                                                  child: GestureDetector(
+                                                    behavior: HitTestBehavior.opaque,
+                                                    onTap: () {
+                                                      _dismissKeyboardAndPopovers();
+                                                      showHostQuickSheet(
+                                                        context,
+                                                        ref,
+                                                        onOpenHostSettings: () => _openSettings(
+                                                          initialSection: SettingsSection.hosts,
+                                                        ),
+                                                      );
+                                                    },
+                                                    child: ConstrainedBox(
+                                                      constraints: const BoxConstraints(maxWidth: 96),
+                                                      child: Container(
+                                                        padding: const EdgeInsets.symmetric(
+                                                          horizontal: 8,
+                                                          vertical: 4.5,
+                                                        ),
+                                                        decoration: BoxDecoration(
+                                                          color: shellSlice.hostIsLocal
+                                                              ? t.fill1
+                                                              : t.primarySoft,
+                                                          borderRadius: BorderRadius.circular(999),
+                                                        ),
+                                                        child: Row(
+                                                          mainAxisSize: MainAxisSize.min,
+                                                          children: [
+                                                            Flexible(
+                                                              child: Text(
+                                                                shellSlice.hostName,
+                                                                maxLines: 1,
+                                                                overflow: TextOverflow.ellipsis,
+                                                                style: TextStyle(
+                                                                  fontSize: 10.5,
+                                                                  fontWeight: FontWeight.w600,
+                                                                  color: shellSlice.hostIsLocal
+                                                                      ? t.text2
+                                                                      : t.primary,
+                                                                ),
                                                               ),
                                                             ),
-                                                          ),
-                                                          const SizedBox(width: 2),
-                                                          Icon(
-                                                            CupertinoIcons.chevron_down,
-                                                            size: 9,
-                                                            color: shellSlice.hostIsLocal
-                                                                ? t.text3
-                                                                : t.primary,
-                                                          ),
-                                                        ],
+                                                            const SizedBox(width: 2),
+                                                            Icon(
+                                                              CupertinoIcons.chevron_down,
+                                                              size: 9,
+                                                              color: shellSlice.hostIsLocal
+                                                                  ? t.text3
+                                                                  : t.primary,
+                                                            ),
+                                                          ],
+                                                        ),
                                                       ),
                                                     ),
                                                   ),
@@ -1073,30 +1467,34 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                       ),
                                     ),
                             ),
-                            const SizedBox(width: 10),
-                            SizedBox(
-                              width: 44,
-                              height: 44,
-                              child: showTopRightBtn
-                                  ? GrassBagGlassCircleButton(
-                                      key: ValueKey('top-right-$isTab'),
-                                      icon: isTab
-                                          ? CupertinoIcons.sidebar_right
-                                          : CupertinoIcons.square_pencil,
-                                      iconSize: 19,
-                                      useOwnLayer: false,
-                                      tooltip: isTab ? '展开工作台' : '新对话',
-                                      tier: shellSlice.glassTier,
-                                      onTap: () {
-                                        if (isTab) {
-                                          ctrl.setTabletWorkbenchOpen(true);
-                                        } else {
-                                          ctrl.startNewChat();
-                                        }
-                                      },
-                                    )
-                                  : const SizedBox.shrink(),
-                            ),
+                            if (showTopRightBtn) ...[
+                              const SizedBox(width: 10),
+                              SizedBox(
+                                width: 44,
+                                height: 44,
+                                child: GrassBagGlassCircleButton(
+                                  key: ValueKey('top-right-$isTab'),
+                                  icon: isTab
+                                      ? CupertinoIcons.sidebar_right
+                                      : CupertinoIcons.square_pencil,
+                                  iconSize: 19,
+                                  useOwnLayer: false,
+                                  tooltip: isTab ? '展开工作台' : '新对话',
+                                  tier: shellSlice.glassTier,
+                                  onTap: () {
+                                    _dismissKeyboardAndPopovers();
+                                    if (isTab) {
+                                      if (!canDualPane && shellSlice.tabletSidebarOpen) {
+                                        ctrl.setTabletSidebarOpen(false);
+                                      }
+                                      ctrl.setTabletWorkbenchOpen(true);
+                                    } else {
+                                      ctrl.startNewChat();
+                                    }
+                                  },
+                                ),
+                              ),
+                            ],
                           ],
                         ),
                       ),
@@ -1170,6 +1568,11 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                       ),
                     ),
                   ),
+
+                // In-App Live Phone-Control Floating Pill (only mounts when a phone automation turn is live!)
+                _LivePhoneControlOverlayPill(
+                  topOffset: topPad + (hasExtraTopBanner ? 132.0 : 64.0),
+                ),
 
                 // Android Local Container & DSH Boot Banner (physical-phone first-run & error recovery!)
                 if (showLocalAndroidBanner)
@@ -1560,15 +1963,25 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                         hostDetailId: shellSlice.hostId,
                       ),
                       plusOpenNotifier: _plusOpenNotifier,
+                      suggestionsOpenNotifier: _suggestionsOpenNotifier,
+                      editingContextNotifier: _editingContextNotifier,
                       showScrollToBottomListenable: _showScrollToBottomNotifier,
+                      hasNewBelowListenable: _hasNewBelowNotifier,
                       composerHeightNotifier: _composerHeightNotifier,
                       onScrollToBottom: _jumpBackToBottom,
                       onMessageSent: () {
+                        _scrollCtrl.cancelMomentumAndHold();
                         _userScrolledAway = false;
+                        _scrollCtrl.allowImeAnchor = true;
                         if (_showScrollToBottomNotifier.value) {
                           _showScrollToBottomNotifier.value = false;
                         }
-                        _ensureStreamScrollFollower(settleTailMs: 360.0);
+                        if (_hasNewBelowNotifier.value) {
+                          _hasNewBelowNotifier.value = false;
+                        }
+                        if (!_isProgrammaticScroll) {
+                          _ensureStreamScrollFollower(settleTailMs: 360.0);
+                        }
                       },
                     ),
                   ),
@@ -1581,21 +1994,25 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           // Left-edge swipe gesture zone on Phone to pull the drawer interactively
           if (!isTab)
             Positioned(
-              top: topPad + 56,
-              bottom: baseComposerBottom + 96,
+              top: topPad + 72,
+              bottom: baseComposerBottom + 110,
               left: 0,
-              width: 24,
+              width: 18,
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragUpdate: (d) {
-                  final next = (_drawerCtrl.value + d.delta.dx / _phoneDrawerWidth).clamp(0.0, 1.0);
+                  final drawerW =
+                      math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
+                  final next = (_drawerCtrl.value + d.delta.dx / drawerW).clamp(0.0, 1.0);
                   if (d.delta.dx > 0 && next > 0.02 && _composerFocus.hasFocus) {
                     _composerFocus.unfocus();
                   }
                   _drawerCtrl.value = next;
                 },
                 onHorizontalDragEnd: (d) {
-                  final v = d.velocity.pixelsPerSecond.dx / _phoneDrawerWidth;
+                  final drawerW =
+                      math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
+                  final v = d.velocity.pixelsPerSecond.dx / drawerW;
                   if (v > 0.6 || (_drawerCtrl.value > 0.35 && v > -0.4)) {
                     _animateDrawerTo(1.0, velocity: v);
                   } else {
@@ -1624,6 +2041,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                 child: RepaintBoundary(
                   child: SessionsSidebar(
                     isTabletDocked: true,
+                    backHandlerNotifier: _drawerBackHandler,
                     onOpenTerminal: _openTerminal,
                     onOpenFeatures: _openAllFeatures,
                     onOpenSettings: () => _openSettings(),
@@ -1635,7 +2053,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               Expanded(child: chatStage),
               // Smoothly animated docked Tablet Right Workbench (unmounted when collapsed -> 0 rebuilds!)
               _AnimatedTabletPane(
-                open: shellSlice.tabletWorkbenchOpen,
+                open: effectiveTabWorkbenchOpen,
                 width: 348,
                 alignment: Alignment.centerLeft,
                 keepAlive: false,
@@ -1656,16 +2074,17 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           )
         : Builder(
             builder: (context) {
+              final effectiveDrawerW = math.min(_phoneDrawerWidth, math.max(220.0, screenSize.width - 48.0));
               // Hoist the floating drawer subtree outside AnimatedBuilder so sliding the drawer
               // triggers ZERO widget rebuilds & ZERO layout passes on every 120fps animation tick!
               final cachedDrawer = RepaintBoundary(
                 child: GestureDetector(
                   onHorizontalDragUpdate: (d) {
                     _drawerCtrl.value =
-                        (_drawerCtrl.value + d.delta.dx / _phoneDrawerWidth).clamp(0.0, 1.0);
+                        (_drawerCtrl.value + d.delta.dx / effectiveDrawerW).clamp(0.0, 1.0);
                   },
                   onHorizontalDragEnd: (d) {
-                    final vel = d.velocity.pixelsPerSecond.dx / _phoneDrawerWidth;
+                    final vel = d.velocity.pixelsPerSecond.dx / effectiveDrawerW;
                     if (vel > 0.5) {
                       _animateDrawerTo(1.0, velocity: vel);
                     } else if (vel < -0.5 || _drawerCtrl.value < 0.65) {
@@ -1679,6 +2098,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                   child: SessionsSidebar(
                     isTabletDocked: false,
                     onCloseDrawer: _closePhoneDrawer,
+                    backHandlerNotifier: _drawerBackHandler,
                     onOpenTerminal: _openTerminal,
                     onOpenFeatures: _openAllFeatures,
                     onOpenSettings: () => _openSettings(),
@@ -1699,10 +2119,12 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                   // so RepaintBoundary(child: chatStage) stays cached in GPU VRAM during the entire
                   // drawer slide (ZERO full-screen glass backdrop re-rasterization per drag frame!)
                   // and ListView scroll position / TextField focus NEVER remount!
+                  // Gate chat IgnorePointer on `v > 0.06` so the final spring settle tail never
+                  // swallows the user's immediate tap on chat or composer!
                   return Stack(
                     children: [
                       IgnorePointer(
-                        ignoring: drawerActive,
+                        ignoring: v > 0.06,
                         child: stageChild,
                       ),
 
@@ -1713,11 +2135,11 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                             onTap: _closePhoneDrawer,
                             onHorizontalDragUpdate: (d) {
                               _drawerCtrl.value =
-                                  (_drawerCtrl.value + d.delta.dx / _phoneDrawerWidth)
+                                  (_drawerCtrl.value + d.delta.dx / effectiveDrawerW)
                                       .clamp(0.0, 1.0);
                             },
                             onHorizontalDragEnd: (d) {
-                              final vel = d.velocity.pixelsPerSecond.dx / _phoneDrawerWidth;
+                              final vel = d.velocity.pixelsPerSecond.dx / effectiveDrawerW;
                               if (vel > 0.5) {
                                 _animateDrawerTo(1.0, velocity: vel);
                               } else if (vel < -0.5 || _drawerCtrl.value < 0.65) {
@@ -1734,19 +2156,25 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                           ),
                         ),
 
-                      // Conditionally mounted slide-over drawer so the full-height Liquid Glass
-                      // sheet frees its Impeller GPU geometry matte textures whenever closed!
-                      if (drawerActive)
-                        Positioned(
-                          top: 0,
-                          bottom: 0,
-                          left: 0,
-                          width: _phoneDrawerWidth,
-                          child: Transform.translate(
-                            offset: Offset(-_phoneDrawerWidth * (1.0 - v), 0),
-                            child: cachedDrawer,
+                      // Keep phone drawer warm via Offstage + TickerMode so Frame 1 of swipe-open
+                      // has ZERO cold-mount hitch while painting ZERO shaders & running ZERO tickers
+                      // whenever closed!
+                      Positioned(
+                        top: 0,
+                        bottom: 0,
+                        left: 0,
+                        width: effectiveDrawerW,
+                        child: Offstage(
+                          offstage: !drawerActive,
+                          child: TickerMode(
+                            enabled: drawerActive,
+                            child: Transform.translate(
+                              offset: Offset(-effectiveDrawerW * (1.0 - v), 0),
+                              child: cachedDrawer,
+                            ),
                           ),
                         ),
+                      ),
                     ],
                   );
                 },
@@ -1755,17 +2183,63 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           );
 
     return ListenableBuilder(
-      listenable: Listenable.merge([_drawerCtrl, _plusOpenNotifier]),
+      listenable: Listenable.merge([
+        _drawerCtrl,
+        _plusOpenNotifier,
+        _suggestionsOpenNotifier,
+        _editingContextNotifier,
+        _composerFocus,
+      ]),
       builder: (context, child) {
-        final hasOpenOverlay = (!isTab && _drawerCtrl.value > 0.05) || _plusOpenNotifier.value;
+        final hasOpenOverlay = (!isTab && _drawerCtrl.value > 0.05) ||
+            _plusOpenNotifier.value ||
+            _suggestionsOpenNotifier.value ||
+            _editingContextNotifier.value != null ||
+            (isTab && shellSlice.tabletWorkbenchOpen) ||
+            _composerFocus.hasFocus;
+        final guardAndroidRootExit =
+            !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
         return PopScope(
-          canPop: !hasOpenOverlay,
+          canPop: !widget.isSplashCovered && !hasOpenOverlay && !guardAndroidRootExit,
           onPopInvokedWithResult: (didPop, _) {
-            if (didPop) return;
-            if (!isTab && _drawerCtrl.value > 0.05) {
-              _closePhoneDrawer();
-            } else if (_plusOpenNotifier.value) {
+            if (didPop || widget.isSplashCovered) return;
+            if (_plusOpenNotifier.value) {
               _plusOpenNotifier.value = false;
+              return;
+            }
+            if (_suggestionsOpenNotifier.value) {
+              _suggestionsOpenNotifier.value = false;
+              return;
+            }
+            if (_editingContextNotifier.value != null) {
+              _cancelEditingTurn();
+              return;
+            }
+            if (!isTab && _drawerCtrl.value > 0.05) {
+              final handledInsideDrawer = _drawerBackHandler.value?.call() ?? false;
+              if (!handledInsideDrawer) {
+                _closePhoneDrawer();
+              }
+              return;
+            }
+            if (isTab && shellSlice.tabletWorkbenchOpen) {
+              ctrl.setTabletWorkbenchOpen(false);
+              return;
+            }
+            if (_composerFocus.hasFocus) {
+              _composerFocus.unfocus();
+              return;
+            }
+            if (guardAndroidRootExit) {
+              final now = DateTime.now();
+              if (_lastBackPressedAt == null ||
+                  now.difference(_lastBackPressedAt!) > const Duration(seconds: 2)) {
+                _lastBackPressedAt = now;
+                ctrl.showToast('再按一次返回退出 GrassBag', tone: ToastTone.info);
+              } else {
+                _lastBackPressedAt = null;
+                SystemNavigator.pop();
+              }
             }
           },
           child: child!,
@@ -1776,12 +2250,32 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         const SingleActivator(LogicalKeyboardKey.keyN, meta: true): () => ctrl.startNewChat(),
         const SingleActivator(LogicalKeyboardKey.keyN, control: true): () => ctrl.startNewChat(),
         const SingleActivator(LogicalKeyboardKey.escape): () {
+          // CRITICAL CJK IME guard: let Escape dismiss Pinyin/Kana candidate popups without
+          // cancelling streaming or closing composer overlays!
+          final composing = _composerCtrl.value.composing;
+          if (_composerFocus.hasFocus && composing.isValid && !composing.isCollapsed) {
+            return;
+          }
+          final drawerVisible = isTab ? shellSlice.tabletSidebarOpen : _drawerCtrl.value > 0.05;
+          if (drawerVisible && _drawerBackHandler.value?.call() == true) {
+            return;
+          }
           if (!isTab && _drawerCtrl.value > 0.05) {
             _closePhoneDrawer();
+          } else if (_suggestionsOpenNotifier.value) {
+            _suggestionsOpenNotifier.value = false;
           } else if (_plusOpenNotifier.value) {
             _plusOpenNotifier.value = false;
-          } else if (ref.read(appProvider).isStreaming) {
-            ctrl.cancelStreaming();
+          } else if (_editingContextNotifier.value != null) {
+            _cancelEditingTurn();
+          } else {
+            final cur = ref.read(appProvider);
+            final hasTakeover = cur.pendingApprovalCommand != null ||
+                cur.activeQuestion != null ||
+                cur.activeCordisRequest != null;
+            if (cur.isStreaming && !hasTakeover) {
+              ctrl.cancelStreaming();
+            }
           }
         },
       },
@@ -1789,16 +2283,19 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         child: Scaffold(
           backgroundColor: Colors.transparent,
           resizeToAvoidBottomInset: false,
-          body: Stack(
-            children: [
-              mainBody,
-              // Bottom-Centered Liquid Glass Toast isolated from GrassBagShell viewInsets rebuilds!
-              _KeyboardAwareToastSlot(
-                baseComposerBottom: baseComposerBottom,
-                plusOpenNotifier: _plusOpenNotifier,
-                composerHeightNotifier: _composerHeightNotifier,
-              ),
-            ],
+          body: _ImeMotionCoordinator(
+            child: Stack(
+              children: [
+                mainBody,
+                // Bottom-Centered Liquid Glass Toast isolated from GrassBagShell viewInsets rebuilds!
+                _KeyboardAwareToastSlot(
+                  baseComposerBottom: baseComposerBottom,
+                  plusOpenNotifier: _plusOpenNotifier,
+                  suggestionsOpenNotifier: _suggestionsOpenNotifier,
+                  composerHeightNotifier: _composerHeightNotifier,
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1807,10 +2304,400 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   }
 }
 
-/// Tiny leaf widget that isolates `MediaQuery.viewInsetsOf(context).bottom` for the
-/// floating composer dock using pure GPU `Transform.translate` so keyboard open/close
-/// runs at silky 120fps with ZERO layout passes and ZERO `RenderLiquidGlassLayer.layout()`
-/// (`toImageSync`) re-captures on normal chat frames!
+/// Custom [ScrollController] whose [ScrollPosition] consumes queued IME tail-growth deltas
+/// synchronously inside `applyContentDimensions` — BEFORE the frame paints — completely
+/// eliminating the 1-frame sawtooth vibration between rising Composer and chat bubbles!
+class _ImeLockStepScrollController extends ScrollController {
+  bool allowImeAnchor = true;
+
+  void queueImeAnchorDelta(double delta) {
+    if (delta <= 0.05 || !allowImeAnchor) return;
+    if (!hasClients || positions.length != 1) return;
+    final pos = position;
+    if (pos is _ImeLockStepScrollPosition) {
+      pos.queueImeAnchorDelta(delta);
+    }
+  }
+
+  void clearPendingImeAnchor() {
+    if (!hasClients) return;
+    for (final pos in positions) {
+      if (pos is _ImeLockStepScrollPosition) {
+        pos.clearPendingImeAnchor();
+      }
+    }
+  }
+
+  bool get isUserDrivenScroll {
+    if (!hasClients || positions.length != 1) return false;
+    final pos = position;
+    return pos is _ImeLockStepScrollPosition && pos.isUserDrivenActivity;
+  }
+
+  /// Immediately stops residual upward ballistic fling momentum when the user sends a message
+  /// or taps Scroll-to-Bottom, so auto-follow re-engages without waiting for fling decay.
+  void cancelMomentumAndHold() {
+    if (!hasClients || positions.length != 1) return;
+    final pos = position;
+    if (pos is _ImeLockStepScrollPosition) {
+      pos.cancelMomentumAndHold();
+    }
+  }
+
+  /// Advances scroll offset smoothly during 60/120Hz stream auto-follow without tearing down
+  /// ScrollActivity or blasting 360 Start/Update/End notifications per second via `jumpTo`.
+  void chaseTo(double targetPixels) {
+    if (!hasClients || positions.length != 1) return;
+    final pos = position;
+    if (pos is _ImeLockStepScrollPosition) {
+      pos.chaseTo(targetPixels);
+    } else {
+      jumpTo(targetPixels);
+    }
+  }
+
+  @override
+  ScrollPosition createScrollPosition(
+    ScrollPhysics physics,
+    ScrollContext context,
+    ScrollPosition? oldPosition,
+  ) {
+    return _ImeLockStepScrollPosition(
+      controller: this,
+      physics: physics,
+      context: context,
+      initialPixels: initialScrollOffset,
+      keepScrollOffset: keepScrollOffset,
+      oldPosition: oldPosition,
+      debugLabel: debugLabel,
+    );
+  }
+}
+
+class _ImeLockStepScrollPosition extends ScrollPositionWithSingleContext {
+  _ImeLockStepScrollPosition({
+    required this.controller,
+    required super.physics,
+    required super.context,
+    super.initialPixels,
+    super.keepScrollOffset,
+    super.oldPosition,
+    super.debugLabel,
+  });
+
+  final _ImeLockStepScrollController controller;
+  double _pendingImeAnchorDelta = 0.0;
+
+  void queueImeAnchorDelta(double delta) {
+    _pendingImeAnchorDelta += delta;
+  }
+
+  void clearPendingImeAnchor() {
+    _pendingImeAnchorDelta = 0.0;
+  }
+
+  bool get isUserDrivenActivity =>
+      activity is DragScrollActivity || activity is BallisticScrollActivity;
+
+  void cancelMomentumAndHold() {
+    if (activity is BallisticScrollActivity) {
+      goIdle();
+    }
+  }
+
+  void chaseTo(double targetPixels) {
+    if (!hasPixels ||
+        !hasContentDimensions ||
+        isUserDrivenActivity ||
+        activity is DrivenScrollActivity) {
+      return;
+    }
+    final clamped = targetPixels.clamp(minScrollExtent, maxScrollExtent);
+    if ((clamped - pixels).abs() <= 0.01) return;
+    forcePixels(clamped);
+  }
+
+  @override
+  double applyBoundaryConditions(double value) => super.applyBoundaryConditions(value);
+
+  @override
+  bool correctForNewDimensions(
+    ScrollMetrics oldPosition,
+    ScrollMetrics newPosition,
+  ) {
+    if (_pendingImeAnchorDelta > 0.05) {
+      final delta = _pendingImeAnchorDelta;
+      _pendingImeAnchorDelta = 0.0;
+      if (controller.allowImeAnchor &&
+          oldPosition.hasContentDimensions &&
+          oldPosition.hasPixels &&
+          newPosition.maxScrollExtent > oldPosition.maxScrollExtent + 0.1) {
+        final prevMax = oldPosition.maxScrollExtent;
+        final distFromPrevBottom =
+            (prevMax - oldPosition.pixels).clamp(0.0, double.infinity);
+        final wasBottomAnchored = prevMax <= 12.0 || distFromPrevBottom <= 76.0;
+        if (wasBottomAnchored) {
+          final growth = newPosition.maxScrollExtent - prevMax;
+          final shift = math.min(delta, growth);
+          final nextPixels = (oldPosition.pixels + shift).clamp(
+            newPosition.minScrollExtent,
+            newPosition.maxScrollExtent,
+          );
+          if ((nextPixels - pixels).abs() > 0.1) {
+            correctPixels(nextPixels);
+            // Returning `false` tells `RenderViewport.performLayout()` to re-run
+            // layout immediately at `nextPixels` on this exact frame (zero 1-frame lag!).
+            return false;
+          }
+        }
+      }
+    }
+    return super.correctForNewDimensions(oldPosition, newPosition);
+  }
+}
+
+/// Immutable handle of 120Hz IME spring listenables shared via [_ImeMotionScope]
+/// (`updateShouldNotify => false` so zero shell/chat widgets rebuild on keyboard ticks!).
+class _ImeMotionData {
+  _ImeMotionData({
+    required this.insetNotifier,
+    required this.openProgressNotifier,
+    required this.knownKeyboardHeightNotifier,
+  });
+
+  /// Smooth logical-pixel keyboard inset: locks 1:1 to continuous OS animations and
+  /// glides via critically-damped iOS 26 spring whenever Android OEM IMEs jump or resize!
+  final ValueListenable<double> insetNotifier;
+
+  /// Independent 0.0 (closed) → 1.0 (open) critically-damped choreography spring driving
+  /// the Empty Stage monotonic hero glide & staggered 4-card cascade with zero twitching.
+  final ValueListenable<double> openProgressNotifier;
+
+  /// Remembered full open keyboard height (default 300px) so Empty Stage centering stays
+  /// rock-steady even if OEM suggestion bars nudge inset height mid-session.
+  final ValueListenable<double> knownKeyboardHeightNotifier;
+}
+
+class _ImeMotionScope extends InheritedWidget {
+  const _ImeMotionScope({
+    required this.data,
+    required super.child,
+  });
+
+  final _ImeMotionData data;
+
+  static _ImeMotionData? of(BuildContext context) {
+    return context.getInheritedWidgetOfExactType<_ImeMotionScope>()?.data;
+  }
+
+  @override
+  bool updateShouldNotify(covariant _ImeMotionScope oldWidget) => false;
+}
+
+/// Single isolated subscriber to `MediaQuery.viewInsetsOf(context).bottom` for the main
+/// stage. Translates noisy/snap Android IME transitions into silky 120Hz critically-damped
+/// springs while locking 1:1 onto native OS frame-by-frame IME animations with zero gap!
+class _ImeMotionCoordinator extends StatefulWidget {
+  const _ImeMotionCoordinator({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_ImeMotionCoordinator> createState() => _ImeMotionCoordinatorState();
+}
+
+class _ImeMotionCoordinatorState extends State<_ImeMotionCoordinator>
+    with TickerProviderStateMixin {
+  static final SpringDescription _insetSpring = SpringDescription.withDampingRatio(
+    mass: 1.0,
+    stiffness: 380.0,
+    ratio: 1.0,
+  );
+  static final SpringDescription _toolbarSpring = SpringDescription.withDampingRatio(
+    mass: 1.0,
+    stiffness: 480.0,
+    ratio: 1.0,
+  );
+  static final SpringDescription _choreographySpring = SpringDescription.withDampingRatio(
+    mass: 1.0,
+    stiffness: 260.0,
+    ratio: 1.0,
+  );
+
+  late final AnimationController _insetCtrl;
+  late final AnimationController _openCtrl;
+  final ValueNotifier<double> _insetNotifier = ValueNotifier<double>(0.0);
+  final ValueNotifier<double> _openProgressNotifier = ValueNotifier<double>(0.0);
+  final ValueNotifier<double> _knownKbHeightNotifier = ValueNotifier<double>(300.0);
+  late final _ImeMotionData _data;
+
+  bool _initialized = false;
+  double _lastRawKb = 0.0;
+  double _lastRawDeltaSign = 0.0;
+  int _lastRawChangeUs = 0;
+  int _consecutiveStreamFrames = 0;
+  double _openTarget = 0.0;
+  Timer? _knownKbSettleTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _insetCtrl = AnimationController.unbounded(vsync: this, value: 0.0)
+      ..addListener(() {
+        final v = _insetCtrl.value.clamp(0.0, 2000.0);
+        if ((v - _insetNotifier.value).abs() > 0.05) {
+          _insetNotifier.value = v;
+        }
+      });
+    _openCtrl = AnimationController.unbounded(vsync: this, value: 0.0)
+      ..addListener(() {
+        final v = _openCtrl.value.clamp(0.0, 1.0);
+        if ((v - _openProgressNotifier.value).abs() > 0.0005) {
+          _openProgressNotifier.value = v;
+        }
+      });
+    _data = _ImeMotionData(
+      insetNotifier: _insetNotifier,
+      openProgressNotifier: _openProgressNotifier,
+      knownKeyboardHeightNotifier: _knownKbHeightNotifier,
+    );
+  }
+
+  @override
+  void dispose() {
+    _knownKbSettleTimer?.cancel();
+    _insetCtrl.dispose();
+    _openCtrl.dispose();
+    _insetNotifier.dispose();
+    _openProgressNotifier.dispose();
+    _knownKbHeightNotifier.dispose();
+    super.dispose();
+  }
+
+  void _syncRawInset(double rawKb) {
+    if (!_initialized) {
+      _initialized = true;
+      _lastRawKb = rawKb;
+      _insetCtrl.value = rawKb;
+      _insetNotifier.value = rawKb;
+      final initOpen = rawKb > 24.0 ? 1.0 : 0.0;
+      _openTarget = initOpen;
+      _openCtrl.value = initOpen;
+      _openProgressNotifier.value = initOpen;
+      if (rawKb >= 140.0) _knownKbHeightNotifier.value = rawKb;
+      return;
+    }
+
+    final delta = rawKb - _lastRawKb;
+    if (delta.abs() < 0.5) return;
+
+    final nowUs = SchedulerBinding.instance.schedulerPhase != SchedulerPhase.idle
+        ? SchedulerBinding.instance.currentFrameTimeStamp.inMicroseconds
+        : DateTime.now().microsecondsSinceEpoch;
+    final dtMs = (_lastRawChangeUs == 0 || nowUs < _lastRawChangeUs)
+        ? 999.0
+        : (nowUs - _lastRawChangeUs) / 1000.0;
+    final sign = delta > 0 ? 1.0 : -1.0;
+    final sameDir = _lastRawDeltaSign == sign;
+
+    if (dtMs <= 48.0 && sameDir) {
+      _consecutiveStreamFrames++;
+    } else {
+      _consecutiveStreamFrames = 0;
+    }
+
+    final prevRaw = _lastRawKb;
+    _lastRawKb = rawKb;
+    _lastRawDeltaSign = sign;
+    _lastRawChangeUs = nowUs;
+
+    if (rawKb >= 140.0) {
+      if (rawKb > _knownKbHeightNotifier.value + 2.0) {
+        _knownKbSettleTimer?.cancel();
+        _knownKbHeightNotifier.value = rawKb;
+      } else if ((rawKb - _knownKbHeightNotifier.value).abs() > 4.0) {
+        // Wait briefly before shrinking knownKeyboardHeight so mid-stream OS frames
+        // (e.g. 140 → 200 → 310) never pull `openTop` downward and then snap back up!
+        _knownKbSettleTimer?.cancel();
+        _knownKbSettleTimer = Timer(const Duration(milliseconds: 140), () {
+          if (mounted && _lastRawKb >= 140.0 && (_lastRawKb - _knownKbHeightNotifier.value).abs() > 4.0) {
+            _knownKbHeightNotifier.value = _lastRawKb;
+          }
+        });
+      }
+    } else {
+      _knownKbSettleTimer?.cancel();
+    }
+
+    // 1. Update smooth inset tracker:
+    //    - Continuous OS 60/120Hz IME animation -> lock 1:1 synchronously (zero gap!)
+    //    - Once 2+ consecutive native stream frames arrive, hand back to 1:1 tracking even if
+    //      a spring was running (prevents spring-lag lockout on fast Android 120Hz IME frames!)
+    //    - Single-frame OEM jump (> 180px) or post-settle toolbar resize -> smooth spring!
+    final isNativeStream = _consecutiveStreamFrames >= 1 ||
+        (delta.abs() <= 180.0 && !(prevRaw > 100.0 && rawKb > 100.0 && dtMs > 70.0));
+    final hasLargeSpringGap = _consecutiveStreamFrames < 2 &&
+        _insetCtrl.isAnimating &&
+        (rawKb - _insetNotifier.value).abs() > 16.0;
+    if (isNativeStream && !hasLargeSpringGap) {
+      if (_insetCtrl.isAnimating) {
+        _insetCtrl.stop();
+      }
+      _insetCtrl.value = rawKb;
+      _insetNotifier.value = rawKb;
+    } else {
+      final spring = (prevRaw > 100.0 && rawKb > 100.0) || hasLargeSpringGap
+          ? _toolbarSpring
+          : _insetSpring;
+      final sim = SpringSimulation(
+        spring,
+        _insetNotifier.value,
+        rawKb,
+        _insetCtrl.velocity.clamp(-2400.0, 2400.0),
+        tolerance: const Tolerance(distance: 0.4, velocity: 1.0),
+      );
+      _insetCtrl.animateWith(sim);
+    }
+
+    // 2. Drive independent choreography spring with hysteresis (24px open / 12px close)
+    //    so Empty Stage ALWAYS plays a silky, jitter-free 300ms spring morph!
+    final nextOpenTarget = rawKb > 24.0
+        ? 1.0
+        : (rawKb <= 12.0 ? 0.0 : _openTarget);
+    if ((nextOpenTarget - _openTarget).abs() > 0.01) {
+      _openTarget = nextOpenTarget;
+      final sim = SpringSimulation(
+        _choreographySpring,
+        _openProgressNotifier.value,
+        nextOpenTarget,
+        _openCtrl.velocity.clamp(-6.0, 6.0),
+        tolerance: const Tolerance(distance: 0.002, velocity: 0.01),
+      );
+      _openCtrl.animateWith(sim);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Every subscriber to `_ImeMotionScope` is strictly a descendant of this coordinator,
+    // so Flutter's BuildOwner permits marking those descendants dirty synchronously here
+    // and rebuilds them in the exact same frame (zero 1-frame IME lag!).
+    _syncRawInset(MediaQuery.viewInsetsOf(context).bottom);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _ImeMotionScope(
+      data: _data,
+      child: widget.child,
+    );
+  }
+}
+
+/// Tiny leaf widget that isolates smooth IME bottom lift for the floating composer dock
+/// using pure GPU `Transform.translate` so keyboard open/close runs at silky 120fps with
+/// ZERO layout passes and ZERO `RenderLiquidGlassLayer.layout()` (`toImageSync`) re-captures!
 class _KeyboardBottomInsetLift extends ConsumerWidget {
   const _KeyboardBottomInsetLift({
     required this.baseBottom,
@@ -1824,7 +2711,7 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final kbInset = MediaQuery.viewInsetsOf(context).bottom;
+    final ime = _ImeMotionScope.of(context);
     final screenH = MediaQuery.sizeOf(context).height;
     final hasTakeover = ref.watch(
       appProvider.select(
@@ -1834,40 +2721,54 @@ class _KeyboardBottomInsetLift extends ConsumerWidget {
             s.activeCordisRequest != null,
       ),
     );
-    // Continuous max(...) avoids any 32px discontinuity snap when kbInset crosses 0 <-> 1px!
-    final targetBottom = math.max(baseBottom, kbInset + 8.0);
-    final lift = (targetBottom - baseBottom).clamp(0.0, double.infinity);
-    // For normal composer (99% of frames), keep maxDockHeight CONSTANT across the entire IME
-    // slide so ConstrainedBox NEVER dirties RenderLiquidGlassLayer.layout() -> 0 toImageSync!
-    // Only bound tightly against the top bar when a tall Approval/Question/Cordis takeover card
-    // is active, quantized to 64px buckets so layout churn drops by ~85%.
-    final double maxDockHeight;
-    if (screenH <= 160.0) {
-      maxDockHeight = double.infinity;
-    } else if (!hasTakeover) {
-      maxDockHeight = (screenH - baseBottom - topClearance).clamp(160.0, screenH);
-    } else {
-      final raw = (screenH - targetBottom - topClearance).clamp(160.0, screenH);
-      maxDockHeight = kbInset > 0 ? ((raw / 64.0).floor() * 64.0).clamp(160.0, screenH) : raw;
-    }
-    // Always keep Transform.translate mounted (Offset.zero at rest is a zero-cost
-    // identity transform) so child TextField NEVER remounts & drops IME connection!
-    return Transform.translate(
-      offset: Offset(0, -lift),
-      child: Align(
-        alignment: Alignment.bottomCenter,
-        heightFactor: 1.0,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: maxDockHeight),
-          child: child,
+
+    Widget buildLift(double kbInset, double settledKbHeight) {
+      // Continuous max(...) avoids any 32px discontinuity snap when kbInset crosses 0 <-> 1px!
+      final targetBottom = math.max(baseBottom, kbInset + 8.0);
+      final lift = (targetBottom - baseBottom).clamp(0.0, double.infinity);
+      // Subtract settled open keyboard height (not animated per-frame `kbInset`) when the keyboard
+      // is open so `/` & `@` popovers NEVER fly behind the top bar while keeping `maxDockHeight`
+      // steady across 120Hz IME flight frames (zero `toImageSync` glass rebakes!).
+      final double maxDockHeight;
+      if (screenH <= 160.0) {
+        maxDockHeight = double.infinity;
+      } else if (!hasTakeover) {
+        final effectiveBottom = kbInset > 24.0
+            ? math.max(baseBottom, settledKbHeight + 8.0)
+            : baseBottom;
+        maxDockHeight = (screenH - effectiveBottom - topClearance).clamp(160.0, screenH);
+      } else {
+        final raw = (screenH - targetBottom - topClearance).clamp(160.0, screenH);
+        maxDockHeight = kbInset > 0 ? ((raw / 64.0).floor() * 64.0).clamp(160.0, screenH) : raw;
+      }
+      // Always keep Transform.translate mounted (Offset.zero at rest is a zero-cost
+      // identity transform) so child TextField NEVER remounts & drops IME connection!
+      return Transform.translate(
+        offset: Offset(0, -lift),
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          heightFactor: 1.0,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: maxDockHeight),
+            child: child,
+          ),
         ),
-      ),
+      );
+    }
+
+    if (ime == null) {
+      final raw = MediaQuery.viewInsetsOf(context).bottom;
+      return buildLift(raw, raw);
+    }
+    return ValueListenableBuilder<double>(
+      valueListenable: ime.insetNotifier,
+      builder: (_, kbInset, __) => buildLift(kbInset, ime.knownKeyboardHeightNotifier.value),
     );
   }
 }
 
 /// Isolated bottom scrim that tracks real live composer height AND lifts above the soft IME
-/// via pure GPU `Transform.translate` (zero Stack layout pass on 120Hz IME animation frames!).
+/// via pure GPU `Transform.translate` in exact lock-step with [_KeyboardBottomInsetLift]!
 class _KeyboardAwareBottomScrim extends StatelessWidget {
   const _KeyboardAwareBottomScrim({
     required this.baseComposerBottom,
@@ -1880,43 +2781,54 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final targetBottom = math.max(baseComposerBottom, kbInset + 8.0);
-    final lift = (targetBottom - baseComposerBottom).clamp(0.0, double.infinity);
-    return ValueListenableBuilder<double>(
-      valueListenable: composerHeightNotifier,
-      builder: (_, compH, __) {
-        final restingH = baseComposerBottom + compH + 22.0;
-        return Transform.translate(
-          offset: Offset(0, -lift),
-          child: IgnorePointer(
-            child: SizedBox(
-              height: restingH,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.bottomCenter,
-                    end: Alignment.topCenter,
-                    colors: [
-                      t.bgSolid.withValues(alpha: t.isDark ? 0.18 : 0.10),
-                      t.bgSolid.withValues(alpha: t.isDark ? 0.04 : 0.02),
-                      t.bgSolid.withValues(alpha: 0.0),
-                    ],
-                    stops: const [0.0, 0.56, 1.0],
-                  ),
-                ),
+    final ime = _ImeMotionScope.of(context);
+    final scrimDecoration = BoxDecoration(
+      gradient: LinearGradient(
+        begin: Alignment.bottomCenter,
+        end: Alignment.topCenter,
+        colors: [
+          t.bgSolid.withValues(alpha: t.isDark ? 0.95 : 0.94),
+          t.bgSolid.withValues(alpha: t.isDark ? 0.78 : 0.74),
+          t.bgSolid.withValues(alpha: t.isDark ? 0.28 : 0.24),
+          t.bgSolid.withValues(alpha: 0.0),
+        ],
+        stops: const [0.0, 0.36, 0.72, 1.0],
+      ),
+    );
+
+    Widget buildWithInset(double kbInset) {
+      final targetBottom = math.max(baseComposerBottom, kbInset + 8.0);
+      final lift = (targetBottom - baseComposerBottom).clamp(0.0, double.infinity);
+      return ValueListenableBuilder<double>(
+        valueListenable: composerHeightNotifier,
+        builder: (_, compH, __) {
+          final restingH = baseComposerBottom + compH + 34.0;
+          return Transform.translate(
+            offset: Offset(0, -lift),
+            child: IgnorePointer(
+              child: SizedBox(
+                height: restingH,
+                child: DecoratedBox(decoration: scrimDecoration),
               ),
             ),
-          ),
-        );
-      },
+          );
+        },
+      );
+    }
+
+    if (ime == null) {
+      return buildWithInset(MediaQuery.viewInsetsOf(context).bottom);
+    }
+    return ValueListenableBuilder<double>(
+      valueListenable: ime.insetNotifier,
+      builder: (_, kbInset, __) => buildWithInset(kbInset),
     );
   }
 }
 
-/// Continuous pixel-accurate trailing spacer inside chat `ListView.builder` tracking live
-/// composer height + exact IME inset (zero 64px stair-stepping!). When the user is anchored at
-/// the bottom of a scrollable chat, smoothly keeps the last bubble locked above the rising keyboard.
+/// Zero-frame-lag trailing spacer inside chat `ListView.builder` tracking live composer
+/// height + smooth IME inset. Queues upward deltas into [_ImeLockStepScrollController] so
+/// `applyContentDimensions` updates scroll offset BEFORE painting the same frame!
 class _KeyboardScrollTail extends StatefulWidget {
   const _KeyboardScrollTail({
     super.key,
@@ -1934,38 +2846,49 @@ class _KeyboardScrollTail extends StatefulWidget {
 }
 
 class _KeyboardScrollTailState extends State<_KeyboardScrollTail> {
-  double _lastKbInset = 0.0;
+  double _lastBottomGap = 0.0;
+  bool _initialized = false;
 
-  @override
-  Widget build(BuildContext context) {
-    final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final deltaKb = kbInset - _lastKbInset;
-    if (deltaKb.abs() > 0.5) {
-      _lastKbInset = kbInset;
-      if (deltaKb > 0 && widget.scrollCtrl.hasClients && widget.scrollCtrl.positions.length == 1) {
-        final pos = widget.scrollCtrl.position;
-        final distFromBottom = pos.maxScrollExtent - pos.pixels;
-        // Only follow smoothly when already near bottom AND conversation is scrollable!
-        if (pos.maxScrollExtent > 12.0 && distFromBottom <= 72.0) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!mounted || !widget.scrollCtrl.hasClients || widget.scrollCtrl.positions.length != 1) {
-              return;
-            }
-            final p = widget.scrollCtrl.position;
-            final target = (p.pixels + deltaKb).clamp(0.0, p.maxScrollExtent);
-            if ((target - p.pixels).abs() > 0.5) {
-              widget.scrollCtrl.jumpTo(target);
-            }
-          });
+  void _syncGapDelta(double bottomGap) {
+    if (!_initialized) {
+      _initialized = true;
+      _lastBottomGap = bottomGap;
+      return;
+    }
+    final delta = bottomGap - _lastBottomGap;
+    if (delta.abs() > 0.1) {
+      _lastBottomGap = bottomGap;
+      if (delta > 0.1) {
+        final ctrl = widget.scrollCtrl;
+        if (ctrl is _ImeLockStepScrollController) {
+          ctrl.queueImeAnchorDelta(delta);
         }
       }
     }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ime = _ImeMotionScope.of(context);
+
+    Widget buildSpacer(double kbInset) {
+      final bottomGap = math.max(widget.baseComposerBottom, kbInset + 8.0);
+      return ValueListenableBuilder<double>(
+        valueListenable: widget.composerHeightNotifier,
+        builder: (_, compH, __) {
+          final totalTail = bottomGap + compH;
+          _syncGapDelta(totalTail);
+          return SizedBox(height: totalTail + 24.0);
+        },
+      );
+    }
+
+    if (ime == null) {
+      return buildSpacer(MediaQuery.viewInsetsOf(context).bottom);
+    }
     return ValueListenableBuilder<double>(
-      valueListenable: widget.composerHeightNotifier,
-      builder: (_, compH, __) {
-        final bottomGap = math.max(widget.baseComposerBottom, kbInset + 8.0);
-        return SizedBox(height: bottomGap + compH + 26.0);
-      },
+      valueListenable: ime.insetNotifier,
+      builder: (_, kbInset, __) => buildSpacer(kbInset),
     );
   }
 }
@@ -1981,6 +2904,7 @@ class _ChatCanvasArea extends ConsumerWidget {
     required this.topPad,
     required this.baseComposerBottom,
     required this.composerHeightNotifier,
+    required this.prependedOlderCountNotifier,
     required this.hideCenterTitle,
     required this.animatedTurnIds,
     required this.onScrollNotification,
@@ -1991,7 +2915,10 @@ class _ChatCanvasArea extends ConsumerWidget {
     required this.onOpenHostSettings,
     required this.onOpenTerminal,
     required this.onPrefillPrompt,
+    required this.onEditTurn,
   });
+
+  static const ValueKey<String> _centerSliverKey = ValueKey<String>('chat-center-sliver');
 
   final ScrollController scrollCtrl;
   final double listTopPad;
@@ -1999,6 +2926,7 @@ class _ChatCanvasArea extends ConsumerWidget {
   final double topPad;
   final double baseComposerBottom;
   final ValueNotifier<double> composerHeightNotifier;
+  final ValueNotifier<int> prependedOlderCountNotifier;
   final bool hideCenterTitle;
   final Set<String> animatedTurnIds;
   final bool Function(ScrollNotification) onScrollNotification;
@@ -2009,6 +2937,7 @@ class _ChatCanvasArea extends ConsumerWidget {
   final VoidCallback onOpenHostSettings;
   final VoidCallback onOpenTerminal;
   final ValueChanged<String> onPrefillPrompt;
+  final ValueChanged<NormalizedTurn> onEditTurn;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -2036,7 +2965,75 @@ class _ChatCanvasArea extends ConsumerWidget {
     final showEmpty = !showLoading && !showError && slice.isEmptyChat;
     final showActiveList = !showLoading && !showError && !showEmpty;
 
-    // Never place `ListView.builder(controller: scrollCtrl)` inside `AnimatedSwitcher`!
+    Widget buildLoadOlderHeader() {
+      return Center(
+        key: const ValueKey('load-older-header'),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: GrassBagSpringTap(
+            onTap: () {
+              if (!slice.loadingOlderTurns) {
+                onLoadOlderTurns();
+              }
+            },
+            pressedScale: 0.95,
+            haptic: true,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+              decoration: BoxDecoration(
+                color: t.fill1,
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: t.sep, width: 0.6),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (slice.loadingOlderTurns) ...[
+                    CupertinoActivityIndicator(radius: 6.5, color: t.primary),
+                    const SizedBox(width: 7),
+                    Text(
+                      '正在加载更早消息…',
+                      style: TextStyle(fontSize: 12, color: t.text2),
+                    ),
+                  ] else ...[
+                    Icon(CupertinoIcons.clock, size: 13, color: t.primary),
+                    const SizedBox(width: 6),
+                    Text(
+                      '加载更早消息',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: t.primary,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    Widget buildTurnItem(int index) {
+      final turns = ref.read(appProvider).turns;
+      final turnKey = index < turns.length ? turns[index].stableKey : 'turn-idx-$index';
+      final scopedKey = '${slice.activeHostId}:${slice.sessionRenderGen}:$turnKey';
+      return _TurnListItem(
+        key: ValueKey(scopedKey),
+        index: index,
+        scopePrefix: '${slice.activeHostId}:${slice.sessionRenderGen}',
+        activeSessionId: slice.activeSessionId,
+        animatedTurnIds: animatedTurnIds,
+        onOpenTerminal: onOpenTerminal,
+        onPrefillPrompt: onPrefillPrompt,
+        onEditTurn: onEditTurn,
+        onOpenModelSettings: onOpenModelSettings,
+        onOpenHostSettings: onOpenHostSettings,
+      );
+    }
+
+    // Never place `CustomScrollView(controller: scrollCtrl)` inside `AnimatedSwitcher`!
     // Otherwise fast session switches (< 140ms) keep an outgoing ScrollPosition attached
     // while mounting the incoming one -> `StateError: Too many elements`!
     return Stack(
@@ -2048,112 +3045,128 @@ class _ChatCanvasArea extends ConsumerWidget {
             onNotification: onScrollNotification,
             child: NotificationListener<ScrollMetricsNotification>(
               onNotification: onScrollMetricsNotification,
-              child: ListView.builder(
-                controller: scrollCtrl,
-                cacheExtent: 1400,
-                addAutomaticKeepAlives: true,
-                addRepaintBoundaries: true,
-                keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                physics: const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
-                ),
-                padding: EdgeInsets.fromLTRB(20, listTopPad, 20, 0),
-                itemCount: slice.turnsCount + 1 + (slice.hasMoreTurns ? 1 : 0),
-                findChildIndexCallback: () {
+              child: ValueListenableBuilder<int>(
+                valueListenable: prependedOlderCountNotifier,
+                builder: (ctx, rawPrepended, _) {
+                  final prepended = rawPrepended.clamp(0, slice.turnsCount);
+                  final forwardCount = slice.turnsCount - prepended;
                   final liveTurns = ref.read(appProvider).turns;
-                  final offset = slice.hasMoreTurns ? 1 : 0;
                   final scopePrefix = '${slice.activeHostId}:${slice.sessionRenderGen}:';
-                  final indexByKey = <String, int>{
-                    for (var i = 0; i < liveTurns.length; i++)
-                      '$scopePrefix${liveTurns[i].stableKey}': offset + i,
+                  final olderIndexByKey = prepended > 0
+                      ? <String, int>{
+                          for (var i = 0; i < prepended && i < liveTurns.length; i++)
+                            '$scopePrefix${liveTurns[i].stableKey}': (prepended - 1 - i),
+                        }
+                      : const <String, int>{};
+                  final forwardHeaderSlot = (prepended == 0 && slice.hasMoreTurns) || prepended > 0;
+                  final forwardOffset = forwardHeaderSlot ? 1 : 0;
+                  final forwardIndexByKey = <String, int>{
+                    for (var i = prepended; i < liveTurns.length; i++)
+                      '$scopePrefix${liveTurns[i].stableKey}': forwardOffset + (i - prepended),
                   };
-                  return (Key key) {
-                    if (key is! ValueKey<String>) return null;
-                    final value = key.value;
-                    if (value == 'load-older-header') return slice.hasMoreTurns ? 0 : null;
-                    if (value == 'chat-scroll-tail') return offset + slice.turnsCount;
-                    return indexByKey[value];
-                  };
-                }(),
-                itemBuilder: (ctx, rawIndex) {
-                  final hasHeader = slice.hasMoreTurns;
-                  if (hasHeader && rawIndex == 0) {
-                    return Center(
-                      key: const ValueKey('load-older-header'),
-                      child: Padding(
-                        padding: const EdgeInsets.only(bottom: 16),
-                        child: GrassBagSpringTap(
-                          onTap: () {
-                            if (!slice.loadingOlderTurns) {
-                              onLoadOlderTurns();
-                            }
-                          },
-                          pressedScale: 0.95,
-                          haptic: true,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                            decoration: BoxDecoration(
-                              color: t.fill1,
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(color: t.sep, width: 0.6),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (slice.loadingOlderTurns) ...[
-                                  CupertinoActivityIndicator(radius: 6.5, color: t.primary),
-                                  const SizedBox(width: 7),
-                                  Text(
-                                    '正在加载更早消息…',
-                                    style: TextStyle(fontSize: 12, color: t.text2),
-                                  ),
-                                ] else ...[
-                                  Icon(CupertinoIcons.clock, size: 13, color: t.primary),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    '加载更早消息',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                      color: t.primary,
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
+
+                  return CustomScrollView(
+                    controller: scrollCtrl,
+                    center: _centerSliverKey,
+                    cacheExtent: 1400,
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    slivers: [
+                      // Upward-growing negative sliver for turns prepended via `loadOlderTurns()`.
+                      // Empty on initial loads (`minScrollExtent == 0.0`), and mathematically
+                      // zero-jump (zero height-estimation drift!) whenever older turns prepend!
+                      if (prepended > 0)
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(20, listTopPad, 20, 0),
+                          sliver: SliverList.builder(
+                            addAutomaticKeepAlives: true,
+                            addRepaintBoundaries: true,
+                            itemCount: prepended + (slice.hasMoreTurns ? 1 : 0),
+                            findChildIndexCallback: (Key key) {
+                              if (key is! ValueKey<String>) return null;
+                              if (key.value == 'load-older-header') {
+                                return slice.hasMoreTurns ? prepended : null;
+                              }
+                              return olderIndexByKey[key.value];
+                            },
+                            itemBuilder: (_, revIdx) {
+                              if (revIdx == prepended) {
+                                return buildLoadOlderHeader();
+                              }
+                              final actualIdx = prepended - 1 - revIdx;
+                              return buildTurnItem(actualIdx);
+                            },
                           ),
                         ),
+                      // Center forward sliver anchored at `pixels == 0.0`:
+                      SliverPadding(
+                        key: _centerSliverKey,
+                        padding: EdgeInsets.fromLTRB(20, prepended == 0 ? listTopPad : 0, 20, 0),
+                        sliver: SliverList.builder(
+                          addAutomaticKeepAlives: true,
+                          addRepaintBoundaries: true,
+                          itemCount: forwardOffset + forwardCount + 1,
+                          findChildIndexCallback: (Key key) {
+                            if (key is! ValueKey<String>) return null;
+                            final v = key.value;
+                            if (v == 'load-older-header' || v == 'older-history-divider') {
+                              return forwardHeaderSlot ? 0 : null;
+                            }
+                            if (v == 'chat-scroll-tail') {
+                              return forwardOffset + forwardCount;
+                            }
+                            return forwardIndexByKey[v];
+                          },
+                          itemBuilder: (_, rawIdx) {
+                            if (forwardHeaderSlot && rawIdx == 0) {
+                              if (prepended == 0) {
+                                return buildLoadOlderHeader();
+                              }
+                              return Center(
+                                key: const ValueKey('older-history-divider'),
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 14),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                                        child: Text(
+                                          '以上为更早消息',
+                                          style: TextStyle(fontSize: 11, color: t.text3),
+                                        ),
+                                      ),
+                                      SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            }
+                            final relIdx = rawIdx - forwardOffset;
+                            if (relIdx == forwardCount) {
+                              return _KeyboardScrollTail(
+                                key: const ValueKey('chat-scroll-tail'),
+                                scrollCtrl: scrollCtrl,
+                                baseComposerBottom: baseComposerBottom,
+                                composerHeightNotifier: composerHeightNotifier,
+                              );
+                            }
+                            return buildTurnItem(prepended + relIdx);
+                          },
+                        ),
                       ),
-                    );
-                  }
-                  final index = hasHeader ? rawIndex - 1 : rawIndex;
-                  if (index == slice.turnsCount) {
-                    return _KeyboardScrollTail(
-                      key: const ValueKey('chat-scroll-tail'),
-                      scrollCtrl: scrollCtrl,
-                      baseComposerBottom: baseComposerBottom,
-                      composerHeightNotifier: composerHeightNotifier,
-                    );
-                  }
-                  final turns = ref.read(appProvider).turns;
-                  final turnKey = index < turns.length ? turns[index].stableKey : 'turn-idx-$index';
-                  final scopedKey = '${slice.activeHostId}:${slice.sessionRenderGen}:$turnKey';
-                  return _TurnListItem(
-                    key: ValueKey(scopedKey),
-                    index: index,
-                    scopePrefix: '${slice.activeHostId}:${slice.sessionRenderGen}',
-                    activeSessionId: slice.activeSessionId,
-                    animatedTurnIds: animatedTurnIds,
-                    onOpenTerminal: onOpenTerminal,
-                    onPrefillPrompt: onPrefillPrompt,
+                    ],
                   );
                 },
               ),
             ),
           ),
         AnimatedSwitcher(
-          duration: const Duration(milliseconds: 190),
-          reverseDuration: const Duration(milliseconds: 120),
+          duration: const Duration(milliseconds: 180),
+          reverseDuration: const Duration(milliseconds: 80),
           switchInCurve: Curves.easeOutCubic,
           switchOutCurve: Curves.easeOut,
           layoutBuilder: (currentChild, previousChildren) => Stack(
@@ -2163,9 +3176,15 @@ class _ChatCanvasArea extends ConsumerWidget {
               if (currentChild != null) currentChild,
             ],
           ),
-          transitionBuilder: (child, anim) => FadeTransition(
-            opacity: anim,
-            child: child,
+          transitionBuilder: (child, anim) => IgnorePointer(
+            ignoring: anim.status == AnimationStatus.reverse,
+            child: FadeTransition(
+              opacity: anim,
+              child: ScaleTransition(
+                scale: Tween<double>(begin: 0.975, end: 1.0).animate(anim),
+                child: child,
+              ),
+            ),
           ),
           child: showLoading
               ? Center(
@@ -2211,11 +3230,16 @@ class _ChatCanvasArea extends ConsumerWidget {
                                   ),
                                 ),
                                 const SizedBox(height: 6),
-                                SelectableText(
-                                  slice.sessionLoadError!,
-contextMenuBuilder: buildGrassBagEditableContextMenu,
-                                  textAlign: TextAlign.center,
-                                  style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text3),
+                                ConstrainedBox(
+                                  constraints: const BoxConstraints(maxHeight: 160),
+                                  child: SingleChildScrollView(
+                                    child: SelectableText(
+                                      slice.sessionLoadError!,
+                                      contextMenuBuilder: buildGrassBagEditableContextMenu,
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text3),
+                                    ),
+                                  ),
                                 ),
                                 const SizedBox(height: 16),
                                 GrassBagPrimaryGlassButton(
@@ -2263,12 +3287,9 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           baseComposerBottom: baseComposerBottom,
                           composerHeightNotifier: composerHeightNotifier,
                           hideCenterTitle: hideCenterTitle,
-                          childBuilder: (kbProgress) => ChatEmptyState(
-                            keyboardProgress: kbProgress,
-                            onSuggestionTap: onEmptySuggestionTap,
-                            onOpenModelSettings: onOpenModelSettings,
-                            onOpenHostSettings: onOpenHostSettings,
-                          ),
+                          onSuggestionTap: onEmptySuggestionTap,
+                          onOpenModelSettings: onOpenModelSettings,
+                          onOpenHostSettings: onOpenHostSettings,
                         )
                       : const SizedBox.shrink(key: ValueKey('stage-overlay-none')),
         ),
@@ -2288,6 +3309,9 @@ class _TurnListItem extends ConsumerWidget {
     required this.animatedTurnIds,
     required this.onOpenTerminal,
     required this.onPrefillPrompt,
+    required this.onEditTurn,
+    required this.onOpenModelSettings,
+    required this.onOpenHostSettings,
   });
 
   final int index;
@@ -2296,6 +3320,9 @@ class _TurnListItem extends ConsumerWidget {
   final Set<String> animatedTurnIds;
   final VoidCallback onOpenTerminal;
   final ValueChanged<String> onPrefillPrompt;
+  final ValueChanged<NormalizedTurn> onEditTurn;
+  final VoidCallback onOpenModelSettings;
+  final VoidCallback onOpenHostSettings;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -2325,16 +3352,20 @@ class _TurnListItem extends ConsumerWidget {
           animateEntrance: shouldAnimate,
           onOpenTerminal: onOpenTerminal,
           onPrefillPrompt: onPrefillPrompt,
+          onEditTurn: onEditTurn,
+          onOpenModelSettings: onOpenModelSettings,
+          onOpenHostSettings: onOpenHostSettings,
         ),
       ),
     );
   }
 }
 
-/// Isolated empty-state scroll canvas that smoothly morphs & centers [ChatEmptyState]
-/// above the rising keyboard by driving a continuous `kbProgress` (`0.0 → 1.0`) so the
-/// 4 suggestion cards & tip gracefully tuck away and the hero stays perfectly centered!
-class _KeyboardAwareEmptyStage extends StatelessWidget {
+/// Isolated empty-state scroll canvas with mathematically monotonic GPU hero glide and
+/// staggered suggestion-deck choreography. Because the hero's Y coordinate is computed directly
+/// as `lerp(closedTop, openTop, openProgress)` instead of fighting `Center` against a
+/// collapsing `Align(heightFactor)`, it NEVER reverses direction or jitters while the IME moves!
+class _KeyboardAwareEmptyStage extends StatefulWidget {
   const _KeyboardAwareEmptyStage({
     super.key,
     required this.screenH,
@@ -2342,7 +3373,9 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
     required this.baseComposerBottom,
     required this.composerHeightNotifier,
     required this.hideCenterTitle,
-    required this.childBuilder,
+    required this.onSuggestionTap,
+    required this.onOpenModelSettings,
+    required this.onOpenHostSettings,
   });
 
   final double screenH;
@@ -2350,37 +3383,161 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
   final double baseComposerBottom;
   final ValueNotifier<double> composerHeightNotifier;
   final bool hideCenterTitle;
-  final Widget Function(double kbProgress) childBuilder;
+  final ValueChanged<String> onSuggestionTap;
+  final VoidCallback onOpenModelSettings;
+  final VoidCallback onOpenHostSettings;
+
+  @override
+  State<_KeyboardAwareEmptyStage> createState() => _KeyboardAwareEmptyStageState();
+}
+
+class _KeyboardAwareEmptyStageState extends State<_KeyboardAwareEmptyStage> {
+  final ScrollController _emptyScrollCtrl = ScrollController();
+  double _heroHeight = 216.0;
+  double _deckHeight = 224.0;
+  ValueListenable<double>? _openListen;
+  bool _wasKeyboardOpening = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextOpen = _ImeMotionScope.of(context)?.openProgressNotifier;
+    if (!identical(nextOpen, _openListen)) {
+      _openListen?.removeListener(_onOpenProgressTick);
+      _openListen = nextOpen;
+      _openListen?.addListener(_onOpenProgressTick);
+    }
+  }
+
+  void _onOpenProgressTick() {
+    final p = _openListen?.value ?? 0.0;
+    final opening = p > 0.05;
+    if (opening && !_wasKeyboardOpening) {
+      // If user scrolled down on a compact screen before opening IME, glide gently back
+      // to top so the hero always frames cleanly above the rising keyboard!
+      if (_emptyScrollCtrl.hasClients && _emptyScrollCtrl.offset > 2.0) {
+        unawaited(
+          _emptyScrollCtrl.animateTo(
+            0.0,
+            duration: const Duration(milliseconds: 240),
+            curve: Curves.easeOutCubic,
+          ),
+        );
+      }
+    }
+    _wasKeyboardOpening = opening;
+  }
+
+  @override
+  void dispose() {
+    _openListen?.removeListener(_onOpenProgressTick);
+    _emptyScrollCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onHeroHeightChanged(double h) {
+    if (!mounted || (h - _heroHeight).abs() <= 1.0) return;
+    setState(() => _heroHeight = h);
+  }
+
+  void _onDeckHeightChanged(double h) {
+    if (!mounted || (h - _deckHeight).abs() <= 1.0) return;
+    setState(() => _deckHeight = h);
+  }
 
   @override
   Widget build(BuildContext context) {
-    final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final kbProgress = ((kbInset - 12.0) / 140.0).clamp(0.0, 1.0);
-    return ValueListenableBuilder<double>(
-      valueListenable: composerHeightNotifier,
-      builder: (_, compH, __) {
-        final liveBottomReserve = math.max(baseComposerBottom, kbInset + 8.0) + compH + 18.0;
-        final liveVisibleH =
-            (screenH - topPad - liveBottomReserve).clamp(140.0, math.max(140.0, screenH));
+    final ime = _ImeMotionScope.of(context);
+    final emptyStateWidget = RepaintBoundary(
+      child: ChatEmptyState(
+        keyboardProgressListenable: ime?.openProgressNotifier,
+        keyboardProgress: ime == null
+            ? ((MediaQuery.viewInsetsOf(context).bottom - 12.0) / 140.0).clamp(0.0, 1.0)
+            : 0.0,
+        onHeroHeightChanged: _onHeroHeightChanged,
+        onDeckHeightChanged: _onDeckHeightChanged,
+        onSuggestionTap: widget.onSuggestionTap,
+        onOpenModelSettings: widget.onOpenModelSettings,
+        onOpenHostSettings: widget.onOpenHostSettings,
+      ),
+    );
+
+    // Listen ONLY to composerHeight, openProgress, and settled knownKeyboardHeight
+    // (NOT raw 120Hz insetNotifier!) so empty-state IME flight runs purely on GPU Transform.translate
+    // with ZERO SingleChildScrollView padding/height relayouts per frame!
+    final listenable = ime == null
+        ? widget.composerHeightNotifier
+        : Listenable.merge([
+            widget.composerHeightNotifier,
+            ime.openProgressNotifier,
+            ime.knownKeyboardHeightNotifier,
+          ]);
+
+    return AnimatedBuilder(
+      animation: listenable,
+      child: emptyStateWidget,
+      builder: (context, cachedEmptyChild) {
+        final compH = widget.composerHeightNotifier.value;
+        final openProgress = (ime?.openProgressNotifier.value ??
+                ((MediaQuery.viewInsetsOf(context).bottom - 12.0) / 140.0))
+            .clamp(0.0, 1.0);
+        final knownKbHeight = ime?.knownKeyboardHeightNotifier.value ?? 300.0;
+
+        final closedBottomReserve = widget.baseComposerBottom + compH + 18.0;
+
+        // Always anchor `openTop` to the settled/peak keyboard height so `openTop` stays
+        // rock-steady across every frame of the spring (ZERO mid-flight dip or wobble!).
+        final openBottomReserve =
+            math.max(widget.baseComposerBottom, knownKbHeight + 8.0) + compH + 18.0;
+
+        final screenH = widget.screenH;
+        final closedVisibleH =
+            (screenH - widget.topPad - closedBottomReserve).clamp(120.0, math.max(120.0, screenH));
+        final openVisibleH =
+            (screenH - widget.topPad - openBottomReserve).clamp(100.0, math.max(100.0, screenH));
+
+        final totalRestingH = _heroHeight + _deckHeight;
+        final heroOpenVisualH = _heroHeight;
+        // Slight optical upward balance (0.44 / 0.42) feels crisper than raw 0.50 on mobile.
+        final closedTop = math.max(4.0, (closedVisibleH - totalRestingH) * 0.44);
+        final openTop = math.max(4.0, (openVisibleH - heroOpenVisualH) * 0.42);
+
+        // Single monotonic curve — hero ALWAYS glides smoothly in one direction, NEVER down-then-up!
+        final heroY = closedTop + (openTop - closedTop) * openProgress;
+
+        // Keep SingleChildScrollView padding & stageH CONSTANT during flight (0.01..0.99),
+        // switching cleanly only when settled open vs closed -> 0 layout thrash at 120Hz!
+        final isSettledOpen = openProgress >= 0.99;
+        final scrollBottomPad = isSettledOpen ? openBottomReserve : closedBottomReserve;
+        final settledContentH =
+            isSettledOpen ? (openTop + heroOpenVisualH) : (closedTop + totalRestingH);
+        final settledVisibleH = isSettledOpen ? openVisibleH : closedVisibleH;
+        final stageH = screenH > 0
+            ? math.max(settledContentH, (settledVisibleH - 8.0).clamp(0.0, screenH))
+            : settledContentH;
 
         return SingleChildScrollView(
+          controller: _emptyScrollCtrl,
           keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
           physics: const BouncingScrollPhysics(
             parent: AlwaysScrollableScrollPhysics(),
           ),
           padding: EdgeInsets.fromLTRB(
             20,
-            topPad,
+            widget.topPad,
             20,
-            liveBottomReserve,
+            scrollBottomPad,
           ),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minHeight: screenH > 0 ? (liveVisibleH - 12.0).clamp(0.0, screenH) : 0.0,
-            ),
-            child: Center(
-              child: RepaintBoundary(
-                child: childBuilder(kbProgress),
+          child: SizedBox(
+            height: stageH,
+            width: double.infinity,
+            child: OverflowBox(
+              alignment: Alignment.topCenter,
+              minHeight: 0.0,
+              maxHeight: double.infinity,
+              child: Transform.translate(
+                offset: Offset(0, heroY),
+                child: cachedEmptyChild,
               ),
             ),
           ),
@@ -2390,29 +3547,33 @@ class _KeyboardAwareEmptyStage extends StatelessWidget {
   }
 }
 
-/// Isolated bottom Toast anchor reacting cleanly to both keyboard inset and '+' deck height.
+/// Isolated bottom Toast anchor reacting cleanly to keyboard inset, '+' deck, and '/'/'@' popover!
 class _KeyboardAwareToastSlot extends StatelessWidget {
   const _KeyboardAwareToastSlot({
     required this.baseComposerBottom,
     required this.plusOpenNotifier,
+    required this.suggestionsOpenNotifier,
     required this.composerHeightNotifier,
   });
 
   final double baseComposerBottom;
   final ValueNotifier<bool> plusOpenNotifier;
+  final ValueNotifier<bool> suggestionsOpenNotifier;
   final ValueNotifier<double> composerHeightNotifier;
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<bool>(
-      valueListenable: plusOpenNotifier,
-      builder: (_, plusOpen, __) => ValueListenableBuilder<double>(
-        valueListenable: composerHeightNotifier,
-        builder: (_, compH, __) => GrassBagToastOverlay(
-          bottomOffset: baseComposerBottom + compH + (plusOpen ? 308.0 : 16.0),
+    return ListenableBuilder(
+      listenable: Listenable.merge([plusOpenNotifier, suggestionsOpenNotifier, composerHeightNotifier]),
+      builder: (_, __) {
+        final extraLift = plusOpenNotifier.value
+            ? 308.0
+            : (suggestionsOpenNotifier.value ? 264.0 : 16.0);
+        return GrassBagToastOverlay(
+          bottomOffset: baseComposerBottom + composerHeightNotifier.value + extraLift,
           includeKeyboardInset: true,
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -2469,6 +3630,156 @@ class _AnimatedTabletPane extends StatelessWidget {
         );
       },
       child: child,
+    );
+  }
+}
+
+/// Floating Apple iOS 26 Liquid Glass pill displayed inside GrassBag whenever a native
+/// Android phone-control task is actively running or paused, keeping pause/resume & emergency
+/// stop within 1 thumb tap even after returning to chat.
+class _LivePhoneControlOverlayPill extends ConsumerWidget {
+  const _LivePhoneControlOverlayPill({required this.topOffset});
+
+  final double topOffset;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final slice = ref.watch(
+      appProvider.select(
+        (s) => (
+          active: s.phoneLiveActive,
+          paused: s.phoneLivePaused,
+          action: s.phoneLiveAction,
+          app: s.phoneLiveApp,
+          steps: s.phoneLiveSteps,
+          tier: s.glassTier,
+        ),
+      ),
+    );
+    if (!slice.active) return const SizedBox.shrink();
+
+    final t = GrassBagTokens.of(context);
+    final ctrl = ref.read(appProvider.notifier);
+    final statusColor = slice.paused ? t.warn : t.primary;
+    final title = slice.paused
+        ? '手机操控已暂停'
+        : (slice.action.isNotEmpty ? slice.action : '正在操控手机…');
+    final subParts = <String>[
+      if (slice.steps > 0) '第 ${slice.steps} 步',
+      if (slice.app.isNotEmpty) slice.app,
+    ];
+
+    return Positioned(
+      top: topOffset,
+      left: 12,
+      right: 12,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: GlassBackdropGroup(
+            enabled: false,
+            child: GrassBagGlass(
+              tier: slice.tier,
+              borderRadius: 999,
+              elevated: true,
+              padding: const EdgeInsets.fromLTRB(12, 7, 8, 7),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: statusColor,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: statusColor.withValues(alpha: 0.45),
+                          blurRadius: 6,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.text,
+                          ),
+                        ),
+                        if (subParts.isNotEmpty)
+                          Text(
+                            subParts.join(' · '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 10.5, color: t.text3),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  GrassBagSpringTap(
+                    pressedScale: 0.92,
+                    haptic: true,
+                    onTap: () => unawaited(ctrl.setPhonePaused(!slice.paused)),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: t.fill1,
+                        borderRadius: BorderRadius.circular(999),
+                        border: Border.all(
+                          color: t.isDark
+                              ? Colors.white.withValues(alpha: 0.14)
+                              : const Color(0x1A132C44),
+                          width: 0.6,
+                        ),
+                      ),
+                      child: Text(
+                        slice.paused ? '继续' : '暂停',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: t.text,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  GrassBagSpringTap(
+                    pressedScale: 0.92,
+                    haptic: true,
+                    onTap: ctrl.triggerEmergencyStop,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: t.err,
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                      child: const Text(
+                        '急停',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

@@ -289,14 +289,19 @@ function maskBit(mask, r, c) {
 
 function writeFormatInfo(size, modules, mask) {
   const bits = computeFormatBits(mask);
-  for (let i = 0; i <= 5; i++) modules[8][i] = (bits >>> i) & 1;
-  modules[8][7] = (bits >>> 6) & 1;
+  // ISO/IEC 18004 format information copy 1 (top-left, modules[row][col]):
+  // bits 0..5 -> col 8 rows 0..5, bit 6 -> (7,8), bit 7 -> (8,8), bit 8 -> (8,7), bits 9..14 -> row 8 cols 5..0
+  for (let i = 0; i <= 5; i++) modules[i][8] = (bits >>> i) & 1;
+  modules[7][8] = (bits >>> 6) & 1;
   modules[8][8] = (bits >>> 7) & 1;
-  modules[7][8] = (bits >>> 8) & 1;
-  for (let i = 9; i < 15; i++) modules[14 - i][8] = (bits >>> i) & 1;
+  modules[8][7] = (bits >>> 8) & 1;
+  for (let i = 9; i < 15; i++) modules[8][14 - i] = (bits >>> i) & 1;
 
-  for (let i = 0; i < 8; i++) modules[size - 1 - i][8] = (bits >>> i) & 1;
-  for (let i = 8; i < 15; i++) modules[8][size - 15 + i] = (bits >>> i) & 1;
+  // ISO/IEC 18004 format information copy 2 (top-right row 8 & bottom-left col 8):
+  // bits 0..7 -> row 8 cols size-1..size-8; bits 8..14 -> col 8 rows size-7..size-1
+  for (let i = 0; i < 8; i++) modules[8][size - 1 - i] = (bits >>> i) & 1;
+  for (let i = 8; i < 15; i++) modules[size - 15 + i][8] = (bits >>> i) & 1;
+  modules[size - 8][8] = 1; // Mandatory fixed Dark Module
 }
 
 function evaluatePenalty(size, modules) {

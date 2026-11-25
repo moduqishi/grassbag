@@ -59,8 +59,14 @@ class GbridgeHttpTransport {
   }) {
     final client = HttpClient();
     client.idleTimeout = const Duration(seconds: 30);
-    if (allowBadCertificates) {
-      client.badCertificateCallback = (_, __, ___) => true;
+    final baseUri = endpoint.baseUri;
+    if (allowBadCertificates && !endpoint.isUnixSocket && baseUri != null) {
+      final targetHost = baseUri.host.toLowerCase();
+      final targetPort = baseUri.hasPort
+          ? baseUri.port
+          : (baseUri.scheme == 'https' ? 443 : 80);
+      client.badCertificateCallback = (_, host, port) =>
+          host.toLowerCase() == targetHost && port == targetPort;
     }
     if (endpoint.isUnixSocket) {
       final addr = InternetAddress(
@@ -113,9 +119,9 @@ class GbridgeHttpTransport {
           req.headers.set(HttpHeaders.cookieHeader, _cookieHeader!);
         }
         final res = await req.close().timeout(timeout);
-        await res.drain<void>();
+        await res.drain<void>().timeout(timeout);
         if (res.statusCode < 200 || res.statusCode >= 400) return false;
-        final gotSetCookie = _captureCookies(res.cookies, res.headers[HttpHeaders.setCookieHeader]);
+        final gotSetCookie = _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
         return _cookieHeader != null && _cookieHeader!.isNotEmpty && gotSetCookie;
       }
 
@@ -238,6 +244,14 @@ class GbridgeHttpTransport {
     return null;
   }
 
+  static List<Cookie> _safeCookies(HttpClientResponse res) {
+    try {
+      return res.cookies;
+    } catch (_) {
+      return const <Cookie>[];
+    }
+  }
+
   bool _captureCookies(List<Cookie> parsedCookies, List<String>? rawSetCookie) {
     final hadHeader = parsedCookies.isNotEmpty || (rawSetCookie != null && rawSetCookie.isNotEmpty);
     final pairs = <String, String>{};
@@ -249,8 +263,12 @@ class GbridgeHttpTransport {
         }
       }
     }
+    final handledNames = <String>{};
+    final nowUtc = DateTime.now().toUtc();
     for (final c in parsedCookies) {
-      if ((c.maxAge != null && c.maxAge! <= 0) || c.value.isEmpty) {
+      handledNames.add(c.name);
+      final isExpiredByDate = c.expires != null && !c.expires!.toUtc().isAfter(nowUtc);
+      if ((c.maxAge != null && c.maxAge! <= 0) || isExpiredByDate || c.value.isEmpty) {
         pairs.remove(c.name);
       } else {
         pairs[c.name] = c.value;
@@ -263,9 +281,32 @@ class GbridgeHttpTransport {
         final idx = first.indexOf('=');
         if (idx <= 0) continue;
         final name = first.substring(0, idx).trim();
+        if (handledNames.contains(name)) continue;
         final value = first.substring(idx + 1).trim();
-        final expired = value.isEmpty ||
-            parts.skip(1).any((a) => RegExp(r'^\s*max-age\s*=\s*0*\s*$', caseSensitive: false).hasMatch(a));
+        var expired = value.isEmpty;
+        if (!expired) {
+          for (final attr in parts.skip(1)) {
+            final eq = attr.indexOf('=');
+            if (eq <= 0) continue;
+            final k = attr.substring(0, eq).trim().toLowerCase();
+            final v = attr.substring(eq + 1).trim();
+            if (k == 'max-age') {
+              final secs = int.tryParse(v);
+              if (secs != null && secs <= 0) {
+                expired = true;
+                break;
+              }
+            } else if (k == 'expires') {
+              try {
+                final dt = HttpDate.parse(v).toUtc();
+                if (!dt.isAfter(nowUtc)) {
+                  expired = true;
+                  break;
+                }
+              } catch (_) {}
+            }
+          }
+        }
         if (expired) {
           pairs.remove(name);
         } else {
@@ -289,17 +330,47 @@ class GbridgeHttpTransport {
     Map<String, String>? query,
     Object? body,
     bool retryAuth = true,
+    int reloadRetryAttempt = 0,
   }) async {
     final usedCookie = _cookieHeader;
     final res = await _send(method, path, query: query, jsonBody: body);
+    if (res.statusCode == 503 && reloadRetryAttempt < 4) {
+      // Absorb transient post-boot Cordis profile hot-reloads (`503 gbridge/reloading`)
+      // without failing initial model/session/workspace hydration!
+      final retryAfterSec = int.tryParse(res.retryAfter ?? '');
+      const delaysMs = <int>[220, 420, 700, 1100];
+      final waitMs = retryAfterSec != null && retryAfterSec > 0
+          ? (retryAfterSec * 1000).clamp(200, 1500)
+          : delaysMs[reloadRetryAttempt];
+      await Future<void>.delayed(Duration(milliseconds: waitMs));
+      if (!_closed) {
+        return requestJson(
+          method,
+          path,
+          query: query,
+          body: body,
+          retryAuth: retryAuth,
+          reloadRetryAttempt: reloadRetryAttempt + 1,
+        );
+      }
+    }
     if (res.statusCode == 401 && retryAuth && !endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
+      // Do NOT wipe `_cookieHeader` before `exchangeAuthToken()` so reverse-proxy / SSO cookies
+      // (Cloudflare Access, Authelia, etc.) stay attached to the token-exchange request!
+      final exchanged = await exchangeAuthToken();
+      if (exchanged) {
+        return requestJson(
+          method,
+          path,
+          query: query,
+          body: body,
+          retryAuth: false,
+          reloadRetryAttempt: reloadRetryAttempt,
+        );
+      }
       if (_cookieHeader == usedCookie && _cookieHeader != null) {
         _cookieHeader = null;
         onCookieUpdated?.call('');
-      }
-      final exchanged = await exchangeAuthToken();
-      if (exchanged) {
-        return requestJson(method, path, query: query, body: body, retryAuth: false);
       }
     }
     return _decodeJsonResponse(res);
@@ -312,6 +383,7 @@ class GbridgeHttpTransport {
     Uint8List? bodyBytes,
     String? contentType,
     bool retryAuth = true,
+    int reloadRetryAttempt = 0,
   }) async {
     final usedCookie = _cookieHeader;
     final res = await _send(
@@ -321,11 +393,26 @@ class GbridgeHttpTransport {
       rawBody: bodyBytes,
       contentType: contentType,
     );
-    if (res.statusCode == 401 && retryAuth && !endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
-      if (_cookieHeader == usedCookie && _cookieHeader != null) {
-        _cookieHeader = null;
-        onCookieUpdated?.call('');
+    if (res.statusCode == 503 && reloadRetryAttempt < 4) {
+      final retryAfterSec = int.tryParse(res.retryAfter ?? '');
+      const delaysMs = <int>[220, 420, 700, 1100];
+      final waitMs = retryAfterSec != null && retryAfterSec > 0
+          ? (retryAfterSec * 1000).clamp(200, 1500)
+          : delaysMs[reloadRetryAttempt];
+      await Future<void>.delayed(Duration(milliseconds: waitMs));
+      if (!_closed) {
+        return requestBytes(
+          method,
+          path,
+          query: query,
+          bodyBytes: bodyBytes,
+          contentType: contentType,
+          retryAuth: retryAuth,
+          reloadRetryAttempt: reloadRetryAttempt + 1,
+        );
       }
+    }
+    if (res.statusCode == 401 && retryAuth && !endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
       final exchanged = await exchangeAuthToken();
       if (exchanged) {
         return requestBytes(
@@ -335,7 +422,12 @@ class GbridgeHttpTransport {
           bodyBytes: bodyBytes,
           contentType: contentType,
           retryAuth: false,
+          reloadRetryAttempt: reloadRetryAttempt,
         );
+      }
+      if (_cookieHeader == usedCookie && _cookieHeader != null) {
+        _cookieHeader = null;
+        onCookieUpdated?.call('');
       }
     }
     if (res.statusCode >= 400) {
@@ -349,7 +441,6 @@ class GbridgeHttpTransport {
       await exchangeAuthToken();
     }
     final wsUri = endpoint.resolveWsUri(path);
-    final usedCookie = _cookieHeader;
     try {
       return await WebSocket.connect(
         wsUri.toString(),
@@ -358,8 +449,6 @@ class GbridgeHttpTransport {
       ).timeout(timeout);
     } on WebSocketException {
       if (!endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
-        final prevCookie = _cookieHeader;
-        if (_cookieHeader == usedCookie) _cookieHeader = null;
         final exchanged = await exchangeAuthToken();
         if (exchanged) {
           return WebSocket.connect(
@@ -367,10 +456,6 @@ class GbridgeHttpTransport {
             headers: buildAuthHeaders(),
             customClient: _client,
           ).timeout(timeout);
-        }
-        // Restore previous cookie on transient errors (e.g. 502/503 reload) so valid sessions survive!
-        if (_cookieHeader == null && prevCookie != null) {
-          _cookieHeader = prevCookie;
         }
       }
       rethrow;
@@ -383,9 +468,20 @@ class GbridgeHttpTransport {
     return _IoRawWebSocket(ws);
   }
 
+  static const int _maxResponseBytes = 64 * 1024 * 1024; // 64 MiB hard cap
+
   Future<Uint8List> _readResponseBytes(HttpClientResponse res) async {
     final builder = BytesBuilder(copy: false);
+    var total = 0;
     await for (final chunk in res) {
+      total += chunk.length;
+      if (total > _maxResponseBytes) {
+        throw const GbridgeException(
+          status: 413,
+          code: 'gbridge/response_too_large',
+          message: 'HTTP response exceeds 64 MiB safety limit',
+        );
+      }
       builder.add(chunk);
     }
     return builder.takeBytes();
@@ -431,7 +527,7 @@ class GbridgeHttpTransport {
 
       final remClose = deadline.difference(DateTime.now());
       final res = await req.close().timeout(remClose > Duration.zero ? remClose : const Duration(milliseconds: 500));
-      _captureCookies(res.cookies, res.headers[HttpHeaders.setCookieHeader]);
+      _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
       final remRead = deadline.difference(DateTime.now());
       final bytes = await _readResponseBytes(res).timeout(
         remRead > const Duration(seconds: 2) ? remRead : const Duration(seconds: 2),
@@ -440,6 +536,7 @@ class GbridgeHttpTransport {
         statusCode: res.statusCode,
         contentType: res.headers.contentType?.mimeType ?? '',
         bytes: bytes,
+        retryAfter: res.headers.value(HttpHeaders.retryAfterHeader),
       );
     } catch (_) {
       try {
@@ -490,9 +587,17 @@ class GbridgeHttpTransport {
         message: '目标地址返回了 HTML 网页而非 API JSON（可能为网页登录认证页或反代拦截）',
       );
     }
-    final decoded = jsonDecode(text);
-    if (decoded is Map<String, dynamic>) return decoded;
-    return <String, dynamic>{'data': decoded};
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is Map<String, dynamic>) return decoded;
+      return <String, dynamic>{'data': decoded};
+    } on FormatException catch (e) {
+      throw GbridgeException(
+        status: statusCode,
+        code: 'gbridge/invalid_json',
+        message: '响应体不是合法的 JSON 格式: ${e.message}',
+      );
+    }
   }
 
   Never _throwResponseError(_RawHttpResponse res) {
@@ -588,11 +693,13 @@ class _RawHttpResponse {
     required this.statusCode,
     required this.contentType,
     required this.bytes,
+    this.retryAfter,
   });
 
   final int statusCode;
   final String contentType;
   final Uint8List bytes;
+  final String? retryAfter;
 }
 
 /// Resilient WebSocket stream client for `/gbridge/v1/stream`:
@@ -710,8 +817,19 @@ class GbridgeStreamClient {
     _closeCurrentSocket();
     _setPhase(_lastBootId == null ? ConnectionPhase.connecting : ConnectionPhase.reconnecting);
 
+    final prevPending = _pendingWelcome;
+    _pendingWelcome = null;
+    if (prevPending != null && !prevPending.isCompleted) {
+      prevPending.completeError(const GbridgeException(
+        status: 0,
+        code: 'gbridge/ws_superseded',
+        message: 'WebSocket connection superseded',
+      ));
+    }
+
     final welcomeCompleter = Completer<WelcomeInfo>();
-    _pendingWelcome = welcomeCompleter;
+    // Guard against uncaught Zone errors if disconnect()/superseded fires before awaiting `.future`.
+    welcomeCompleter.future.ignore();
 
     try {
       final ws = await _transport.openWebSocket(wsPath);
@@ -723,14 +841,15 @@ class GbridgeStreamClient {
           message: 'WebSocket connection superseded',
         );
       }
+      _pendingWelcome = welcomeCompleter;
       ws.pingInterval = const Duration(seconds: 20);
       _ws = ws;
       _wsSub = ws.listen(
         (raw) {
           if (epoch == _connEpoch) _onRawMessage(raw);
         },
-        onError: (Object _) => _handleDisconnect(epoch),
-        onDone: () => _handleDisconnect(epoch),
+        onError: (Object _) => _handleDisconnect(epoch, closeCode: ws.closeCode),
+        onDone: () => _handleDisconnect(epoch, closeCode: ws.closeCode),
         cancelOnError: true,
       );
 
@@ -778,14 +897,14 @@ class GbridgeStreamClient {
     }
   }
 
-  void subscribe(String channel) {
+  void subscribe(String channel, {bool force = false}) {
     if (channel.isEmpty) return;
     final added = _channels.add(channel);
     if (_vanillaMux != null) {
-      _vanillaMux!.subscribe(channel);
+      _vanillaMux!.subscribe(channel, force: force);
       return;
     }
-    if (added && _ws != null && _phase == ConnectionPhase.connected) {
+    if ((added || force) && _ws != null && _phase == ConnectionPhase.connected) {
       _sendJson({'op': 'sub', 'channel': channel});
     }
   }
@@ -828,11 +947,43 @@ class GbridgeStreamClient {
     _sendJson({'op': 'ping', if (id != null) 'id': id});
   }
 
+  /// Immediately wakes up a sleeping backoff reconnect (e.g. on network change or app resume)
+  /// or checks liveness if currently connected.
+  void reconnectNow() {
+    if (_vanillaMux != null) {
+      _vanillaMux!.reconnectNow();
+      return;
+    }
+    if (_disposed || _manualDisconnect) return;
+    if (_phase == ConnectionPhase.connected && _ws != null) {
+      unawaited(checkLiveness());
+      return;
+    }
+    if (_reconnectTimer != null ||
+        _phase == ConnectionPhase.disconnected ||
+        _phase == ConnectionPhase.error) {
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+      _reconnectAttempt = 0;
+      unawaited(connect().catchError((_) => const WelcomeInfo(
+            bootId: '',
+            currentSeq: 0,
+            resumed: false,
+            replayedCount: 0,
+            heartbeatMs: 20000,
+            pendingInteractions: [],
+          )));
+    }
+  }
+
   /// Probe the live WebSocket for half-open / blackholed connections (e.g. after Android resume).
   /// Triggers immediate reconnect if no pong arrives within [timeout].
-  Future<bool> checkLiveness({Duration timeout = const Duration(seconds: 3)}) async {
+  Future<bool> checkLiveness({
+    Duration timeout = const Duration(seconds: 3),
+    bool force = false,
+  }) async {
     if (_vanillaMux != null) {
-      return _vanillaMux!.checkLiveness(timeout: timeout);
+      return _vanillaMux!.checkLiveness(timeout: timeout, force: force);
     }
     if (_disposed || _manualDisconnect) return false;
     // Never abort an in-flight handshake/reconnect!
@@ -902,10 +1053,15 @@ class GbridgeStreamClient {
         _lastSeq = welcome.currentSeq;
       }
       _setPhase(ConnectionPhase.connected);
-      // Re-send any channels subscribed during the in-flight `hello -> welcome` window!
+      // Re-send any channels subscribed or unsubscribed during the in-flight `hello -> welcome` window!
       for (final ch in _channels) {
         if (!_sentHelloChannels.contains(ch)) {
           _sendJson({'op': 'sub', 'channel': ch});
+        }
+      }
+      for (final ch in _sentHelloChannels) {
+        if (!_channels.contains(ch)) {
+          _sendJson({'op': 'unsub', 'channel': ch});
         }
       }
       _sentHelloChannels = Set<String>.of(_channels);
@@ -951,21 +1107,27 @@ class GbridgeStreamClient {
 
   static final math.Random _jitterRng = math.Random();
 
-  void _handleDisconnect(int epoch) {
+  void _handleDisconnect(int epoch, {int? closeCode}) {
     if (epoch != _connEpoch) return;
+    final effectiveCloseCode = closeCode ?? _ws?.closeCode;
     _connEpoch++;
     _closeCurrentSocket();
+    final isRevoked = effectiveCloseCode == 4001 || effectiveCloseCode == 1008;
     final pending = _pendingWelcome;
     if (pending != null && !pending.isCompleted) {
-      pending.completeError(const GbridgeException(
-        status: 0,
-        code: 'gbridge/ws_closed',
-        message: 'WebSocket closed before welcome',
+      pending.completeError(GbridgeException(
+        status: isRevoked ? 401 : 0,
+        code: isRevoked ? 'gbridge/unauthorized' : 'gbridge/ws_closed',
+        message: isRevoked ? 'WebSocket authorization rejected' : 'WebSocket closed before welcome',
       ));
     }
     _pendingWelcome = null;
     if (_disposed || _manualDisconnect) {
       _setPhase(ConnectionPhase.disconnected);
+      return;
+    }
+    if (isRevoked) {
+      _setPhase(ConnectionPhase.needsAuth);
       return;
     }
     if (autoReconnect) {

@@ -471,5 +471,397 @@ void main() {
       expect(reducer.turns.last.isStreaming, isFalse);
       expect(reducer.turns.last.hasError, isFalse);
     });
+
+    test('turn.start settles prior unclosed streaming turn and running tool steps', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 'turn-prev',
+          status: 'streaming',
+          userMessage: NormalizedUserMessage(id: 'u-prev', text: '旧问题'),
+          steps: [
+            ToolStep(callId: 'c-run', name: 'bash', title: 'bash', status: 'running'),
+          ],
+        ),
+      ]);
+
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 20,
+        type: 'turn.start',
+        data: {
+          'turnId': 'turn-next',
+          'userMessage': {'id': 'u-next', 'text': '新问题'},
+        },
+      ));
+      expect(reducer.turns, hasLength(2));
+      expect(reducer.turns.first.status, 'completed');
+      final settledStep = reducer.turns.first.steps.single as ToolStep;
+      expect(settledStep.status, 'ok');
+      expect(reducer.turns.last.turnId, 'turn-next');
+      expect(reducer.turns.last.isStreaming, isTrue);
+    });
+
+    test('turn.snapshot updates ToolStep status/summary when step count is unchanged', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 't-snap',
+          status: 'streaming',
+          steps: [
+            ToolStep(callId: 'c1', name: 'bash', title: 'bash', status: 'running'),
+          ],
+        ),
+      ]);
+
+      final changed = reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 5,
+        type: 'turn.snapshot',
+        data: {
+          'turns': [
+            {
+              'turnId': 't-snap',
+              'status': 'streaming',
+              'steps': [
+                {
+                  'kind': 'tool',
+                  'callId': 'c1',
+                  'name': 'bash',
+                  'title': 'bash',
+                  'status': 'ok',
+                  'summary': 'done',
+                },
+              ],
+            },
+          ],
+        },
+      ));
+      expect(changed, isTrue);
+      final step = reducer.turns.single.steps.single as ToolStep;
+      expect(step.status, 'ok');
+      expect(step.summary, 'done');
+    });
+
+    test('turn.delta turn/start settles running tools on prior turn', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 'turn-1',
+          status: 'streaming',
+          steps: [
+            ToolStep(callId: 'c-old', name: 'read', title: 'read', status: 'running'),
+          ],
+        ),
+      ]);
+
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 12,
+        type: 'turn.delta',
+        data: {
+          'turnId': 'turn-1',
+          'chunk': {'type': 'turn/start', 'turn': 2},
+        },
+      ));
+      expect(reducer.turns, hasLength(2));
+      expect((reducer.turns.first.steps.single as ToolStep).status, 'ok');
+      expect(reducer.turns.last.turnId, 'turn-2');
+    });
+
+    test('parseRemoteHostInput handles userinfo@host:port and rejects invalid ports', () {
+      final withUserInfo = parseRemoteHostInput('user:pass@192.168.1.25:3080/?token=abc');
+      expect(withUserInfo, isNotNull);
+      expect(withUserInfo!.address, contains('192.168.1.25:3080'));
+      expect(withUserInfo.token, 'abc');
+
+      expect(parseRemoteHostInput('http://192.168.1.25:99999'), isNull);
+      expect(parseRemoteHostInput('http://192.168.1.25:0'), isNull);
+    });
+
+    test('v30 persistent StringBuffer survives repeated turns flushes and detaches cleanly on structural events', () {
+      final reducer = TurnStreamReducer();
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.start',
+        data: {'turnId': 't-v30'},
+      ));
+
+      // Stream reasoning across multiple intermediate `turns` snapshots
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 2,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v30', 'id': 'r1', 'delta': 'Step 1: '},
+      ));
+      expect((reducer.turns.single.steps.single as ReasoningStep).text, 'Step 1: ');
+      // Repeated read with no new delta returns identical cached list without mutating
+      final snapA = reducer.turns;
+      final snapB = reducer.turns;
+      expect(identical(snapA, snapB), isTrue);
+
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 3,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v30', 'id': 'r1', 'delta': 'analyze.'},
+      ));
+      expect((reducer.turns.single.steps.single as ReasoningStep).text, 'Step 1: analyze.');
+
+      // Stream assistant text across multiple intermediate `turns` snapshots
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 4,
+        type: 'text.delta',
+        data: {'turnId': 't-v30', 'delta': 'Hello '},
+      ));
+      expect(reducer.turns.single.assistantText, 'Hello ');
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 5,
+        type: 'text.delta',
+        data: {'turnId': 't-v30', 'delta': 'GrassBag'},
+      ));
+      expect(reducer.turns.single.assistantText, 'Hello GrassBag');
+
+      // Tool call must flush & detach the active text buffer cleanly (promoting text to narration)
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 6,
+        type: 'tool.call',
+        data: {'turnId': 't-v30', 'callId': 'c-v30', 'name': 'read', 'title': 'read file'},
+      ));
+      expect(reducer.turns.single.assistantText, isEmpty);
+      expect(reducer.turns.single.steps.whereType<ReasoningStep>().length, 2);
+
+      // Post-tool text starts fresh (zero stale carryover from pre-tool buffer!)
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 7,
+        type: 'text.delta',
+        data: {'turnId': 't-v30', 'delta': 'Final answer.'},
+      ));
+      expect(reducer.turns.single.assistantText, 'Final answer.');
+
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 8,
+        type: 'turn.end',
+        data: {'turnId': 't-v30', 'status': 'completed'},
+      ));
+      expect(reducer.turns.single.status, 'completed');
+      expect(reducer.turns.single.assistantText, 'Final answer.');
+    });
+
+    test('v31 turn.snapshot preserves prepended older turns and merges server maskedRanges & references', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 'turn-older-1',
+          seqStart: 1,
+          seqEnd: 3,
+          status: 'completed',
+          userMessage: NormalizedUserMessage(id: 'u-1', text: 'older message'),
+          assistantText: 'older answer',
+        ),
+        const NormalizedTurn(
+          turnId: 'client-turn-500',
+          seqStart: 10,
+          seqEnd: 10,
+          status: 'streaming',
+          userMessage: NormalizedUserMessage(
+            id: 'u-client-500',
+            text: 'key sk-1234567890abcdef12345678',
+          ),
+        ),
+      ]);
+
+      // Live snapshot carrying only the recent window (>= seq 10) with server-masked ranges & refs
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 12,
+        type: 'turn.snapshot',
+        data: {
+          'turns': [
+            {
+              'turnId': 'turn-new-10',
+              'seqStart': 10,
+              'seqEnd': 12,
+              'status': 'streaming',
+              'userMessage': {
+                'id': 'u-srv-10',
+                'text': 'key sk-1234567890abcdef12345678',
+                'maskedRanges': [
+                  {'start': 4, 'end': 31, 'kind': 'api_key', 'visiblePrefix': 6},
+                ],
+                'references': [
+                  {'kind': 'file', 'path': 'lib/main.dart'},
+                ],
+              },
+              'steps': <dynamic>[],
+              'assistantText': 'received',
+            },
+          ],
+        },
+      ));
+
+      expect(reducer.turns, hasLength(2));
+      expect(reducer.turns.first.turnId, 'turn-older-1');
+      expect(reducer.turns.last.turnId, 'turn-new-10');
+      expect(reducer.turns.last.stableKey, 'client-turn-500');
+      expect(reducer.turns.last.userMessage?.maskedRanges, hasLength(1));
+      expect(reducer.turns.last.userMessage?.references, hasLength(1));
+    });
+
+    test('v31 stale turn.end for another turnId does not cancel a newer streaming interrupt turn', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 'turn-new-interrupt',
+          seqStart: 20,
+          seqEnd: 21,
+          status: 'streaming',
+          assistantText: 'fresh interrupt output',
+        ),
+      ]);
+
+      final changed = reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 22,
+        type: 'turn.completed',
+        data: {'turnId': 'turn-old-cancelled', 'reason': 'cancelled'},
+      ));
+      expect(changed, isFalse);
+      expect(reducer.turns.single.status, 'streaming');
+      expect(reducer.turns.single.assistantText, 'fresh interrupt output');
+    });
+
+    test('v32 reasoning/tool durationMs, post-tool dedup, abandoned drop, @file reconcile & client-turn interrupt guard', () {
+      final reducer = TurnStreamReducer();
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.start',
+        data: {'turnId': 't-v32'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 2,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v32', 'id': 'r1', 'delta': '先定位配置文件。'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 3,
+        type: 'tool.call',
+        data: {'turnId': 't-v32', 'callId': 'c1', 'name': 'read', 'title': 'read config'},
+      ));
+      final reasonedBefore = reducer.turns.single.steps.whereType<ReasoningStep>().single;
+      expect(reasonedBefore.durationMs, isNotNull);
+
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 4,
+        type: 'tool.result',
+        data: {'turnId': 't-v32', 'callId': 'c1', 'name': 'read', 'status': 'ok', 'summary': 'ok'},
+      ));
+      final toolStep = reducer.turns.single.steps.whereType<ToolStep>().single;
+      expect(toolStep.durationMs, isNotNull);
+
+      // Persisted assistant.message carrying the same reasoning must NOT duplicate it after the ToolStep!
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 5,
+        type: 'assistant.message',
+        data: {'turnId': 't-v32', 'text': '已完成检查', 'reasoning': '先定位配置文件。'},
+      ));
+      expect(reducer.turns.single.steps.whereType<ReasoningStep>().length, 1);
+      expect(reducer.turns.single.steps.first, isA<ReasoningStep>());
+      expect(reducer.turns.single.steps.last, isA<ToolStep>());
+
+      // assistant-stream/abandoned drops unfinalized trailing live reasoning step
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 6,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v32', 'id': 'r-abandoned', 'delta': '准备再次重试...'},
+      ));
+      expect(reducer.turns.single.steps.whereType<ReasoningStep>().length, 2);
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 7,
+        type: 'turn.delta',
+        data: {
+          'turnId': 't-v32',
+          'chunks': [
+            {'type': 'assistant-stream/abandoned'},
+          ],
+        },
+      ));
+      expect(reducer.turns.single.steps.whereType<ReasoningStep>().length, 1);
+
+      // Stale turn.completed from earlier cancelled turn must NOT cancel a new optimistic client-turn-* interrupt turn
+      final interruptReducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 'turn-old-dying',
+          status: 'cancelled',
+          userMessage: NormalizedUserMessage(id: 'u-old', text: '旧问题'),
+        ),
+        const NormalizedTurn(
+          turnId: 'client-turn-999',
+          status: 'streaming',
+          userMessage: NormalizedUserMessage(id: 'u-999', text: '看看 @app/lib/main.dart'),
+        ),
+      ]);
+      final staleApplied = interruptReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 20,
+        type: 'turn.completed',
+        data: {'turnId': 'turn-old-dying', 'reason': 'cancelled'},
+      ));
+      expect(staleApplied, isFalse);
+      expect(interruptReducer.turns.last.status, 'streaming');
+
+      // turn.snapshot reconciles optimistic user prompt even when server prepends @file ref line
+      interruptReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 21,
+        type: 'turn.snapshot',
+        data: {
+          'turns': [
+            {
+              'turnId': 'turn-old-dying',
+              'seqStart': 1,
+              'seqEnd': 5,
+              'status': 'cancelled',
+              'userMessage': {'id': 'u-old', 'text': '旧问题'},
+              'steps': <dynamic>[],
+              'assistantText': '',
+            },
+            {
+              'turnId': 'turn-srv-999',
+              'seqStart': 21,
+              'seqEnd': 21,
+              'status': 'streaming',
+              'userMessage': {
+                'id': 'u-srv-999',
+                'text': '@file:app/lib/main.dart\n看看 @app/lib/main.dart',
+              },
+              'steps': <dynamic>[],
+              'assistantText': '',
+            },
+          ],
+        },
+      ));
+      expect(interruptReducer.turns, hasLength(2));
+      expect(interruptReducer.turns.last.turnId, 'turn-srv-999');
+      expect(interruptReducer.turns.last.stableKey, 'client-turn-999');
+
+      // Matching turn.completed with reason: 'interrupted' sets error status + clear localized errorMessage
+      interruptReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 22,
+        type: 'turn.completed',
+        data: {'turnId': 'turn-srv-999', 'reason': 'interrupted'},
+      ));
+      expect(interruptReducer.turns.last.status, 'error');
+      expect(interruptReducer.turns.last.errorMessage, '本轮回复已被中断');
+    });
   });
 }

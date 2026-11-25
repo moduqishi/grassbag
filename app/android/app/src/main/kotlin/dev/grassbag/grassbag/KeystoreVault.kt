@@ -3,6 +3,8 @@ package dev.grassbag.grassbag
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.system.Os
+import android.system.OsConstants
 import android.util.Base64
 import android.util.Log
 import java.io.File
@@ -55,9 +57,9 @@ class KeystoreVault(ctx: Context) {
             cachedKey = ksKey
             return ksKey
         }
-        val fallback = loadOrCreateFallbackKey()
-        cachedKey = fallback
-        return fallback
+        // Never poison cachedKey with the fallback key on a transient AndroidKeyStore hiccup:
+        // leaving cachedKey null allows subsequent reads to retry AndroidKeyStore cleanly!
+        return loadOrCreateFallbackKey()
     }
 
     @Synchronized
@@ -72,13 +74,28 @@ class KeystoreVault(ctx: Context) {
             }
         }
         val raw = ByteArray(32).also(rng::nextBytes)
-        runCatching {
-            keyFile.writeBytes(raw)
-            keyFile.setReadable(false, false)
-            keyFile.setWritable(false, false)
-            keyFile.setReadable(true, true)
-            keyFile.setWritable(true, true)
+        // Create atomically with mode 0600 + fsync + Os.rename (zero TOCTOU window, never return unsaved key).
+        val tmpFile = File(dir, ".gb_vault_key_v1.tmp")
+        val fd = Os.open(
+            tmpFile.absolutePath,
+            OsConstants.O_CREAT or OsConstants.O_WRONLY or OsConstants.O_TRUNC,
+            0x180 // 0600
+        )
+        try {
+            var written = 0
+            while (written < raw.size) {
+                val n = Os.write(fd, raw, written, raw.size - written)
+                if (n <= 0) throw java.io.IOException("Short write while persisting vault fallback key")
+                written += n
+            }
+            Os.fsync(fd)
+        } catch (t: Throwable) {
+            runCatching { tmpFile.delete() }
+            throw t
+        } finally {
+            runCatching { Os.close(fd) }
         }
+        Os.rename(tmpFile.absolutePath, keyFile.absolutePath)
         return SecretKeySpec(raw, "AES")
     }
 
@@ -105,14 +122,12 @@ class KeystoreVault(ctx: Context) {
             cachedKey = null
             if (invalidated) {
                 runCatching { encryptWith(masterKey(forceRegenerate = true)) }.getOrElse {
-                    val fb = loadOrCreateFallbackKey()
-                    cachedKey = fb
-                    encryptWith(fb)
+                    encryptWith(loadOrCreateFallbackKey())
                 }
             } else {
-                val fb = loadOrCreateFallbackKey()
-                cachedKey = fb
-                encryptWith(fb)
+                // Transient KeyStore error: use fallback key for this write WITHOUT permanently poisoning cachedKey,
+                // so previously stored AndroidKeyStore secrets stay readable when KeyStore recovers!
+                encryptWith(loadOrCreateFallbackKey())
             }
         }
         store.edit().putString(k, Base64.encodeToString(blob, Base64.NO_WRAP)).apply()
@@ -173,12 +188,16 @@ class KeystoreVault(ctx: Context) {
         } finally {
             spec.clearPassword()
         }
-        val c = Cipher.getInstance(ALG)
-        c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
-        val header = "GBAG2".toByteArray(Charsets.US_ASCII)
-        c.updateAAD(header + salt)
-        val enc = c.doFinal(plain)
-        return header + salt + iv + enc
+        return try {
+            val c = Cipher.getInstance(ALG)
+            c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+            val header = "GBAG2".toByteArray(Charsets.US_ASCII)
+            c.updateAAD(header + salt)
+            val enc = c.doFinal(plain)
+            header + salt + iv + enc
+        } finally {
+            key.fill(0)
+        }
     }
 
     companion object {

@@ -17,7 +17,9 @@ import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../detail/session_detail_page.dart';
 import '../sdui/sdui_renderer.dart';
+import '../web/deepseek_signin_page.dart';
 import '../web/web_embed.dart';
 
 /// Bounded LRU cache for base64-decoded user image attachments so 42Hz streaming rebuilds
@@ -32,6 +34,225 @@ void clearTurnProcessCaches() {
   _ToolStepRowState._kDetailCache.clear();
 }
 
+Map<String, dynamic>? _tryParseJsonMap(String raw) {
+  final trimmed = raw.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  try {
+    final decoded = jsonDecode(trimmed);
+    if (decoded is Map) return Map<String, dynamic>.from(decoded);
+  } catch (_) {}
+  return null;
+}
+
+String _humanizeToolName(String name) {
+  final n = name.toLowerCase().trim();
+  switch (n) {
+    case 'phone_open':
+      return '打开应用';
+    case 'phone_tap':
+      return '点击屏幕';
+    case 'phone_long_press':
+      return '长按元素';
+    case 'phone_swipe':
+      return '滑动屏幕';
+    case 'phone_type':
+      return '输入文本';
+    case 'phone_screen':
+      return '读取当前屏幕';
+    case 'phone_screenshot':
+      return '截取当前屏幕';
+    case 'phone_apps':
+      return '获取应用列表';
+    case 'phone_key':
+      return '模拟系统按键';
+    case 'phone_intent':
+      return '执行快捷动作';
+    case 'phone_wait':
+      return '等待界面响应';
+    case 'phone_handoff':
+      return '等待人工接管';
+    case 'phone_return_app':
+      return '返回 GrassBag';
+    case 'todo_write':
+    case 'todowrite':
+      return '更新待办清单';
+    case 'read':
+    case 'read_file':
+      return '读取文件';
+    case 'write':
+    case 'write_file':
+    case 'create_file':
+      return '写入文件';
+    case 'edit':
+    case 'edit_file':
+    case 'apply_patch':
+      return '编辑文件';
+    case 'bash':
+    case 'shell':
+    case 'cmd':
+    case 'exec':
+    case 'terminal':
+      return '执行终端命令';
+    case 'grep':
+    case 'search':
+    case 'ripgrep':
+      return '检索代码';
+    case 'glob':
+    case 'find':
+    case 'find_files':
+      return '查找文件';
+    case 'ls':
+    case 'list_dir':
+    case 'list_directory':
+    case 'listdir':
+      return '浏览目录';
+    case 'delete':
+    case 'delete_file':
+    case 'remove_file':
+    case 'rm':
+      return '删除文件';
+    case 'subagent':
+    case 'task':
+    case 'delegate':
+    case 'spawn_subagent':
+      return '委派子代理';
+    case 'ask_user':
+    case 'user_questions':
+      return '向你确认';
+    case 'web_search':
+      return '联网搜索';
+    case 'web_fetch':
+    case 'fetch_url':
+      return '抓取网页';
+    default:
+      if (n.startsWith('phone_')) return '操控手机';
+      if (n.startsWith('mcp__') || n.startsWith('mcp.')) {
+        final parts = name.split(RegExp(r'__|[:./]')).where((p) => p.isNotEmpty).toList();
+        return parts.length >= 2 ? 'MCP · ${parts.last}' : 'MCP 工具';
+      }
+      return name;
+  }
+}
+
+String _humanizeToolDisplayTitle(ToolStep step) {
+  final prefix = '${step.name} · ';
+  final stripped = step.title.startsWith(prefix) && step.title.length > prefix.length
+      ? step.title.substring(prefix.length).trim()
+      : step.title.trim();
+  final n = step.name.toLowerCase().trim();
+  if (stripped.isNotEmpty && stripped.toLowerCase() != n) {
+    return stripped;
+  }
+  final parsed = _tryParseJsonMap(step.summary);
+  if (parsed != null) {
+    final opened = (parsed['opened'] ?? parsed['label'] ?? parsed['appLabel'] ?? parsed['appName'] ?? '')
+        .toString()
+        .trim();
+    if (opened.isNotEmpty) return opened;
+    final pkg = (parsed['package'] ?? parsed['packageName'] ?? '').toString().trim();
+    if (pkg.isNotEmpty) return pkg;
+  }
+  switch (n) {
+    case 'phone_open':
+      return '目标应用';
+    case 'phone_screen':
+      return '当前界面';
+    case 'phone_screenshot':
+      return '当前屏幕';
+    case 'phone_apps':
+      return '已安装应用';
+    case 'phone_return_app':
+      return '回到 GrassBag';
+    case 'phone_tap':
+      return '屏幕元素';
+    case 'phone_long_press':
+      return '目标元素';
+    case 'phone_swipe':
+      return '屏幕滑动';
+    case 'phone_type':
+      return '文本输入';
+    case 'phone_key':
+      return '系统按键';
+    case 'phone_wait':
+      return '界面稳定';
+    case 'phone_handoff':
+      return '人工确认';
+    case 'todo_write':
+    case 'todowrite':
+      return '任务进度';
+    default:
+      return stripped.isNotEmpty ? stripped : _humanizeToolName(step.name);
+  }
+}
+
+String _humanizeSummaryPill(ToolStep step) {
+  final raw = step.summary.trim();
+  if (raw.isEmpty) return '';
+  final looksJson = raw.startsWith('{') || raw.startsWith('[');
+  if (!looksJson) return raw;
+  final parsed = _tryParseJsonMap(raw);
+  if (parsed == null) return '';
+  if (parsed['ok'] == false || parsed['error'] != null) {
+    final err = parsed['error'] ?? parsed['message'] ?? '失败';
+    return err.toString().trim();
+  }
+  final n = step.name.toLowerCase().trim();
+  if (n == 'phone_open') {
+    final opened = (parsed['opened'] ?? parsed['label'] ?? '').toString().trim();
+    return opened.isNotEmpty ? '已打开 $opened' : '已打开';
+  }
+  if (n == 'phone_screenshot') {
+    if (parsed['width'] != null && parsed['height'] != null) {
+      return '${parsed['width']}×${parsed['height']}';
+    }
+    return parsed['ok'] == true ? '截屏完成' : '';
+  }
+  if (n == 'phone_screen') {
+    final nodes = parsed['nodes'];
+    if (nodes is List) return '${nodes.length} 元素';
+    return parsed['ok'] == true ? '已读取' : '';
+  }
+  if (n == 'phone_apps') {
+    final apps = parsed['apps'];
+    if (apps is List) return '${apps.length} 个应用';
+    return parsed['ok'] == true ? '已列出' : '';
+  }
+  if (n == 'phone_return_app') {
+    return parsed['ok'] == true ? '已返回' : '';
+  }
+  final msg = (parsed['summary'] ?? parsed['message'] ?? '').toString().trim();
+  if (msg.isNotEmpty) return msg;
+  if (n.startsWith('phone_') && parsed['ok'] == true) return '已完成';
+  return '';
+}
+
+String _prettyFormatJsonIfApplicable(String raw) {
+  final trimmed = raw.trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      return const JsonEncoder.withIndent('  ').convert(jsonDecode(trimmed));
+    } catch (_) {}
+  }
+  return raw;
+}
+
+bool _isMostlyChinese(String text) {
+  var cjk = 0;
+  var letters = 0;
+  var sampled = 0;
+  for (final rune in text.runes) {
+    if (rune >= 0x4E00 && rune <= 0x9FFF) {
+      cjk++;
+      letters++;
+    } else if ((rune >= 0x41 && rune <= 0x5A) || (rune >= 0x61 && rune <= 0x7A)) {
+      letters++;
+    }
+    if (++sampled >= 400 && letters >= 40) break;
+  }
+  return letters > 0 && (cjk / letters) >= 0.30;
+}
+
 /// Renders one `NormalizedTurn`: Apple iOS 26 luminous user bubble (with secret redaction
 /// & long-press [GlassContextMenu]), `dsh-Go`-grade borderless `StreamRow` + `StreamThread`
 /// multi-step timeline, and rich inline-Markdown assistant reply + deliverable cards.
@@ -42,14 +263,42 @@ class TurnView extends ConsumerWidget {
     required this.onOpenTerminal,
     this.animateEntrance = false,
     this.onPrefillPrompt,
+    this.onEditTurn,
     this.onRegenerate,
+    this.onOpenModelSettings,
+    this.onOpenHostSettings,
   });
 
   final NormalizedTurn turn;
   final VoidCallback onOpenTerminal;
   final bool animateEntrance;
   final ValueChanged<String>? onPrefillPrompt;
+  final ValueChanged<NormalizedTurn>? onEditTurn;
   final VoidCallback? onRegenerate;
+  final VoidCallback? onOpenModelSettings;
+  final VoidCallback? onOpenHostSettings;
+
+  static List<String> _extractModifiedFiles(List<NormalizedStep> steps) {
+    final out = <String>[];
+    final seen = <String>{};
+    for (final s in steps) {
+      if (s is! ToolStep || s.status == 'error' || s.status == 'cancelled') continue;
+      final n = s.name.toLowerCase();
+      final isEdit = n.contains('edit') ||
+          n.contains('write') ||
+          n.contains('patch') ||
+          n.contains('create') ||
+          n.contains('replace');
+      if (!isEdit) continue;
+      final prefix = '${s.name} · ';
+      final candidate = s.title.startsWith(prefix)
+          ? s.title.substring(prefix.length).trim()
+          : s.title.trim();
+      if (candidate.isEmpty || candidate.contains(' ') && !candidate.contains('/')) continue;
+      if (seen.add(candidate)) out.add(candidate);
+    }
+    return out;
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -58,7 +307,6 @@ class TurnView extends ConsumerWidget {
         (s) => (
           activeHostId: s.activeHostId,
           sessionRenderGen: s.sessionRenderGen,
-          secretRevealed: s.secretRevealed,
           autoFoldSteps: s.autoFoldSteps,
           isExpanded: s.expandedTurnProcessIds.contains(turn.stableKey) ||
               s.expandedTurnProcessIds.contains(turn.turnId),
@@ -73,73 +321,67 @@ class TurnView extends ConsumerWidget {
                   s.turnFeedback['${s.activeSessionId}:${turn.assistantMessageId ?? turn.turnId}'] ??
                   s.turnFeedback['${s.activeSessionId}:${turn.turnId}']),
           isCreatingSession: turn.isStreaming ? s.isCreatingSession : false,
+          sendStage: turn.isStreaming ? s.sendStage : SendStage.idle,
+          uploadDoneCount: turn.isStreaming ? s.uploadDoneCount : 0,
+          uploadTotalCount: turn.isStreaming ? s.uploadTotalCount : 0,
+          streamStalled: turn.isStreaming ? s.streamStalled : false,
         ),
       ),
     );
     final ctrl = ref.read(appProvider.notifier);
     final t = GrassBagTokens.of(context);
-    // Independent per-turn process expansion: open while actively streaming (unless collapsed),
-    // or respect autoFoldSteps & explicit per-turn toggle when finished!
+    // Smooth iOS 26 / Claude-style lifecycle with hysteresis: stay open while actively reasoning
+    // or executing tools, and wait until the answer clearly establishes (>= 60 chars or paragraph
+    // break) before auto-folding so short pre-tool narrations never flap the accordion!
+    // Never auto-fold cancelled turns so users can still inspect partial thinking/steps.
+    final hasLiveRunningTool = turn.steps.any((s) => s is ToolStep && s.status == 'running');
+    final answerEstablished =
+        turn.assistantText.length >= 60 || turn.assistantText.contains('\n\n');
+    final isCancelledTurn = turn.status == 'cancelled' || turn.status == 'interrupted';
     final processOpen = turn.isStreaming
-        ? !slice.isCollapsed
-        : (slice.autoFoldSteps ? slice.isExpanded : !slice.isCollapsed);
+        ? (answerEstablished && !hasLiveRunningTool && slice.autoFoldSteps
+            ? slice.isExpanded
+            : !slice.isCollapsed)
+        : (isCancelledTurn
+            ? !slice.isCollapsed
+            : (slice.autoFoldSteps ? slice.isExpanded : !slice.isCollapsed));
     final effectiveRegenerate = onRegenerate ??
         (turn.userMessage != null
-            ? () {
-                if (ref.read(appProvider).isStreaming) return;
-                final u = turn.userMessage!;
-                final prompt = u.text.trim().isNotEmpty ? u.text : '请重新执行上一条请求';
-                ctrl.sendPrompt(prompt, includePendingAttachments: false);
-              }
+            ? () => unawaited(ctrl.regenerateOrRetryTurn(turn))
             : null);
+    final effectiveEditTurn = turn.userMessage != null && turn.userMessage!.text.trim().isNotEmpty
+        ? () {
+            if (onEditTurn != null) {
+              onEditTurn!(turn);
+            } else {
+              onPrefillPrompt?.call(turn.userMessage!.text);
+            }
+          }
+        : null;
 
-    Widget buildUserBubble(NormalizedUserMessage msg) {
-      return Material(
-        type: MaterialType.transparency,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: t.isDark
-                  ? [
-                      Color.lerp(t.userBubble, Colors.white, 0.08)!,
-                      t.userBubble,
-                    ]
-                  : [
-                      Color.lerp(t.userBubble, Colors.white, 0.24)!,
-                      t.userBubble,
-                    ],
-            ),
-            borderRadius: const BorderRadius.only(
-              topLeft: Radius.circular(22),
-              topRight: Radius.circular(22),
-              bottomLeft: Radius.circular(22),
-              bottomRight: Radius.circular(7),
-            ),
-            border: Border.all(
-              color: t.isDark
-                  ? Colors.white.withValues(alpha: 0.09)
-                  : Colors.white.withValues(alpha: 0.80),
-              width: 0.75,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: t.isDark ? 0.28 : 0.05),
-                blurRadius: 14,
-                offset: const Offset(0, 4),
-              ),
-            ],
-          ),
-          child: _UserMessageContent(
-            msg: msg,
-            revealed: slice.secretRevealed,
-            onToggleReveal: ctrl.toggleSecretRevealed,
-          ),
-        ),
-      );
-    }
+    final visibleProcessSteps = turn.steps
+        .where((s) => !(s is NoticeStep && s.level == 'error'))
+        .toList(growable: false);
+    final completedToolCount = visibleProcessSteps.whereType<ToolStep>().length;
+    final modifiedFiles = turn.isStreaming
+        ? const <String>[]
+        : _extractModifiedFiles(visibleProcessSteps);
+    final isExplicitlyCancelled = !turn.isStreaming &&
+        (turn.status == 'cancelled' || turn.status == 'interrupted') &&
+        !turn.hasError;
+    final isEmptyStoppedTurn = !turn.isStreaming &&
+        !turn.hasError &&
+        turn.assistantText.isEmpty &&
+        turn.deliverables.isEmpty &&
+        visibleProcessSteps.isEmpty &&
+        turn.userMessage != null;
+    final showCancelledRow = (isExplicitlyCancelled &&
+            turn.assistantText.isEmpty &&
+            turn.deliverables.isEmpty &&
+            turn.userMessage != null) ||
+        isEmptyStoppedTurn;
+    final showCancelledPartialBadge = isExplicitlyCancelled &&
+        (turn.assistantText.isNotEmpty || turn.deliverables.isNotEmpty);
 
     final body = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -148,21 +390,18 @@ class TurnView extends ConsumerWidget {
           RepaintBoundary(
             child: _UserMessageBlock(
               msg: turn.userMessage!,
-              revealed: slice.secretRevealed,
-              onToggleReveal: ctrl.toggleSecretRevealed,
-              bubbleBuilder: buildUserBubble,
               onCopy: () {
                 Clipboard.setData(ClipboardData(text: turn.userMessage!.text));
-                ctrl.showToast('已复制消息内容');
               },
-              onPrefillPrompt: onPrefillPrompt,
+              onPrefillPrompt: effectiveEditTurn != null ? (_) => effectiveEditTurn() : onPrefillPrompt,
             ),
           ),
-        if (turn.steps.isNotEmpty) ...[
+        if (visibleProcessSteps.isNotEmpty) ...[
           const SizedBox(height: 16),
           RepaintBoundary(
             child: _TurnProcessBlock(
               turn: turn,
+              visibleSteps: visibleProcessSteps,
               tier: slice.glassTier,
               open: processOpen,
               canTranslateCot: slice.canTranslateCot,
@@ -182,85 +421,177 @@ class TurnView extends ConsumerWidget {
           const SizedBox(height: 16),
           _LiveAwaitingResponseRow(
             isCreatingSession: slice.isCreatingSession,
+            sendStage: slice.sendStage,
+            uploadDone: slice.uploadDoneCount,
+            uploadTotal: slice.uploadTotalCount,
             startedAtMs: turn.userMessage?.createdAt,
           ),
-        ] else if (!turn.isStreaming &&
-            turn.assistantText.isEmpty &&
-            turn.deliverables.isEmpty &&
-            !turn.hasError &&
-            turn.userMessage != null) ...[
-          const SizedBox(height: 14),
-          Row(
-            children: [
-              Icon(CupertinoIcons.stop_circle, size: 14, color: t.text3),
-              const SizedBox(width: 6),
-              Text(
-                '已停止生成',
-                style: TextStyle(fontSize: 12.5, color: t.text3),
-              ),
-              if (effectiveRegenerate != null) ...[
-                const SizedBox(width: 10),
-                GrassBagSpringTap(
-                  onTap: effectiveRegenerate,
-                  pressedScale: 0.94,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(CupertinoIcons.arrow_clockwise, size: 11.5, color: t.primary),
-                        const SizedBox(width: 4),
-                        Text(
-                          '重试',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                            color: t.primary,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+        ],
+        if (turn.isStreaming && slice.streamStalled) ...[
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: GrassBagSpringTap(
+              pressedScale: 0.95,
+              haptic: true,
+              onTap: () => unawaited(ctrl.syncStalledStream()),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                decoration: BoxDecoration(
+                  color: t.warnSoft,
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(color: t.warn.withValues(alpha: 0.25), width: 0.6),
                 ),
-              ],
-            ],
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(CupertinoIcons.arrow_2_circlepath, size: 12.5, color: t.warn),
+                    const SizedBox(width: 5),
+                    Text(
+                      '响应较慢 · 点击同步状态',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: t.warn,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+        if (showCancelledRow) ...[
+          const SizedBox(height: 12),
+          Consumer(
+            builder: (_, ref, __) {
+              final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
+              return Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(CupertinoIcons.stop_circle, size: 14, color: t.text3),
+                      const SizedBox(width: 6),
+                      Text(
+                        '已停止生成',
+                        style: TextStyle(fontSize: 12.5, color: t.text3),
+                      ),
+                    ],
+                  ),
+                  if (effectiveRegenerate != null)
+                    GrassBagSpringTap(
+                      enabled: !streaming,
+                      onTap: effectiveRegenerate,
+                      pressedScale: 0.94,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: t.fill1,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              CupertinoIcons.arrow_clockwise,
+                              size: 11.5,
+                              color: streaming ? t.text3.withValues(alpha: 0.45) : t.primary,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '重试',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: streaming ? t.text3.withValues(alpha: 0.45) : t.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  if (effectiveEditTurn != null)
+                    GrassBagSpringTap(
+                      enabled: !streaming,
+                      onTap: effectiveEditTurn,
+                      pressedScale: 0.94,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: t.fill1,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              CupertinoIcons.pencil,
+                              size: 11.5,
+                              color: streaming ? t.text3.withValues(alpha: 0.45) : t.text2,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '编辑修改',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: streaming ? t.text3.withValues(alpha: 0.45) : t.text2,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
           ),
         ],
         if (turn.assistantText.isNotEmpty ||
             turn.deliverables.isNotEmpty ||
-            (!turn.isStreaming && turn.steps.isNotEmpty && !turn.hasError))
+            (!turn.isStreaming &&
+                visibleProcessSteps.isNotEmpty &&
+                !turn.hasError &&
+                turn.status != 'cancelled' &&
+                turn.status != 'interrupted'))
           Padding(
             padding: const EdgeInsets.only(top: 14),
-            child: _AssistantBody(
-              turnId: '${slice.activeHostId}:${slice.sessionRenderGen}:${turn.stableKey}',
-              text: turn.assistantText,
-              isStreaming: turn.isStreaming,
-              deliverables: turn.deliverables,
-              usage: turn.usage,
-              feedback: slice.feedback,
-              onCopy: () {
-                Clipboard.setData(ClipboardData(text: turn.assistantText));
-                ctrl.showToast('已复制回复内容');
-              },
-              onFork: () => ctrl.forkActiveSession(turnId: turn.turnId),
-              onFeedback: (rating) => ctrl.putTurnFeedback(turn.turnId, rating),
-              onRegenerate: turn.hasError ? null : effectiveRegenerate,
-              onDeliverableTap: (name) {
-                final match =
-                    turn.deliverables.where((d) => (d['name'] ?? '').toString() == name).firstOrNull;
-                showDeliverablePreviewSheet(
-                  context,
-                  ref,
-                  name: name,
-                  path: match?['path']?.toString(),
-                  subtitle: (match?['note'] ?? '生成产物').toString(),
-                  sizeLabel: (match?['size'] ?? '').toString(),
-                );
-              },
+            child: RepaintBoundary(
+              child: _AssistantBody(
+                turnId: '${slice.activeHostId}:${turn.stableKey}',
+                text: turn.assistantText,
+                isStreaming: turn.isStreaming,
+                deliverables: turn.deliverables,
+                modifiedFiles: modifiedFiles,
+                completedToolCount: completedToolCount,
+                cancelledPartial: showCancelledPartialBadge,
+                usage: turn.usage,
+                feedback: slice.feedback,
+                onCopy: () {
+                  Clipboard.setData(ClipboardData(text: turn.assistantText));
+                },
+                onFork: () => ctrl.forkActiveSession(turnId: turn.turnId),
+                onFeedback: (rating) => ctrl.putTurnFeedback(turn.turnId, rating),
+                onRegenerate: turn.hasError ? null : effectiveRegenerate,
+                onContinue: showCancelledPartialBadge
+                    ? () => unawaited(ctrl.continueTurn(turn))
+                    : null,
+                onDeliverableTap: (item) {
+                  final name = (item['name'] ?? '附件').toString();
+                  showDeliverablePreviewSheet(
+                    context,
+                    ref,
+                    name: name,
+                    path: item['path']?.toString(),
+                    subtitle: (item['note'] ?? '生成产物').toString(),
+                    sizeLabel: (item['size'] ?? '').toString(),
+                  );
+                },
+              ),
             ),
           ),
         if (turn.hasError) ...[
@@ -270,9 +601,22 @@ class TurnView extends ConsumerWidget {
             tier: slice.glassTier,
             onCopy: (txt) {
               Clipboard.setData(ClipboardData(text: txt));
-              ctrl.showToast('已复制报错详情');
             },
             onRetry: effectiveRegenerate,
+            onEdit: effectiveEditTurn,
+            onOpenModel: () => showModelSheet(
+              context,
+              ref,
+              onOpenModelSettings: onOpenModelSettings,
+            ),
+            onOpenHost: onOpenHostSettings ??
+                () => showHostQuickSheet(
+                      context,
+                      ref,
+                      onOpenHostSettings: onOpenHostSettings,
+                    ),
+            onSignIn: () => launchDeepSeekSignInFlow(context, ref),
+            onCompact: () => unawaited(ctrl.compactContext()),
           ),
         ],
         const SizedBox(height: 24),
@@ -336,10 +680,16 @@ class _TurnEntranceState extends State<_TurnEntrance>
 class _LiveAwaitingResponseRow extends ConsumerStatefulWidget {
   const _LiveAwaitingResponseRow({
     required this.isCreatingSession,
+    this.sendStage = SendStage.idle,
+    this.uploadDone = 0,
+    this.uploadTotal = 0,
     this.startedAtMs,
   });
 
   final bool isCreatingSession;
+  final SendStage sendStage;
+  final int uploadDone;
+  final int uploadTotal;
   final int? startedAtMs;
 
   @override
@@ -351,6 +701,24 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
   int _elapsedTenths = 0;
   late final int _originMs;
 
+  void _syncTimer() {
+    final active = WidgetsBinding.instance is WidgetsFlutterBinding &&
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    if (active) {
+      _timer ??= Timer.periodic(const Duration(milliseconds: 100), (_) {
+        if (!mounted) return;
+        final tenths = (DateTime.now().millisecondsSinceEpoch - _originMs) ~/ 100;
+        if (tenths != _elapsedTenths) {
+          setState(() => _elapsedTenths = tenths);
+        }
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -358,18 +726,16 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
     final started = widget.startedAtMs;
     if (started != null && started > 0 && now - started > 0 && now - started < 3600 * 1000) {
       _originMs = started;
-      _elapsedTenths = (now - started) ~/ 200;
+      _elapsedTenths = (now - started) ~/ 100;
     } else {
       _originMs = now;
     }
-    // 5Hz timer instead of 120Hz vsync Ticker — saves ~95% idle vsync wakeups while waiting.
-    _timer = Timer.periodic(const Duration(milliseconds: 200), (_) {
-      if (!mounted) return;
-      final tenths = (DateTime.now().millisecondsSinceEpoch - _originMs) ~/ 200;
-      if (tenths != _elapsedTenths) {
-        setState(() => _elapsedTenths = tenths);
-      }
-    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncTimer();
   }
 
   @override
@@ -379,11 +745,22 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
   }
 
   String _phaseLabel(String? livePhase) {
-    if (widget.isCreatingSession) return '正在创建对话并接入工作区…';
+    if (widget.isCreatingSession || widget.sendStage == SendStage.creatingSession) {
+      return '正在创建对话并接入工作区…';
+    }
+    if (widget.sendStage == SendStage.uploadingAttachments) {
+      if (widget.uploadTotal > 1) {
+        return '正在上传附件 (${widget.uploadDone}/${widget.uploadTotal})…';
+      }
+      return '正在上传附件…';
+    }
+    if (widget.sendStage == SendStage.sending) {
+      return '正在发送消息…';
+    }
     final p = (livePhase ?? '').toLowerCase();
     if (p.contains('reason') || p.contains('think')) return '正在深度思考…';
     if (p.contains('tool')) return '正在准备执行工具…';
-    if (p.contains('text') || p.contains('answer')) return '正在组织回复…';
+    if (p.contains('stream') || p.contains('text') || p.contains('answer')) return '正在组织回复…';
     return '已发送，等待模型响应…';
   }
 
@@ -391,7 +768,7 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
   Widget build(BuildContext context) {
     final livePhase = ref.watch(appProvider.select((s) => s.sessionTelemetry.livePhase));
     final t = GrassBagTokens.of(context);
-    final sec = (_elapsedTenths * 0.2).toStringAsFixed(1);
+    final sec = (_elapsedTenths * 0.1).toStringAsFixed(1);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
       child: Row(
@@ -405,10 +782,8 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(
+            child: GrassBagShimmerText(
               _phaseLabel(livePhase),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 13,
                 fontWeight: FontWeight.w500,
@@ -416,7 +791,7 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
               ),
             ),
           ),
-          if (_elapsedTenths >= 2)
+          if (_elapsedTenths >= 3)
             Text(
               '${sec}s',
               style: TextStyle(
@@ -435,17 +810,11 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
 class _UserMessageBlock extends StatefulWidget {
   const _UserMessageBlock({
     required this.msg,
-    required this.revealed,
-    required this.onToggleReveal,
-    required this.bubbleBuilder,
     required this.onCopy,
     this.onPrefillPrompt,
   });
 
   final NormalizedUserMessage msg;
-  final bool revealed;
-  final VoidCallback onToggleReveal;
-  final Widget Function(NormalizedUserMessage) bubbleBuilder;
   final VoidCallback onCopy;
   final ValueChanged<String>? onPrefillPrompt;
 
@@ -455,13 +824,33 @@ class _UserMessageBlock extends StatefulWidget {
 
 class _UserMessageBlockState extends State<_UserMessageBlock> {
   bool _hovered = false;
+  bool _copied = false;
+  bool _secretRevealed = false;
+  bool _longExpanded = false;
 
   String? _formatTime(int? ms) {
     if (ms == null || ms <= 0) return null;
     final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+    final now = DateTime.now();
     final hh = dt.hour.toString().padLeft(2, '0');
     final mm = dt.minute.toString().padLeft(2, '0');
-    return '$hh:$mm';
+    final today = DateTime(now.year, now.month, now.day);
+    final msgDay = DateTime(dt.year, dt.month, dt.day);
+    final diffDays = today.difference(msgDay).inDays;
+    if (diffDays == 0) return '$hh:$mm';
+    if (diffDays == 1) return '昨天 $hh:$mm';
+    if (dt.year == now.year) return '${dt.month}月${dt.day}日 $hh:$mm';
+    return '${dt.year}/${dt.month}/${dt.day} $hh:$mm';
+  }
+
+  void _handleCopy() {
+    widget.onCopy();
+    if (!_copied) {
+      setState(() => _copied = true);
+      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+        if (mounted) setState(() => _copied = false);
+      });
+    }
   }
 
   @override
@@ -472,6 +861,54 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
         defaultTargetPlatform == TargetPlatform.macOS ||
         defaultTargetPlatform == TargetPlatform.windows ||
         defaultTargetPlatform == TargetPlatform.linux;
+
+    final bubble = Material(
+      type: MaterialType.transparency,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: t.isDark
+                ? [
+                    Color.lerp(t.userBubble, Colors.white, 0.08)!,
+                    t.userBubble,
+                  ]
+                : [
+                    Color.lerp(t.userBubble, Colors.white, 0.24)!,
+                    t.userBubble,
+                  ],
+          ),
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(22),
+            topRight: Radius.circular(22),
+            bottomLeft: Radius.circular(22),
+            bottomRight: Radius.circular(7),
+          ),
+          border: Border.all(
+            color: t.isDark
+                ? Colors.white.withValues(alpha: 0.09)
+                : Colors.white.withValues(alpha: 0.80),
+            width: 0.75,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: t.isDark ? 0.28 : 0.05),
+              blurRadius: 14,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: _UserMessageContent(
+          msg: widget.msg,
+          revealed: _secretRevealed,
+          onToggleReveal: () => setState(() => _secretRevealed = !_secretRevealed),
+          longExpanded: _longExpanded,
+          onToggleLongExpand: () => setState(() => _longExpanded = !_longExpanded),
+        ),
+      ),
+    );
 
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
@@ -484,9 +921,10 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
             crossAxisAlignment: CrossAxisAlignment.end,
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Always wrap user bubble in SelectionArea so BOTH mobile and desktop users can
-              // highlight & copy partial text without long-press context menu hijacking selection!
-              SelectionArea(contextMenuBuilder: buildGrassBagSelectableContextMenu, child: widget.bubbleBuilder(widget.msg)),
+              SelectionArea(
+                contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                child: bubble,
+              ),
               Padding(
                 padding: const EdgeInsets.only(top: 4, right: 4),
                 child: Row(
@@ -502,33 +940,40 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                         ),
                       ),
                     IgnorePointer(
-                      ignoring: isDesktop && !_hovered,
+                      ignoring: isDesktop && !_hovered && !_copied,
                       child: () {
                         final iconColor = isDesktop ? t.text3 : t.text3.withValues(alpha: 0.78);
                         final row = Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             if (timeStr != null) const SizedBox(width: 4),
-                            Tooltip(
-                              message: '复制消息',
-                              child: GrassBagSpringTap(
-                                onTap: widget.onCopy,
-                                pressedScale: 0.9,
-                                child: SizedBox(
-                                  width: 36,
-                                  height: 32,
-                                  child: Center(
-                                    child: Icon(CupertinoIcons.doc_on_doc, size: 13.5, color: iconColor),
+                            if (widget.msg.text.isNotEmpty)
+                              Tooltip(
+                                message: _copied ? '已复制' : '复制消息',
+                                child: GrassBagSpringTap(
+                                  onTap: _handleCopy,
+                                  pressedScale: 0.9,
+                                  haptic: true,
+                                  child: SizedBox(
+                                    width: 36,
+                                    height: 32,
+                                    child: Center(
+                                      child: Icon(
+                                        _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                                        size: 13.5,
+                                        color: _copied ? t.ok : iconColor,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
-                            if (widget.onPrefillPrompt != null)
+                            if (widget.onPrefillPrompt != null && widget.msg.text.trim().isNotEmpty)
                               Tooltip(
                                 message: '编辑重发',
                                 child: GrassBagSpringTap(
                                   onTap: () => widget.onPrefillPrompt!(widget.msg.text),
                                   pressedScale: 0.9,
+                                  haptic: true,
                                   child: SizedBox(
                                     width: 36,
                                     height: 32,
@@ -540,10 +985,9 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                               ),
                           ],
                         );
-                        // Avoid permanent offscreen OpacityLayer saveLayer on every mobile user bubble!
                         if (!isDesktop) return row;
                         return AnimatedOpacity(
-                          opacity: _hovered ? 1.0 : 0.0,
+                          opacity: (_hovered || _copied) ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 140),
                           child: row,
                         );
@@ -565,21 +1009,121 @@ class _UserMessageContent extends StatelessWidget {
     required this.msg,
     required this.revealed,
     required this.onToggleReveal,
+    required this.longExpanded,
+    required this.onToggleLongExpand,
   });
 
   final NormalizedUserMessage msg;
   final bool revealed;
   final VoidCallback onToggleReveal;
+  final bool longExpanded;
+  final VoidCallback onToggleLongExpand;
+
+  static int _countLines(String s) {
+    var count = 1;
+    for (var i = 0; i < s.length; i++) {
+      if (s.codeUnitAt(i) == 0x0A) count++;
+    }
+    return count;
+  }
+
+  static String _formatBytes(num? raw) {
+    if (raw == null || raw <= 0) return '';
+    final b = raw.toDouble();
+    if (b < 1024) return '${b.round()} B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
+    return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  static IconData _fileIconFor(String name, String mime) {
+    final lower = name.toLowerCase();
+    if (mime.startsWith('image/')) return CupertinoIcons.photo_fill;
+    if (lower.endsWith('.pdf')) return CupertinoIcons.doc_richtext;
+    if (lower.endsWith('.zip') || lower.endsWith('.tar') || lower.endsWith('.gz')) {
+      return CupertinoIcons.archivebox_fill;
+    }
+    if (lower.endsWith('.dart') ||
+        lower.endsWith('.ts') ||
+        lower.endsWith('.js') ||
+        lower.endsWith('.py') ||
+        lower.endsWith('.json') ||
+        lower.endsWith('.yaml') ||
+        lower.endsWith('.yml') ||
+        lower.endsWith('.md')) {
+      return CupertinoIcons.doc_text_fill;
+    }
+    return CupertinoIcons.doc_fill;
+  }
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final hasAttachments = msg.attachments.isNotEmpty;
+    final hasReferences = msg.references.isNotEmpty;
+    final lineCount = _countLines(msg.text);
+    final isLongMessage = msg.maskedRanges.isEmpty && (lineCount > 10 || msg.text.length > 620);
+
     Widget buildTextWidget() {
       if (msg.maskedRanges.isEmpty) {
-        return Text(
-          msg.text,
-          style: TextStyle(fontSize: 14.5, height: 1.55, letterSpacing: -0.1, color: t.text),
+        if (!isLongMessage) {
+          return Text(
+            msg.text,
+            style: TextStyle(fontSize: 14.5, height: 1.55, letterSpacing: -0.1, color: t.text),
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AnimatedSize(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.topLeft,
+              child: Text(
+                msg.text,
+                maxLines: longExpanded ? null : 7,
+                overflow: longExpanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 14.5, height: 1.55, letterSpacing: -0.1, color: t.text),
+              ),
+            ),
+            const SizedBox(height: 6),
+            SelectionContainer.disabled(
+              child: GrassBagSpringTap(
+                onTap: onToggleLongExpand,
+                pressedScale: 0.95,
+                haptic: true,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: t.isDark
+                        ? Colors.white.withValues(alpha: 0.08)
+                        : Colors.white.withValues(alpha: 0.7),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: t.sep, width: 0.5),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        longExpanded ? '收起内容' : '展开全部（共 $lineCount 行）',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: t.primary,
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                      Icon(
+                        longExpanded ? CupertinoIcons.chevron_up : CupertinoIcons.chevron_down,
+                        size: 11,
+                        color: t.primary,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
         );
       }
 
@@ -655,7 +1199,7 @@ class _UserMessageContent extends StatelessWidget {
       );
     }
 
-    if (!hasAttachments) return buildTextWidget();
+    if (!hasAttachments && !hasReferences) return buildTextWidget();
 
     Uint8List? decodeAttBytes(Map<String, dynamic> att) {
       final rawBytes = att['bytes'];
@@ -664,8 +1208,11 @@ class _UserMessageContent extends StatelessWidget {
       if (b64.isEmpty) return null;
       final comma = b64.indexOf(',');
       final payload = (b64.startsWith('data:') && comma > 0) ? b64.substring(comma + 1) : b64;
+      final payloadLen = payload.length;
+      final midStart = payloadLen > 48 ? (payloadLen ~/ 2) - 12 : 0;
+      final tailStart = payloadLen > 24 ? payloadLen - 24 : 0;
       final cacheKey =
-          '${payload.length}:${payload.hashCode}:${payload.substring(0, math.min(24, payload.length))}';
+          '$payloadLen:${payload.substring(0, math.min(24, payloadLen))}:${payload.substring(midStart, math.min(midStart + 24, payloadLen))}:${payload.substring(tailStart)}';
       final cached = _decodedAttachmentBytesCache[cacheKey];
       if (cached != null) return cached;
       try {
@@ -687,94 +1234,182 @@ class _UserMessageContent extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        Wrap(
-          spacing: 6,
-          runSpacing: 6,
-          children: [
-            for (final att in msg.attachments)
-              Builder(
-                builder: (ctx) {
-                  final name = (att['name'] ?? att['filename'] ?? '附件').toString();
-                  final isImg = att['mimeType']?.toString().startsWith('image/') == true ||
-                      att['type']?.toString() == 'image';
-                  final imgBytes = isImg ? decodeAttBytes(att) : null;
-                  final imgUrl = isImg
-                      ? (att['url'] ?? att['previewUrl'] ?? att['src'])?.toString().trim()
-                      : null;
-                  if (imgBytes != null ||
-                      (imgUrl != null &&
-                          (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')))) {
-                    return GestureDetector(
-                      onTap: () => showImagePreviewDialog(
-                        ctx,
-                        bytes: imgBytes,
-                        url: imgUrl,
-                        title: name,
-                      ),
-                      child: Container(
-                        width: 76,
-                        height: 76,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: t.sepStrong, width: 0.7),
+        if (hasAttachments)
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final att in msg.attachments)
+                Builder(
+                  builder: (ctx) {
+                    final name = (att['name'] ?? att['filename'] ?? '附件').toString();
+                    final mime = att['mimeType']?.toString() ?? '';
+                    final sizeStr = _formatBytes(att['size'] as num?);
+                    final isImg = mime.startsWith('image/') || att['type']?.toString() == 'image';
+                    final imgBytes = isImg ? decodeAttBytes(att) : null;
+                    final imgUrl = isImg
+                        ? (att['url'] ?? att['previewUrl'] ?? att['src'] ?? att['uri'])
+                            ?.toString()
+                            .trim()
+                        : null;
+                    if (imgBytes != null ||
+                        (imgUrl != null &&
+                            (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')))) {
+                      return GestureDetector(
+                        onTap: () => showImagePreviewDialog(
+                          ctx,
+                          bytes: imgBytes,
+                          url: imgUrl,
+                          title: name,
                         ),
-                        clipBehavior: Clip.antiAlias,
-                        child: imgBytes != null
-                            ? Image.memory(
-                                imgBytes,
-                                fit: BoxFit.cover,
-                                gaplessPlayback: true,
-                                cacheWidth: thumbCachePx,
-                                errorBuilder: (_, __, ___) => Center(
-                                  child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                        child: Container(
+                          width: 76,
+                          height: 76,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: t.sepStrong, width: 0.7),
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: imgBytes != null
+                              ? Image.memory(
+                                  imgBytes,
+                                  fit: BoxFit.cover,
+                                  gaplessPlayback: true,
+                                  cacheWidth: thumbCachePx,
+                                  errorBuilder: (_, __, ___) => Center(
+                                    child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                                  ),
+                                )
+                              : Image.network(
+                                  imgUrl!,
+                                  fit: BoxFit.cover,
+                                  gaplessPlayback: true,
+                                  cacheWidth: thumbCachePx,
+                                  errorBuilder: (_, __, ___) => Center(
+                                    child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                                  ),
                                 ),
-                              )
-                            : Image.network(
-                                imgUrl!,
-                                fit: BoxFit.cover,
-                                gaplessPlayback: true,
-                                cacheWidth: thumbCachePx,
-                                errorBuilder: (_, __, ___) => Center(
-                                  child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
-                                ),
+                        ),
+                      );
+                    }
+                    final attPath = (att['path'] ?? att['workspacePath'])?.toString().trim() ?? '';
+                    final chip = Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+                      decoration: BoxDecoration(
+                        color: t.isDark
+                            ? Colors.white.withValues(alpha: 0.08)
+                            : Colors.white.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(9),
+                        border: Border.all(color: t.sep, width: 0.5),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(_fileIconFor(name, mime), size: 12.5, color: t.primary),
+                          const SizedBox(width: 5),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 160),
+                            child: Text(
+                              name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
+                            ),
+                          ),
+                          if (sizeStr.isNotEmpty) ...[
+                            const SizedBox(width: 5),
+                            Text(
+                              sizeStr,
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontFeatures: const [FontFeature.tabularFigures()],
+                                color: t.text3,
                               ),
+                            ),
+                          ],
+                        ],
                       ),
                     );
-                  }
-                  return Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: t.isDark
-                          ? Colors.white.withValues(alpha: 0.08)
-                          : Colors.white.withValues(alpha: 0.72),
-                      borderRadius: BorderRadius.circular(9),
-                      border: Border.all(color: t.sep, width: 0.5),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          isImg ? CupertinoIcons.photo_fill : CupertinoIcons.doc_fill,
-                          size: 12,
-                          color: t.primary,
+                    if (attPath.isNotEmpty) {
+                      return GrassBagSpringTap(
+                        onTap: () => showWorkspaceFilePreviewSheet(ctx, path: attPath, title: name),
+                        pressedScale: 0.95,
+                        child: chip,
+                      );
+                    }
+                    return chip;
+                  },
+                ),
+            ],
+          ),
+        if (hasReferences) ...[
+          if (hasAttachments) const SizedBox(height: 6),
+          SelectionContainer.disabled(
+            child: Wrap(
+              spacing: 5,
+              runSpacing: 5,
+              children: [
+                for (final refItem in msg.references)
+                  () {
+                    final kind = (refItem['kind'] ?? refItem['type'] ?? 'file').toString();
+                    final path = (refItem['path'] ?? refItem['value'] ?? refItem['id'] ?? '').toString().trim();
+                    final label = (refItem['label'] ?? refItem['name'] ?? path).toString().trim();
+                    if (label.isEmpty) return const SizedBox.shrink();
+                    final isSession = kind == 'session';
+                    final baseLabel = !isSession && label.contains('/')
+                        ? (label.split('/').where((s) => s.isNotEmpty).lastOrNull ?? label)
+                        : label;
+                    final pill = Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3.5),
+                      decoration: BoxDecoration(
+                        color: t.isDark
+                            ? t.primary.withValues(alpha: 0.16)
+                            : Colors.white.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: t.primary.withValues(alpha: 0.28),
+                          width: 0.6,
                         ),
-                        const SizedBox(width: 5),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 160),
-                          child: Text(
-                            name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isSession ? CupertinoIcons.chat_bubble_text : CupertinoIcons.at,
+                            size: 11,
+                            color: t.primary,
                           ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-          ],
-        ),
+                          const SizedBox(width: 4),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 180),
+                            child: Text(
+                              baseLabel,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: isSession ? null : 'monospace',
+                                fontSize: 11,
+                                fontWeight: FontWeight.w500,
+                                color: t.isDark ? t.primaryHi : t.primary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (!isSession && path.isNotEmpty) {
+                      return GrassBagSpringTap(
+                        onTap: () => showWorkspaceFilePreviewSheet(context, path: path, title: baseLabel),
+                        pressedScale: 0.95,
+                        child: pill,
+                      );
+                    }
+                    return pill;
+                  }(),
+              ],
+            ),
+          ),
+        ],
         if (msg.text.isNotEmpty) ...[
           const SizedBox(height: 8),
           buildTextWidget(),
@@ -784,17 +1419,120 @@ class _UserMessageContent extends StatelessWidget {
   }
 }
 
-/// Tiny isolated consumer for live phase + rounded t/s so speed ticks NEVER rebuild the entire TurnView!
+/// Tiny isolated live tabular elapsed timer (`0.4s`, `12s`) that pauses off-route & in tests.
+class _LiveElapsedClock extends StatefulWidget {
+  const _LiveElapsedClock({
+    this.startedAtMs,
+    this.style,
+    this.minTenths = 3,
+  });
+
+  final int? startedAtMs;
+  final TextStyle? style;
+  final int minTenths;
+
+  @override
+  State<_LiveElapsedClock> createState() => _LiveElapsedClockState();
+}
+
+class _LiveElapsedClockState extends State<_LiveElapsedClock> {
+  Timer? _timer;
+  int _elapsedTenths = 0;
+  late final int _originMs;
+
+  void _syncTimer() {
+    final active = WidgetsBinding.instance is WidgetsFlutterBinding &&
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    if (active) {
+      _timer ??= Timer.periodic(const Duration(milliseconds: 200), (_) {
+        if (!mounted) return;
+        final tenths = (DateTime.now().millisecondsSinceEpoch - _originMs) ~/ 100;
+        if (tenths != _elapsedTenths) {
+          setState(() => _elapsedTenths = tenths);
+        }
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final started = widget.startedAtMs;
+    if (started != null && started > 0 && now - started >= 0 && now - started < 3600 * 1000) {
+      _originMs = started;
+      _elapsedTenths = (now - started) ~/ 100;
+    } else {
+      _originMs = now;
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncTimer();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_elapsedTenths < widget.minTenths) return const SizedBox.shrink();
+    final t = GrassBagTokens.of(context);
+    final label = _elapsedTenths >= 100
+        ? '${_elapsedTenths ~/ 10}s'
+        : '${(_elapsedTenths * 0.1).toStringAsFixed(1)}s';
+    return Text(
+      label,
+      style: widget.style ??
+          TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w500,
+            fontFeatures: const [FontFeature.tabularFigures()],
+            color: t.text3,
+          ),
+    );
+  }
+}
+
+/// Tiny isolated consumer for live phase + concrete tool target + rounded t/s so speed ticks
+/// NEVER rebuild the entire TurnView!
 class _LiveProcessSummaryText extends ConsumerWidget {
   const _LiveProcessSummaryText({
-    required this.runningToolName,
+    required this.runningTool,
+    required this.runningToolCount,
     required this.hasAssistantText,
     required this.hasReasoning,
   });
 
-  final String? runningToolName;
+  final ToolStep? runningTool;
+  final int runningToolCount;
   final bool hasAssistantText;
   final bool hasReasoning;
+
+  static String _shortTargetFor(ToolStep tool) {
+    final raw = _humanizeToolDisplayTitle(tool).trim();
+    final humanName = _humanizeToolName(tool.name).trim();
+    if (raw.isEmpty || raw == humanName || raw.toLowerCase() == tool.name.toLowerCase()) {
+      return '';
+    }
+    if (raw.contains('/')) {
+      final segs = raw.split('/').where((s) => s.isNotEmpty).toList();
+      if (segs.isNotEmpty) {
+        final tail = segs.last;
+        return tail.length > 26 ? '${tail.substring(0, 25)}…' : tail;
+      }
+    }
+    return raw.length > 26 ? '${raw.substring(0, 25)}…' : raw;
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -810,18 +1548,29 @@ class _LiveProcessSummaryText extends ConsumerWidget {
     );
     final t = GrassBagTokens.of(context);
     final p = (live.phase ?? '').toLowerCase();
-    final speed = live.tpsRounded != null ? ' · ${live.tpsRounded} t/s' : '';
-    final summaryText = runningToolName != null
-        ? '正在执行 $runningToolName…$speed'
-        : (p.contains('text') || hasAssistantText)
-            ? '正在生成回复$speed'
-            : (p.contains('reason') || p.contains('think') || hasReasoning)
-                ? '正在思考…$speed'
-                : '正在思考与执行步骤…$speed';
-    return Text(
+    final isToolPhase = runningTool != null || p.contains('tool');
+    // Never show bogus frozen LLM decode t/s while executing a shell/file tool!
+    final speed = (!isToolPhase && live.tpsRounded != null) ? ' · ${live.tpsRounded} t/s' : '';
+    final String summaryText;
+    if (runningTool != null) {
+      final verb = _humanizeToolName(runningTool!.name);
+      final target = _shortTargetFor(runningTool!);
+      if (runningToolCount > 1) {
+        summaryText = target.isNotEmpty
+            ? '正在并行执行 $runningToolCount 项操作 · $target'
+            : '正在并行执行 $runningToolCount 项操作…';
+      } else {
+        summaryText = target.isNotEmpty ? '正在$verb $target' : '正在$verb…';
+      }
+    } else if (p.contains('stream') || p.contains('text') || p.contains('answer') || hasAssistantText) {
+      summaryText = '正在生成回复$speed';
+    } else if (p.contains('reason') || p.contains('think') || hasReasoning) {
+      summaryText = '正在深度思考…$speed';
+    } else {
+      summaryText = '正在思考与执行步骤…$speed';
+    }
+    return GrassBagShimmerText(
       summaryText,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
       style: TextStyle(
         fontSize: 13,
         fontWeight: FontWeight.w500,
@@ -836,6 +1585,7 @@ class _LiveProcessSummaryText extends ConsumerWidget {
 class _TurnProcessBlock extends StatelessWidget {
   const _TurnProcessBlock({
     required this.turn,
+    required this.visibleSteps,
     required this.tier,
     required this.open,
     required this.canTranslateCot,
@@ -848,6 +1598,7 @@ class _TurnProcessBlock extends StatelessWidget {
   });
 
   final NormalizedTurn turn;
+  final List<NormalizedStep> visibleSteps;
   final GrassBagGlassTier tier;
   final bool open;
   final bool canTranslateCot;
@@ -865,33 +1616,52 @@ class _TurnProcessBlock extends StatelessWidget {
     var toolCount = 0;
     var reasonCount = 0;
     var errTools = 0;
+    var cancelledTools = 0;
+    var runningToolCount = 0;
     ToolStep? runningTool;
-    for (final s in turn.steps) {
+    for (final s in visibleSteps) {
       if (s is ToolStep) {
         toolCount++;
-        if (s.status == 'running') runningTool = s;
+        if (s.status == 'running') {
+          runningTool = s;
+          runningToolCount++;
+        }
         if (s.status == 'error') errTools++;
+        if (s.status == 'cancelled') cancelledTools++;
       } else if (s is ReasoningStep) {
         reasonCount++;
       }
     }
+    final isCancelledTurn = !turn.isStreaming &&
+        (turn.status == 'cancelled' || turn.status == 'interrupted') &&
+        !turn.hasError;
     final durSec = turn.usage?.durationMs != null
         ? '${(turn.usage!.durationMs! / 1000).toStringAsFixed(1)}s'
         : null;
     final settledSummaryText = () {
       final bits = <String>[];
+      if (isCancelledTurn) {
+        bits.add('已停止');
+      }
       if (durSec != null) {
         bits.add('耗时 $durSec');
-      } else if (reasonCount > 0) {
+      } else if (reasonCount > 0 && !isCancelledTurn) {
         bits.add('已思考');
+      } else if (reasonCount > 0 && toolCount == 0) {
+        bits.add('思考已中断');
       }
       if (toolCount > 0) bits.add('$toolCount 项操作');
       if (errTools > 0) bits.add('$errTools 项异常');
+      if (cancelledTools > 0 && errTools == 0 && !isCancelledTurn) bits.add('已中断');
       if (bits.isEmpty) {
-        return turn.hasError ? '执行遇到错误' : '执行过程 (${turn.steps.length})';
+        return turn.hasError ? '执行遇到错误' : '执行过程 (${visibleSteps.length})';
       }
       return bits.join(' · ');
     }();
+
+    // Only the very last non-narration ReasoningStep is actively thinking when no tool is
+    // running and answer text hasn't started yet — prevents stacked pulsing boxes on multi-step turns!
+    final lastVisibleStep = visibleSteps.isNotEmpty ? visibleSteps.last : null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -913,9 +1683,13 @@ class _TurnProcessBlock extends StatelessWidget {
                         : Icon(
                             errTools > 0 || turn.hasError
                                 ? CupertinoIcons.exclamationmark_circle_fill
-                                : CupertinoIcons.sparkles,
+                                : (isCancelledTurn
+                                    ? CupertinoIcons.stop_circle
+                                    : CupertinoIcons.sparkles),
                             size: 15.5,
-                            color: errTools > 0 || turn.hasError ? t.err : t.primary,
+                            color: errTools > 0 || turn.hasError
+                                ? t.err
+                                : (isCancelledTurn ? t.text3 : t.primary),
                           ),
                   ),
                 ),
@@ -923,7 +1697,8 @@ class _TurnProcessBlock extends StatelessWidget {
                 Expanded(
                   child: turn.isStreaming
                       ? _LiveProcessSummaryText(
-                          runningToolName: runningTool?.name,
+                          runningTool: runningTool,
+                          runningToolCount: runningToolCount,
                           hasAssistantText: turn.assistantText.isNotEmpty,
                           hasReasoning: reasonCount > 0,
                         )
@@ -939,6 +1714,11 @@ class _TurnProcessBlock extends StatelessWidget {
                           ),
                         ),
                 ),
+                if (turn.isStreaming) ...[
+                  const SizedBox(width: 6),
+                  _LiveElapsedClock(startedAtMs: turn.userMessage?.createdAt),
+                  const SizedBox(width: 6),
+                ],
                 AnimatedRotation(
                   turns: open ? 0.5 : 0.0,
                   duration: const Duration(milliseconds: 240),
@@ -953,11 +1733,11 @@ class _TurnProcessBlock extends StatelessWidget {
             ),
           ),
         ),
-        // Explicit toggle-only disclosure: smoothly eases on open/close without EVER
-        // fighting or double-animating when inner thinking/tool rows resize or stream.
+        // Explicit toggle-only disclosure: glides smoothly open on live first step mount without
+        // fighting inner thinking/tool resizes once settled open.
         _SmoothDisclosure(
           expanded: open,
-          instant: turn.isStreaming,
+          animateOnMount: turn.isStreaming,
           builder: () => CustomPaint(
             painter: _StreamThreadRailPainter(color: t.sepStrong),
             child: Padding(
@@ -965,13 +1745,18 @@ class _TurnProcessBlock extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  for (final step in turn.steps)
+                  for (final step in visibleSteps)
                     if (step is ReasoningStep)
                       _ThinkingStepRow(
                         key: ValueKey('reason-${step.id}'),
                         step: step,
                         canTranslate: canTranslateCot && !turn.isStreaming,
                         isStreaming: turn.isStreaming,
+                        isActivelyThinking: turn.isStreaming &&
+                            runningTool == null &&
+                            turn.assistantText.isEmpty &&
+                            identical(step, lastVisibleStep) &&
+                            !step.id.startsWith('narration-'),
                         onToggleExpand: () => onToggleStep(step.id),
                         onToggleTranslate: () => onToggleTranslate(step.id, step.text),
                       )
@@ -1028,12 +1813,12 @@ class _SmoothDisclosure extends StatefulWidget {
   const _SmoothDisclosure({
     required this.expanded,
     required this.builder,
-    this.instant = false,
+    this.animateOnMount = false,
   });
 
   final bool expanded;
-  final bool instant;
   final Widget Function() builder;
+  final bool animateOnMount;
 
   @override
   State<_SmoothDisclosure> createState() => _SmoothDisclosureState();
@@ -1048,11 +1833,12 @@ class _SmoothDisclosureState extends State<_SmoothDisclosure>
   @override
   void initState() {
     super.initState();
+    final startCollapsed = widget.animateOnMount && widget.expanded;
     _ctrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 220),
       reverseDuration: const Duration(milliseconds: 170),
-      value: widget.expanded ? 1.0 : 0.0,
+      value: startCollapsed ? 0.0 : (widget.expanded ? 1.0 : 0.0),
     )..addStatusListener(_onStatus);
     _sizeAnim = CurvedAnimation(
       parent: _ctrl,
@@ -1064,6 +1850,9 @@ class _SmoothDisclosureState extends State<_SmoothDisclosure>
       curve: const Interval(0.10, 1.0, curve: Curves.easeOut),
       reverseCurve: const Interval(0.0, 0.72, curve: Curves.easeIn),
     );
+    if (startCollapsed) {
+      _ctrl.forward();
+    }
   }
 
   void _onStatus(AnimationStatus status) {
@@ -1074,9 +1863,7 @@ class _SmoothDisclosureState extends State<_SmoothDisclosure>
   void didUpdateWidget(covariant _SmoothDisclosure oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.expanded == oldWidget.expanded) return;
-    if (widget.instant) {
-      _ctrl.value = widget.expanded ? 1.0 : 0.0;
-    } else if (widget.expanded) {
+    if (widget.expanded) {
       _ctrl.forward();
     } else {
       _ctrl.reverse();
@@ -1096,10 +1883,11 @@ class _SmoothDisclosureState extends State<_SmoothDisclosure>
       return const SizedBox.shrink();
     }
     final child = widget.builder();
-    if (widget.expanded && _ctrl.isCompleted) {
-      return child;
-    }
+    final settledOpen = widget.expanded && _ctrl.isCompleted;
+    // Keep wrapper topology 100% constant between animating and settled-open so Stateful
+    // children (scroll positions, copied states, expanded subtrees) NEVER unmount/remount!
     return ClipRect(
+      clipBehavior: settledOpen ? Clip.none : Clip.hardEdge,
       child: FadeTransition(
         opacity: _fadeAnim,
         child: SizeTransition(
@@ -1124,6 +1912,7 @@ class _BreathingStatusDot extends StatefulWidget {
 class _BreathingStatusDotState extends State<_BreathingStatusDot>
     with SingleTickerProviderStateMixin {
   late final AnimationController _ctrl;
+  bool _running = false;
 
   @override
   void initState() {
@@ -1131,7 +1920,22 @@ class _BreathingStatusDotState extends State<_BreathingStatusDot>
     _ctrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 950),
-    )..repeat(reverse: true);
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final shouldRun = WidgetsBinding.instance is WidgetsFlutterBinding &&
+        (ModalRoute.of(context)?.isCurrent ?? true) &&
+        !MediaQuery.disableAnimationsOf(context);
+    if (shouldRun && !_running) {
+      _running = true;
+      _ctrl.repeat(reverse: true);
+    } else if (!shouldRun && _running) {
+      _running = false;
+      _ctrl.stop();
+    }
   }
 
   @override
@@ -1160,17 +1964,19 @@ class _BreathingDotPainter extends CustomPainter {
 
   final Animation<double> animation;
   final Color color;
+  final Paint _haloPaint = Paint();
+  final Paint _corePaint = Paint();
 
   @override
   void paint(Canvas canvas, Size size) {
     final v = Curves.easeInOut.transform(animation.value);
+    final dim = math.min(size.width, size.height);
+    final scale = (dim / 20.0).clamp(0.55, 1.25);
     final center = Offset(size.width * 0.5, size.height * 0.5);
-    canvas.drawCircle(
-      center,
-      5.0 + 4.0 * v,
-      Paint()..color = color.withValues(alpha: 0.28 * (1.0 - v) + 0.08),
-    );
-    canvas.drawCircle(center, 3.75, Paint()..color = color);
+    _haloPaint.color = color.withValues(alpha: 0.28 * (1.0 - v) + 0.08);
+    _corePaint.color = color;
+    canvas.drawCircle(center, (5.0 + 4.0 * v) * scale, _haloPaint);
+    canvas.drawCircle(center, 3.75 * scale, _corePaint);
   }
 
   @override
@@ -1196,12 +2002,13 @@ class _StreamThreadRailPainter extends CustomPainter {
       oldDelegate.color != color;
 }
 
-class _ThinkingStepRow extends ConsumerWidget {
+class _ThinkingStepRow extends ConsumerStatefulWidget {
   const _ThinkingStepRow({
     super.key,
     required this.step,
     required this.canTranslate,
     required this.isStreaming,
+    this.isActivelyThinking = false,
     required this.onToggleExpand,
     required this.onToggleTranslate,
   });
@@ -1209,11 +2016,77 @@ class _ThinkingStepRow extends ConsumerWidget {
   final ReasoningStep step;
   final bool canTranslate;
   final bool isStreaming;
+  final bool isActivelyThinking;
   final VoidCallback onToggleExpand;
   final VoidCallback onToggleTranslate;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_ThinkingStepRow> createState() => _ThinkingStepRowState();
+}
+
+class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
+  final ScrollController _thinkScrollCtrl = ScrollController();
+  bool _userScrolledUp = false;
+  bool _scrollScheduled = false;
+  int _lastLiveTextLen = 0;
+  String? _cachedZhStepId;
+  int _cachedZhTextLen = -1;
+  bool _cachedMostlyZh = false;
+
+  bool _isStepMostlyChinese(ReasoningStep step) {
+    if (_cachedZhStepId == step.id && _cachedZhTextLen == step.text.length) {
+      return _cachedMostlyZh;
+    }
+    _cachedZhStepId = step.id;
+    _cachedZhTextLen = step.text.length;
+    _cachedMostlyZh = _isMostlyChinese(step.text);
+    return _cachedMostlyZh;
+  }
+
+  @override
+  void dispose() {
+    _thinkScrollCtrl.dispose();
+    super.dispose();
+  }
+
+  bool _copied = false;
+
+  void _handleCopyThinking(String text) {
+    Clipboard.setData(ClipboardData(text: text));
+    if (!_copied) {
+      setState(() => _copied = true);
+      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+        if (mounted) setState(() => _copied = false);
+      });
+    }
+  }
+
+  void _maybeAutoFollowLive(bool isLive, bool showBody, int textLen) {
+    if (!isLive || !showBody) {
+      _lastLiveTextLen = textLen;
+      return;
+    }
+    if (textLen > _lastLiveTextLen && !_userScrolledUp) {
+      _lastLiveTextLen = textLen;
+      if (!_scrollScheduled) {
+        _scrollScheduled = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollScheduled = false;
+          if (!mounted || !_thinkScrollCtrl.hasClients || _userScrolledUp) return;
+          final max = _thinkScrollCtrl.position.maxScrollExtent;
+          if (max > 0 && (max - _thinkScrollCtrl.offset) > 2.0) {
+            _thinkScrollCtrl.jumpTo(max);
+          }
+        });
+      }
+    } else {
+      _lastLiveTextLen = textLen;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final step = widget.step;
     final stepSlice = ref.watch(
       appProvider.select(
         (s) => (
@@ -1236,17 +2109,23 @@ class _ThinkingStepRow extends ConsumerWidget {
         (translated && effectiveTranslation != null && effectiveTranslation.isNotEmpty)
             ? effectiveTranslation
             : step.text;
-    final showTranslateBtn =
-        step.text.trim().isNotEmpty && (canTranslate || effectiveTranslation != null);
+    final isNarration = step.id.startsWith('narration-');
+    final isLiveThinking = widget.isActivelyThinking && !isNarration && step.durationMs == null;
+    // Show a sleek auto-scrolling 4-line live reasoning viewport ONLY while this exact step
+    // is actively thinking — prevents multiple stacked live boxes across multi-step agent turns!
+    final showLiveViewport = isLiveThinking && !expanded && bodyText.trim().isNotEmpty;
     final dur = step.durationMs != null
-        ? '${(step.durationMs! / 1000).toStringAsFixed(1)}s'
+        ? (step.durationMs! < 1000
+            ? '${step.durationMs}ms'
+            : '${(step.durationMs! / 1000).toStringAsFixed(1)}s')
         : null;
+    _maybeAutoFollowLive(isLiveThinking, expanded || showLiveViewport, bodyText.length);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         GrassBagSpringTap(
-          onTap: onToggleExpand,
+          onTap: widget.onToggleExpand,
           pressedScale: 0.985,
           haptic: true,
           child: Padding(
@@ -1256,18 +2135,48 @@ class _ThinkingStepRow extends ConsumerWidget {
                 SizedBox(
                   width: 22,
                   height: 22,
-                  child: Icon(CupertinoIcons.lightbulb, size: 14, color: t.text3),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  dur != null ? '思考 $dur' : '思考',
-                  style: TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w500,
-                    fontFeatures: const [FontFeature.tabularFigures()],
-                    color: t.text2,
+                  child: Center(
+                    child: isLiveThinking
+                        ? _BreathingStatusDot(color: t.primary)
+                        : Icon(
+                            isNarration ? CupertinoIcons.text_quote : CupertinoIcons.lightbulb,
+                            size: 14,
+                            color: t.text3,
+                          ),
                   ),
                 ),
+                const SizedBox(width: 6),
+                if (isLiveThinking) ...[
+                  Text(
+                    '思考中',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w500,
+                      color: t.primary,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  _LiveElapsedClock(
+                    minTenths: 5,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w500,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      color: t.text3,
+                    ),
+                  ),
+                ] else
+                  Text(
+                    isNarration
+                        ? '说明'
+                        : (dur != null ? '思考 $dur' : '思考'),
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w500,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      color: t.text2,
+                    ),
+                  ),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 6),
                   child: Container(
@@ -1300,61 +2209,152 @@ class _ThinkingStepRow extends ConsumerWidget {
           ),
         ),
         _SmoothDisclosure(
-          expanded: expanded,
-          instant: isStreaming,
-          builder: () => Container(
-            margin: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: t.fill1,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: t.sep, width: 0.5),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 180),
-                  child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-key: ValueKey('${step.id}-$translated'),
-                    child: Text(
-                      bodyText,
-                      style: TextStyle(fontSize: 12.5, height: 1.6, color: t.text2),
-                    ),
-                  ),
+          expanded: expanded || showLiveViewport,
+          animateOnMount: isLiveThinking,
+          builder: () {
+            final showTranslateBtn = expanded &&
+                step.text.isNotEmpty &&
+                (effectiveTranslation != null || (widget.canTranslate && !_isStepMostlyChinese(step)));
+            final textNode = SelectionArea(
+              contextMenuBuilder: buildGrassBagSelectableContextMenu,
+              key: ValueKey('${step.id}-$translated'),
+              child: Text(
+                bodyText,
+                style: TextStyle(
+                  fontSize: showLiveViewport ? 12.0 : 12.5,
+                  height: 1.58,
+                  color: showLiveViewport ? t.text3 : t.text2,
                 ),
-                if (showTranslateBtn) ...[
-                  const SizedBox(height: 8),
-                  GrassBagSpringTap(
-                    onTap: translating ? () {} : onToggleTranslate,
-                    pressedScale: 0.94,
-                    haptic: true,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
+              ),
+            );
+            final scrollViewport = NotificationListener<ScrollNotification>(
+              onNotification: (n) {
+                if (n is ScrollUpdateNotification && n.dragDetails != null) {
+                  final atBottom = (n.metrics.maxScrollExtent - n.metrics.pixels) <= 18.0;
+                  _userScrolledUp = !atBottom;
+                }
+                return false;
+              },
+              child: SingleChildScrollView(
+                controller: _thinkScrollCtrl,
+                physics: const BouncingScrollPhysics(),
+                child: isLiveThinking
+                    ? textNode
+                    : AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 180),
+                        child: textNode,
+                      ),
+              ),
+            );
+            return AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              margin: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
+              padding: EdgeInsets.all(showLiveViewport ? 10 : 12),
+              decoration: BoxDecoration(
+                color: t.fill1,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: showLiveViewport ? t.primary.withValues(alpha: 0.16) : t.sep,
+                  width: 0.55,
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutCubic,
+                    constraints: BoxConstraints(maxHeight: showLiveViewport ? 96 : 280),
+                    child: showLiveViewport
+                        ? ShaderMask(
+                            blendMode: BlendMode.dstIn,
+                            shaderCallback: (bounds) => const LinearGradient(
+                              begin: Alignment.topCenter,
+                              end: Alignment.bottomCenter,
+                              colors: [
+                                Colors.transparent,
+                                Colors.white,
+                                Colors.white,
+                                Colors.transparent,
+                              ],
+                              stops: [0.0, 0.12, 0.90, 1.0],
+                            ).createShader(bounds),
+                            child: scrollViewport,
+                          )
+                        : scrollViewport,
+                  ),
+                  if (expanded) ...[
+                    const SizedBox(height: 8),
+                    Row(
                       children: [
-                        if (translating)
-                          CupertinoActivityIndicator(radius: 6, color: t.primary)
-                        else
-                          Icon(CupertinoIcons.globe, size: 13, color: t.primary),
-                        const SizedBox(width: 5),
-                        Text(
-                          translating
-                              ? '正在翻译…'
-                              : (translated ? '查看原文' : '翻译思考过程'),
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                            color: t.primary,
+                        if (showTranslateBtn) ...[
+                          GrassBagSpringTap(
+                            enabled: !translating,
+                            onTap: translating ? () {} : widget.onToggleTranslate,
+                            pressedScale: 0.94,
+                            haptic: true,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (translating)
+                                    CupertinoActivityIndicator(radius: 6, color: t.primary)
+                                  else
+                                    Icon(CupertinoIcons.globe, size: 13, color: t.primary),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    translating
+                                        ? '正在翻译…'
+                                        : (translated ? '查看原文' : '翻译思考过程'),
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: t.primary,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           ),
-                        ),
+                          const SizedBox(width: 6),
+                        ],
+                        if (bodyText.trim().isNotEmpty)
+                          GrassBagSpringTap(
+                            onTap: () => _handleCopyThinking(bodyText),
+                            pressedScale: 0.94,
+                            haptic: true,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                                    size: 12.5,
+                                    color: _copied ? t.ok : t.text3,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _copied ? '已复制' : '复制',
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: _copied ? t.ok : t.text3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
                       ],
                     ),
-                  ),
+                  ],
                 ],
-              ],
-            ),
-          ),
+              ),
+            );
+          },
         ),
       ],
     );
@@ -1390,8 +2390,65 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
   String _loadedCacheKey = '';
   bool _loading = false;
   bool _loadedOnce = false;
+  bool _initialFetchAttempted = false;
   bool _pendingForceReload = false;
   bool _copied = false;
+  Timer? _livePollTimer;
+
+  void _syncLivePollTimer(bool expanded, bool isRunning) {
+    final shouldPoll = expanded &&
+        isRunning &&
+        WidgetsBinding.instance is WidgetsFlutterBinding &&
+        (ModalRoute.of(context)?.isCurrent ?? true);
+    if (shouldPoll) {
+      _livePollTimer ??= Timer.periodic(const Duration(milliseconds: 1500), (_) {
+        if (!mounted || widget.step.status != 'running' || !widget.isStreaming) {
+          _livePollTimer?.cancel();
+          _livePollTimer = null;
+          return;
+        }
+        if (!_loading) {
+          _ensureLoaded(forceRefresh: true);
+        }
+      });
+    } else {
+      _livePollTimer?.cancel();
+      _livePollTimer = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _livePollTimer?.cancel();
+    super.dispose();
+  }
+
+  // Memoized display labels & JSON summary so streaming flushes run 0 repeated jsonDecodes!
+  String? _memoName;
+  String? _memoTitle;
+  String? _memoSummary;
+  String _memoDisplayTitle = '';
+  String _memoSummaryPill = '';
+  String? _memoFormattedSummaryRaw;
+  String _memoFormattedSummary = '';
+
+  String _formattedSummaryFor(String raw) {
+    if (_memoFormattedSummaryRaw == raw) return _memoFormattedSummary;
+    _memoFormattedSummaryRaw = raw;
+    _memoFormattedSummary = _prettyFormatJsonIfApplicable(raw);
+    return _memoFormattedSummary;
+  }
+
+  void _syncMemoizedLabels(ToolStep step) {
+    if (_memoName == step.name && _memoTitle == step.title && _memoSummary == step.summary) {
+      return;
+    }
+    _memoName = step.name;
+    _memoTitle = step.title;
+    _memoSummary = step.summary;
+    _memoDisplayTitle = _humanizeToolDisplayTitle(step);
+    _memoSummaryPill = _humanizeSummaryPill(step);
+  }
 
   String _currentCacheKey() {
     final s = ref.read(appProvider);
@@ -1405,6 +2462,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     if (cached != null) {
       _detail = cached;
       _loadedOnce = widget.step.status != 'running';
+      _initialFetchAttempted = _loadedOnce;
     }
   }
 
@@ -1426,6 +2484,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
       _detail = null;
       _loading = false;
       _loadedOnce = false;
+      _initialFetchAttempted = false;
       _pendingForceReload = false;
       _copied = false;
       _primeFromCache();
@@ -1436,8 +2495,14 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     }
     final statusChanged = oldWidget.step.status != widget.step.status;
     final settledFromStream = oldWidget.isStreaming && !widget.isStreaming;
-    if (expanded && (!_loadedOnce || statusChanged || settledFromStream)) {
-      _ensureLoaded(forceRefresh: statusChanged || settledFromStream);
+    final runningMetaChanged = widget.step.status == 'running' &&
+        (oldWidget.step.title != widget.step.title || oldWidget.step.summary != widget.step.summary);
+    if (expanded &&
+        ((!_loadedOnce && !_initialFetchAttempted) ||
+            statusChanged ||
+            settledFromStream ||
+            runningMetaChanged)) {
+      _ensureLoaded(forceRefresh: statusChanged || settledFromStream || runningMetaChanged);
     }
   }
 
@@ -1446,6 +2511,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
       if (forceRefresh) _pendingForceReload = true;
       return;
     }
+    _initialFetchAttempted = true;
     setState(() => _loading = true);
     final callId = widget.step.callId;
     final cacheKey = _currentCacheKey();
@@ -1461,9 +2527,12 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     final shouldReload = _pendingForceReload;
     _pendingForceReload = false;
     setState(() {
-      _detail = res;
+      if (res.isNotEmpty || _detail == null) {
+        _detail = res;
+      }
       _loading = false;
-      _loadedOnce = true;
+      // Never lock `_loadedOnce = true` on an empty 404 while the tool is still running!
+      _loadedOnce = widget.step.status != 'running' || res.isNotEmpty;
     });
     if (shouldReload) {
       _ensureLoaded(forceRefresh: true);
@@ -1534,7 +2603,9 @@ child: Text(
               onTap: () {
                 Clipboard.setData(ClipboardData(text: fullOut));
                 HapticFeedback.selectionClick();
-                ref.read(appProvider.notifier).showToast('已复制完整输出', tone: ToastTone.ok);
+                ProviderScope.containerOf(ctx, listen: false)
+                    .read(appProvider.notifier)
+                    .showToast('已复制完整输出', tone: ToastTone.ok);
                 Navigator.of(ctx).pop();
               },
             ),
@@ -1549,9 +2620,9 @@ child: Text(
     final expanded = ref.watch(
       appProvider.select((s) => s.expandedStepIds.contains(widget.step.callId)),
     );
-    if (expanded && !_loadedOnce && !_loading) {
+    if (expanded && !_loadedOnce && !_initialFetchAttempted && !_loading) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && !_loadedOnce && !_loading) {
+        if (mounted && !_loadedOnce && !_initialFetchAttempted && !_loading) {
           _ensureLoaded();
         }
       });
@@ -1559,15 +2630,18 @@ child: Text(
     final t = GrassBagTokens.of(context);
     final step = widget.step;
     final n = step.name.toLowerCase();
-    final isWrite = n == 'write' || n == 'write_file' || n == 'create_file' || n == 'create';
-    final isEdit = isWrite ||
-        n == 'edit' ||
-        n == 'edit_file' ||
-        n == 'patch' ||
-        n == 'apply_patch' ||
-        n == 'replace' ||
-        n.contains('edit') ||
-        n.contains('write');
+    final isTodo = n.contains('todo');
+    final isWrite = !isTodo &&
+        (n == 'write' || n == 'write_file' || n == 'create_file' || n == 'create');
+    final isEdit = !isTodo &&
+        (isWrite ||
+            n == 'edit' ||
+            n == 'edit_file' ||
+            n == 'patch' ||
+            n == 'apply_patch' ||
+            n == 'replace' ||
+            n.contains('edit') ||
+            n.contains('write'));
     final isCmd = n == 'cmd' ||
         n == 'bash' ||
         n == 'shell' ||
@@ -1580,40 +2654,135 @@ child: Text(
         n.contains('exec');
     final isWeb = n.contains('web') || n.contains('fetch') || n.contains('http');
     final isSubagent = n.contains('subagent') || n.contains('agent') || n.contains('delegate');
+    final isPhone = n.startsWith('phone_');
     final isErr = step.status == 'error';
+    final isCancelled = step.status == 'cancelled';
     final isRunning = widget.isStreaming && step.status == 'running';
+    _syncLivePollTimer(expanded, isRunning);
 
-    final icon = isEdit
-        ? CupertinoIcons.pencil
-        : isCmd
-            ? CupertinoIcons.chevron_left_slash_chevron_right
-            : isWeb
-                ? CupertinoIcons.globe
-                : isSubagent
-                    ? CupertinoIcons.arrow_branch
-                    : CupertinoIcons.search;
-    final verb = isWrite
-        ? '写入'
-        : (isEdit
-            ? '编辑'
-            : (isCmd
-                ? '执行'
-                : (isWeb ? '联网' : (isSubagent ? '委派' : '查阅'))));
-    final prefix = '${step.name} · ';
-    final displayTitle = step.title.startsWith(prefix) && step.title.length > prefix.length
-        ? step.title.substring(prefix.length)
-        : step.title;
-
-    final argsMap = _detail?['args'] is Map ? _detail!['args'] as Map : const {};
-    final argsText = (_detail?['argsText']?.toString() ?? '').trim();
-    final outputText = (_detail?['outputText']?.toString() ?? '').trim();
-    final effectiveOutput = outputText.isNotEmpty
-        ? outputText
-        : (step.summary.isNotEmpty
-            ? step.summary
-            : (isRunning ? '正在执行中…' : '（该操作无额外输出）'));
-    final cmdText = (argsMap['command'] ?? argsMap['cmd'])?.toString().trim() ?? '';
-    final filePath = (argsMap['file_path'] ?? argsMap['path'])?.toString().trim() ?? '';
+    final IconData icon;
+    final String verb;
+    if (isPhone) {
+      switch (n) {
+        case 'phone_tap':
+          icon = CupertinoIcons.hand_point_right_fill;
+          verb = '点按';
+          break;
+        case 'phone_long_press':
+          icon = CupertinoIcons.hand_draw_fill;
+          verb = '长按';
+          break;
+        case 'phone_swipe':
+          icon = CupertinoIcons.arrow_up_arrow_down;
+          verb = '滑动';
+          break;
+        case 'phone_type':
+          icon = CupertinoIcons.keyboard;
+          verb = '输入';
+          break;
+        case 'phone_open':
+          icon = CupertinoIcons.app_badge;
+          verb = '打开';
+          break;
+        case 'phone_screen':
+          icon = CupertinoIcons.viewfinder;
+          verb = '识屏';
+          break;
+        case 'phone_screenshot':
+          icon = CupertinoIcons.camera_viewfinder;
+          verb = '截屏';
+          break;
+        case 'phone_apps':
+          icon = CupertinoIcons.square_grid_2x2;
+          verb = '应用';
+          break;
+        case 'phone_key':
+          icon = CupertinoIcons.return_icon;
+          verb = '按键';
+          break;
+        case 'phone_intent':
+          icon = CupertinoIcons.bolt_fill;
+          verb = '快捷';
+          break;
+        case 'phone_wait':
+          icon = CupertinoIcons.clock;
+          verb = '等待';
+          break;
+        case 'phone_handoff':
+          icon = CupertinoIcons.person_crop_circle_badge_checkmark;
+          verb = '接管';
+          break;
+        case 'phone_return_app':
+          icon = CupertinoIcons.arrow_uturn_left_circle;
+          verb = '返回';
+          break;
+        default:
+          icon = CupertinoIcons.device_phone_portrait;
+          verb = '操控';
+          break;
+      }
+    } else if (isTodo) {
+      icon = CupertinoIcons.checkmark_circle;
+      verb = '待办';
+    } else {
+      final isRead = n == 'read' || n == 'read_file' || n.contains('read_file');
+      final isDir = n == 'ls' || n == 'list_dir' || n == 'list_directory' || n == 'listdir';
+      final isDel = n == 'delete' || n == 'delete_file' || n == 'remove_file' || n == 'rm';
+      final isMcp = n.startsWith('mcp__') || n.startsWith('mcp.');
+      icon = isDel
+          ? CupertinoIcons.trash
+          : isEdit
+              ? CupertinoIcons.pencil
+              : isCmd
+                  ? CupertinoIcons.chevron_left_slash_chevron_right
+                  : isWeb
+                      ? CupertinoIcons.globe
+                      : isSubagent
+                          ? CupertinoIcons.arrow_branch
+                          : isRead
+                              ? CupertinoIcons.doc_text
+                              : isDir
+                                  ? CupertinoIcons.folder
+                                  : isMcp
+                                      ? CupertinoIcons.cube_box
+                                      : CupertinoIcons.search;
+      verb = isDel
+          ? '删除'
+          : isWrite
+              ? '写入'
+              : (isEdit
+                  ? '编辑'
+                  : (isCmd
+                      ? '执行'
+                      : (isWeb
+                          ? '联网'
+                          : (isSubagent
+                              ? '委派'
+                              : (isRead
+                                  ? '读取'
+                                  : (isDir ? '目录' : (isMcp ? 'MCP' : '检索')))))));
+    }
+    _syncMemoizedLabels(step);
+    final rawDisplayTitle = _memoDisplayTitle;
+    // Middle-shorten deep file paths so the actual filename is ALWAYS visible instead of ellipsis!
+    final displayTitle = () {
+      if (rawDisplayTitle.length > 34 && rawDisplayTitle.contains('/')) {
+        final segs = rawDisplayTitle.split('/').where((s) => s.isNotEmpty).toList();
+        if (segs.length >= 3) {
+          final tail2 = '${segs[segs.length - 2]}/${segs.last}';
+          if (tail2.length < rawDisplayTitle.length - 3) {
+            return '…/$tail2';
+          }
+        }
+      }
+      return rawDisplayTitle;
+    }();
+    final isFileTool = isEdit ||
+        isWrite ||
+        n == 'read' ||
+        n == 'read_file' ||
+        n.contains('read_file');
+    final summaryPill = _memoSummaryPill;
     final durLabel = step.durationMs != null
         ? (step.durationMs! < 1000
             ? '${step.durationMs}ms'
@@ -1648,7 +2817,9 @@ child: Text(
                             : Icon(
                                 icon,
                                 size: 14,
-                                color: isErr ? t.err : (isEdit ? t.primary : t.text3),
+                                color: isErr
+                                    ? t.err
+                                    : ((isEdit || isPhone) ? t.primary : t.text3),
                               ),
                       ),
                     ),
@@ -1661,27 +2832,50 @@ child: Text(
                         color: isErr ? t.err : t.text2,
                       ),
                     ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
-                      child: Container(
-                        width: 3,
-                        height: 3,
-                        decoration: BoxDecoration(color: t.text3, shape: BoxShape.circle),
-                      ),
-                    ),
-                    Expanded(
-                      child: Text(
-                        displayTitle,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+                    ...() {
+                      final isRedundantTitle = displayTitle.trim().isEmpty ||
+                          displayTitle.trim() == _humanizeToolName(step.name).trim() ||
+                          displayTitle.trim().toLowerCase() == step.name.trim().toLowerCase();
+                      final shownTitle = isRedundantTitle
+                          ? (isRunning ? '准备参数…' : _humanizeToolName(step.name))
+                          : displayTitle;
+                      return [
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          child: Container(
+                            width: 3,
+                            height: 3,
+                            decoration: BoxDecoration(color: t.text3, shape: BoxShape.circle),
+                          ),
+                        ),
+                        Expanded(
+                          child: Text(
+                            shownTitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontFamily: (!isRedundantTitle && (isEdit || isCmd)) ? 'monospace' : null,
+                              fontSize: 12.5,
+                              color: isErr
+                                  ? t.err
+                                  : (isRedundantTitle && isRunning ? t.text3 : t.text),
+                            ),
+                          ),
+                        ),
+                      ];
+                    }(),
+                    if (isRunning) ...[
+                      const SizedBox(width: 6),
+                      _LiveElapsedClock(
+                        minTenths: 5,
                         style: TextStyle(
-                          fontFamily: (isEdit || isCmd) ? 'monospace' : null,
-                          fontSize: 12.5,
-                          color: isErr ? t.err : t.text,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w500,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.primary,
                         ),
                       ),
-                    ),
-                    if (durLabel != null && !isErr) ...[
+                    ] else if (durLabel != null && !isErr && !isCancelled) ...[
                       const SizedBox(width: 6),
                       Text(
                         durLabel,
@@ -1691,32 +2885,52 @@ child: Text(
                           color: t.text3,
                         ),
                       ),
-                    ] else if (step.summary.isNotEmpty && !isErr && !expanded) ...[
+                    ],
+                    if (summaryPill.isNotEmpty && !isErr && !isCancelled && !expanded) ...[
                       const SizedBox(width: 8),
                       ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 100),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: isCmd ? t.okSoft : t.fill1,
-                            borderRadius: BorderRadius.circular(99),
-                          ),
-                          child: Text(
-                            step.summary,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontFamily: isEdit ? 'monospace' : null,
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                              fontFeatures: const [FontFeature.tabularFigures()],
-                              color: isCmd ? t.ok : t.text2,
+                        constraints: const BoxConstraints(maxWidth: 112),
+                        child: () {
+                          final isPositiveCmd = isCmd &&
+                              (summaryPill.toLowerCase().contains('exit 0') ||
+                                  summaryPill.toLowerCase() == 'ok' ||
+                                  summaryPill.contains('通过'));
+                          return Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: isPositiveCmd ? t.okSoft : t.fill1,
+                              borderRadius: BorderRadius.circular(99),
                             ),
-                          ),
-                        ),
+                            child: Text(
+                              summaryPill,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: isEdit ? 'monospace' : null,
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w600,
+                                fontFeatures: const [FontFeature.tabularFigures()],
+                                color: isPositiveCmd ? t.ok : t.text2,
+                              ),
+                            ),
+                          );
+                        }(),
                       ),
                     ],
-                    if (isErr) ...[
+                    if (isCancelled) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: t.fill2,
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                        child: Text(
+                          '已中断',
+                          style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.text3),
+                        ),
+                      ),
+                    ] else if (isErr) ...[
                       const SizedBox(width: 6),
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
@@ -1757,12 +2971,48 @@ child: Text(
             ),
           ),
         ),
-        // Inline expandable tool parameters + real execution output panel
+        // Inline expandable tool parameters + real execution output panel (formatted lazily ONLY when expanded!)
         _SmoothDisclosure(
           expanded: expanded,
-          instant: widget.isStreaming,
-          builder: () => Container(
-            margin: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
+          builder: () {
+            final argsMap = _detail?['args'] is Map ? _detail!['args'] as Map : const {};
+            final rawArgs = (_detail?['argsText']?.toString() ?? '').trim();
+            final rawOut = (_detail?['outputText']?.toString() ?? '').trim();
+            // loadToolDetail() already pretty-prints JSON; memoize fallback summary formatting.
+            final argsText = rawArgs;
+            final outputText = rawOut;
+            final effectiveOutput = outputText.isNotEmpty
+                ? outputText
+                : (step.summary.isNotEmpty
+                    ? _formattedSummaryFor(step.summary)
+                    : (isRunning ? '正在执行中…' : (isCancelled ? '已中断该操作' : '（该操作无额外输出）')));
+            final cmdText = (argsMap['command'] ?? argsMap['cmd'])?.toString().trim() ?? '';
+            final filePath = (argsMap['file_path'] ??
+                    argsMap['filePath'] ??
+                    argsMap['path'] ??
+                    argsMap['target_file'] ??
+                    argsMap['filename'])
+                ?.toString()
+                .trim() ??
+                '';
+            final resolvedFilePath = filePath.isNotEmpty
+                ? filePath
+                : (isFileTool && rawDisplayTitle.isNotEmpty && !rawDisplayTitle.contains(' ')
+                    ? rawDisplayTitle
+                    : '');
+            // Synthesize real inline colored diff directly from edit/write/patch args!
+            final synthDiff = isEdit ? _synthesizeInlineDiffFromArgs(argsMap) : null;
+            final synthDiffRecord = (synthDiff != null && resolvedFilePath.isNotEmpty)
+                ? WorkspaceDiffRecord(
+                    path: resolvedFilePath,
+                    summary: '+${synthDiff.added} -${synthDiff.removed}',
+                    added: synthDiff.added,
+                    removed: synthDiff.removed,
+                    unifiedDiff: synthDiff.unified,
+                  )
+                : null;
+            return Container(
+              margin: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
             padding: const EdgeInsets.all(11),
             decoration: BoxDecoration(
               color: t.codeBg,
@@ -1791,8 +3041,8 @@ child: Text(
                 else ...[
                   if (cmdText.isNotEmpty) ...[
                     SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: Text(
+                      contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                      child: Text(
                         '\$ $cmdText',
                         style: const TextStyle(
                           fontFamily: 'monospace',
@@ -1804,6 +3054,57 @@ child: Text(
                       ),
                     ),
                     const SizedBox(height: 7),
+                  ] else if (synthDiff != null) ...[
+                    Row(
+                      children: [
+                        Text(
+                          '改动预览',
+                          style: const TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF94A3B8),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        if (synthDiff.added > 0)
+                          Text(
+                            '+${synthDiff.added}',
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF34D399),
+                            ),
+                          ),
+                        if (synthDiff.added > 0 && synthDiff.removed > 0) const SizedBox(width: 5),
+                        if (synthDiff.removed > 0)
+                          Text(
+                            '-${synthDiff.removed}',
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFFFCA5A5),
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 170),
+                      child: SingleChildScrollView(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: SelectionArea(
+                            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                            child: Text.rich(
+                              _highlightDiffSpan(synthDiff.unified),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
                   ] else if (argsText.isNotEmpty) ...[
                     Text(
                       '调用参数 (${step.name})',
@@ -1818,8 +3119,8 @@ child: Text(
                       constraints: const BoxConstraints(maxHeight: 110),
                       child: SingleChildScrollView(
                         child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: Text(
+                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                          child: Text(
                             argsText,
                             style: const TextStyle(
                               fontFamily: 'monospace',
@@ -1846,8 +3147,8 @@ child: Text(
                     constraints: const BoxConstraints(maxHeight: 220),
                     child: SingleChildScrollView(
                       child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: Text(
+                        contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                        child: Text(
                           effectiveOutput,
                           style: TextStyle(
                             fontFamily: 'monospace',
@@ -1861,8 +3162,8 @@ child: Text(
                   ),
                   const SizedBox(height: 8),
                   Wrap(
-                    spacing: 12,
-                    runSpacing: 6,
+                    spacing: 4,
+                    runSpacing: 2,
                     children: [
                       GrassBagSpringTap(
                         onTap: () {
@@ -1872,26 +3173,29 @@ child: Text(
                             if (mounted) setState(() => _copied = false);
                           });
                         },
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
-                              size: 12,
-                              color: _copied ? const Color(0xFF34D399) : const Color(0xFF94A3B8),
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              _copied ? '已复制' : '复制输出',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w500,
-                                color: _copied
-                                    ? const Color(0xFF34D399)
-                                    : const Color(0xFFCBD5E1),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                                size: 12,
+                                color: _copied ? const Color(0xFF34D399) : const Color(0xFF94A3B8),
                               ),
-                            ),
-                          ],
+                              const SizedBox(width: 4),
+                              Text(
+                                _copied ? '已复制' : '复制输出',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w500,
+                                  color: _copied
+                                      ? const Color(0xFF34D399)
+                                      : const Color(0xFFCBD5E1),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                       if (effectiveOutput.length > 260)
@@ -1900,67 +3204,126 @@ child: Text(
                             context,
                             isCmd: isCmd,
                             isErr: isErr,
-                            commandOrTitle: cmdText.isNotEmpty ? cmdText : displayTitle,
+                            commandOrTitle: cmdText.isNotEmpty ? cmdText : rawDisplayTitle,
                             fullOut: effectiveOutput,
                           ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.arrow_up_left_arrow_down_right,
-                                  size: 11.5, color: Color(0xFF60A5FA)),
-                              SizedBox(width: 4),
-                              Text(
-                                '全屏查看',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: Color(0xFF60A5FA),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.arrow_up_left_arrow_down_right,
+                                    size: 11.5, color: Color(0xFF60A5FA)),
+                                SizedBox(width: 4),
+                                Text(
+                                  '全屏查看',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF60A5FA),
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
+                          ),
+                        ),
+                      if (resolvedFilePath.isNotEmpty && !isErr)
+                        GrassBagSpringTap(
+                          onTap: () => showWorkspaceFilePreviewSheet(
+                            context,
+                            path: resolvedFilePath,
+                          ),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.doc_text,
+                                    size: 12, color: Color(0xFF7DD3FC)),
+                                SizedBox(width: 4),
+                                Text(
+                                  '查看文件',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF7DD3FC),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       if (isEdit && !isErr)
                         GrassBagSpringTap(
                           onTap: () => showDiffSheet(
                             context,
-                            filePath.isNotEmpty ? filePath : displayTitle,
+                            resolvedFilePath.isNotEmpty ? resolvedFilePath : rawDisplayTitle,
+                            record: synthDiffRecord,
                           ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.doc_text_search,
-                                  size: 12, color: Color(0xFF60A5FA)),
-                              SizedBox(width: 4),
-                              Text(
-                                '查看 Diff',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: Color(0xFF60A5FA),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.doc_text_search,
+                                    size: 12, color: Color(0xFF60A5FA)),
+                                SizedBox(width: 4),
+                                Text(
+                                  '查看 Diff',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFF60A5FA),
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
+                          ),
+                        ),
+                      if (step.subagentSessionId != null && step.subagentSessionId!.isNotEmpty)
+                        GrassBagSpringTap(
+                          onTap: () => ref.read(appProvider.notifier).selectSession(step.subagentSessionId!),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.arrow_branch,
+                                    size: 12, color: Color(0xFFC4B5FD)),
+                                SizedBox(width: 4),
+                                Text(
+                                  '查看子代理',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: Color(0xFFC4B5FD),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       if (isCmd)
                         GrassBagSpringTap(
                           onTap: widget.onOpenTerminal,
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.chevron_left_slash_chevron_right,
-                                  size: 11.5, color: Color(0xFF94A3B8)),
-                              SizedBox(width: 4),
-                              Text(
-                                '打开终端',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w500,
-                                  color: Color(0xFFCBD5E1),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(CupertinoIcons.chevron_left_slash_chevron_right,
+                                    size: 11.5, color: Color(0xFF94A3B8)),
+                                SizedBox(width: 4),
+                                Text(
+                                  '打开终端',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w500,
+                                    color: Color(0xFFCBD5E1),
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
                     ],
@@ -1968,7 +3331,8 @@ child: Text(
                 ],
               ],
             ),
-          ),
+          );
+          },
         ),
       ],
     );
@@ -1977,22 +3341,51 @@ child: Text(
 
 /// Unmistakable, always-visible Turn Error Banner Card matching `@deepseek-ai/dsh-client-ui-chat`'s
 /// `turn-error` display — never hidden inside collapsed steps, always selectable & copyable!
-class _TurnErrorCard extends StatelessWidget {
+class _TurnErrorCard extends StatefulWidget {
   const _TurnErrorCard({
     required this.turn,
     required this.tier,
     required this.onCopy,
     this.onRetry,
+    this.onEdit,
+    this.onOpenModel,
+    this.onOpenHost,
+    this.onSignIn,
+    this.onCompact,
   });
 
   final NormalizedTurn turn;
   final GrassBagGlassTier tier;
   final ValueChanged<String> onCopy;
   final VoidCallback? onRetry;
+  final VoidCallback? onEdit;
+  final VoidCallback? onOpenModel;
+  final VoidCallback? onOpenHost;
+  final VoidCallback? onSignIn;
+  final VoidCallback? onCompact;
+
+  @override
+  State<_TurnErrorCard> createState() => _TurnErrorCardState();
+}
+
+class _TurnErrorCardState extends State<_TurnErrorCard> {
+  bool _showTechDetail = false;
+  bool _copied = false;
+
+  void _handleCopy(String payload) {
+    widget.onCopy(payload);
+    if (!_copied) {
+      setState(() => _copied = true);
+      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+        if (mounted) setState(() => _copied = false);
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
+    final turn = widget.turn;
     final noticeErrors = turn.steps
         .whereType<NoticeStep>()
         .where((s) => s.level == 'error' && s.text.trim().isNotEmpty)
@@ -2005,6 +3398,11 @@ class _TurnErrorCard extends StatelessWidget {
     final copyPayload = (code != null && code.isNotEmpty && !rawDetail.contains(code))
         ? '[$code] $rawDetail'
         : rawDetail;
+    final classified = GrassBagController.classifyReadableError(rawDetail, code: code);
+    final showCompactRawInDefault = _isMostlyChinese(rawDetail);
+    final primaryBody = showCompactRawInDefault ? rawDetail : classified.guidance;
+    final hasInspectableDetail = copyPayload.isNotEmpty &&
+        (copyPayload != primaryBody || (code != null && code.isNotEmpty));
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -2027,7 +3425,7 @@ class _TurnErrorCard extends StatelessWidget {
               const SizedBox(width: 7),
               Expanded(
                 child: Text(
-                  code != null && code.isNotEmpty ? '执行失败 · $code' : '执行失败',
+                  classified.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -2037,53 +3435,164 @@ class _TurnErrorCard extends StatelessWidget {
                   ),
                 ),
               ),
+              if (hasInspectableDetail)
+                GrassBagSpringTap(
+                  onTap: () => setState(() => _showTechDetail = !_showTechDetail),
+                  pressedScale: 0.94,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _showTechDetail ? '收起详情' : '技术详情',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.err.withValues(alpha: 0.85),
+                          ),
+                        ),
+                        const SizedBox(width: 3),
+                        AnimatedRotation(
+                          turns: _showTechDetail ? 0.5 : 0.0,
+                          duration: const Duration(milliseconds: 180),
+                          child: Icon(
+                            CupertinoIcons.chevron_down,
+                            size: 11,
+                            color: t.err.withValues(alpha: 0.85),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
             ],
           ),
-          const SizedBox(height: 8),
-          SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: Text(
-              rawDetail,
-              style: TextStyle(
-                fontFamily: rawDetail.contains('Error') || rawDetail.contains('HTTP')
-                    ? 'monospace'
-                    : null,
-                fontSize: 12.5,
-                height: 1.48,
-                color: t.isDark ? t.text : Color.lerp(t.err, t.text, 0.35)!,
+          const SizedBox(height: 6),
+          Text(
+            primaryBody,
+            style: TextStyle(
+              fontSize: 12.5,
+              height: 1.48,
+              color: t.isDark ? t.text : Color.lerp(t.err, t.text, 0.42)!,
+            ),
+          ),
+          _SmoothDisclosure(
+            expanded: _showTechDetail && hasInspectableDetail,
+            builder: () => Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: t.isDark
+                      ? Colors.black.withValues(alpha: 0.22)
+                      : Colors.white.withValues(alpha: 0.65),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: t.err.withValues(alpha: 0.20),
+                    width: 0.6,
+                  ),
+                ),
+                child: SelectionArea(
+                  contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                  child: Text(
+                    copyPayload,
+                    style: TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 11.5,
+                      height: 1.45,
+                      color: t.isDark ? t.text2 : Color.lerp(t.err, t.text, 0.30)!,
+                    ),
+                  ),
+                ),
               ),
             ),
           ),
           const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              GrassBagSecondaryGlassButton(
-                label: '复制报错',
-                icon: CupertinoIcons.doc_on_doc,
-                height: 34,
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                tier: tier,
-                insideGlass: true,
-                destructive: true,
-                onTap: () => onCopy(copyPayload),
-              ),
-              if (onRetry != null)
-                GrassBagPrimaryGlassButton(
-                  label: '重新发送',
-                  icon: CupertinoIcons.arrow_clockwise,
-                  height: 34,
-                  padding: const EdgeInsets.symmetric(horizontal: 13),
-                  tier: tier,
-                  insideGlass: true,
-                  color: t.err,
-                  foregroundColor: t.err.computeLuminance() > 0.48
-                      ? const Color(0xFF1A0A0A)
-                      : Colors.white,
-                  onTap: onRetry!,
-                ),
-            ],
+          Consumer(
+            builder: (_, ref, __) {
+              final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
+              return Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (widget.onRetry != null)
+                    GrassBagPrimaryGlassButton(
+                      label: '重新发送',
+                      icon: CupertinoIcons.arrow_clockwise,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 13),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !streaming,
+                      color: t.isDark ? const Color(0xFFD94444) : t.err,
+                      foregroundColor: Colors.white,
+                      onTap: widget.onRetry!,
+                    ),
+                  if (widget.onEdit != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '编辑修改',
+                      icon: CupertinoIcons.pencil,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !streaming,
+                      onTap: widget.onEdit!,
+                    ),
+                  if (classified.actionKind == 'signin' && widget.onSignIn != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '重新登录 DeepSeek',
+                      icon: CupertinoIcons.person_crop_circle_badge_checkmark,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      onTap: widget.onSignIn!,
+                    ),
+                  if (classified.actionKind == 'host' && widget.onOpenHost != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '检查主机',
+                      icon: CupertinoIcons.antenna_radiowaves_left_right,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      onTap: widget.onOpenHost!,
+                    ),
+                  if (classified.actionKind == 'model' && widget.onOpenModel != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '切换模型 / 密钥',
+                      icon: CupertinoIcons.sparkles,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      onTap: widget.onOpenModel!,
+                    ),
+                  if (classified.actionKind == 'compact' && widget.onCompact != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '精简上下文',
+                      icon: CupertinoIcons.arrow_down_right_arrow_up_left,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      onTap: widget.onCompact!,
+                    ),
+                  GrassBagSecondaryGlassButton(
+                    label: _copied ? '已复制' : '复制报错',
+                    icon: _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                    height: 34,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    tier: widget.tier,
+                    insideGlass: true,
+                    destructive: !_copied,
+                    onTap: () => _handleCopy(copyPayload),
+                  ),
+                ],
+              );
+            },
           ),
         ],
       ),
@@ -2097,12 +3606,16 @@ class _AssistantBody extends StatefulWidget {
     required this.text,
     required this.isStreaming,
     required this.deliverables,
+    this.modifiedFiles = const [],
+    this.completedToolCount = 0,
+    this.cancelledPartial = false,
     this.usage,
     this.feedback,
     required this.onCopy,
     required this.onFork,
     required this.onFeedback,
     this.onRegenerate,
+    this.onContinue,
     required this.onDeliverableTap,
   });
 
@@ -2110,13 +3623,17 @@ class _AssistantBody extends StatefulWidget {
   final String text;
   final bool isStreaming;
   final List<Map<String, dynamic>> deliverables;
+  final List<String> modifiedFiles;
+  final int completedToolCount;
+  final bool cancelledPartial;
   final TurnUsage? usage;
   final String? feedback;
   final VoidCallback onCopy;
   final VoidCallback onFork;
   final ValueChanged<String> onFeedback;
   final VoidCallback? onRegenerate;
-  final ValueChanged<String> onDeliverableTap;
+  final VoidCallback? onContinue;
+  final ValueChanged<Map<String, dynamic>> onDeliverableTap;
 
   @override
   State<_AssistantBody> createState() => _AssistantBodyState();
@@ -2178,7 +3695,11 @@ class _AssistantBodyState extends State<_AssistantBody>
   static final RegExp _headingPattern = RegExp(r'^(#{1,6})\s+(.+)$');
   static final RegExp _hrPattern = RegExp(r'^([-*_])(?:\s*\1){2,}$');
   static final RegExp _tableSepPattern = RegExp(r'^\|?[\s:]*-+[\s:]*(?:\|[\s:]*-+[\s:]*)*\|?$');
-  static final RegExp _bulletPattern = RegExp(r'^([-*+•]|\d+\.)\s+(.+)$');
+  // Matches a table separator row mid-stream once at least one `-` cell exists (even with trailing `| ` or `| :`),
+  // preventing the table card from violently flickering back to raw pipe text on every column!
+  static final RegExp _streamingTableSepPartialRe =
+      RegExp(r'^\|?[\s:]*-+[\s:]*(?:\|[\s:\-]*)*$');
+  static final RegExp _bulletPattern = RegExp(r'^([-*+•]|\d+[.)])\s+(.+)$');
   static final RegExp _taskPrefixPattern = RegExp(r'^\[([ xX])\]\s+(.*)$');
   static final RegExp _standaloneImageRe = RegExp(r'^!\[([^\]]*)\]\((https?://[^\s)]+)\)$');
   static final Map<String, int> _revealedProgressByTurn = <String, int>{};
@@ -2196,7 +3717,6 @@ class _AssistantBodyState extends State<_AssistantBody>
   final List<_CachedMdBlock> _settledCachedBlocks = [];
   final List<_CachedMdBlock> _tailCachedBlocks = [];
   final Set<int> _streamedBlockIndices = <int>{};
-  Widget? _settledColumnCache;
   final List<TapGestureRecognizer> _fallbackRecognizers = [];
   final List<TapGestureRecognizer> _pendingDisposeRecognizers = [];
   bool _pendingDisposeScheduled = false;
@@ -2204,8 +3724,11 @@ class _AssistantBodyState extends State<_AssistantBody>
   String _settledHeadAnchor = '';
   String _settledTailAnchor = '';
   int _cachedSettledLen = -1;
+  int _cachedVisibleLen = -1;
+  String? _cachedSourceText;
   String? _cachedTailText;
   int _lastPrefixScanLen = 0;
+  bool _animateActionStripEntrance = false;
 
   static const int _anchorSampleLen = 24;
 
@@ -2275,7 +3798,6 @@ class _AssistantBodyState extends State<_AssistantBody>
       }
     }
     _tailCachedBlocks.clear();
-    _settledColumnCache = null;
     if (immediate) {
       for (final r in _fallbackRecognizers) {
         r.dispose();
@@ -2292,6 +3814,8 @@ class _AssistantBodyState extends State<_AssistantBody>
     _settledHeadAnchor = '';
     _settledTailAnchor = '';
     _cachedSettledLen = -1;
+    _cachedVisibleLen = -1;
+    _cachedSourceText = null;
     _cachedTailText = null;
     _lastPrefixScanLen = 0;
   }
@@ -2308,6 +3832,7 @@ class _AssistantBodyState extends State<_AssistantBody>
   // Smooth 60/120Hz adaptive typewriter engine (eliminates lumpy chunk pops & vertical jitter)
   late int _revealedLen;
   double _charBudget = 0.0;
+  Duration? _lastEmitElapsed;
   Ticker? _typeTicker;
   Duration? _lastTickElapsed;
 
@@ -2318,10 +3843,18 @@ class _AssistantBodyState extends State<_AssistantBody>
     // Streaming turns restore prior progress if remounted after scrolling out & back,
     // and reveal at least 1 character on Frame 0 so the assistant block never collapses to 0px -> 50px.
     if (widget.isStreaming) {
+      _animateActionStripEntrance = true;
       final prev = _revealedProgressByTurn[widget.turnId] ?? 0;
-      _revealedLen = prev > 0
-          ? prev.clamp(0, widget.text.length)
-          : _safeInitialReveal(widget.text);
+      if (prev > 0) {
+        _revealedLen = prev.clamp(0, widget.text.length);
+      } else if (widget.text.length > 64) {
+        // Switching back to an already-populated live stream: snap to the live frontier
+        // so users don't watch hundreds of already-generated chars replay from char 1!
+        _revealedLen = widget.text.length;
+        _rememberRevealed(widget.turnId, _revealedLen);
+      } else {
+        _revealedLen = _safeInitialReveal(widget.text);
+      }
     } else {
       _revealedLen = widget.text.length;
     }
@@ -2339,9 +3872,14 @@ class _AssistantBodyState extends State<_AssistantBody>
       _streamedBlockIndices.clear();
       if (widget.isStreaming) {
         final prev = _revealedProgressByTurn[widget.turnId] ?? 0;
-        _revealedLen = prev > 0
-            ? prev.clamp(0, targetLen)
-            : _safeInitialReveal(widget.text);
+        if (prev > 0) {
+          _revealedLen = prev.clamp(0, targetLen);
+        } else if (targetLen > 64) {
+          _revealedLen = targetLen;
+          _rememberRevealed(widget.turnId, _revealedLen);
+        } else {
+          _revealedLen = _safeInitialReveal(widget.text);
+        }
       } else {
         _revealedLen = targetLen;
       }
@@ -2382,6 +3920,11 @@ class _AssistantBodyState extends State<_AssistantBody>
       _revealedLen = targetLen;
       _revealedProgressByTurn.remove(widget.turnId);
       _stopTypeTicker();
+    } else if (oldWidget.isStreaming && !widget.isStreaming && widget.cancelledPartial) {
+      // User tapped Stop -> halt typewriter INSTANTLY instead of drifting another ~300ms!
+      _revealedLen = targetLen;
+      _revealedProgressByTurn.remove(widget.turnId);
+      _stopTypeTicker();
     } else if (_revealedLen < targetLen) {
       _startTypeTicker();
     } else if (!widget.isStreaming && _revealedLen >= targetLen) {
@@ -2415,6 +3958,7 @@ class _AssistantBodyState extends State<_AssistantBody>
       _typeTicker!.stop();
     }
     _lastTickElapsed = null;
+    _lastEmitElapsed = null;
     _charBudget = 0.0;
   }
 
@@ -2444,6 +3988,19 @@ class _AssistantBodyState extends State<_AssistantBody>
     _charBudget += charsPerSec * dtSec;
     final step = _charBudget.floor();
     if (step <= 0) return;
+
+    // Adaptive setState pacing: 60Hz (16ms) for prose, 25Hz (40ms) when streaming a large
+    // unsettled code block / table tail (>400 chars) so 120Hz phones avoid redundant full-tail re-layout.
+    final unsettledLen = _revealedLen - _settledLen;
+    final minEmitUs = widget.isStreaming
+        ? (unsettledLen > 400 ? 40000 : 15500)
+        : 15500;
+    if (_lastEmitElapsed != null &&
+        (elapsed - _lastEmitElapsed!).inMicroseconds < minEmitUs &&
+        _revealedLen + step < targetLen) {
+      return;
+    }
+    _lastEmitElapsed = elapsed;
     _charBudget -= step;
 
     var nextLen = (_revealedLen + step).clamp(0, targetLen);
@@ -2476,21 +4033,31 @@ class _AssistantBodyState extends State<_AssistantBody>
     return trimmedLine.substring(count).trim().isEmpty;
   }
 
-  /// Stabilize dangling unclosed inline syntax at the streaming tail (`**`, `` ` ``)
-  /// so half-typed tokens never flicker raw syntax markers back and forth.
-  /// Starts scanning from [settledOffset] (guaranteed outside open fences) using indexOf
-  /// so 60/120Hz typewriter frames are O(tail) with ZERO full-message `split('\n')` allocations!
+  static final RegExp _incompleteLinkTailRe = RegExp(r'(!?)\[([^\]\n]+)\]\([^)\n]*$');
+  static final RegExp _incompleteBlockStarterRe = RegExp(
+    r'^(?:#{1,6}\s*|-{1,2}|>{1}\s*\[![A-Za-z]*|[-*+]\s+\[[ xX]?\]?)$',
+  );
+
+  /// Stabilize dangling unclosed block & inline syntax at the streaming tail
+  /// (`**`, `` ` ``, `~~`, `[label](url`, GFM table separators, partial closing code/math fences)
+  /// so tokens render styled smoothly with ZERO raw-syntax flash or card flicker.
   static String _stabilizeStreamingText(String raw, [int settledOffset = 0]) {
     if (raw.isEmpty) return raw;
     String? openChar;
     var openLen = 0;
+    var inMathBlock = false;
+    var mathBlockCloser = r'$$';
     var pos = settledOffset.clamp(0, raw.length);
     final rawLen = raw.length;
+    var lastLineStart = pos;
     while (pos < rawLen) {
       final nl = raw.indexOf('\n', pos);
       final end = nl < 0 ? rawLen : nl;
-      final t = raw.substring(pos, end).trimLeft();
-      if (openChar == null) {
+      lastLineStart = pos;
+      final rawLine = raw.substring(pos, end);
+      final t = rawLine.trimLeft();
+      final exactTrim = rawLine.trim();
+      if (openChar == null && !inMathBlock) {
         final m = _openFenceRe.firstMatch(t);
         if (m != null) {
           final f = m.group(1)!;
@@ -2499,42 +4066,138 @@ class _AssistantBodyState extends State<_AssistantBody>
             openChar = f[0];
             openLen = f.length;
           }
+        } else if (exactTrim.startsWith(r'$$') && !exactTrim.substring(2).contains(r'$$')) {
+          inMathBlock = true;
+          mathBlockCloser = r'$$';
+        } else if (exactTrim.startsWith(r'\[') && !exactTrim.substring(2).contains(r'\]')) {
+          inMathBlock = true;
+          mathBlockCloser = r'\]';
         }
-      } else if (_isClosingFence(t, openChar, openLen)) {
+      } else if (inMathBlock) {
+        if (exactTrim.endsWith(mathBlockCloser)) {
+          inMathBlock = false;
+        }
+      } else if (_isClosingFence(t, openChar!, openLen)) {
         openChar = null;
         openLen = 0;
       }
       if (nl < 0) break;
       pos = nl + 1;
     }
-    if (openChar != null) return raw;
-    // Stabilize trailing unclosed delimiters (`***`, `**`, `~~`, `` `` ``, `` ` ``, half-closed `**word*`) on the last line
+
+    // 1. Inside an open fenced code block: strip a half-typed closing fence (`\n`` `)
+    //    so literal backticks never flash on the last line of the code card!
+    if (openChar != null) {
+      final lastLine = raw.substring(lastLineStart);
+      final lt = lastLine.trimLeft();
+      if (lastLineStart > settledOffset &&
+          lt.isNotEmpty &&
+          lt.length < openLen &&
+          lt.split('').every((c) => c == openChar)) {
+        return raw.substring(0, lastLineStart > 0 ? lastLineStart - 1 : 0);
+      }
+      return raw;
+    }
+
+    // 2. Inside an open display math block: strip trailing single `$` or `\` partial closer.
+    if (inMathBlock) {
+      final lastLine = raw.substring(lastLineStart).trim();
+      if ((mathBlockCloser == r'$$' && lastLine == r'$') ||
+          (mathBlockCloser == r'\]' && lastLine == r'\')) {
+        return raw.substring(0, lastLineStart > 0 ? lastLineStart - 1 : 0);
+      }
+      return raw;
+    }
+
+    // 3. Stabilize prose / table tail on the last line.
     final lastNl = raw.lastIndexOf('\n');
-    final tail = lastNl >= 0 ? raw.substring(lastNl + 1) : raw;
+    final prefix = lastNl >= 0 ? raw.substring(0, lastNl + 1) : '';
+    var tail = lastNl >= 0 ? raw.substring(lastNl + 1) : raw;
+    final tailTrim = tail.trim();
+
+    // 3a. GFM table streaming protection:
+    //     - If the previous line looks like a table header/row (`contains('|')`):
+    //       * Bare `|` at the start of a new row -> hold until first cell chars arrive (no stray `|` paragraph).
+    //       * Partial separator row (`| --- | ` / `| --- | :`) -> normalize to clean closed separator so
+    //         `_tableSepPattern` stays matched continuously and never flips back to raw pipe text!
+    if (lastNl > 0) {
+      final prevNl = raw.lastIndexOf('\n', lastNl - 1);
+      final prevLine = raw.substring(prevNl + 1, lastNl).trim();
+      if (prevLine.contains('|')) {
+        if (tailTrim == '|' || tailTrim == '| -' || tailTrim == '| :' || tailTrim == '| :-') {
+          return raw.substring(0, lastNl);
+        }
+        if (_streamingTableSepPartialRe.hasMatch(tailTrim) &&
+            !_tableSepPattern.hasMatch(tailTrim)) {
+          // Close trailing partial cell (`| ` or `| :`) cleanly so table card never unmounts!
+          final cleaned = tailTrim.replaceFirst(RegExp(r'\|[\s:]*$'), '|');
+          if (_tableSepPattern.hasMatch(cleaned)) {
+            return '$prefix$cleaned';
+          }
+          return raw.substring(0, lastNl);
+        }
+      }
+    }
+
+    // 3b. Hold bare line-start block tokens (`#`, `## `, `--`, `> [!`, `- [x]`) until content arrives.
+    if (tailTrim.isNotEmpty && _incompleteBlockStarterRe.hasMatch(tailTrim)) {
+      return lastNl >= 0 ? raw.substring(0, lastNl) : '';
+    }
+
+    // 3c. Sanitize incomplete `[label](https://...` or `![alt](https://...` at the end of the tail
+    //     so bare-URL autolink never hijacks half-streamed links and collapses lines when `)` arrives!
+    final linkMatch = _incompleteLinkTailRe.firstMatch(tail);
+    if (linkMatch != null) {
+      final isImg = linkMatch.group(1) == '!';
+      final label = linkMatch.group(2) ?? '';
+      tail = '${tail.substring(0, linkMatch.start)}${isImg ? '' : label}';
+    }
+
+    // 3d. Strip bare trailing opener tokens, OR auto-close active inline spans (`**text`, `` `code ``, `~~del`)
+    //     so bold / inline-code / strikethrough render styled immediately while streaming!
     if (tail.endsWith('``') && !tail.endsWith('```')) {
-      return raw.substring(0, raw.length - 2);
+      return '$prefix${tail.substring(0, tail.length - 2)}';
     }
     final backticks = '`'.allMatches(tail).length;
-    if (backticks.isOdd && tail.endsWith('`')) {
-      return raw.substring(0, raw.length - 1);
+    if (backticks.isOdd) {
+      if (tail.endsWith('`')) {
+        return '$prefix${tail.substring(0, tail.length - 1)}';
+      }
+      // Auto-close active inline code span (`foo -> `foo`)
+      return '$prefix$tail`';
     }
     if (tail.endsWith('***')) {
-      return raw.substring(0, raw.length - 3);
+      return '$prefix${tail.substring(0, tail.length - 3)}';
     }
     if (tail.endsWith('**')) {
       final boldCount = '**'.allMatches(tail).length;
-      if (boldCount.isOdd) return raw.substring(0, raw.length - 2);
+      if (boldCount.isOdd) return '$prefix${tail.substring(0, tail.length - 2)}';
     } else if (tail.endsWith('*') && tail.length >= 2 && tail[tail.length - 2] != ' ') {
-      // Prevent `**bold*` (first char of closing `**`) from flashing italic before the second `*` arrives.
       final withoutLast = tail.substring(0, tail.length - 1);
       final boldCount = '**'.allMatches(withoutLast).length;
-      if (boldCount.isOdd) return raw.substring(0, raw.length - 1);
+      if (boldCount.isOdd) return '$prefix$withoutLast**';
+    } else {
+      final boldCount = '**'.allMatches(tail).length;
+      if (boldCount.isOdd) {
+        final lastOpen = tail.lastIndexOf('**');
+        if (lastOpen >= 0 && lastOpen + 2 < tail.length && tail[lastOpen + 2] != ' ') {
+          return '$prefix$tail**';
+        }
+      }
     }
     if (tail.endsWith('~~')) {
       final strikeCount = '~~'.allMatches(tail).length;
-      if (strikeCount.isOdd) return raw.substring(0, raw.length - 2);
+      if (strikeCount.isOdd) return '$prefix${tail.substring(0, tail.length - 2)}';
+    } else {
+      final strikeCount = '~~'.allMatches(tail).length;
+      if (strikeCount.isOdd) {
+        final lastOpen = tail.lastIndexOf('~~');
+        if (lastOpen >= 0 && lastOpen + 2 < tail.length && tail[lastOpen + 2] != ' ') {
+          return '$prefix$tail~~';
+        }
+      }
     }
-    return raw;
+    return '$prefix$tail';
   }
 
   void _handleCopy() {
@@ -2654,6 +4317,59 @@ class _AssistantBodyState extends State<_AssistantBody>
     return -1;
   }
 
+  /// Find balanced `]` matching `[` at [startIdx] (hoisted static helper to avoid per-char closures).
+  static int _findBalancedBracketClose(String input, int startIdx) {
+    final len = input.length;
+    var scan = startIdx;
+    var bDepth = 0;
+    while (scan < len) {
+      final c = input[scan];
+      if (c == r'\' && scan + 1 < len) {
+        scan += 2;
+        continue;
+      }
+      if (c == '`') {
+        var te = scan;
+        while (te < len && input[te] == '`') {
+          te++;
+        }
+        final cc = _findExactBacktickClose(input, te, te - scan);
+        scan = cc >= 0 ? cc + (te - scan) : te;
+        continue;
+      }
+      if (c == '[') {
+        bDepth++;
+      } else if (c == ']') {
+        if (bDepth == 0) return scan;
+        bDepth--;
+      } else if (c == '\n') {
+        return -1;
+      }
+      scan++;
+    }
+    return -1;
+  }
+
+  /// Find balanced `)` matching `(` at [startIdx] (hoisted static helper to avoid per-char closures).
+  static int _findBalancedParenClose(String input, int startIdx) {
+    final len = input.length;
+    var scan = startIdx;
+    var pDepth = 0;
+    while (scan < len) {
+      final c = input[scan];
+      if (c == '(') {
+        pDepth++;
+      } else if (c == ')') {
+        if (pDepth == 0) return scan;
+        pDepth--;
+      } else if (c == ' ' || c == '\n' || c == '\t') {
+        return -1;
+      }
+      scan++;
+    }
+    return -1;
+  }
+
   static List<InlineSpan> _buildMarkdownSpans(
     String input,
     GrassBagTokens t,
@@ -2677,6 +4393,34 @@ class _AssistantBodyState extends State<_AssistantBody>
     var i = 0;
     while (i < len) {
       final ch = input[i];
+
+      // DeepSeek inline/display LaTeX `\(...\)` and `\[...\]` BEFORE generic backslash unescaping!
+      if (ch == r'\' && i + 1 < len && (input[i + 1] == '(' || input[i + 1] == '[')) {
+        final isBracket = input[i + 1] == '[';
+        final closeToken = isBracket ? r'\]' : r'\)';
+        final closeIdx = _findClosingDelim(input, i + 2, closeToken, allowNewline: isBracket);
+        if (closeIdx > i + 2) {
+          final mathBody = input.substring(i + 2, closeIdx).trim();
+          if (mathBody.isNotEmpty) {
+            flushBuf();
+            spans.add(
+              TextSpan(
+                text: _formatReadableLatex(mathBody),
+                recognizer: linkRecognizer,
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 13.4,
+                  fontStyle: FontStyle.italic,
+                  color: t.isDark ? t.primaryHi : t.primary,
+                  backgroundColor: t.fill1,
+                ),
+              ),
+            );
+            i = closeIdx + 2;
+            continue;
+          }
+        }
+      }
 
       // Escaped markdown punctuation
       if (ch == r'\' && i + 1 < len && r'\`*_{}[]()#+-.!~|$'.contains(input[i + 1])) {
@@ -2708,11 +4452,11 @@ class _AssistantBodyState extends State<_AssistantBody>
               flushBuf();
               spans.add(
                 TextSpan(
-                  text: ' $mathBody ',
+                  text: _formatReadableLatex(mathBody),
                   recognizer: linkRecognizer,
                   style: TextStyle(
                     fontFamily: 'monospace',
-                    fontSize: 13.2,
+                    fontSize: 13.4,
                     fontStyle: FontStyle.italic,
                     color: t.isDark ? t.primaryHi : t.primary,
                     backgroundColor: t.fill1,
@@ -2726,7 +4470,8 @@ class _AssistantBodyState extends State<_AssistantBody>
         }
       }
 
-      // Inline code span `` `code` `` rendered as pure TextSpan (exact backtick-run matching!).
+      // Inline code span `` `code` `` rendered as pure TextSpan WITHOUT invisible NBSP (\u00A0)
+      // so copying commands, flags, or paths pastes cleanly into shells & IDEs!
       if (ch == '`') {
         var tickEnd = i;
         while (tickEnd < len && input[tickEnd] == '`') {
@@ -2739,12 +4484,13 @@ class _AssistantBodyState extends State<_AssistantBody>
           final code = input.substring(tickEnd, closeIdx).trim();
           spans.add(
             TextSpan(
-              text: '\u00A0$code\u00A0',
+              text: code,
               recognizer: linkRecognizer,
               style: TextStyle(
                 fontFamily: 'monospace',
                 fontSize: 13,
                 fontWeight: FontWeight.w500,
+                letterSpacing: 0.1,
                 decoration: TextDecoration.none,
                 color: t.text,
                 backgroundColor: t.isDark
@@ -2758,11 +4504,11 @@ class _AssistantBodyState extends State<_AssistantBody>
         }
       }
 
-      // Inline Markdown image `![alt](https://...)` -> tappable preview link
+      // Inline Markdown image `![alt](https://...)` -> tappable preview link (balanced brackets & parens!)
       if (linkRecognizer == null && ch == '!' && i + 1 < len && input[i + 1] == '[') {
-        final closeBracket = input.indexOf(']', i + 2);
+        final closeBracket = _findBalancedBracketClose(input, i + 2);
         if (closeBracket > i + 1 && closeBracket + 1 < len && input[closeBracket + 1] == '(') {
-          final closeParen = input.indexOf(')', closeBracket + 2);
+          final closeParen = _findBalancedParenClose(input, closeBracket + 2);
           if (closeParen > closeBracket + 2) {
             final alt = input.substring(i + 2, closeBracket).trim();
             final imgUrl = input.substring(closeBracket + 2, closeParen).trim();
@@ -2800,34 +4546,43 @@ class _AssistantBodyState extends State<_AssistantBody>
         }
       }
 
-      // Link `[label](https://...)` with balanced parentheses & recursive inline styling in label
+      // Link `[label](url)` — supports `https://`, `file://`, and relative workspace file paths!
       if (linkRecognizer == null && ch == '[') {
-        final closeBracket = input.indexOf(']', i + 1);
+        final closeBracket = _findBalancedBracketClose(input, i + 1);
         if (closeBracket > i + 1 && closeBracket + 1 < len && input[closeBracket + 1] == '(') {
-          var urlEnd = closeBracket + 2;
-          var parenDepth = 0;
-          var validEnd = -1;
-          while (urlEnd < len) {
-            final c = input[urlEnd];
-            if (c == '(') {
-              parenDepth++;
-            } else if (c == ')') {
-              if (parenDepth == 0) {
-                validEnd = urlEnd;
-                break;
-              }
-              parenDepth--;
-            } else if (c == ' ' || c == '\n' || c == '\t') {
-              break;
-            }
-            urlEnd++;
-          }
+          final validEnd = _findBalancedParenClose(input, closeBracket + 2);
           if (validEnd > closeBracket + 2) {
             final linkLabel = input.substring(i + 1, closeBracket);
-            final linkUrl = input.substring(closeBracket + 2, validEnd);
-            if (linkUrl.startsWith('http://') || linkUrl.startsWith('https://')) {
+            final linkUrl = input.substring(closeBracket + 2, validEnd).trim();
+            final isWebUrl = linkUrl.startsWith('http://') || linkUrl.startsWith('https://');
+            final isFileLink = linkUrl.startsWith('file://') ||
+                (!linkUrl.contains('://') &&
+                    !linkUrl.startsWith('#') &&
+                    !linkUrl.startsWith('mailto:') &&
+                    (linkUrl.contains('/') ||
+                        RegExp(r'\.[a-zA-Z0-9]{1,8}(?:#L\d+(?:-L?\d+)?)?$').hasMatch(linkUrl)));
+            if (isWebUrl || isFileLink) {
               flushBuf();
-              final recognizer = _makeUrlRecognizer(linkUrl, previewContext);
+              final TapGestureRecognizer recognizer;
+              if (isWebUrl) {
+                recognizer = _makeUrlRecognizer(linkUrl, previewContext);
+              } else {
+                var cleanPath = linkUrl.startsWith('file://')
+                    ? Uri.decodeFull(linkUrl.substring(7))
+                    : linkUrl;
+                final hashIdx = cleanPath.indexOf('#');
+                if (hashIdx > 0) cleanPath = cleanPath.substring(0, hashIdx);
+                recognizer = TapGestureRecognizer()
+                  ..onTap = () {
+                    if (previewContext != null && previewContext.mounted) {
+                      showWorkspaceFilePreviewSheet(
+                        previewContext,
+                        path: cleanPath,
+                        title: linkLabel.trim().isNotEmpty ? linkLabel.trim() : null,
+                      );
+                    }
+                  };
+              }
               outRecognizers.add(recognizer);
               final labelChildren = depth < 4
                   ? _buildMarkdownSpans(
@@ -3075,13 +4830,14 @@ class _AssistantBodyState extends State<_AssistantBody>
     }
     flushBuf();
     if (showCursor) {
-      // Pure text-metric cursor glyph (identical baseline & line height — ZERO vertical twitch!)
+      // Non-copyable, Word-Joiner-anchored breathing capsule caret (NEVER orphans onto a blank
+      // line, NEVER copies into clipboard when selecting text mid-stream, and matches line height!).
+      spans.add(const TextSpan(text: '\u2060'));
       spans.add(
-        TextSpan(
-          text: ' ▍',
-          style: TextStyle(
-            color: t.primary.withValues(alpha: 0.78),
-            fontWeight: FontWeight.w400,
+        WidgetSpan(
+          alignment: PlaceholderAlignment.middle,
+          child: SelectionContainer.disabled(
+            child: _LiveStreamingCaret(color: t.primary),
           ),
         ),
       );
@@ -3173,26 +4929,45 @@ class _AssistantBodyState extends State<_AssistantBody>
         continue;
       }
 
-      // Display LaTeX math block (`$$ ... $$` single-line or multi-line)
-      if (trimmed.startsWith(r'$$')) {
+      // Display LaTeX math block (`$$ ... $$` or DeepSeek `\[ ... \]`, single-line or multi-line).
+      // CRITICAL: If a closer appears mid-line with trailing prose (e.g. `$$E=mc^2$$ 是质能方程`),
+      // leave the line to inline paragraph parsing so we NEVER swallow the rest of the message!
+      if (trimmed.startsWith(r'$$') || trimmed.startsWith(r'\[')) {
+        final isBracketMath = trimmed.startsWith(r'\[');
+        final closer = isBracketMath ? r'\]' : r'$$';
         final rest = trimmed.substring(2).trim();
-        if (rest.endsWith(r'$$') && rest.length > 2) {
-          flushParagraph();
-          final formula = rest.substring(0, rest.length - 2).trim();
-          out.add(_RawMdBlock(kind: _MdBlockKind.math, raw: line, body: formula));
-          i++;
-          continue;
-        }
-        if (rest.isEmpty) {
+        final closerIdxInRest = rest.indexOf(closer);
+        if (closerIdxInRest >= 0) {
+          // Single-line display math ONLY when the closer is cleanly at the very end!
+          if (closerIdxInRest == rest.length - closer.length && rest.length > closer.length) {
+            flushParagraph();
+            final formula = rest.substring(0, closerIdxInRest).trim();
+            out.add(_RawMdBlock(kind: _MdBlockKind.math, raw: line, body: formula));
+            i++;
+            continue;
+          }
+          // Otherwise fall through to paragraph inline math parsing!
+        } else {
+          // Multi-line display math: `$$\nexpr\n$$` or `$$expr\n...$$`
           flushParagraph();
           final startIdx = i;
-          final mathLines = <String>[];
+          final mathLines = <String>[if (rest.isNotEmpty) rest];
           i++;
-          while (i < lines.length && lines[i].trim() != r'$$') {
+          while (i < lines.length) {
+            final curTrim = lines[i].trim();
+            if (curTrim == closer) {
+              i++;
+              break;
+            }
+            if (curTrim.endsWith(closer)) {
+              final beforeCloser = curTrim.substring(0, curTrim.length - closer.length).trim();
+              if (beforeCloser.isNotEmpty) mathLines.add(beforeCloser);
+              i++;
+              break;
+            }
             mathLines.add(lines[i]);
             i++;
           }
-          if (i < lines.length) i++;
           out.add(
             _RawMdBlock(
               kind: _MdBlockKind.math,
@@ -3292,12 +5067,15 @@ class _AssistantBodyState extends State<_AssistantBody>
         continue;
       }
 
-      // Bullet, numbered list, or task-checkbox item (`- [x]`, `- [ ]`)
+      // Bullet, numbered list, or task-checkbox item (`- [x]`, `- [ ]`, `1.`, `1)`)
       final bulletMatch = _bulletPattern.firstMatch(trimmed);
       if (bulletMatch != null) {
         flushParagraph();
-        final leadingSpaces = line.length - trimmed.length;
-        final indent = (leadingSpaces ~/ 2).clamp(0, 4) * 14.0;
+        var leadingCols = 0;
+        for (var ci = 0; ci < line.length - trimmed.length; ci++) {
+          leadingCols += line.codeUnitAt(ci) == 0x09 /* '\t' */ ? 2 : 1;
+        }
+        final indent = (leadingCols ~/ 2).clamp(0, 4) * 14.0;
         var itemBody = bulletMatch.group(2)!;
         bool? taskChecked;
         final taskMatch = _taskPrefixPattern.firstMatch(itemBody);
@@ -3341,44 +5119,20 @@ class _AssistantBodyState extends State<_AssistantBody>
     final key = ValueKey('md-blk-$idx');
     switch (blk.kind) {
       case _MdBlockKind.code:
-        if (isStreamingBlock) {
+        if (isStreamingBlock || widget.isStreaming) {
           _streamedBlockIndices.add(idx);
         }
-        return RepaintBoundary(
-          key: key,
-          child: _FencedCodeBlock(
-            lang: blk.lang,
-            code: blk.body,
-            isStreaming: isStreamingBlock,
-            initiallyExpanded: isStreamingBlock || _streamedBlockIndices.contains(idx),
-          ),
+        return _FencedCodeBlock(
+          lang: blk.lang,
+          code: blk.body,
+          isStreaming: isStreamingBlock,
+          initiallyExpanded: isStreamingBlock || _streamedBlockIndices.contains(idx),
         );
       case _MdBlockKind.math:
-        return Padding(
+        return _DisplayMathCard(
           key: key,
-          padding: const EdgeInsets.only(top: 4, bottom: 10),
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            decoration: BoxDecoration(
-              color: t.fill1,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: t.sep, width: 0.6),
-            ),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Text(
-                blk.body,
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 13.5,
-                  height: 1.55,
-                  fontStyle: FontStyle.italic,
-                  color: t.isDark ? t.primaryHi : t.primary,
-                ),
-              ),
-            ),
-          ),
+          rawLatex: blk.body,
+          isStreaming: isStreamingBlock,
         );
       case _MdBlockKind.heading:
         final fontSize = switch (blk.level) {
@@ -3402,6 +5156,7 @@ class _AssistantBodyState extends State<_AssistantBody>
                 blk.body,
                 t,
                 recognizers,
+                showCursor: showCursor,
                 previewContext: context,
               ),
             ),
@@ -3500,22 +5255,72 @@ class _AssistantBodyState extends State<_AssistantBody>
           for (int ri = 2; ri < blk.tableLines.length; ri++)
             _splitTableRow(blk.tableLines[ri].trim()),
         ];
-        return RepaintBoundary(
-          key: key,
-          child: _MarkdownTableCard(
-            headers: headers,
-            alignments: alignments,
-            rows: rows,
-            rawMarkdown: blk.raw,
-            spanBuilder: (cellText, tokens, cellRecognizers) => _buildMarkdownSpans(
-              cellText,
-              tokens,
-              cellRecognizers,
-              previewContext: context,
-            ),
+        return _MarkdownTableCard(
+          headers: headers,
+          alignments: alignments,
+          rows: rows,
+          rawMarkdown: blk.raw,
+          isStreaming: isStreamingBlock,
+          spanBuilder: (cellText, tokens, cellRecognizers) => _buildMarkdownSpans(
+            cellText,
+            tokens,
+            cellRecognizers,
+            previewContext: context,
           ),
         );
       case _MdBlockKind.quote:
+        final calloutMatch = RegExp(
+          r'^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*(?:\n|$)',
+          caseSensitive: false,
+        ).firstMatch(blk.body.trimLeft());
+        final String? calloutKind = calloutMatch?.group(1)?.toUpperCase();
+        final effectiveQuoteBody = calloutMatch != null
+            ? blk.body.trimLeft().substring(calloutMatch.end).trim()
+            : blk.body;
+        final Color accentColor;
+        final Color bgColor;
+        final IconData? calloutIcon;
+        final String? calloutLabel;
+        switch (calloutKind) {
+          case 'NOTE':
+            accentColor = t.primary;
+            bgColor = t.primarySoft;
+            calloutIcon = CupertinoIcons.info_circle_fill;
+            calloutLabel = '备注';
+            break;
+          case 'TIP':
+            accentColor = t.ok;
+            bgColor = t.okSoft;
+            calloutIcon = CupertinoIcons.lightbulb_fill;
+            calloutLabel = '提示';
+            break;
+          case 'IMPORTANT':
+            accentColor = const Color(0xFF8B5CF6);
+            bgColor = const Color(0xFF8B5CF6).withValues(alpha: t.isDark ? 0.16 : 0.10);
+            calloutIcon = CupertinoIcons.exclamationmark_circle_fill;
+            calloutLabel = '重要';
+            break;
+          case 'WARNING':
+            accentColor = t.warn;
+            bgColor = t.warnSoft;
+            calloutIcon = CupertinoIcons.exclamationmark_triangle_fill;
+            calloutLabel = '注意';
+            break;
+          case 'CAUTION':
+            accentColor = t.err;
+            bgColor = t.errSoft;
+            calloutIcon = CupertinoIcons.xmark_octagon_fill;
+            calloutLabel = '警告';
+            break;
+          default:
+            accentColor = t.primary;
+            bgColor = t.fill1;
+            calloutIcon = null;
+            calloutLabel = null;
+        }
+        final nestedBlocks = _splitMarkdownBlocks(effectiveQuoteBody);
+        final hasRichNested = nestedBlocks.length > 1 ||
+            (nestedBlocks.length == 1 && nestedBlocks.first.kind != _MdBlockKind.paragraph);
         return Padding(
           key: key,
           padding: const EdgeInsets.only(bottom: 9),
@@ -3523,23 +5328,64 @@ class _AssistantBodyState extends State<_AssistantBody>
             borderRadius: BorderRadius.circular(12),
             child: DecoratedBox(
               decoration: BoxDecoration(
-                color: t.fill1,
+                color: bgColor,
                 border: Border(
-                  left: BorderSide(color: t.primary, width: 3.5),
+                  left: BorderSide(color: accentColor, width: 3.5),
                 ),
               ),
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(11, 8, 12, 8),
-                child: Text.rich(
-                  TextSpan(
-                    style: TextStyle(fontSize: 14, height: 1.58, color: t.text2),
-                    children: _buildMarkdownSpans(
-                      blk.body,
-                      t,
-                      recognizers,
-                      previewContext: context,
-                    ),
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (calloutLabel != null && calloutIcon != null) ...[
+                      Row(
+                        children: [
+                          Icon(calloutIcon, size: 13.5, color: accentColor),
+                          const SizedBox(width: 5),
+                          Text(
+                            calloutLabel,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: accentColor,
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (effectiveQuoteBody.isNotEmpty) const SizedBox(height: 5),
+                    ],
+                    if (effectiveQuoteBody.isNotEmpty)
+                      hasRichNested
+                          ? Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                for (var ni = 0; ni < nestedBlocks.length; ni++)
+                                  _buildSingleBlockWidget(
+                                    idx * 1000 + ni + 1,
+                                    nestedBlocks[ni],
+                                    t,
+                                    recognizers,
+                                    showCursor: showCursor && ni == nestedBlocks.length - 1,
+                                    isStreamingBlock: false,
+                                  ),
+                              ],
+                            )
+                          : Text.rich(
+                              TextSpan(
+                                style: TextStyle(fontSize: 14, height: 1.58, color: t.text2),
+                                children: _buildMarkdownSpans(
+                                  effectiveQuoteBody,
+                                  t,
+                                  recognizers,
+                                  showCursor: showCursor,
+                                  previewContext: context,
+                                ),
+                              ),
+                            ),
+                  ],
                 ),
               ),
             ),
@@ -3555,7 +5401,7 @@ class _AssistantBodyState extends State<_AssistantBody>
               ConstrainedBox(
                 constraints: const BoxConstraints(minWidth: 22),
                 child: Padding(
-                  padding: const EdgeInsets.only(right: 4, top: 2),
+                  padding: EdgeInsets.only(right: 4, top: blk.taskChecked != null ? 4.5 : 2),
                   child: blk.taskChecked != null
                       ? Icon(
                           blk.taskChecked!
@@ -3642,6 +5488,7 @@ class _AssistantBodyState extends State<_AssistantBody>
     String? openChar;
     var openLen = 0;
     var inMathBlock = false;
+    var mathBlockCloser = r'$$';
     var pos = startPos;
     var lastSafeCut = -1;
     while (pos < maxCut) {
@@ -3649,21 +5496,44 @@ class _AssistantBodyState extends State<_AssistantBody>
       if (nl < 0 || nl >= maxCut) break;
       final line = fullSource.substring(pos, nl);
       final trimmed = line.trimLeft();
+      final exactTrim = line.trim();
       if (openChar == null && !inMathBlock) {
         final m = _openFenceRe.firstMatch(trimmed);
         if (m != null && !(m.group(1)![0] == '`' && (m.group(2) ?? '').contains('`'))) {
           final f = m.group(1)!;
           openChar = f[0];
           openLen = f.length;
-        } else if (trimmed == r'$$') {
-          inMathBlock = true;
-        } else if (trimmed.isEmpty && nl + 1 < revealedLen) {
+        } else if (exactTrim.startsWith(r'$$')) {
+          // Mirror `_splitMarkdownBlocks`: only enter multi-line math when NO closer appears on this line!
+          final rest = exactTrim.substring(2);
+          if (!rest.contains(r'$$')) {
+            inMathBlock = true;
+            mathBlockCloser = r'$$';
+          }
+        } else if (exactTrim.startsWith(r'\[')) {
+          final rest = exactTrim.substring(2);
+          if (!rest.contains(r'\]')) {
+            inMathBlock = true;
+            mathBlockCloser = r'\]';
+          }
+        } else if (exactTrim.isEmpty && nl + 1 < revealedLen) {
           // A blank line outside open fences guarantees clean block flush before nl + 1.
           lastSafeCut = nl + 1;
+        } else if (tailLen > 600 &&
+            pos > startPos &&
+            !trimmed.contains('|') &&
+            !trimmed.startsWith('>') &&
+            (_bulletPattern.hasMatch(trimmed) || _headingPattern.hasMatch(trimmed)) &&
+            !line.startsWith(' ') &&
+            !line.startsWith('\t')) {
+          // Also settle long tight bullet lists / heading chains so 50-item lists stay O(tail)!
+          lastSafeCut = pos;
         }
       } else if (inMathBlock) {
-        if (trimmed == r'$$') inMathBlock = false;
-      } else if (_isClosingFence(trimmed, openChar!, openLen)) {
+        if (exactTrim == mathBlockCloser || exactTrim.endsWith(mathBlockCloser)) {
+          inMathBlock = false;
+        }
+      } else if (_isClosingFence(trimmed, openChar as String, openLen)) {
         openChar = null;
         openLen = 0;
       }
@@ -3674,19 +5544,23 @@ class _AssistantBodyState extends State<_AssistantBody>
       final deltaBlocks = _splitMarkdownBlocks(deltaSlice);
       if (deltaBlocks.isEmpty) return;
 
-      // Remember any code block that was actively streamed in the tail before it moves to settled!
+      // Wrap each settled block in its own keyed RepaintBoundary so moving from tail -> settled
+      // inside ONE flat Column preserves Element identity (zero SelectionArea wipe or code collapse!).
       final baseIdx = _settledCachedBlocks.length;
       for (var i = 0; i < deltaBlocks.length; i++) {
         final blk = deltaBlocks[i];
         final absIdx = baseIdx + i;
         final recs = <TapGestureRecognizer>[];
-        final w = _buildSingleBlockWidget(
-          absIdx,
-          blk,
-          t,
-          recs,
-          showCursor: false,
-          isStreamingBlock: false,
+        final w = RepaintBoundary(
+          key: ValueKey('md-blk-$absIdx'),
+          child: _buildSingleBlockWidget(
+            absIdx,
+            blk,
+            t,
+            recs,
+            showCursor: false,
+            isStreamingBlock: false,
+          ),
         );
         _settledCachedBlocks.add(
           _CachedMdBlock(
@@ -3707,14 +5581,6 @@ class _AssistantBodyState extends State<_AssistantBody>
       final tailAnchorStart = math.max(0, lastSafeCut - _anchorSampleLen);
       _settledTailAnchor = fullSource.substring(tailAnchorStart, lastSafeCut);
 
-      _settledColumnCache = RepaintBoundary(
-        key: const ValueKey('md-settled-blocks'),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [for (final b in _settledCachedBlocks) b.widget],
-        ),
-      );
       // Clear cached tail blocks since their indices shifted into settled!
       for (final b in _tailCachedBlocks) {
         _deferDisposeRecognizers(b.recognizers);
@@ -3767,11 +5633,18 @@ class _AssistantBodyState extends State<_AssistantBody>
       final blk = tailBlocks[ti];
       final absIdx = baseIdx + ti;
       final isLast = ti == tailBlocks.length - 1;
-      final isStreamingCode = showCursor && isLast && blk.kind == _MdBlockKind.code;
+      final isStreamingRichBlock = showCursor &&
+          isLast &&
+          (blk.kind == _MdBlockKind.code ||
+              blk.kind == _MdBlockKind.math ||
+              blk.kind == _MdBlockKind.table);
       final wantsCursor = showCursor &&
           isLast &&
-          (blk.kind == _MdBlockKind.paragraph || blk.kind == _MdBlockKind.bullet);
-      final cacheFlag = wantsCursor || isStreamingCode;
+          (blk.kind == _MdBlockKind.paragraph ||
+              blk.kind == _MdBlockKind.bullet ||
+              blk.kind == _MdBlockKind.heading ||
+              blk.kind == _MdBlockKind.quote);
+      final cacheFlag = wantsCursor || isStreamingRichBlock;
 
       if (ti < _tailCachedBlocks.length) {
         final existing = _tailCachedBlocks[ti];
@@ -3782,13 +5655,16 @@ class _AssistantBodyState extends State<_AssistantBody>
         }
         _deferDisposeRecognizers(existing.recognizers);
         final recs = <TapGestureRecognizer>[];
-        final w = _buildSingleBlockWidget(
-          absIdx,
-          blk,
-          t,
-          recs,
-          showCursor: wantsCursor,
-          isStreamingBlock: isStreamingCode,
+        final w = RepaintBoundary(
+          key: ValueKey('md-blk-$absIdx'),
+          child: _buildSingleBlockWidget(
+            absIdx,
+            blk,
+            t,
+            recs,
+            showCursor: wantsCursor,
+            isStreamingBlock: isStreamingRichBlock,
+          ),
         );
         _tailCachedBlocks[ti] = _CachedMdBlock(
           kind: blk.kind,
@@ -3799,13 +5675,16 @@ class _AssistantBodyState extends State<_AssistantBody>
         );
       } else {
         final recs = <TapGestureRecognizer>[];
-        final w = _buildSingleBlockWidget(
-          absIdx,
-          blk,
-          t,
-          recs,
-          showCursor: wantsCursor,
-          isStreamingBlock: isStreamingCode,
+        final w = RepaintBoundary(
+          key: ValueKey('md-blk-$absIdx'),
+          child: _buildSingleBlockWidget(
+            absIdx,
+            blk,
+            t,
+            recs,
+            showCursor: wantsCursor,
+            isStreamingBlock: isStreamingRichBlock,
+          ),
         );
         _tailCachedBlocks.add(
           _CachedMdBlock(
@@ -3819,27 +5698,18 @@ class _AssistantBodyState extends State<_AssistantBody>
       }
     }
 
-    final tailWidget = _tailCachedBlocks.isEmpty
-        ? null
-        : RepaintBoundary(
-            key: const ValueKey('md-active-tail'),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              mainAxisSize: MainAxisSize.min,
-              children: [for (final b in _tailCachedBlocks) b.widget],
-            ),
-          );
-
-    if (_settledColumnCache == null) {
-      return tailWidget ?? const SizedBox.shrink();
-    }
-    if (tailWidget == null) {
-      return _settledColumnCache!;
+    // Flatten settled + tail blocks into ONE single parent Column with stable `md-blk-$absIdx`
+    // keys so settling a prefix NEVER unmounts/remounts code blocks or wipes user text selection!
+    if (_settledCachedBlocks.isEmpty && _tailCachedBlocks.isEmpty) {
+      return const SizedBox.shrink();
     }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
-      children: [_settledColumnCache!, tailWidget],
+      children: [
+        for (final b in _settledCachedBlocks) b.widget,
+        for (final b in _tailCachedBlocks) b.widget,
+      ],
     );
   }
 
@@ -3861,34 +5731,50 @@ class _AssistantBodyState extends State<_AssistantBody>
       _disposeAllCachedBlocks();
     }
 
-    // Incrementally settle completed prefix blocks into their own RepaintBoundary
-    // BEFORE slicing the mutable tail — O(delta) work, ZERO full-message copy or O(N) startsWith!
-    if (visibleLen - _settledLen >= 160) {
-      _advanceSettledPrefix(widget.text, visibleLen, t);
-    }
+    // O(1) fast-path short-circuit: skip substring(), prefix scan, and _stabilizeStreamingText()
+    // whenever neither visible frontier, source string, streaming state, nor theme changed!
+    final canReuseCachedBody = !themeChanged &&
+        _cachedRichBody != null &&
+        _cachedVisibleLen == visibleLen &&
+        _cachedSettledLen == _settledLen &&
+        _cachedStreaming == isTyping &&
+        identical(_cachedSourceText, widget.text);
 
-    final rawTail = _settledLen == 0 && visibleLen >= widget.text.length
-        ? widget.text
-        : widget.text.substring(_settledLen, visibleLen);
-    // _settledLen always ends at a blank line outside open code/math fences -> offset 0 is exact!
-    final displayTail = isTyping ? _stabilizeStreamingText(rawTail, 0) : rawTail;
+    late final String displayTail;
+    if (canReuseCachedBody) {
+      displayTail = _cachedTailText ?? '';
+    } else {
+      // Incrementally settle completed prefix blocks into their own RepaintBoundary
+      // BEFORE slicing the mutable tail — O(delta) work, ZERO full-message copy or O(N) startsWith!
+      if (visibleLen - _settledLen >= 160) {
+        _advanceSettledPrefix(widget.text, visibleLen, t);
+      }
 
-    if (_cachedRichBody == null ||
-        _cachedSettledLen != _settledLen ||
-        _cachedTailText != displayTail ||
-        _cachedStreaming != isTyping ||
-        themeChanged) {
-      _cachedRichBody = _buildRichMarkdownBody(displayTail, t, showCursor: isTyping);
-      _cachedSettledLen = _settledLen;
-      _cachedTailText = displayTail;
-      _cachedStreaming = isTyping;
-      _cachedDark = t.isDark;
-      _cachedAccent = t.accent;
-      _cachedTextColor = t.text;
-      _cachedPrimaryColor = t.primary;
-      _cachedCardSolidColor = t.cardSolid;
-      _cachedCodeBgColor = t.codeBg;
-      _cachedSepColor = t.sep;
+      final rawTail = _settledLen == 0 && visibleLen >= widget.text.length
+          ? widget.text
+          : widget.text.substring(_settledLen, visibleLen);
+      // _settledLen always ends at a blank line outside open code/math fences -> offset 0 is exact!
+      displayTail = isTyping ? _stabilizeStreamingText(rawTail, 0) : rawTail;
+
+      if (_cachedRichBody == null ||
+          _cachedSettledLen != _settledLen ||
+          _cachedTailText != displayTail ||
+          _cachedStreaming != isTyping ||
+          themeChanged) {
+        _cachedRichBody = _buildRichMarkdownBody(displayTail, t, showCursor: isTyping);
+        _cachedSettledLen = _settledLen;
+        _cachedTailText = displayTail;
+        _cachedStreaming = isTyping;
+        _cachedDark = t.isDark;
+        _cachedAccent = t.accent;
+        _cachedTextColor = t.text;
+        _cachedPrimaryColor = t.primary;
+        _cachedCardSolidColor = t.cardSolid;
+        _cachedCodeBgColor = t.codeBg;
+        _cachedSepColor = t.sep;
+      }
+      _cachedVisibleLen = visibleLen;
+      _cachedSourceText = widget.text;
     }
     final richBody = _cachedRichBody!;
 
@@ -3900,13 +5786,30 @@ class _AssistantBodyState extends State<_AssistantBody>
         // Keep mounted whenever typing with non-empty source text so Frame 0 never collapses
         // if the first character is temporarily stripped syntax (e.g. leading `**`).
         if (_settledLen > 0 || displayTail.isNotEmpty || (isTyping && widget.text.isNotEmpty))
-          SelectionArea(contextMenuBuilder: buildGrassBagSelectableContextMenu, child: richBody),
+          SelectionArea(contextMenuBuilder: buildGrassBagSelectableContextMenu, child: richBody)
+        else if (!isTyping &&
+            widget.text.isEmpty &&
+            widget.deliverables.isEmpty &&
+            widget.completedToolCount > 0)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Row(
+              children: [
+                Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: t.ok),
+                const SizedBox(width: 6),
+                Text(
+                  '已完成 ${widget.completedToolCount} 项操作',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.text2),
+                ),
+              ],
+            ),
+          ),
         for (final item in widget.deliverables) ...[
           const SizedBox(height: 14),
           GrassBagSpringTap(
             pressedScale: 0.975,
             haptic: true,
-            onTap: () => widget.onDeliverableTap((item['name'] ?? '附件').toString()),
+            onTap: () => widget.onDeliverableTap(item),
             child: GrassBagCard(
               borderRadius: 22,
               padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
@@ -3925,6 +5828,8 @@ class _AssistantBodyState extends State<_AssistantBody>
                       children: [
                         Text(
                           (item['name'] ?? '产物').toString(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.w600,
@@ -3939,6 +5844,8 @@ class _AssistantBodyState extends State<_AssistantBody>
                             final size = (item['size'] ?? '').toString().trim();
                             return size.isEmpty ? note : '$note · $size';
                           }(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 11.5,
                             fontFeatures: const [FontFeature.tabularFigures()],
@@ -3948,6 +5855,7 @@ class _AssistantBodyState extends State<_AssistantBody>
                       ],
                     ),
                   ),
+                  const SizedBox(width: 8),
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                     decoration: BoxDecoration(
@@ -3975,60 +5883,164 @@ class _AssistantBodyState extends State<_AssistantBody>
             ),
           ),
         ],
-        // Quiet minimalist one-tap action strip below completed replies (wait until typewriter settles!)
+        // Quiet minimalist bottom chrome (modified files + one-tap action pills) smoothly revealed
+        // with SizeTransition + FadeTransition so completion NEVER causes a 1-frame layout pop!
         if (!isTyping)
-          Padding(
-            padding: const EdgeInsets.only(top: 10),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
+          _ReplyActionStripReveal(
+            animate: _animateActionStripEntrance,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                if (widget.text.isNotEmpty)
-                  _QuietReplyAction(
-                    icon: _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
-                    label: _copied ? '已复制' : '复制',
-                    active: _copied,
-                    onTap: _handleCopy,
+                if (widget.modifiedFiles.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  SelectionContainer.disabled(
+                    child: Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(CupertinoIcons.pencil_outline, size: 12.5, color: t.text3),
+                            const SizedBox(width: 4),
+                            Text(
+                              '已修改 ${widget.modifiedFiles.length} 个文件',
+                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text3),
+                            ),
+                          ],
+                        ),
+                        for (final path in widget.modifiedFiles.take(5))
+                          GrassBagSpringTap(
+                            pressedScale: 0.95,
+                            haptic: true,
+                            onTap: () => showDiffSheet(context, path),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: t.fill1,
+                                borderRadius: BorderRadius.circular(9),
+                                border: Border.all(color: t.sep, width: 0.5),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(CupertinoIcons.doc_text, size: 11.5, color: t.primary),
+                                  const SizedBox(width: 4),
+                                  ConstrainedBox(
+                                    constraints: const BoxConstraints(maxWidth: 150),
+                                    child: Text(
+                                      path.contains('/')
+                                          ? (path.split('/').where((s) => s.isNotEmpty).lastOrNull ?? path)
+                                          : path,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w500,
+                                        color: t.text2,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
-                _QuietReplyAction(
-                  icon: CupertinoIcons.arrow_branch,
-                  label: '分叉',
-                  onTap: widget.onFork,
-                ),
-                if (widget.onRegenerate != null)
-                  Consumer(
-                    builder: (_, ref, __) {
-                      final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
-                      if (streaming) return const SizedBox.shrink();
-                      return _QuietReplyAction(
-                        icon: CupertinoIcons.arrow_clockwise,
-                        label: '重新生成',
-                        onTap: widget.onRegenerate!,
-                      );
-                    },
+                ],
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      if (widget.text.isNotEmpty)
+                        _QuietReplyAction(
+                          icon: _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                          label: _copied ? '已复制' : '复制',
+                          active: _copied,
+                          onTap: _handleCopy,
+                        ),
+                      if (widget.cancelledPartial && widget.onContinue != null)
+                        Consumer(
+                          builder: (_, ref, __) {
+                            final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
+                            return _QuietReplyAction(
+                              icon: CupertinoIcons.play_arrow_solid,
+                              label: '继续',
+                              enabled: !streaming,
+                              onTap: widget.onContinue!,
+                            );
+                          },
+                        ),
+                      _QuietReplyAction(
+                        icon: CupertinoIcons.arrow_branch,
+                        label: '分叉',
+                        onTap: widget.onFork,
+                      ),
+                      if (widget.onRegenerate != null)
+                        Consumer(
+                          builder: (_, ref, __) {
+                            final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
+                            return _QuietReplyAction(
+                              icon: CupertinoIcons.arrow_clockwise,
+                              label: '重新生成',
+                              enabled: !streaming,
+                              onTap: widget.onRegenerate!,
+                            );
+                          },
+                        ),
+                      _QuietReplyAction(
+                        icon: widget.feedback == 'up'
+                            ? CupertinoIcons.hand_thumbsup_fill
+                            : CupertinoIcons.hand_thumbsup,
+                        label: '赞',
+                        active: widget.feedback == 'up',
+                        onTap: () => widget.onFeedback('up'),
+                      ),
+                      _QuietReplyAction(
+                        icon: widget.feedback == 'down'
+                            ? CupertinoIcons.hand_thumbsdown_fill
+                            : CupertinoIcons.hand_thumbsdown,
+                        label: '踩',
+                        active: widget.feedback == 'down',
+                        warnActive: true,
+                        onTap: () => widget.onFeedback('down'),
+                      ),
+                      if (widget.cancelledPartial)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: t.fill1,
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.stop_circle, size: 12, color: t.text3),
+                              const SizedBox(width: 4),
+                              Text(
+                                '已停止生成',
+                                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500, color: t.text3),
+                              ),
+                            ],
+                          ),
+                        ),
+                      if (widget.usage != null &&
+                          (widget.usage!.inputTokens > 0 ||
+                              widget.usage!.outputTokens > 0 ||
+                              (widget.usage!.cacheReadTokens ?? 0) > 0))
+                        _TurnUsageMicroBadge(
+                          usage: widget.usage!,
+                          toolCount: widget.completedToolCount,
+                        ),
+                    ],
                   ),
-                _QuietReplyAction(
-                  icon: widget.feedback == 'up'
-                      ? CupertinoIcons.hand_thumbsup_fill
-                      : CupertinoIcons.hand_thumbsup,
-                  label: '赞',
-                  active: widget.feedback == 'up',
-                  onTap: () => widget.onFeedback('up'),
                 ),
-                _QuietReplyAction(
-                  icon: widget.feedback == 'down'
-                      ? CupertinoIcons.hand_thumbsdown_fill
-                      : CupertinoIcons.hand_thumbsdown,
-                  label: '踩',
-                  active: widget.feedback == 'down',
-                  warnActive: true,
-                  onTap: () => widget.onFeedback('down'),
-                ),
-                if (widget.usage != null &&
-                    (widget.usage!.inputTokens > 0 ||
-                        widget.usage!.outputTokens > 0 ||
-                        (widget.usage!.cacheReadTokens ?? 0) > 0))
-                  _TurnUsageMicroBadge(usage: widget.usage!),
               ],
             ),
           ),
@@ -4056,12 +6068,14 @@ class _MarkdownTableCard extends StatefulWidget {
     required this.rows,
     required this.rawMarkdown,
     required this.spanBuilder,
+    this.isStreaming = false,
   });
 
   final List<String> headers;
   final List<TextAlign> alignments;
   final List<List<String>> rows;
   final String rawMarkdown;
+  final bool isStreaming;
   final List<InlineSpan> Function(
     String text,
     GrassBagTokens t,
@@ -4154,6 +6168,17 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
       _syncFromController();
     });
   }
+
+  static final RegExp _cellMarkdownStripRe = RegExp(r'[*_`~\[\]]');
+  static final RegExp _cellUrlStripRe = RegExp(r'\(https?://[^)]+\)');
+
+  int _cachedWidthRowCount = -1;
+  int _cachedWidthColCount = -1;
+  double _cachedWidthCardW = -1;
+  String _cachedHeadersSig = '';
+  String _cachedWidthSig = '';
+  List<double>? _cachedRawWidths;
+  Map<int, TableColumnWidth>? _cachedColWidths;
 
   @override
   void initState() {
@@ -4322,47 +6347,92 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
         final maxCardW = constraints.maxWidth.isFinite ? constraints.maxWidth : 640.0;
         final cellMaxW = maxCardW >= 620 ? 300.0 : (maxCardW >= 420 ? 235.0 : 195.0);
 
-        // Precompute fixed column widths in O(rows * cols) without double-pass
-        // IntrinsicColumnWidth layout during chat scrolling.
-        final colWidths = <int, TableColumnWidth>{};
-        double estimatedCellWidth(String raw, {bool isHeader = false}) {
-          final stripped = raw
-              .replaceAll(RegExp(r'[*_`~\[\]]'), '')
-              .replaceAll(RegExp(r'\(https?://[^)]+\)'), '');
-          double units = 0;
-          for (final rune in stripped.runes) {
-            units += (rune > 0x2E80) ? 1.85 : 0.96;
+        // Precompute fixed column widths incrementally during streaming:
+        // when headers, colCount, and card width are unchanged and rows grow monotonically,
+        // only measure the new/last row instead of rescanning rows 0..31 on every character!
+        final sampleLimit = widget.rows.length < 32 ? widget.rows.length : 32;
+        final headersSig = widget.headers.join('|');
+        final lastRowSig = sampleLimit > 0 ? widget.rows[sampleLimit - 1].join('|') : '';
+        final widthSig = '$headersSig#$lastRowSig';
+        Map<int, TableColumnWidth> colWidths;
+        if (_cachedColWidths != null &&
+            _cachedWidthColCount == colCount &&
+            _cachedWidthRowCount == sampleLimit &&
+            (_cachedWidthCardW - maxCardW).abs() < 1.0 &&
+            _cachedWidthSig == widthSig) {
+          colWidths = _cachedColWidths!;
+        } else {
+          double estimatedCellWidth(String raw, {bool isHeader = false}) {
+            final stripped = raw
+                .replaceAll(_cellMarkdownStripRe, '')
+                .replaceAll(_cellUrlStripRe, '');
+            double units = 0;
+            for (final rune in stripped.runes) {
+              units += (rune > 0x2E80) ? 1.85 : 0.96;
+            }
+            final px = units * (isHeader ? 8.2 : 7.8) + 30.0;
+            return px.clamp(68.0, cellMaxW);
           }
-          final px = units * (isHeader ? 8.2 : 7.8) + 30.0;
-          return px.clamp(68.0, cellMaxW);
-        }
 
-        double totalW = 0;
-        final rawWidths = List<double>.filled(colCount, 68.0);
-        for (int ci = 0; ci < colCount; ci++) {
-          double w = estimatedCellWidth(widget.headers[ci], isHeader: true);
-          final sampleLimit = widget.rows.length < 32 ? widget.rows.length : 32;
-          for (int ri = 0; ri < sampleLimit; ri++) {
-            final row = widget.rows[ri];
-            if (ci < row.length) {
-              final cw = estimatedCellWidth(row[ci]);
-              if (cw > w) w = cw;
+          final canIncremental = _cachedRawWidths != null &&
+              _cachedRawWidths!.length == colCount &&
+              _cachedWidthColCount == colCount &&
+              _cachedHeadersSig == headersSig &&
+              (_cachedWidthCardW - maxCardW).abs() < 1.0 &&
+              sampleLimit >= _cachedWidthRowCount &&
+              _cachedWidthRowCount >= 0;
+
+          final List<double> rawWidths;
+          if (canIncremental) {
+            rawWidths = _cachedRawWidths!;
+            final startRow = math.max(0, _cachedWidthRowCount - 1);
+            for (int ri = startRow; ri < sampleLimit; ri++) {
+              final row = widget.rows[ri];
+              final len = math.min(colCount, row.length);
+              for (int ci = 0; ci < len; ci++) {
+                final cw = estimatedCellWidth(row[ci]);
+                if (cw > rawWidths[ci]) rawWidths[ci] = cw;
+              }
+            }
+          } else {
+            rawWidths = List<double>.filled(colCount, 68.0);
+            for (int ci = 0; ci < colCount; ci++) {
+              double w = estimatedCellWidth(widget.headers[ci], isHeader: true);
+              for (int ri = 0; ri < sampleLimit; ri++) {
+                final row = widget.rows[ri];
+                if (ci < row.length) {
+                  final cw = estimatedCellWidth(row[ci]);
+                  if (cw > w) w = cw;
+                }
+              }
+              rawWidths[ci] = w;
+            }
+            _cachedRawWidths = rawWidths;
+          }
+
+          double totalW = 0;
+          for (int ci = 0; ci < colCount; ci++) {
+            totalW += rawWidths[ci];
+          }
+          colWidths = <int, TableColumnWidth>{};
+          // If total table width is narrower than card width, gently stretch columns
+          // proportionally so compact tables fill the card cleanly.
+          if (totalW > 0 && totalW < maxCardW - 2 && colCount > 0) {
+            final scale = ((maxCardW - 2) / totalW).clamp(1.0, 1.85);
+            for (int ci = 0; ci < colCount; ci++) {
+              colWidths[ci] = FixedColumnWidth((rawWidths[ci] * scale).clamp(68.0, cellMaxW));
+            }
+          } else {
+            for (int ci = 0; ci < colCount; ci++) {
+              colWidths[ci] = FixedColumnWidth(rawWidths[ci]);
             }
           }
-          rawWidths[ci] = w;
-          totalW += w;
-        }
-        // If total table width is narrower than card width, gently stretch columns
-        // proportionally so compact tables fill the card cleanly.
-        if (totalW > 0 && totalW < maxCardW - 2 && colCount > 0) {
-          final scale = ((maxCardW - 2) / totalW).clamp(1.0, 1.85);
-          for (int ci = 0; ci < colCount; ci++) {
-            colWidths[ci] = FixedColumnWidth((rawWidths[ci] * scale).clamp(68.0, cellMaxW));
-          }
-        } else {
-          for (int ci = 0; ci < colCount; ci++) {
-            colWidths[ci] = FixedColumnWidth(rawWidths[ci]);
-          }
+          _cachedColWidths = colWidths;
+          _cachedWidthColCount = colCount;
+          _cachedWidthRowCount = sampleLimit;
+          _cachedWidthCardW = maxCardW;
+          _cachedHeadersSig = headersSig;
+          _cachedWidthSig = widthSig;
         }
 
         final tableContent = Listener(
@@ -4544,15 +6614,20 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
                     ),
                     SelectionContainer.disabled(
                       child: Container(
-                        width: canScroll ? maxCardW : null,
-                        height: 30,
+                        width: canScroll
+                            ? maxCardW
+                            : (m.viewport > 1.0 ? math.min(m.viewport, maxCardW) : null),
+                        height: 34,
                         padding: const EdgeInsets.symmetric(horizontal: 8),
                         decoration: BoxDecoration(
                           color: headerBg.withValues(alpha: 0.72),
                           border: Border(top: BorderSide(color: t.sep, width: 0.5)),
                         ),
                         child: Row(
-                          mainAxisSize: canScroll ? MainAxisSize.max : MainAxisSize.min,
+                          mainAxisSize:
+                              (canScroll || m.viewport > 1.0) ? MainAxisSize.max : MainAxisSize.min,
+                          mainAxisAlignment:
+                              canScroll ? MainAxisAlignment.start : MainAxisAlignment.end,
                           children: [
                             if (canScroll) ...[
                               _TableNudgeButton(
@@ -4673,6 +6748,14 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
                                 color: t.sep,
                               ),
                             ],
+                            if (widget.isStreaming) ...[
+                              SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: _BreathingStatusDot(color: t.primary),
+                              ),
+                              const SizedBox(width: 6),
+                            ],
                             ValueListenableBuilder<bool>(
                               valueListenable: _copied,
                               builder: (_, copied, __) => GrassBagSpringTap(
@@ -4737,8 +6820,8 @@ class _TableNudgeButton extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       onTap: enabled ? onTap : null,
       child: SizedBox(
-        width: 22,
-        height: 24,
+        width: 34,
+        height: 32,
         child: Center(
           child: Icon(
             icon,
@@ -4749,6 +6832,458 @@ class _TableNudgeButton extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Lightweight, single-pass LaTeX -> Unicode math pretty-formatter for inline & display math.
+/// Preserves readability without external font bundles while display cards keep exact raw LaTeX on copy.
+String _formatReadableLatex(String tex) {
+  var s = tex.trim();
+  if (s.isEmpty) return s;
+  // Simple `\frac{a}{b}` -> `(a)/(b)` (handles non-nested braces cleanly)
+  s = s.replaceAllMapped(
+    RegExp(r'\\d?frac\{([^{}]+)\}\{([^{}]+)\}'),
+    (m) => '(${m.group(1)!.trim()}) / (${m.group(2)!.trim()})',
+  );
+  s = s.replaceAllMapped(
+    RegExp(r'\\sqrt\{([^{}]+)\}'),
+    (m) => '√(${m.group(1)!.trim()})',
+  );
+  s = s.replaceAllMapped(
+    RegExp(r'\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]+)\}'),
+    (m) => m.group(1)!,
+  );
+  const symbolMap = <String, String>{
+    r'\alpha': 'α',
+    r'\beta': 'β',
+    r'\gamma': 'γ',
+    r'\delta': 'δ',
+    r'\epsilon': 'ε',
+    r'\varepsilon': 'ε',
+    r'\theta': 'θ',
+    r'\lambda': 'λ',
+    r'\mu': 'μ',
+    r'\nu': 'ν',
+    r'\xi': 'ξ',
+    r'\pi': 'π',
+    r'\rho': 'ρ',
+    r'\sigma': 'σ',
+    r'\tau': 'τ',
+    r'\phi': 'φ',
+    r'\varphi': 'φ',
+    r'\chi': 'χ',
+    r'\psi': 'ψ',
+    r'\omega': 'ω',
+    r'\Gamma': 'Γ',
+    r'\Delta': 'Δ',
+    r'\Theta': 'Θ',
+    r'\Lambda': 'Λ',
+    r'\Pi': 'Π',
+    r'\Sigma': 'Σ',
+    r'\Phi': 'Φ',
+    r'\Psi': 'Ψ',
+    r'\Omega': 'Ω',
+    r'\infty': '∞',
+    r'\pm': '±',
+    r'\mp': '∓',
+    r'\times': '×',
+    r'\div': '÷',
+    r'\cdot': '·',
+    r'\dots': '…',
+    r'\cdots': '⋯',
+    r'\ldots': '…',
+    r'\leq': '≤',
+    r'\le': '≤',
+    r'\geq': '≥',
+    r'\ge': '≥',
+    r'\neq': '≠',
+    r'\ne': '≠',
+    r'\approx': '≈',
+    r'\equiv': '≡',
+    r'\sim': '∼',
+    r'\propto': '∝',
+    r'\rightarrow': '→',
+    r'\to': '→',
+    r'\leftarrow': '←',
+    r'\leftrightarrow': '↔',
+    r'\Rightarrow': '⇒',
+    r'\Leftarrow': '⇐',
+    r'\Leftrightarrow': '⇔',
+    r'\iff': '⇔',
+    r'\in': '∈',
+    r'\notin': '∉',
+    r'\subset': '⊂',
+    r'\subseteq': '⊆',
+    r'\cup': '∪',
+    r'\cap': '∩',
+    r'\emptyset': '∅',
+    r'\forall': '∀',
+    r'\exists': '∃',
+    r'\partial': '∂',
+    r'\nabla': '∇',
+    r'\sum': '∑',
+    r'\prod': '∏',
+    r'\int': '∫',
+    r'\degree': '°',
+    r'\quad': '  ',
+    r'\qquad': '   ',
+    r'\,': ' ',
+    r'\;': ' ',
+    r'\left': '',
+    r'\right': '',
+  };
+  s = s.replaceAllMapped(RegExp(r'\\[a-zA-Z]+|\\[,;]'), (m) {
+    final tok = m.group(0)!;
+    return symbolMap[tok] ?? tok;
+  });
+  const supMap = <String, String>{
+    '0': '⁰',
+    '1': '¹',
+    '2': '²',
+    '3': '³',
+    '4': '⁴',
+    '5': '⁵',
+    '6': '⁶',
+    '7': '⁷',
+    '8': '⁸',
+    '9': '⁹',
+    '+': '⁺',
+    '-': '⁻',
+    'n': 'ⁿ',
+    'i': 'ⁱ',
+  };
+  const subMap = <String, String>{
+    '0': '₀',
+    '1': '₁',
+    '2': '₂',
+    '3': '₃',
+    '4': '₄',
+    '5': '₅',
+    '6': '₆',
+    '7': '₇',
+    '8': '₈',
+    '9': '₉',
+    '+': '₊',
+    '-': '₋',
+    'i': 'ᵢ',
+    'j': 'ⱼ',
+    'k': 'ₖ',
+    'n': 'ₙ',
+    'x': 'ₓ',
+  };
+  s = s.replaceAllMapped(RegExp(r'\^([0-9+\-ni])'), (m) => supMap[m.group(1)!] ?? m.group(0)!);
+  s = s.replaceAllMapped(RegExp(r'_([0-9+\-ijknx])'), (m) => subMap[m.group(1)!] ?? m.group(0)!);
+  return s;
+}
+
+class _DisplayMathCard extends StatefulWidget {
+  const _DisplayMathCard({
+    super.key,
+    required this.rawLatex,
+    this.isStreaming = false,
+  });
+
+  final String rawLatex;
+  final bool isStreaming;
+
+  @override
+  State<_DisplayMathCard> createState() => _DisplayMathCardState();
+}
+
+class _DisplayMathCardState extends State<_DisplayMathCard> {
+  bool _copied = false;
+
+  void _copyLatex() {
+    Clipboard.setData(ClipboardData(text: widget.rawLatex));
+    if (!_copied) {
+      setState(() => _copied = true);
+      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+        if (mounted) setState(() => _copied = false);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final formatted = _formatReadableLatex(widget.rawLatex);
+    return Padding(
+      padding: const EdgeInsets.only(top: 4, bottom: 10),
+      child: Container(
+        width: double.infinity,
+        decoration: BoxDecoration(
+          color: t.fill1,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: t.sep, width: 0.6),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SelectionContainer.disabled(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 6, 8, 2),
+                child: Row(
+                  children: [
+                    if (widget.isStreaming) ...[
+                      SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: _BreathingStatusDot(color: t.primary),
+                      ),
+                      const SizedBox(width: 5),
+                    ],
+                    Text(
+                      '公式',
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        color: t.text3,
+                      ),
+                    ),
+                    const Spacer(),
+                    GrassBagSpringTap(
+                      onTap: _copyLatex,
+                      pressedScale: 0.94,
+                      haptic: true,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                              size: 11.5,
+                              color: _copied ? t.ok : t.text3,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              _copied ? '已复制 LaTeX' : '复制 LaTeX',
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w600,
+                                color: _copied ? t.ok : t.text3,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(14, 4, 14, 12),
+              child: Text(
+                formatted,
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 14,
+                  height: 1.6,
+                  fontStyle: FontStyle.italic,
+                  color: t.isDark ? t.primaryHi : t.primary,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Synthesizes a clean unified diff preview from tool call args (`old_string`/`new_string`,
+/// `oldText`/`newText`, or `patch`/`diff`) for inline display inside expanded edit tool rows.
+({String unified, int added, int removed})? _synthesizeInlineDiffFromArgs(Map argsMap) {
+  if (argsMap.isEmpty) return null;
+  final rawPatch = (argsMap['patch'] ?? argsMap['diff'] ?? argsMap['unifiedDiff'])?.toString().trim();
+  if (rawPatch != null && rawPatch.isNotEmpty) {
+    var added = 0;
+    var removed = 0;
+    for (final line in rawPatch.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) added++;
+      if (line.startsWith('-') && !line.startsWith('---')) removed++;
+    }
+    return (unified: rawPatch, added: added, removed: removed);
+  }
+  final oldStr = (argsMap['old_string'] ?? argsMap['oldString'] ?? argsMap['oldText'] ?? argsMap['target'])
+      ?.toString();
+  final newStr = (argsMap['new_string'] ?? argsMap['newString'] ?? argsMap['newText'] ?? argsMap['replacement'])
+      ?.toString();
+  if (oldStr == null && newStr == null) return null;
+  final oldLines = (oldStr != null && oldStr.isNotEmpty) ? oldStr.split('\n') : const <String>[];
+  final newLines = (newStr != null && newStr.isNotEmpty) ? newStr.split('\n') : const <String>[];
+  if (oldLines.isEmpty && newLines.isEmpty) return null;
+  final buf = StringBuffer('@@ -1,${oldLines.length} +1,${newLines.length} @@\n');
+  for (final l in oldLines) {
+    buf.writeln('-$l');
+  }
+  for (final l in newLines) {
+    buf.writeln('+$l');
+  }
+  return (
+    unified: buf.toString().trimRight(),
+    added: newLines.length,
+    removed: oldLines.length,
+  );
+}
+
+/// Syntax-colored unified diff span (distinguishes `+++`/`---` headers, `@@` hunks, `+` adds, `-` removes).
+TextSpan _highlightDiffSpan(String displayText) {
+  final displayLines = displayText.split('\n');
+  return TextSpan(
+    style: const TextStyle(
+      fontFamily: 'monospace',
+      fontSize: 12,
+      height: 1.52,
+      color: Color(0xFFE2E8F0),
+    ),
+    children: [
+      for (int li = 0; li < displayLines.length; li++)
+        () {
+          final line = displayLines[li];
+          final text = li == displayLines.length - 1 ? line : '$line\n';
+          if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) {
+            return TextSpan(
+              text: text,
+              style: const TextStyle(color: Color(0xFF94A3B8), fontWeight: FontWeight.w600),
+            );
+          }
+          if (line.startsWith('@@')) {
+            return TextSpan(
+              text: text,
+              style: const TextStyle(
+                color: Color(0xFFC4B5FD),
+                backgroundColor: Color(0x1F8B5CF6),
+                fontWeight: FontWeight.w600,
+              ),
+            );
+          }
+          if (line.startsWith('+')) {
+            return TextSpan(
+              text: text,
+              style: const TextStyle(
+                color: Color(0xFF6EE7B7),
+                backgroundColor: Color(0x1F10B981),
+              ),
+            );
+          }
+          if (line.startsWith('-')) {
+            return TextSpan(
+              text: text,
+              style: const TextStyle(
+                color: Color(0xFFFCA5A5),
+                backgroundColor: Color(0x1FEF4444),
+              ),
+            );
+          }
+          return TextSpan(text: text);
+        }(),
+    ],
+  );
+}
+
+/// Zero-dependency, single-pass O(N) syntax highlighter for dark code cards.
+/// Cached by `_FencedCodeBlockState` so scrolling and sibling rebuilds cost 0ms.
+final RegExp _codeTokenRe = RegExp(
+  r'(?://[^\n]*|/\*[\s\S]*?\*/|#[^\n]*)' // comments
+  r'|"(?:\\.|[^"\\\n])*"' // double-quoted strings
+  r"|'(?:\\.|[^'\\\n])*'" // single-quoted strings
+  r'|`(?:\\.|[^`\\])*`' // backtick strings
+  r'|@[A-Za-z_][A-Za-z0-9_]*' // annotations
+  r'|\b0[xX][0-9a-fA-F_]+\b|\b\d+(?:\.\d+)?\b' // numbers
+  r'|\b[A-Z][A-Za-z0-9_]*\b' // PascalCase types
+  r'|\b[a-z_][A-Za-z0-9_]*\b', // identifiers & keywords
+);
+
+const Set<String> _codeKeywords = <String>{
+  'abstract', 'as', 'async', 'await', 'bool', 'break', 'case', 'catch', 'class',
+  'const', 'continue', 'covariant', 'def', 'default', 'defer', 'del', 'do', 'double',
+  'dynamic', 'elif', 'else', 'enum', 'except', 'export', 'extends', 'extension',
+  'external', 'factory', 'false', 'final', 'finally', 'float', 'fn', 'for', 'from',
+  'func', 'function', 'get', 'go', 'if', 'impl', 'implements', 'import', 'in', 'int',
+  'interface', 'is', 'lambda', 'late', 'let', 'match', 'mixin', 'mut', 'new', 'nil',
+  'none', 'null', 'object', 'on', 'override', 'package', 'part', 'pass', 'private',
+  'protected', 'pub', 'public', 'raise', 'required', 'return', 'sealed', 'select',
+  'self', 'set', 'static', 'str', 'string', 'struct', 'super', 'switch', 'sync',
+  'this', 'throw', 'trait', 'true', 'try', 'type', 'typedef', 'typeof', 'use', 'val',
+  'var', 'void', 'where', 'while', 'with', 'yield',
+  'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'UPDATE', 'DELETE', 'JOIN', 'LEFT',
+  'RIGHT', 'INNER', 'GROUP', 'ORDER', 'BY', 'LIMIT', 'CREATE', 'TABLE', 'ALTER',
+};
+
+const Set<String> _hashCommentLangs = <String>{
+  'py', 'python', 'sh', 'bash', 'zsh', 'shell', 'yaml', 'yml', 'toml', 'rb', 'ruby', 'r', 'perl',
+};
+
+TextSpan _highlightCodeSpan(String code, String rawLang) {
+  final lang = rawLang.trim().toLowerCase();
+  if (lang == 'diff' || lang == 'patch') {
+    return _highlightDiffSpan(code);
+  }
+  const baseStyle = TextStyle(
+    fontFamily: 'monospace',
+    fontSize: 12,
+    height: 1.52,
+    color: Color(0xFFE2E8F0),
+  );
+  // Skip tokenization on giant blobs (> 24k chars) to guarantee zero frame hitch.
+  if (code.length > 24000) {
+    return TextSpan(text: code, style: baseStyle);
+  }
+  final allowHashComment = lang.isEmpty || _hashCommentLangs.contains(lang);
+  final isJson = lang == 'json' || lang == 'jsonc';
+  final spans = <TextSpan>[];
+  var cursor = 0;
+
+  for (final m in _codeTokenRe.allMatches(code)) {
+    if (m.start > cursor) {
+      spans.add(TextSpan(text: code.substring(cursor, m.start)));
+    }
+    final tok = m.group(0)!;
+    final first = tok.codeUnitAt(0);
+    TextStyle? style;
+    if (tok.startsWith('//') || tok.startsWith('/*')) {
+      style = const TextStyle(color: Color(0xFF64748B), fontStyle: FontStyle.italic);
+    } else if (first == 0x23 /* '#' */) {
+      if (allowHashComment) {
+        style = const TextStyle(color: Color(0xFF64748B), fontStyle: FontStyle.italic);
+      }
+    } else if (first == 0x22 /* '"' */ || first == 0x27 /* "'" */ || first == 0x60 /* '`' */) {
+      if (isJson && first == 0x22) {
+        // Check if followed by `:` (JSON key vs string value)
+        var look = m.end;
+        while (look < code.length && (code.codeUnitAt(look) == 0x20 || code.codeUnitAt(look) == 0x09)) {
+          look++;
+        }
+        style = (look < code.length && code.codeUnitAt(look) == 0x3A /* ':' */)
+            ? const TextStyle(color: Color(0xFF7DD3FC))
+            : const TextStyle(color: Color(0xFF86EFAC));
+      } else {
+        style = const TextStyle(color: Color(0xFF86EFAC));
+      }
+    } else if (first == 0x40 /* '@' */) {
+      style = const TextStyle(color: Color(0xFFFDE68A));
+    } else if (first >= 0x30 && first <= 0x39) {
+      style = const TextStyle(color: Color(0xFFFDBA74));
+    } else if (first >= 0x41 && first <= 0x5A) {
+      style = _codeKeywords.contains(tok)
+          ? const TextStyle(color: Color(0xFFC084FC), fontWeight: FontWeight.w600)
+          : const TextStyle(color: Color(0xFF93C5FD));
+    } else {
+      if (_codeKeywords.contains(tok)) {
+        style = const TextStyle(color: Color(0xFFC084FC), fontWeight: FontWeight.w600);
+      } else if (m.end < code.length && code.codeUnitAt(m.end) == 0x28 /* '(' */) {
+        style = const TextStyle(color: Color(0xFF7DD3FC));
+      }
+    }
+    spans.add(TextSpan(text: tok, style: style));
+    cursor = m.end;
+  }
+  if (cursor < code.length) {
+    spans.add(TextSpan(text: code.substring(cursor)));
+  }
+  return TextSpan(style: baseStyle, children: spans);
 }
 
 class _FencedCodeBlock extends StatefulWidget {
@@ -4776,12 +7311,17 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   bool _softWrap = false;
   bool _userToggled = false;
   late bool _expanded;
+  String? _cachedHighlightKey;
+  TextSpan? _cachedHighlightSpan;
+  // Line-level incremental highlight cache so streaming a 300-line code block tokenizes
+  // ONLY the last active line in O(line) instead of re-running regex on char 0..N every 40ms!
+  String _cachedLineLang = '';
+  final List<String> _cachedLines = [];
+  final List<InlineSpan> _cachedLineSpans = [];
 
   @override
   void initState() {
     super.initState();
-    // Keep live-streamed code blocks expanded so finishing a 40+ line code block NEVER
-    // violently collapses and jumps scrollback by ~300px! Historical long blocks still collapse.
     _expanded = widget.isStreaming || widget.initiallyExpanded;
   }
 
@@ -4821,40 +7361,96 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
     return s;
   }
 
-  Widget _buildCodeText(String displayText, bool isDiff) {
-    if (isDiff) {
-      final displayLines = displayText.split('\n');
-      return Text.rich(
-        TextSpan(
+  Widget _buildCodeText(String displayText, GrassBagTokens t) {
+    final key = '${widget.lang}\u0000${widget.isStreaming}\u0000$displayText';
+    if (_cachedHighlightKey != key || _cachedHighlightSpan == null) {
+      _cachedHighlightKey = key;
+      final lang = widget.lang.trim().toLowerCase();
+      final canIncremental = displayText.length <= 24000 &&
+          lang != 'diff' &&
+          lang != 'patch' &&
+          !displayText.contains('/*');
+      TextSpan baseSpan;
+      if (canIncremental) {
+        if (_cachedLineLang != lang) {
+          _cachedLineLang = lang;
+          _cachedLines.clear();
+          _cachedLineSpans.clear();
+        }
+        final lines = displayText.split('\n');
+        var common = 0;
+        final limit = math.min(_cachedLines.length, lines.length);
+        // Completed lines before the final line hit O(1) string equality!
+        while (common < limit - 1 && _cachedLines[common] == lines[common]) {
+          common++;
+        }
+        if (common < _cachedLines.length) {
+          _cachedLines.removeRange(common, _cachedLines.length);
+          _cachedLineSpans.removeRange(common, _cachedLineSpans.length);
+        }
+        for (var i = common; i < lines.length; i++) {
+          final lineText = lines[i];
+          final lineWithNl = i == lines.length - 1 ? lineText : '$lineText\n';
+          _cachedLines.add(lineText);
+          _cachedLineSpans.add(_highlightCodeSpan(lineWithNl, widget.lang));
+        }
+        baseSpan = TextSpan(
           style: const TextStyle(
             fontFamily: 'monospace',
             fontSize: 12,
-            height: 1.5,
+            height: 1.52,
             color: Color(0xFFE2E8F0),
           ),
-          children: [
-            for (int li = 0; li < displayLines.length; li++)
-              TextSpan(
-                text: li == displayLines.length - 1 ? displayLines[li] : '${displayLines[li]}\n',
-                style: displayLines[li].startsWith('+')
-                    ? const TextStyle(color: Color(0xFF6EE7B7))
-                    : (displayLines[li].startsWith('-')
-                        ? const TextStyle(color: Color(0xFFFCA5A5))
-                        : null),
-              ),
-          ],
-        ),
-        softWrap: _softWrap,
-      );
+          children: List<InlineSpan>.of(_cachedLineSpans, growable: false),
+        );
+      } else {
+        baseSpan = _highlightCodeSpan(displayText, widget.lang);
+      }
+      _cachedHighlightSpan = widget.isStreaming
+          ? TextSpan(
+              style: baseSpan.style,
+              children: [
+                if (baseSpan.children != null) ...baseSpan.children! else baseSpan,
+                const TextSpan(text: '\u2060'),
+                WidgetSpan(
+                  alignment: PlaceholderAlignment.middle,
+                  child: SelectionContainer.disabled(
+                    child: _LiveStreamingCaret(color: t.primaryHi, height: 13.5),
+                  ),
+                ),
+              ],
+            )
+          : baseSpan;
     }
-    return Text(
-      displayText,
+    return Text.rich(
+      _cachedHighlightSpan!,
       softWrap: _softWrap,
-      style: const TextStyle(
-        fontFamily: 'monospace',
-        fontSize: 12,
-        height: 1.52,
-        color: Color(0xFFE2E8F0),
+    );
+  }
+
+  void _openFullscreenCode(BuildContext context, int lineCount) {
+    final t = GrassBagTokens.of(context);
+    final label = widget.lang.isEmpty ? '代码查看' : '${widget.lang} · $lineCount 行';
+    showGrassBagSheet(
+      context,
+      title: label,
+      subtitle: '可横向滚动或局部划选复制',
+      preferredHeight: 480,
+      expandable: true,
+      bodyBuilder: (_) => Container(
+        decoration: BoxDecoration(
+          color: t.codeBg,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.1), width: 0.6),
+        ),
+        padding: const EdgeInsets.all(12),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SelectionArea(
+            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+            child: Text.rich(_highlightCodeSpan(widget.code, widget.lang)),
+          ),
+        ),
       ),
     );
   }
@@ -4862,11 +7458,9 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final isDiff = widget.lang.toLowerCase() == 'diff';
-    // Fast codeUnitAt line count — skips .split('\n') + .join('\n') allocations on every 120Hz tick!
     final lineCount = _countLines(widget.code);
-    // Never abruptly auto-collapse a code block mid-stream at line 41 (causes sudden ~300px scroll jump)!
     final isLong = !widget.isStreaming && lineCount > _collapseThreshold;
+    final showFullscreenBtn = !widget.isStreaming && (lineCount > 12 || widget.code.length > 500);
     final displayText =
         (isLong && !_expanded) ? _takeFirstLines(widget.code, _collapsedPreviewLines) : widget.code;
 
@@ -4887,43 +7481,56 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
             children: [
               SelectionContainer.disabled(
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                   color: t.codeBar,
                   child: Row(
                     children: [
-                      Flexible(
-                        child: Text(
-                          widget.lang.isEmpty ? 'code' : widget.lang,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                            color: Color(0xFF94A3B8),
-                          ),
+                      Expanded(
+                        child: Row(
+                          children: [
+                            if (widget.isStreaming) ...[
+                              SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: _BreathingStatusDot(color: t.primaryHi),
+                              ),
+                              const SizedBox(width: 5),
+                            ],
+                            Flexible(
+                              child: Text(
+                                widget.lang.isEmpty ? 'code' : widget.lang,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF94A3B8),
+                                ),
+                              ),
+                            ),
+                            if (lineCount > 10) ...[
+                              const SizedBox(width: 6),
+                              Text(
+                                '$lineCount 行',
+                                style: const TextStyle(
+                                  fontSize: 10.5,
+                                  fontFeatures: [FontFeature.tabularFigures()],
+                                  color: Color(0xFF64748B),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
-                      if (lineCount > 10) ...[
-                        const SizedBox(width: 6),
-                        Text(
-                          '$lineCount 行',
-                          style: const TextStyle(
-                            fontSize: 10.5,
-                            fontFeatures: [FontFeature.tabularFigures()],
-                            color: Color(0xFF64748B),
-                          ),
-                        ),
-                      ],
-                      const Spacer(),
-                      if (isLong) ...[
+                      if (isLong)
                         GrassBagSpringTap(
                           onTap: () => setState(() {
                             _userToggled = true;
                             _expanded = !_expanded;
                           }),
                           child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 8),
                             child: Text(
                               _expanded ? '收起' : '展开',
                               style: const TextStyle(
@@ -4934,12 +7541,25 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                             ),
                           ),
                         ),
-                        const SizedBox(width: 8),
-                      ],
+                      if (showFullscreenBtn)
+                        GrassBagSpringTap(
+                          onTap: () => _openFullscreenCode(context, lineCount),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 7, vertical: 8),
+                            child: Text(
+                              '全屏',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF94A3B8),
+                              ),
+                            ),
+                          ),
+                        ),
                       GrassBagSpringTap(
                         onTap: () => setState(() => _softWrap = !_softWrap),
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 8),
                           child: Text(
                             _softWrap ? '单行' : '换行',
                             style: TextStyle(
@@ -4952,7 +7572,6 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                           ),
                         ),
                       ),
-                      const SizedBox(width: 8),
                       GrassBagSpringTap(
                         onTap: () {
                           Clipboard.setData(ClipboardData(text: widget.code));
@@ -4961,46 +7580,55 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                             if (mounted) setState(() => _copied = false);
                           });
                         },
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
-                              size: 12,
-                              color: _copied ? const Color(0xFF34D399) : const Color(0xFFCBD5E1),
-                            ),
-                            const SizedBox(width: 4),
-                            Text(
-                              _copied ? '已复制' : '复制',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 8),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                                size: 12,
                                 color: _copied ? const Color(0xFF34D399) : const Color(0xFFCBD5E1),
                               ),
-                            ),
-                          ],
+                              const SizedBox(width: 4),
+                              Text(
+                                _copied ? '已复制' : '复制',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: _copied ? const Color(0xFF34D399) : const Color(0xFFCBD5E1),
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ],
                   ),
                 ),
               ),
-              if (_softWrap)
-                Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: _buildCodeText(displayText, isDiff),
-                )
-              else
-                CupertinoScrollbar(
-                  controller: _hCtrl,
-                  thumbVisibility: false,
-                  child: SingleChildScrollView(
-                    controller: _hCtrl,
-                    scrollDirection: Axis.horizontal,
-                    padding: const EdgeInsets.all(12),
-                    child: _buildCodeText(displayText, isDiff),
-                  ),
-                ),
+              AnimatedSize(
+                duration: widget.isStreaming
+                    ? Duration.zero
+                    : const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                alignment: Alignment.topCenter,
+                child: _softWrap
+                    ? Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: _buildCodeText(displayText, t),
+                      )
+                    : CupertinoScrollbar(
+                        controller: _hCtrl,
+                        thumbVisibility: false,
+                        child: SingleChildScrollView(
+                          controller: _hCtrl,
+                          scrollDirection: Axis.horizontal,
+                          padding: const EdgeInsets.all(12),
+                          child: _buildCodeText(displayText, t),
+                        ),
+                      ),
+              ),
               if (isLong && !_expanded)
                 SelectionContainer.disabled(
                   child: GestureDetector(
@@ -5010,7 +7638,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                       _expanded = true;
                     }),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      padding: const EdgeInsets.symmetric(vertical: 9),
                       decoration: BoxDecoration(
                         color: t.codeBar.withValues(alpha: 0.72),
                         border: Border(
@@ -5038,8 +7666,9 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
 }
 
 class _TurnUsageMicroBadge extends StatelessWidget {
-  const _TurnUsageMicroBadge({required this.usage});
+  const _TurnUsageMicroBadge({required this.usage, this.toolCount = 0});
   final TurnUsage usage;
+  final int toolCount;
 
   static String _fmtTok(int n) {
     if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
@@ -5056,16 +7685,24 @@ class _TurnUsageMicroBadge extends StatelessWidget {
     final hitPct = totalIn > 0 && cacheRead > 0
         ? ((cacheRead / totalIn) * 100).toStringAsFixed(0)
         : null;
+    final durMs = usage.durationMs ?? 0;
+    final durLabel = durMs >= 500 ? '${(durMs / 1000).toStringAsFixed(1)}s' : null;
+    // Only display `t/s` when no multi-second tool calls polluted wall-clock `durationMs`.
+    final tps = (toolCount == 0 && durMs >= 500 && usage.outputTokens > 0)
+        ? (usage.outputTokens / (durMs / 1000.0))
+        : null;
     final parts = <String>[
       if (usage.inputTokens > 0) '↑${_fmtTok(usage.inputTokens)}',
       if (usage.outputTokens > 0) '↓${_fmtTok(usage.outputTokens)}',
       if (hitPct != null) '缓存 $hitPct%',
+      if (durLabel != null) durLabel,
+      if (tps != null && tps >= 1.0) '${tps.round()} t/s',
     ];
     if (parts.isEmpty) return const SizedBox.shrink();
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
       decoration: BoxDecoration(
-        color: t.fill1.withValues(alpha: t.isDark ? 0.06 : 0.05),
+        color: t.fill1,
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
@@ -5080,6 +7717,158 @@ class _TurnUsageMicroBadge extends StatelessWidget {
   }
 }
 
+/// Smooth height + fade reveal when a freshly streamed reply finishes typing
+/// (historical turns mount immediately at full height & opacity with zero animation!).
+class _ReplyActionStripReveal extends StatefulWidget {
+  const _ReplyActionStripReveal({
+    required this.animate,
+    required this.child,
+  });
+
+  final bool animate;
+  final Widget child;
+
+  @override
+  State<_ReplyActionStripReveal> createState() => _ReplyActionStripRevealState();
+}
+
+class _ReplyActionStripRevealState extends State<_ReplyActionStripReveal>
+    with SingleTickerProviderStateMixin {
+  AnimationController? _ctrl;
+  Animation<double>? _size;
+  Animation<double>? _fade;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.animate) {
+      _ctrl = AnimationController(
+        vsync: this,
+        duration: const Duration(milliseconds: 220),
+      );
+      _size = CurvedAnimation(parent: _ctrl!, curve: Curves.easeOutCubic);
+      _fade = CurvedAnimation(
+        parent: _ctrl!,
+        curve: const Interval(0.15, 1.0, curve: Curves.easeOut),
+      );
+      _ctrl!.forward();
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final size = _size;
+    final fade = _fade;
+    if (size == null || fade == null) return widget.child;
+    return ClipRect(
+      child: SizeTransition(
+        sizeFactor: size,
+        axisAlignment: -1.0,
+        child: FadeTransition(
+          opacity: fade,
+          child: widget.child,
+        ),
+      ),
+    );
+  }
+}
+
+/// Zero-layout-twitch, non-copyable breathing capsule caret for streaming prose & code blocks.
+class _LiveStreamingCaret extends StatefulWidget {
+  const _LiveStreamingCaret({required this.color, this.height = 15.0});
+
+  final Color color;
+  final double height;
+
+  @override
+  State<_LiveStreamingCaret> createState() => _LiveStreamingCaretState();
+}
+
+class _LiveStreamingCaretState extends State<_LiveStreamingCaret>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  bool _running = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 780),
+      value: 1.0,
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final shouldRun = WidgetsBinding.instance is WidgetsFlutterBinding &&
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.of(context)?.isCurrent ?? true) &&
+        !MediaQuery.disableAnimationsOf(context);
+    if (shouldRun && !_running) {
+      _running = true;
+      _ctrl.repeat(reverse: true);
+    } else if (!shouldRun && _running) {
+      _running = false;
+      _ctrl.stop();
+      _ctrl.value = 1.0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RepaintBoundary(
+      child: Padding(
+        padding: const EdgeInsets.only(left: 2.5),
+        child: SizedBox(
+          width: 2.5,
+          height: widget.height,
+          child: CustomPaint(
+            painter: _StreamingCaretPainter(animation: _ctrl, color: widget.color),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _StreamingCaretPainter extends CustomPainter {
+  _StreamingCaretPainter({required this.animation, required this.color})
+      : super(repaint: animation);
+
+  final Animation<double> animation;
+  final Color color;
+  final Paint _paint = Paint();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final v = Curves.easeInOut.transform(animation.value);
+    _paint.color = color.withValues(alpha: 0.28 + 0.66 * v);
+    final rrect = RRect.fromRectAndRadius(
+      Offset.zero & size,
+      Radius.circular(size.width * 0.5),
+    );
+    canvas.drawRRect(rrect, _paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _StreamingCaretPainter oldDelegate) =>
+      oldDelegate.color != color || oldDelegate.animation != animation;
+}
+
 class _QuietReplyAction extends StatelessWidget {
   const _QuietReplyAction({
     required this.icon,
@@ -5087,6 +7876,7 @@ class _QuietReplyAction extends StatelessWidget {
     required this.onTap,
     this.active = false,
     this.warnActive = false,
+    this.enabled = true,
   });
 
   final IconData icon;
@@ -5094,23 +7884,29 @@ class _QuietReplyAction extends StatelessWidget {
   final VoidCallback onTap;
   final bool active;
   final bool warnActive;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final activeFg = warnActive ? t.warn : t.ok;
     final activeBg = warnActive ? t.warnSoft : t.okSoft;
-    final fg = active ? activeFg : t.text3;
+    final fg = !enabled
+        ? t.text3.withValues(alpha: 0.36)
+        : (active ? activeFg : t.text3);
     return GrassBagSpringTap(
       onTap: onTap,
+      enabled: enabled,
       pressedScale: 0.92,
       haptic: true,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
         curve: Curves.easeOutCubic,
-        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
+        padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 6),
         decoration: BoxDecoration(
-          color: active ? activeBg : t.fill1.withValues(alpha: t.isDark ? 0.08 : 0.06),
+          color: active && enabled
+              ? activeBg
+              : (enabled ? t.fill1 : t.fill1.withValues(alpha: 0.04)),
           borderRadius: BorderRadius.circular(999),
         ),
         child: Row(

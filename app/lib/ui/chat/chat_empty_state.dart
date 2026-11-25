@@ -1,5 +1,7 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
@@ -13,11 +15,11 @@ import '../web/deepseek_signin_page.dart';
 
 /// Flagship Apple iOS 26 Empty New Chat Screen:
 /// - Floating cute GrassBag mascot silhouette (zero clunky box!)
-/// - Light-weight 28pt time greeting + quiet subtitle
-/// - Crystal Liquid Glass floating Workspace capsule ([GrassBagGlassPillButton])
+/// - Light-weight 28pt time greeting + quiet subtitle (fixed typography; pure-GPU scale on IME!)
+/// - Crystal Liquid Glass floating Workspace capsule
 /// - Whisper-light borderless SetupItem row (Preset + 4-Tier Permission)
-/// - 2×2 continuous superellipse frosted Suggestion cards with Apple squircle icons
-/// - Interactive rotating tip line (smoothly tucks away when keyboard is open)
+/// - 2×2 continuous superellipse frosted Suggestion cards with staggered GPU exit/bloom choreography
+/// - Interactive rotating tip line (exits first on keyboard rise, blooms last on dismiss)
 class ChatEmptyState extends ConsumerWidget {
   const ChatEmptyState({
     super.key,
@@ -26,6 +28,9 @@ class ChatEmptyState extends ConsumerWidget {
     this.onOpenHostSettings,
     this.keyboardOpen = false,
     this.keyboardProgress = 0.0,
+    this.keyboardProgressListenable,
+    this.onHeroHeightChanged,
+    this.onDeckHeightChanged,
   });
 
   final ValueChanged<String> onSuggestionTap;
@@ -34,9 +39,19 @@ class ChatEmptyState extends ConsumerWidget {
   final bool keyboardOpen;
 
   /// Smooth continuous keyboard-elevation progress `0.0` (closed) → `1.0` (open).
-  /// Smoothly tucks away the 4 suggestion cards & rotating tip while scaling the
-  /// hero cleanly above the rising composer so nothing is ever occluded!
+  /// Used when [keyboardProgressListenable] is not supplied (e.g., standalone / tests).
   final double keyboardProgress;
+
+  /// Optional 120Hz spring-driven progress listenable so IME choreography updates
+  /// pure GPU transforms & opacities with ZERO full-widget rebuilds or layout jitter!
+  final ValueListenable<double>? keyboardProgressListenable;
+
+  /// Reports resting hero section height (above suggestion deck) to the parent stage
+  /// for mathematically monotonic vertical centering with zero down-then-up bounce.
+  final ValueChanged<double>? onHeroHeightChanged;
+
+  /// Reports resting suggestion deck + tip height to the parent stage.
+  final ValueChanged<double>? onDeckHeightChanged;
 
   String _timeGreeting() {
     final h = DateTime.now().hour;
@@ -71,6 +86,7 @@ class ChatEmptyState extends ConsumerWidget {
           isActiveHostDesktop: s.isActiveHostDesktop,
           tipIndex: s.tipIndex,
           nativeRuntimeStatus: s.nativeRuntimeStatus,
+          nativeStatusHydrated: s.nativeStatusHydrated,
           runtimeProgressPct: s.runtimeProgressPct,
           runtimeProgressMsg: s.runtimeProgressMsg,
         ),
@@ -82,12 +98,18 @@ class ChatEmptyState extends ConsumerWidget {
     final tip = kEmptyTips[state.tipIndex % kEmptyTips.length];
     final rt = state.nativeRuntimeStatus;
     final isAndroidNative = GrassBagNativeBridge.instance.isAndroidNative;
+    final isHostTransientConnecting = state.connectionPhase == ConnectionPhase.connecting ||
+        state.connectionPhase == ConnectionPhase.reconnecting ||
+        state.connectionPhase == ConnectionPhase.bootstrapping;
     final showLocalContainerBanner = isAndroidNative &&
         state.hostIsLocal &&
-        (!rt.engineRunning || (state.runtimeProgressPct > 0 && state.runtimeProgressPct < 100));
+        state.nativeStatusHydrated &&
+        (!rt.engineRunning ||
+            (state.runtimeProgressPct > 0 && state.runtimeProgressPct < 100) ||
+            state.connectionPhase == ConnectionPhase.error);
     final showRemoteStatusBanner = !state.hostIsLocal &&
         !state.isDshConnected &&
-        state.connectionPhase != ConnectionPhase.connecting;
+        !isHostTransientConnecting;
     final showLocalDesktopErrorBanner = !isAndroidNative &&
         state.hostIsLocal &&
         !state.isDshConnected &&
@@ -117,7 +139,7 @@ class ChatEmptyState extends ConsumerWidget {
         t.dusk,
         '运行当前项目的测试或静态检查，定位问题并给出修复方案',
       ),
-      if (isDesktopHost)
+      if (isDesktopHost || !isAndroidNative)
         (
           CupertinoIcons.arrow_branch,
           '梳理 Git 改动',
@@ -133,20 +155,206 @@ class ChatEmptyState extends ConsumerWidget {
           t.warn,
           '帮我查看手机下载目录的大文件，并按类型给出清理或压缩建议',
         ),
-      (
-        CupertinoIcons.doc_text_fill,
-        '整理项目文档',
-        '生成清晰结构与接口说明',
-        t.primary,
-        '阅读当前项目核心模块并整理一份清晰的架构与使用说明文档',
-      ),
+      if (isAndroidNative && state.hostIsLocal)
+        (
+          CupertinoIcons.device_phone_portrait,
+          '操控手机',
+          '用自然语言自动操作应用',
+          t.primary,
+          '帮我打开系统设置，查看当前网络与电量状态后返回 GrassBag',
+        )
+      else
+        (
+          CupertinoIcons.doc_text_fill,
+          '整理项目文档',
+          '生成清晰结构与接口说明',
+          t.primary,
+          '阅读当前项目核心模块并整理一份清晰的架构与使用说明文档',
+        ),
     ];
 
-    final effectiveKbProgress =
+    final fallbackProgress =
         (keyboardOpen ? 1.0 : keyboardProgress).clamp(0.0, 1.0);
-    final kbCurve = Curves.easeOutCubic.transform(effectiveKbProgress);
-    final footerVisibleFactor = (1.0 - kbCurve).clamp(0.0, 1.0);
-    final footerOpacity = (1.0 - kbCurve * 1.45).clamp(0.0, 1.0);
+    final listenable = keyboardProgressListenable;
+
+    Widget buildHeroHeader() {
+      const mascot = RepaintBoundary(child: _FloatingMascot(size: 48));
+      final greetingBlock = RepaintBoundary(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _timeGreeting(),
+              style: TextStyle(
+                fontSize: 28.0,
+                fontWeight: FontWeight.w300,
+                letterSpacing: -0.5,
+                color: t.text,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 5.0, bottom: 16.0),
+              child: Text(
+                '今天想做点什么？',
+                style: TextStyle(fontSize: 14, color: t.text2),
+              ),
+            ),
+          ],
+        ),
+      );
+      return _KbProgressBuilder(
+        listenable: listenable,
+        fallback: fallbackProgress,
+        builder: (_, p, __) {
+          // Pure GPU scale & parallax tuck phase-locked 1:1 to `_openProgressNotifier`
+          // (no double-easing over OS/spring curve -> symmetric open & dismiss!).
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Transform.translate(
+                offset: Offset(0, 4.0 * p),
+                child: Transform.scale(
+                  scale: 1.0 - 0.14 * p,
+                  alignment: Alignment.bottomCenter,
+                  child: mascot,
+                ),
+              ),
+              const SizedBox(height: 10.0),
+              Transform.translate(
+                offset: Offset(0, -2.0 * p),
+                child: Transform.scale(
+                  scale: 1.0 - 0.08 * p,
+                  alignment: Alignment.topCenter,
+                  child: greetingBlock,
+                ),
+              ),
+            ],
+          );
+        },
+      );
+    }
+
+    // Hoist static workspace capsule + setup row OUTSIDE _KbProgressBuilder so 120Hz
+    // IME spring ticks only translate a cached layer instead of rebuilding widgets!
+    final staticWorkspaceAndSetup = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        GrassBagSpringTap(
+          pressedScale: 0.96,
+          haptic: true,
+          onTap: () => showWorkspaceSheet(context, ref),
+          child: Container(
+            height: 38,
+            padding: const EdgeInsets.symmetric(horizontal: 15),
+            decoration: ShapeDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: t.isDark
+                    ? [
+                        Colors.white.withValues(alpha: 0.12),
+                        Colors.white.withValues(alpha: 0.06),
+                      ]
+                    : [
+                        Colors.white.withValues(alpha: 0.88),
+                        Colors.white.withValues(alpha: 0.72),
+                      ],
+              ),
+              shape: StadiumBorder(
+                side: BorderSide(
+                  color: t.isDark
+                      ? Colors.white.withValues(alpha: 0.20)
+                      : Colors.white.withValues(alpha: 0.94),
+                  width: 0.75,
+                ),
+              ),
+              shadows: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: t.isDark ? 0.24 : 0.07),
+                  blurRadius: 14,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (isHostTransientConnecting && state.activeWorkspace.isNotEmpty) ...[
+                  GrassBagStatusDot(color: t.primary, pulsing: true, size: 7),
+                  const SizedBox(width: 7),
+                ] else ...[
+                  Icon(CupertinoIcons.folder_fill, size: 15, color: t.primary),
+                  const SizedBox(width: 7),
+                ],
+                Flexible(
+                  child: Text(
+                    state.activeWorkspace.isEmpty
+                        ? ((isHostTransientConnecting || state.hydratingDomains)
+                            ? (state.hostIsLocal ? '正在连接本机 DSH…' : '正在连接「${state.hostName}」…')
+                            : '选择工作区')
+                        : '在「${state.activeWorkspace}」中${state.hostIsLocal ? '' : ' · ${state.hostName}'}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      letterSpacing: -0.1,
+                      color: t.text,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.text3),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 9),
+
+        // Whisper-light borderless SetupItem row (Preset & 4-Tier Permission)
+        Wrap(
+          alignment: WrapAlignment.center,
+          spacing: 4,
+          runSpacing: 4,
+          children: [
+            _SetupItem(
+              icon: CupertinoIcons.compass,
+              label: state.activePreset.name,
+              onTap: () => showPresetSheet(context, ref),
+            ),
+            _SetupItem(
+              icon: perm.risky
+                  ? CupertinoIcons.exclamationmark_shield_fill
+                  : CupertinoIcons.shield,
+              label: perm.name,
+              warnTone: perm.risky,
+              onTap: () => showPermissionSheet(context, ref),
+            ),
+          ],
+        ),
+      ],
+    );
+
+    final heroControls = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        buildHeroHeader(),
+
+        // Luminous translucent workspace capsule (vector-composited so scrolling inside
+        // _KeyboardAwareEmptyStage stays 100% 120fps with zero scrolling Impeller shaders!)
+        _KbProgressBuilder(
+          listenable: listenable,
+          fallback: fallbackProgress,
+          child: RepaintBoundary(child: staticWorkspaceAndSetup),
+          builder: (_, p, child) {
+            return Transform.translate(
+              offset: Offset(0, -7.0 * p),
+              child: child,
+            );
+          },
+        ),
+      ],
+    );
 
     return Center(
       child: ConstrainedBox(
@@ -154,130 +362,19 @@ class ChatEmptyState extends ConsumerWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Transform.scale(
-              scale: 1.0 - 0.16 * kbCurve,
-              alignment: Alignment.bottomCenter,
-              child: const RepaintBoundary(
-                child: _FloatingMascot(size: 48),
-              ),
-            ),
-            SizedBox(height: 10.0 - 4.0 * kbCurve),
-            Text(
-              _timeGreeting(),
-              style: TextStyle(
-                fontSize: 28.0 - 3.5 * kbCurve,
-                fontWeight: FontWeight.w300,
-                letterSpacing: -0.5,
-                color: t.text,
-              ),
-            ),
-            Padding(
-              padding: EdgeInsets.only(
-                top: 5.0 - 2.0 * kbCurve,
-                bottom: 16.0 - 5.0 * kbCurve,
-              ),
-              child: Text(
-                '今天想做点什么？',
-                style: TextStyle(fontSize: 14, color: t.text2),
-              ),
-            ),
-
-            // Luminous translucent workspace capsule (vector-composited so scrolling inside
-            // _KeyboardAwareEmptyStage stays 100% 120fps with zero scrolling Impeller shaders!)
-            GrassBagSpringTap(
-              pressedScale: 0.96,
-              haptic: true,
-              onTap: () => showWorkspaceSheet(context, ref),
-              child: Container(
-                height: 38,
-                padding: const EdgeInsets.symmetric(horizontal: 15),
-                decoration: ShapeDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: t.isDark
-                        ? [
-                            Colors.white.withValues(alpha: 0.12),
-                            Colors.white.withValues(alpha: 0.06),
-                          ]
-                        : [
-                            Colors.white.withValues(alpha: 0.88),
-                            Colors.white.withValues(alpha: 0.72),
-                          ],
-                  ),
-                  shape: StadiumBorder(
-                    side: BorderSide(
-                      color: t.isDark
-                          ? Colors.white.withValues(alpha: 0.20)
-                          : Colors.white.withValues(alpha: 0.94),
-                      width: 0.75,
-                    ),
-                  ),
-                  shadows: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: t.isDark ? 0.24 : 0.07),
-                      blurRadius: 14,
-                      offset: const Offset(0, 4),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(CupertinoIcons.folder_fill, size: 15, color: t.primary),
-                    const SizedBox(width: 7),
-                    Flexible(
-                      child: Text(
-                        state.activeWorkspace.isEmpty
-                            ? (state.connectionPhase == ConnectionPhase.connecting
-                                ? (state.hostIsLocal ? '正在连接本机 DSH…' : '正在连接「${state.hostName}」…')
-                                : '选择工作区')
-                            : '在「${state.activeWorkspace}」中${state.hostIsLocal ? '' : ' · ${state.hostName}'}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w500,
-                          letterSpacing: -0.1,
-                          color: t.text,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.text3),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 9),
-
-            // Whisper-light borderless SetupItem row (Preset & 4-Tier Permission)
-            Wrap(
-              alignment: WrapAlignment.center,
-              spacing: 4,
-              runSpacing: 4,
-              children: [
-                _SetupItem(
-                  icon: CupertinoIcons.compass,
-                  label: state.activePreset.name,
-                  onTap: () => showPresetSheet(context, ref),
-                ),
-                _SetupItem(
-                  icon: perm.risky
-                      ? CupertinoIcons.exclamationmark_shield_fill
-                      : CupertinoIcons.shield,
-                  label: perm.name,
-                  warnTone: perm.risky,
-                  onTap: () => showPermissionSheet(context, ref),
-                ),
-              ],
-            ),
+            _MeasureBoxHeight(
+              onHeightChanged: onHeroHeightChanged,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  heroControls,
             if (showLocalContainerBanner) ...[
               const SizedBox(height: 14),
               _LocalRuntimeBanner(
                 rt: rt,
                 progressPct: state.runtimeProgressPct,
                 progressMsg: state.runtimeProgressMsg,
+                hasConnectionError: state.connectionPhase == ConnectionPhase.error,
                 tier: state.glassTier,
                 onBootstrap: () => ctrl.bootstrapLocalRuntime(),
                 onStartEngine: () => ctrl.restartLocalEngine(),
@@ -300,7 +397,15 @@ class ChatEmptyState extends ConsumerWidget {
                   }
                 },
                 onSecondaryTap: () {
-                  if (onOpenHostSettings != null) {
+                  final isNeedsAuth =
+                      state.hostNeedsAuth || state.connectionPhase == ConnectionPhase.needsAuth;
+                  if (isNeedsAuth) {
+                    showHostQuickSheet(
+                      context,
+                      ref,
+                      onOpenHostSettings: onOpenHostSettings,
+                    );
+                  } else if (onOpenHostSettings != null) {
                     onOpenHostSettings!();
                   } else {
                     showHostQuickSheet(context, ref);
@@ -429,159 +534,378 @@ class ChatEmptyState extends ConsumerWidget {
                 ),
               ),
             ],
-            // Smoothly collapse 2×2 suggestion cards + rotating tip when keyboard rises
-            // so the core greeting, workspace pill & controls stay gracefully framed above IME!
-            IgnorePointer(
-              ignoring: effectiveKbProgress > 0.12,
-              child: ClipRect(
-                child: Align(
-                  alignment: Alignment.topCenter,
-                  heightFactor: footerVisibleFactor,
-                  child: Opacity(
-                    opacity: footerOpacity,
-                    child: Transform.translate(
-                      offset: Offset(0, 14.0 * kbCurve),
-                      child: Transform.scale(
-                        scale: 1.0 - 0.04 * kbCurve,
-                        alignment: Alignment.topCenter,
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const SizedBox(height: 22),
-
-                            // Continuous Superellipse Luminous 2×2 Suggestion Cards
-                            LayoutBuilder(
-                              builder: (ctx, constraints) {
-                                final twoCol = constraints.maxWidth >= 340;
-                                if (!twoCol) {
-                                  return Column(
-                                    children: [
-                                      for (final s in suggestions)
-                                        Padding(
-                                          padding: const EdgeInsets.only(bottom: 8),
-                                          child: _SuggestionTile(
-                                            icon: s.$1,
-                                            title: s.$2,
-                                            subtitle: s.$3,
-                                            accent: s.$4,
-                                            onTap: () => onSuggestionTap(s.$5),
-                                          ),
-                                        ),
-                                    ],
-                                  );
-                                }
-                                return Column(
-                                  children: [
-                                    Row(
-                                      children: [
-                                        Expanded(
-                                          child: _SuggestionTile(
-                                            icon: suggestions[0].$1,
-                                            title: suggestions[0].$2,
-                                            subtitle: suggestions[0].$3,
-                                            accent: suggestions[0].$4,
-                                            onTap: () => onSuggestionTap(suggestions[0].$5),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Expanded(
-                                          child: _SuggestionTile(
-                                            icon: suggestions[1].$1,
-                                            title: suggestions[1].$2,
-                                            subtitle: suggestions[1].$3,
-                                            accent: suggestions[1].$4,
-                                            onTap: () => onSuggestionTap(suggestions[1].$5),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 10),
-                                    Row(
-                                      children: [
-                                        Expanded(
-                                          child: _SuggestionTile(
-                                            icon: suggestions[2].$1,
-                                            title: suggestions[2].$2,
-                                            subtitle: suggestions[2].$3,
-                                            accent: suggestions[2].$4,
-                                            onTap: () => onSuggestionTap(suggestions[2].$5),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Expanded(
-                                          child: _SuggestionTile(
-                                            icon: suggestions[3].$1,
-                                            title: suggestions[3].$2,
-                                            subtitle: suggestions[3].$3,
-                                            accent: suggestions[3].$4,
-                                            onTap: () => onSuggestionTap(suggestions[3].$5),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ],
-                                );
-                              },
-                            ),
-                            // Interactive Rotating Tip Row
-                            Padding(
-                              padding: const EdgeInsets.only(top: 12),
-                              child: GrassBagSpringTap(
-                                onTap: ctrl.nextEmptyTip,
-                                pressedScale: 0.98,
-                                haptic: true,
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
-                                      const SizedBox(width: 8),
-                                      Expanded(
-                                        child: AnimatedSwitcher(
-                                          duration: const Duration(milliseconds: 220),
-                                          switchInCurve: Curves.linear,
-                                          switchOutCurve: Curves.linear,
-                                          transitionBuilder: (child, anim) => FadeTransition(
-                                            opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
-                                            child: SlideTransition(
-                                              position: Tween<Offset>(
-                                                begin: const Offset(0, 0.25),
-                                                end: Offset.zero,
-                                              ).animate(CurvedAnimation(parent: anim, curve: Curves.easeOutCubic)),
-                                              child: child,
-                                            ),
-                                          ),
-                                          child: Align(
-                                            key: ValueKey(tip),
-                                            alignment: Alignment.centerLeft,
-                                            child: Text(
-                                              tip,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(fontSize: 12, color: t.text3),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                      Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
-                                    ],
-                                  ),
+                ],
+              ),
+            ),
+            // Hoist static suggestion cards + rotating tip OUTSIDE `_KbProgressBuilder` inside
+            // RepaintBoundaries so 120Hz IME spring ticks NEVER rebuild GrassBagCard / LayoutBuilder!
+            () {
+              final singleColTiles = [
+                for (var i = 0; i < suggestions.length; i++)
+                  RepaintBoundary(
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: _SuggestionTile(
+                        icon: suggestions[i].$1,
+                        title: suggestions[i].$2,
+                        subtitle: suggestions[i].$3,
+                        accent: suggestions[i].$4,
+                        onTap: () => onSuggestionTap(suggestions[i].$5),
+                      ),
+                    ),
+                  ),
+              ];
+              final twoColRow1 = RepaintBoundary(
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _SuggestionTile(
+                        icon: suggestions[0].$1,
+                        title: suggestions[0].$2,
+                        subtitle: suggestions[0].$3,
+                        accent: suggestions[0].$4,
+                        onTap: () => onSuggestionTap(suggestions[0].$5),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _SuggestionTile(
+                        icon: suggestions[1].$1,
+                        title: suggestions[1].$2,
+                        subtitle: suggestions[1].$3,
+                        accent: suggestions[1].$4,
+                        onTap: () => onSuggestionTap(suggestions[1].$5),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+              final twoColRow2 = RepaintBoundary(
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _SuggestionTile(
+                        icon: suggestions[2].$1,
+                        title: suggestions[2].$2,
+                        subtitle: suggestions[2].$3,
+                        accent: suggestions[2].$4,
+                        onTap: () => onSuggestionTap(suggestions[2].$5),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _SuggestionTile(
+                        icon: suggestions[3].$1,
+                        title: suggestions[3].$2,
+                        subtitle: suggestions[3].$3,
+                        accent: suggestions[3].$4,
+                        onTap: () => onSuggestionTap(suggestions[3].$5),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+              final tipRowContent = RepaintBoundary(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: GrassBagSpringTap(
+                    onTap: ctrl.nextEmptyTip,
+                    pressedScale: 0.98,
+                    haptic: true,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      child: Row(
+                        children: [
+                          Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 220),
+                              switchInCurve: Curves.linear,
+                              switchOutCurve: Curves.linear,
+                              transitionBuilder: (child, anim) => _TipSlideFadeTransition(
+                                animation: anim,
+                                child: child,
+                              ),
+                              child: Align(
+                                key: ValueKey(tip),
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  tip,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 12, height: 1.38, color: t.text3),
                                 ),
                               ),
                             ),
-                          ],
-                        ),
+                          ),
+                          const SizedBox(width: 6),
+                          Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                        ],
                       ),
                     ),
                   ),
                 ),
-              ),
-            ),
+              );
+
+              return _MeasureBoxHeight(
+                onHeightChanged: onDeckHeightChanged,
+                child: LayoutBuilder(
+                  builder: (ctx, constraints) {
+                    final twoCol = constraints.maxWidth >= 300;
+                    return _KbProgressBuilder(
+                      listenable: listenable,
+                      fallback: fallbackProgress,
+                      builder: (_, p, __) {
+                        return IgnorePointer(
+                          ignoring: p > 0.08,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const SizedBox(height: 22),
+                              if (!twoCol)
+                                Column(
+                                  children: [
+                                    for (var i = 0; i < singleColTiles.length; i++)
+                                      _StaggeredDeckSlice(
+                                        progress: p,
+                                        start: 0.02 + 0.03 * (singleColTiles.length - 1 - i),
+                                        end: 0.54 + 0.06 * (singleColTiles.length - 1 - i),
+                                        dy: 14.0 + 3.0 * i,
+                                        minScale: 0.93,
+                                        child: singleColTiles[i],
+                                      ),
+                                  ],
+                                )
+                              else
+                                Column(
+                                  children: [
+                                    _StaggeredDeckSlice(
+                                      progress: p,
+                                      start: 0.08,
+                                      end: 0.72,
+                                      dy: 16.0,
+                                      minScale: 0.94,
+                                      child: twoColRow1,
+                                    ),
+                                    const SizedBox(height: 10),
+                                    _StaggeredDeckSlice(
+                                      progress: p,
+                                      start: 0.02,
+                                      end: 0.58,
+                                      dy: 22.0,
+                                      minScale: 0.92,
+                                      child: twoColRow2,
+                                    ),
+                                  ],
+                                ),
+                              _StaggeredDeckSlice(
+                                progress: p,
+                                start: 0.0,
+                                end: 0.42,
+                                dy: 12.0,
+                                minScale: 0.96,
+                                child: tipRowContent,
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              );
+            }(),
           ],
         ),
       ),
     );
+  }
+}
+
+/// Subscribes to a 120Hz [ValueListenable] when provided (avoiding full-widget rebuilds
+/// during IME spring ticks), or falls back to a static [fallback] progress value.
+class _KbProgressBuilder extends StatelessWidget {
+  const _KbProgressBuilder({
+    required this.listenable,
+    required this.fallback,
+    required this.builder,
+    this.child,
+  });
+
+  final ValueListenable<double>? listenable;
+  final double fallback;
+  final Widget Function(BuildContext context, double progress, Widget? child) builder;
+  final Widget? child;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = listenable;
+    if (l == null) {
+      return builder(context, fallback.clamp(0.0, 1.0), child);
+    }
+    return ValueListenableBuilder<double>(
+      valueListenable: l,
+      child: child,
+      builder: (ctx, value, cachedChild) =>
+          builder(ctx, value.clamp(0.0, 1.0), cachedChild),
+    );
+  }
+}
+
+/// Pure-GPU staggered exit & bloom-in slice for suggestion rows and rotating tip.
+/// Phase-locked linearly to `_openProgressNotifier` (symmetric open & dismiss!) and
+/// skips painting completely once faded out while maintaining exact layout height.
+class _StaggeredDeckSlice extends StatelessWidget {
+  const _StaggeredDeckSlice({
+    required this.progress,
+    required this.start,
+    required this.end,
+    required this.dy,
+    required this.minScale,
+    required this.child,
+  });
+
+  final double progress;
+  final double start;
+  final double end;
+  final double dy;
+  final double minScale;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final span = (end - start).clamp(0.01, 1.0);
+    final local = ((progress - start) / span).clamp(0.0, 1.0);
+    final opacity = (1.0 - local).clamp(0.0, 1.0);
+    final scale = 1.0 - (1.0 - minScale) * local;
+    return Visibility(
+      visible: opacity > 0.005,
+      maintainSize: true,
+      maintainAnimation: true,
+      maintainState: true,
+      child: FadeTransition(
+        opacity: AlwaysStoppedAnimation<double>(opacity),
+        child: Transform.translate(
+          offset: Offset(0, dy * local),
+          child: Transform.scale(
+            scale: scale,
+            alignment: Alignment.topCenter,
+            child: child,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Directional tip ticker transition: incoming tips glide up from below while outgoing
+/// tips glide cleanly upward out of sight (owns & disposes its CurvedAnimations).
+class _TipSlideFadeTransition extends StatefulWidget {
+  const _TipSlideFadeTransition({
+    required this.animation,
+    required this.child,
+  });
+
+  final Animation<double> animation;
+  final Widget child;
+
+  @override
+  State<_TipSlideFadeTransition> createState() => _TipSlideFadeTransitionState();
+}
+
+class _TipSlideFadeTransitionState extends State<_TipSlideFadeTransition> {
+  late CurvedAnimation _fadeCurve;
+  late CurvedAnimation _slideCurve;
+
+  void _init() {
+    _fadeCurve = CurvedAnimation(
+      parent: widget.animation,
+      curve: Curves.easeOut,
+      reverseCurve: Curves.easeIn,
+    );
+    _slideCurve = CurvedAnimation(
+      parent: widget.animation,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TipSlideFadeTransition oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.animation != widget.animation) {
+      _fadeCurve.dispose();
+      _slideCurve.dispose();
+      _init();
+    }
+  }
+
+  @override
+  void dispose() {
+    _fadeCurve.dispose();
+    _slideCurve.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isReverse = widget.animation.status == AnimationStatus.reverse;
+    final begin = isReverse ? const Offset(0, -0.32) : const Offset(0, 0.32);
+    return FadeTransition(
+      opacity: _fadeCurve,
+      child: SlideTransition(
+        position: Tween<Offset>(begin: begin, end: Offset.zero).animate(_slideCurve),
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+/// Lightweight layout height observer reporting resting section height only when it
+/// actually changes by > 0.5px (zero layout loops, zero frame churn).
+class _MeasureBoxHeight extends SingleChildRenderObjectWidget {
+  const _MeasureBoxHeight({
+    required this.onHeightChanged,
+    required super.child,
+  });
+
+  final ValueChanged<double>? onHeightChanged;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderMeasureBoxHeight(onHeightChanged);
+
+  @override
+  void updateRenderObject(BuildContext context, _RenderMeasureBoxHeight renderObject) {
+    renderObject.onHeightChanged = onHeightChanged;
+  }
+}
+
+class _RenderMeasureBoxHeight extends RenderProxyBox {
+  _RenderMeasureBoxHeight(this.onHeightChanged);
+
+  ValueChanged<double>? onHeightChanged;
+  double _lastReported = -1.0;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final cb = onHeightChanged;
+    if (cb == null || !hasSize) return;
+    final h = size.height;
+    if (h > 0 && (h - _lastReported).abs() > 0.5) {
+      _lastReported = h;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        cb(h);
+      });
+    }
   }
 }
 
@@ -686,6 +1010,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
     required this.rt,
     required this.progressPct,
     required this.progressMsg,
+    this.hasConnectionError = false,
     required this.tier,
     required this.onBootstrap,
     required this.onStartEngine,
@@ -694,6 +1019,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
   final NativeRuntimeStatus rt;
   final int progressPct;
   final String progressMsg;
+  final bool hasConnectionError;
   final GrassBagGlassTier tier;
   final VoidCallback onBootstrap;
   final VoidCallback onStartEngine;
@@ -703,7 +1029,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final deploying = progressPct > 0 && progressPct < 100;
     final starting = rt.engineState == 'starting';
-    final hasErr = rt.engineState == 'error';
+    final hasErr = rt.engineState == 'error' || hasConnectionError;
 
     final title = deploying
         ? '正在部署本机 Ubuntu + DSH 容器 ($progressPct%)'
@@ -844,7 +1170,7 @@ class _SetupItem extends StatelessWidget {
   }
 }
 
-class _SuggestionTile extends StatelessWidget {
+class _SuggestionTile extends StatefulWidget {
   const _SuggestionTile({
     required this.icon,
     required this.title,
@@ -860,51 +1186,72 @@ class _SuggestionTile extends StatelessWidget {
   final VoidCallback onTap;
 
   @override
+  State<_SuggestionTile> createState() => _SuggestionTileState();
+}
+
+class _SuggestionTileState extends State<_SuggestionTile> {
+  bool _hovered = false;
+
+  @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return GrassBagSpringTap(
-      onTap: onTap,
-      pressedScale: 0.96,
-      haptic: true,
-      child: GrassBagCard(
-        borderRadius: 20,
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 12),
-        child: Row(
-          children: [
-            GrassBagSquircleIcon(
-              icon: icon,
-              color: accent,
-              size: 36,
-              iconSize: 16.5,
-            ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13.5,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: -0.2,
-                      color: t.text,
-                    ),
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) {
+        if (!_hovered) setState(() => _hovered = true);
+      },
+      onExit: (_) {
+        if (_hovered) setState(() => _hovered = false);
+      },
+      child: GrassBagSpringTap(
+        onTap: widget.onTap,
+        pressedScale: 0.96,
+        haptic: true,
+        child: AnimatedScale(
+          scale: _hovered ? 1.012 : 1.0,
+          duration: const Duration(milliseconds: 140),
+          curve: Curves.easeOutCubic,
+          child: GrassBagCard(
+            borderRadius: 20,
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 12),
+            child: Row(
+              children: [
+                GrassBagSquircleIcon(
+                  icon: widget.icon,
+                  color: widget.accent,
+                  size: 36,
+                  iconSize: 16.5,
+                ),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: -0.2,
+                          color: t.text,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        widget.subtitle,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11.5, color: t.text3),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 11.5, color: t.text3),
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );

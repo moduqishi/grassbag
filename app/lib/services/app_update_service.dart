@@ -53,6 +53,8 @@ class ParsedAppVersion {
   final String? prerelease;
 
   String get coreString => '$major.$minor.$patch';
+  String get versionString =>
+      (prerelease != null && prerelease!.isNotEmpty) ? '$coreString-$prerelease' : coreString;
 
   @override
   bool operator ==(Object other) {
@@ -108,7 +110,8 @@ int compareAppVersions(ParsedAppVersion a, ParsedAppVersion b) {
   if (aPre == null && bPre != null) return 1;
   if (aPre != null && bPre == null) return -1;
   if (aPre != null && bPre != null && aPre != bPre) {
-    return aPre.compareTo(bPre);
+    final cmp = _compareSemVerPrerelease(aPre, bPre);
+    if (cmp != 0) return cmp;
   }
 
   // If both expose positive build numbers, use monotonic Android versionCode as tie-breaker.
@@ -118,6 +121,27 @@ int compareAppVersions(ParsedAppVersion a, ParsedAppVersion b) {
     return aBuild.compareTo(bBuild);
   }
   return 0;
+}
+
+/// SemVer 2.0 §11 dot-separated prerelease comparison (`rc.10 > rc.2`, numeric < alphanumeric).
+int _compareSemVerPrerelease(String a, String b) {
+  final aParts = a.split('.');
+  final bParts = b.split('.');
+  final minLen = aParts.length < bParts.length ? aParts.length : bParts.length;
+  for (var i = 0; i < minLen; i++) {
+    final ap = aParts[i];
+    final bp = bParts[i];
+    if (ap == bp) continue;
+    final ai = int.tryParse(ap);
+    final bi = int.tryParse(bp);
+    if (ai != null && bi != null) {
+      return ai.compareTo(bi);
+    }
+    if (ai != null) return -1;
+    if (bi != null) return 1;
+    return ap.compareTo(bp);
+  }
+  return aParts.length.compareTo(bParts.length);
 }
 
 @immutable
@@ -163,20 +187,22 @@ class AppReleaseInfo {
     return '${(bytes / 1024).toStringAsFixed(0)} KB';
   }
 
-  static final RegExp _kApkBuildRegex = RegExp(r'v?\d+\.\d+\.\d+\+(\d+)', caseSensitive: false);
-  static final RegExp _kBodyBuildRegex = RegExp(r'\d+\.\d+\.\d+\s*\((\d+)\)');
+  static final RegExp _kApkBuildRegex =
+      RegExp(r'v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+|[-_.]b)(\d+)', caseSensitive: false);
+  static final RegExp _kBodyBuildRegex = RegExp(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*\((\d+)\)');
 
   static AppReleaseInfo? fromGitHubReleaseJson(Map<String, dynamic> json) {
     final tag = json['tag_name']?.toString().trim() ?? '';
     if (tag.isEmpty) return null;
 
     final parsedTag = parseAppVersion(tag);
-    final versionName = parsedTag?.coreString ?? tag.replaceFirst(RegExp(r'^v'), '');
+    final versionName = parsedTag?.versionString ?? tag.replaceFirst(RegExp(r'^v'), '');
     final title = (json['name']?.toString().trim().isNotEmpty == true)
         ? json['name'].toString().trim()
         : tag;
     final body = json['body']?.toString().trim() ?? '';
-    final htmlUrl = json['html_url']?.toString().trim() ?? kGrassBagReleasesWebUrl;
+    final rawHtmlUrl = json['html_url']?.toString().trim() ?? '';
+    final htmlUrl = rawHtmlUrl.isNotEmpty ? rawHtmlUrl : kGrassBagReleasesWebUrl;
     final publishedRaw = json['published_at']?.toString().trim();
     final publishedAt = publishedRaw == null ? null : DateTime.tryParse(publishedRaw);
     final isPrerelease = json['prerelease'] == true;
@@ -203,8 +229,10 @@ class AppReleaseInfo {
       }
       final chosen = preferred ?? fallback;
       if (chosen != null) {
-        apkName = chosen['name']?.toString();
-        apkDownloadUrl = chosen['browser_download_url']?.toString();
+        final rawApkName = chosen['name']?.toString().trim() ?? '';
+        final rawApkUrl = chosen['browser_download_url']?.toString().trim() ?? '';
+        apkName = rawApkName.isNotEmpty ? rawApkName : null;
+        apkDownloadUrl = rawApkUrl.isNotEmpty ? rawApkUrl : null;
         apkSizeBytes = (chosen['size'] as num?)?.toInt();
       }
     }
@@ -347,6 +375,8 @@ class AppUpdateService {
     required String destinationPath,
     void Function(int receivedBytes, int totalBytes)? onProgress,
     bool Function()? isCancelled,
+    int? expectedSizeBytes,
+    void Function(void Function() abort)? onAbortReady,
   }) {
     final uri = Uri.parse(downloadUrl.trim());
     return downloadAppUpdateApk(
@@ -354,6 +384,8 @@ class AppUpdateService {
       destinationPath,
       onProgress: onProgress,
       isCancelled: isCancelled,
+      expectedSizeBytes: expectedSizeBytes,
+      onAbortReady: onAbortReady,
     );
   }
 

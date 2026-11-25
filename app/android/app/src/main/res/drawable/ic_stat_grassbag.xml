@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Monochrome alpha-only GrassBag sprout + pouch silhouette for Android status bar -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,2.5C9.7,2.5 8,4.2 8,6.5C10.3,6.5 12,4.8 12,2.5Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,4.2C12,6.4 13.7,8 16,8C16,5.8 14.3,4.2 12,4.2Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11.1,6.2H12.9V9.2H11.1V6.2Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M7.5,9.2H16.5C18.4,9.2 19.8,10.7 20,12.6L20.5,17.2C20.7,19.4 19,21.2 16.8,21.2H7.2C5,21.2 3.3,19.4 3.5,17.2L4,12.6C4.2,10.7 5.6,9.2 7.5,9.2ZM8.8,13.6C8.1,13.6 7.6,14.1 7.6,14.8C7.6,15.5 8.1,16 8.8,16H15.2C15.9,16 16.4,15.5 16.4,14.8C16.4,14.1 15.9,13.6 15.2,13.6H8.8Z" />
+</vector>

@@ -29,10 +29,14 @@ final ValueNotifier<int> _grassBagOpenSheetDepth = ValueNotifier<int>(0);
 class _GlobalToastScope extends InheritedWidget {
   const _GlobalToastScope({
     required this.bottomOffsetNotifier,
+    required this.registerOffset,
+    required this.unregisterOffset,
     required super.child,
   });
 
   final ValueNotifier<double> bottomOffsetNotifier;
+  final void Function(Object token, double offset) registerOffset;
+  final void Function(Object token) unregisterOffset;
 
   static _GlobalToastScope? maybeOf(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<_GlobalToastScope>();
@@ -54,9 +58,36 @@ class GrassBagGlobalToastHost extends StatefulWidget {
 
 class _GrassBagGlobalToastHostState extends State<GrassBagGlobalToastHost> {
   final ValueNotifier<double> _bottomOffset = ValueNotifier<double>(28.0);
+  final List<({Object token, double offset})> _offsetStack = [];
+
+  void _syncTopOffset() {
+    final next = _offsetStack.isEmpty ? 28.0 : _offsetStack.last.offset;
+    if ((_bottomOffset.value - next).abs() > 0.5) {
+      _bottomOffset.value = next;
+    }
+  }
+
+  void _registerOffset(Object token, double offset) {
+    final idx = _offsetStack.indexWhere((e) => identical(e.token, token));
+    if (idx >= 0) {
+      _offsetStack[idx] = (token: token, offset: offset);
+    } else {
+      _offsetStack.add((token: token, offset: offset));
+    }
+    _syncTopOffset();
+  }
+
+  void _unregisterOffset(Object token) {
+    final before = _offsetStack.length;
+    _offsetStack.removeWhere((e) => identical(e.token, token));
+    if (_offsetStack.length != before) {
+      _syncTopOffset();
+    }
+  }
 
   @override
   void dispose() {
+    _offsetStack.clear();
     _bottomOffset.dispose();
     super.dispose();
   }
@@ -65,6 +96,8 @@ class _GrassBagGlobalToastHostState extends State<GrassBagGlobalToastHost> {
   Widget build(BuildContext context) {
     return _GlobalToastScope(
       bottomOffsetNotifier: _bottomOffset,
+      registerOffset: _registerOffset,
+      unregisterOffset: _unregisterOffset,
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -105,6 +138,21 @@ class GrassBagToastOverlay extends ConsumerStatefulWidget {
 }
 
 class _GrassBagToastOverlayState extends ConsumerState<GrassBagToastOverlay> {
+  GrassBagToastMessage? _retainedToast;
+  final Object _offsetToken = Object();
+  _GlobalToastScope? _registeredScope;
+
+  @override
+  void dispose() {
+    final scope = _registeredScope;
+    if (scope != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        scope.unregisterOffset(_offsetToken);
+      });
+    }
+    super.dispose();
+  }
+
   void _openErrorDetail(
     BuildContext context,
     WidgetRef ref,
@@ -189,11 +237,12 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
   Widget build(BuildContext context) {
     final globalScope = _GlobalToastScope.maybeOf(context);
     if (!widget.isGlobalHost && globalScope != null) {
+      _registeredScope = globalScope;
       final isCurrentRoute = ModalRoute.of(context)?.isCurrent ?? true;
-      if (isCurrentRoute && (globalScope.bottomOffsetNotifier.value - widget.bottomOffset).abs() > 0.5) {
+      if (isCurrentRoute) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
-            globalScope.bottomOffsetNotifier.value = widget.bottomOffset;
+            globalScope.registerOffset(_offsetToken, widget.bottomOffset);
           }
         });
       }
@@ -209,13 +258,15 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
     final toast = ref.watch(appProvider.select((s) => s.toast));
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
     final t = GrassBagTokens.of(context);
-    final isInspectable = toast != null &&
-        (toast.tone == ToastTone.warn ||
-            (toast.detail != null && toast.detail!.trim().isNotEmpty));
+    if (toast != null) {
+      _retainedToast = toast;
+    }
+    final displayToast = toast ?? _retainedToast;
+    final isVisible = toast != null;
 
-    // When no toast is visible, unmount the viewInsets-subscribing child completely so the
-    // root overlay NEVER leaks a permanent 120Hz InheritedElement MediaQuery.viewInsetsOf dependency!
-    if (toast == null) {
+    // When no toast is visible AND its reverse exit animation has finished, unmount the
+    // viewInsets-subscribing host completely so the root overlay leaks ZERO 120Hz rebuilds!
+    if (displayToast == null) {
       return const Positioned(
         left: 0,
         bottom: 0,
@@ -223,27 +274,42 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
       );
     }
 
+    final isInspectable = (displayToast.detail != null && displayToast.detail!.trim().isNotEmpty) ||
+        (displayToast.tone == ToastTone.warn && displayToast.text.trim().length > 48);
     final isCurrentRoute = widget.isGlobalHost || (ModalRoute.of(context)?.isCurrent ?? true);
     return _ToastPositionedHost(
+      visible: isVisible,
+      tier: tier,
       bottomOffset: widget.bottomOffset,
       includeKeyboardInset: widget.includeKeyboardInset && isCurrentRoute,
+      onExited: () {
+        if (mounted && ref.read(appProvider).toast == null && _retainedToast != null) {
+          setState(() => _retainedToast = null);
+        }
+      },
       child: Center(
-        key: ValueKey('toast-${toast.id}'),
+        key: ValueKey('toast-${displayToast.id}'),
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 360),
           child: Material(
             type: MaterialType.transparency,
             child: GestureDetector(
+              onVerticalDragEnd: (details) {
+                if ((details.primaryVelocity ?? 0) > 160) {
+                  ref.read(appProvider.notifier).dismissToast();
+                }
+              },
               onTap: isInspectable
-                  ? () => _openErrorDetail(context, ref, toast)
+                  ? () => _openErrorDetail(context, ref, displayToast)
                   : () => ref.read(appProvider.notifier).dismissToast(),
               child: GrassBagGlass(
                 tier: tier,
-                borderRadius: toast.tone == ToastTone.warn ? 20 : 999,
+                borderRadius: displayToast.tone == ToastTone.warn ? 20 : 999,
                 elevated: true,
+                useSheetSettings: true,
                 padding: EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: toast.tone == ToastTone.warn ? 10 : 9,
+                  horizontal: 13,
+                  vertical: displayToast.tone == ToastTone.warn ? 10 : 9,
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
@@ -252,7 +318,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       width: 22,
                       height: 22,
                       decoration: BoxDecoration(
-                        color: switch (toast.tone) {
+                        color: switch (displayToast.tone) {
                           ToastTone.ok => t.okSoft,
                           ToastTone.warn => t.errSoft,
                           ToastTone.info => t.primarySoft,
@@ -260,13 +326,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                         shape: BoxShape.circle,
                       ),
                       child: Icon(
-                        switch (toast.tone) {
+                        switch (displayToast.tone) {
                           ToastTone.ok => CupertinoIcons.checkmark_alt,
                           ToastTone.warn => CupertinoIcons.exclamationmark,
                           ToastTone.info => CupertinoIcons.sparkles,
                         },
                         size: 13,
-                        color: switch (toast.tone) {
+                        color: switch (displayToast.tone) {
                           ToastTone.ok => t.ok,
                           ToastTone.warn => t.err,
                           ToastTone.info => t.primary,
@@ -276,8 +342,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     const SizedBox(width: 9),
                     Flexible(
                       child: Text(
-                        toast.text,
-                        maxLines: toast.tone == ToastTone.warn ? 2 : 1,
+                        displayToast.text,
+                        maxLines: displayToast.tone == ToastTone.warn ? 2 : 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           fontSize: 13,
@@ -296,7 +362,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                         style: TextStyle(
                           fontSize: 11.5,
                           fontWeight: FontWeight.w600,
-                          color: toast.tone == ToastTone.warn ? t.err : t.primary,
+                          color: displayToast.tone == ToastTone.warn ? t.err : t.primary,
                           decoration: TextDecoration.none,
                         ),
                       ),
@@ -304,7 +370,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       Icon(
                         CupertinoIcons.chevron_right,
                         size: 11,
-                        color: toast.tone == ToastTone.warn ? t.err : t.primary,
+                        color: displayToast.tone == ToastTone.warn ? t.err : t.primary,
                       ),
                     ],
                   ],
@@ -318,18 +384,24 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
   }
 }
 
-/// Isolated leaf widget mounted ONLY while a toast is visible. Unmounting it on toast dismiss
-/// removes its `MediaQuery.viewInsetsOf` dependency via `Element.deactivate()`, eliminating
-/// permanent 120Hz root-overlay rebuilds during every keyboard animation!
+/// Isolated leaf widget mounted ONLY while a toast is visible (or finishing its 160ms reverse
+/// exit animation). Unmounting it on exit removes its `MediaQuery.viewInsetsOf` dependency via
+/// `Element.deactivate()`, eliminating permanent 120Hz root-overlay rebuilds during keyboard motion!
 class _ToastPositionedHost extends StatefulWidget {
   const _ToastPositionedHost({
+    required this.visible,
+    required this.tier,
     required this.bottomOffset,
     required this.includeKeyboardInset,
+    required this.onExited,
     required this.child,
   });
 
+  final bool visible;
+  final GrassBagGlassTier tier;
   final double bottomOffset;
   final bool includeKeyboardInset;
+  final VoidCallback onExited;
   final Widget child;
 
   @override
@@ -339,8 +411,8 @@ class _ToastPositionedHost extends StatefulWidget {
 class _ToastPositionedHostState extends State<_ToastPositionedHost>
     with SingleTickerProviderStateMixin {
   late final AnimationController _enterCtrl;
+  late final CurvedAnimation _curved;
   late final Animation<Offset> _slide;
-  late final Animation<double> _scale;
 
   @override
   void initState() {
@@ -348,19 +420,31 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
     _enterCtrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 220),
-    )..forward();
-    final curved = CurvedAnimation(
+      reverseDuration: const Duration(milliseconds: 160),
+    )..addStatusListener((status) {
+        if (status == AnimationStatus.dismissed && !widget.visible) {
+          widget.onExited();
+        }
+      });
+    if (widget.visible) {
+      _enterCtrl.forward();
+    }
+    _curved = CurvedAnimation(
       parent: _enterCtrl,
       curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+      reverseCurve: Curves.easeInCubic,
     );
-    _slide = Tween<Offset>(begin: const Offset(0, 0.22), end: Offset.zero).animate(curved);
-    _scale = Tween<double>(begin: 0.95, end: 1.0).animate(curved);
+    _slide = Tween<Offset>(begin: const Offset(0, 0.24), end: Offset.zero).animate(_curved);
   }
 
   @override
   void didUpdateWidget(covariant _ToastPositionedHost oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.child.key != widget.child.key) {
+    if (widget.visible && !oldWidget.visible) {
+      _enterCtrl.forward();
+    } else if (!widget.visible && oldWidget.visible) {
+      _enterCtrl.reverse();
+    } else if (widget.visible && oldWidget.child.key != widget.child.key) {
       _enterCtrl
         ..value = 0.0
         ..forward();
@@ -369,6 +453,7 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
 
   @override
   void dispose() {
+    _curved.dispose();
     _enterCtrl.dispose();
     super.dispose();
   }
@@ -378,16 +463,29 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
     final kbInset = widget.includeKeyboardInset
         ? MediaQuery.viewInsetsOf(context).bottom
         : 0.0;
+    final viewBot = MediaQuery.viewPaddingOf(context).bottom;
+    final effectiveKb = kbInset > viewBot ? (kbInset - viewBot) : 0.0;
+    final safeBottom = math.max(widget.bottomOffset, viewBot + 12.0);
+    final motionChild = SlideTransition(
+      position: _slide,
+      child: GrassBagMaterializeTransition(
+        animation: _enterCtrl,
+        tier: widget.tier,
+        alignment: Alignment.bottomCenter,
+        scaleFrom: 0.94,
+        contentSigma: 3.5,
+        child: widget.child,
+      ),
+    );
     return Positioned(
       left: 16,
       right: 16,
-      bottom: widget.bottomOffset + kbInset,
-      child: SlideTransition(
-        position: _slide,
-        child: ScaleTransition(
-          scale: _scale,
-          alignment: Alignment.bottomCenter,
-          child: widget.child,
+      bottom: safeBottom,
+      child: Transform.translate(
+        offset: Offset(0, -effectiveKb),
+        child: IgnorePointer(
+          ignoring: !widget.visible,
+          child: motionChild,
         ),
       ),
     );
@@ -407,99 +505,108 @@ Future<bool> showGrassBagConfirmDialog(
   final t = GrassBagTokens.of(context);
   final tier = ProviderScope.containerOf(context, listen: false).read(appProvider).glassTier;
   HapticFeedback.mediumImpact();
-
-  final result = await showGeneralDialog<bool>(
-    context: context,
-    barrierDismissible: true,
-    barrierLabel: cancelLabel,
-    barrierColor: t.isDark ? const Color(0x88080C12) : const Color(0x42182230),
-    transitionDuration: const Duration(milliseconds: 220),
-    pageBuilder: (dialogCtx, animation, secondaryAnimation) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 28),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 332),
-            child: Material(
-              type: MaterialType.transparency,
-              child: GrassBagGlass(
-                tier: tier,
-                borderRadius: 28,
-                elevated: true,
-                useSheetSettings: true,
-                padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(
-                      title,
-                      style: TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.3,
-                        color: t.text,
-                      ),
-                    ),
-                    if (message.trim().isNotEmpty) ...[
-                      const SizedBox(height: 8),
+  _grassBagOpenSheetDepth.value++;
+  try {
+    final result = await showGeneralDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: cancelLabel,
+      barrierColor: t.isDark ? const Color(0x88080C12) : const Color(0x42182230),
+      transitionDuration: const Duration(milliseconds: 220),
+      pageBuilder: (dialogCtx, animation, secondaryAnimation) {
+        final maxDialogH = (MediaQuery.sizeOf(dialogCtx).height * 0.78).clamp(240.0, 560.0);
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 28),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: 332, maxHeight: maxDialogH),
+              child: Material(
+                type: MaterialType.transparency,
+                child: GrassBagGlass(
+                  tier: tier,
+                  borderRadius: 32,
+                  elevated: true,
+                  useSheetSettings: true,
+                  padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
                       Text(
-                        message,
+                        title,
                         style: TextStyle(
-                          fontSize: 13.5,
-                          height: 1.48,
-                          color: t.text2,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.3,
+                          color: t.text,
                         ),
                       ),
-                    ],
-                    const SizedBox(height: 20),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: GrassBagSecondaryGlassButton(
-                            label: cancelLabel,
-                            height: 42,
-                            tier: tier,
-                            insideGlass: true,
-                            onTap: () => Navigator.of(dialogCtx).pop(false),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: GrassBagPrimaryGlassButton(
-                            label: confirmLabel,
-                            height: 42,
-                            tier: tier,
-                            insideGlass: true,
-                            color: isDestructive
-                                ? (t.isDark ? const Color(0xFFD94444) : t.err)
-                                : t.primary,
-                            foregroundColor: isDestructive ? Colors.white : t.onPrimary,
-                            onTap: () => Navigator.of(dialogCtx).pop(true),
+                      if (message.trim().isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Flexible(
+                          child: SingleChildScrollView(
+                            physics: const BouncingScrollPhysics(),
+                            child: Text(
+                              message,
+                              style: TextStyle(
+                                fontSize: 13.5,
+                                height: 1.48,
+                                color: t.text2,
+                              ),
+                            ),
                           ),
                         ),
                       ],
-                    ),
-                  ],
+                      const SizedBox(height: 20),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: GrassBagSecondaryGlassButton(
+                              label: cancelLabel,
+                              height: 44,
+                              tier: tier,
+                              insideGlass: true,
+                              onTap: () => Navigator.of(dialogCtx).pop(false),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: GrassBagPrimaryGlassButton(
+                              label: confirmLabel,
+                              height: 44,
+                              tier: tier,
+                              insideGlass: true,
+                              color: isDestructive
+                                  ? (t.isDark ? const Color(0xFFD94444) : t.err)
+                                  : t.primary,
+                              foregroundColor: isDestructive ? Colors.white : t.onPrimary,
+                              onTap: () => Navigator.of(dialogCtx).pop(true),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
           ),
-        ),
-      );
-    },
-    transitionBuilder: (ctx, anim, secondaryAnim, child) {
-      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutBack);
-      return FadeTransition(
-        opacity: CurvedAnimation(parent: anim, curve: Curves.easeOut),
-        child: ScaleTransition(
-          scale: Tween<double>(begin: 0.92, end: 1.0).animate(curved),
+        );
+      },
+      transitionBuilder: (ctx, anim, secondaryAnim, child) {
+        return GrassBagMaterializeTransition(
+          animation: anim,
+          tier: tier,
+          scaleFrom: tier == GrassBagGlassTier.solid ? 0.92 : 1.08,
+          contentSigma: 6.0,
           child: child,
-        ),
-      );
-    },
-  );
-  return result == true;
+        );
+      },
+    );
+    return result == true;
+  } finally {
+    _grassBagOpenSheetDepth.value = math.max(0, _grassBagOpenSheetDepth.value - 1);
+  }
 }
 
 /// Presents a true pixel-accurate intrinsic content-height Apple iOS 26 floating Liquid Glass
@@ -532,53 +639,11 @@ Future<T?> showGrassBagSheet<T>(
     transitionBuilder: (ctx, anim, _, child) {
       final sz = MediaQuery.sizeOf(ctx);
       final isDesktopDialog = sz.width >= 840 && sz.height >= 520;
-      if (!isDesktopDialog) {
-        // Native Apple iOS 26 sheet choreography: pure bottom slide with ZERO ancestor
-        // FadeTransition/OpacityLayer so the glass backdrop never flashes transparent!
-        final curved = CurvedAnimation(
-          parent: anim,
-          curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-          reverseCurve: Curves.easeInCubic,
-        );
-        return SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0, 1.0),
-            end: Offset.zero,
-          ).animate(curved),
-          child: child,
-        );
-      }
-      if (tier == GrassBagGlassTier.solid || kIsWeb) {
-        final curved = CurvedAnimation(
-          parent: anim,
-          curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-          reverseCurve: Curves.easeInCubic,
-        );
-        return FadeTransition(
-          opacity: curved,
-          child: ScaleTransition(
-            scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-            alignment: Alignment.center,
-            child: child,
-          ),
-        );
-      }
-      // Desktop centered dialog: pure GPU Slide + Scale without per-frame visibility/toImageSync!
-      final curved = CurvedAnimation(
-        parent: anim,
-        curve: const Cubic(0.22, 1.0, 0.36, 1.0),
-        reverseCurve: Curves.easeInCubic,
-      );
-      return SlideTransition(
-        position: Tween<Offset>(
-          begin: const Offset(0, 0.04),
-          end: Offset.zero,
-        ).animate(curved),
-        child: ScaleTransition(
-          scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-          alignment: Alignment.center,
-          child: child,
-        ),
+      return _GrassBagSheetRouteTransition(
+        animation: anim,
+        isDesktopDialog: isDesktopDialog,
+        tier: tier,
+        child: child,
       );
     },
     pageBuilder: (dialogCtx, _, __) {
@@ -617,6 +682,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
     with SingleTickerProviderStateMixin {
   late final SingleSpringController _dragSpring;
   bool _dragging = false;
+  bool _dismissing = false;
 
   @override
   void initState() {
@@ -635,11 +701,12 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   }
 
   void _onDragStart(DragStartDetails _) {
+    if (_dismissing) return;
     _dragging = true;
   }
 
   void _onDragUpdate(DragUpdateDetails d) {
-    if (!_dragging) return;
+    if (!_dragging || _dismissing) return;
     final cur = _dragSpring.value;
     final delta = d.delta.dy;
     // Rubber-band resistance on incremental upward delta only (never multiply accumulated
@@ -651,9 +718,11 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   }
 
   void _onDragEnd(DragEndDetails d) {
+    if (!_dragging || _dismissing) return;
     _dragging = false;
     final vel = d.primaryVelocity ?? 0.0;
     if (_dragSpring.value > 72.0 || vel > 520.0) {
+      _dismissing = true;
       Navigator.of(context).pop();
     } else {
       _dragSpring.animateTo(0.0, fromVelocity: vel);
@@ -661,6 +730,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   }
 
   void _onDragCancel() {
+    if (_dismissing) return;
     _dragging = false;
     _dragSpring.animateTo(0.0);
   }
@@ -758,20 +828,30 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
                                   width: 30,
                                   height: 30,
                                   decoration: BoxDecoration(
-                                    color: t.isDark
-                                        ? Colors.white.withValues(alpha: 0.11)
-                                        : t.fill2,
+                                    gradient: LinearGradient(
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                      colors: t.isDark
+                                          ? [
+                                              Colors.white.withValues(alpha: 0.16),
+                                              Colors.white.withValues(alpha: 0.08),
+                                            ]
+                                          : [
+                                              Colors.white.withValues(alpha: 0.78),
+                                              const Color(0x14162E42),
+                                            ],
+                                    ),
                                     shape: BoxShape.circle,
                                     border: Border.all(
                                       color: t.isDark
-                                          ? Colors.white.withValues(alpha: 0.10)
-                                          : Colors.white.withValues(alpha: 0.55),
-                                      width: 0.5,
+                                          ? Colors.white.withValues(alpha: 0.12)
+                                          : const Color(0x16162E42),
+                                      width: 0.55,
                                     ),
                                   ),
                                   child: Icon(
                                     CupertinoIcons.xmark,
-                                    size: 14,
+                                    size: 13.5,
                                     color: t.text2,
                                   ),
                                 ),
@@ -787,7 +867,7 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
               Flexible(
                 child: RepaintBoundary(
                   child: SingleChildScrollView(
-                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.manual,
                     physics: const BouncingScrollPhysics(),
                     child: widget.bodyBuilder(context),
                   ),
@@ -814,7 +894,104 @@ class _IntrinsicLiquidGlassSheetState extends State<_IntrinsicLiquidGlassSheet>
   }
 }
 
-class _SheetKeyboardFrame extends StatelessWidget {
+/// Stateful route transition for [showGrassBagSheet] owning & disposing its [CurvedAnimation]s
+/// cleanly (zero listener leaks!) and giving desktop glass dialogs smooth optical materialization.
+class _GrassBagSheetRouteTransition extends StatefulWidget {
+  const _GrassBagSheetRouteTransition({
+    required this.animation,
+    required this.isDesktopDialog,
+    required this.tier,
+    required this.child,
+  });
+
+  final Animation<double> animation;
+  final bool isDesktopDialog;
+  final GrassBagGlassTier tier;
+  final Widget child;
+
+  @override
+  State<_GrassBagSheetRouteTransition> createState() =>
+      _GrassBagSheetRouteTransitionState();
+}
+
+class _GrassBagSheetRouteTransitionState
+    extends State<_GrassBagSheetRouteTransition> {
+  late CurvedAnimation _curve;
+  late Animation<Offset> _sheetSlide;
+  late Animation<Offset> _dialogSlide;
+  late Animation<double> _dialogScale;
+
+  void _initAnimations() {
+    _curve = CurvedAnimation(
+      parent: widget.animation,
+      curve: const Cubic(0.22, 1.0, 0.36, 1.0),
+      reverseCurve: Curves.easeInCubic,
+    );
+    _sheetSlide = Tween<Offset>(
+      begin: const Offset(0, 1.0),
+      end: Offset.zero,
+    ).animate(_curve);
+    _dialogSlide = Tween<Offset>(
+      begin: const Offset(0, 0.03),
+      end: Offset.zero,
+    ).animate(_curve);
+    _dialogScale = Tween<double>(begin: 0.96, end: 1.0).animate(_curve);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _initAnimations();
+  }
+
+  @override
+  void didUpdateWidget(covariant _GrassBagSheetRouteTransition oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.animation != widget.animation) {
+      _curve.dispose();
+      _initAnimations();
+    }
+  }
+
+  @override
+  void dispose() {
+    _curve.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.isDesktopDialog) {
+      return SlideTransition(
+        position: _sheetSlide,
+        child: widget.child,
+      );
+    }
+    if (widget.tier == GrassBagGlassTier.solid || kIsWeb) {
+      return FadeTransition(
+        opacity: _curve,
+        child: ScaleTransition(
+          scale: _dialogScale,
+          alignment: Alignment.center,
+          child: widget.child,
+        ),
+      );
+    }
+    return SlideTransition(
+      position: _dialogSlide,
+      child: GrassBagMaterializeTransition(
+        animation: widget.animation,
+        tier: widget.tier,
+        alignment: Alignment.center,
+        scaleFrom: 0.95,
+        contentSigma: 4.5,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _SheetKeyboardFrame extends StatefulWidget {
   const _SheetKeyboardFrame({
     required this.size,
     required this.viewPad,
@@ -828,46 +1005,79 @@ class _SheetKeyboardFrame extends StatelessWidget {
   final Widget child;
 
   @override
+  State<_SheetKeyboardFrame> createState() => _SheetKeyboardFrameState();
+}
+
+class _SheetKeyboardFrameState extends State<_SheetKeyboardFrame> {
+  Timer? _settleTimer;
+  double? _settledMaxH;
+  double _lastKbInset = -1.0;
+  double _lastViewportH = -1.0;
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final baseMargin = isDesktopDialog
+    final baseMargin = widget.isDesktopDialog
         ? 24.0
-        : (viewPad.bottom > 0 ? viewPad.bottom + 8.0 : 12.0);
+        : (widget.viewPad.bottom > 0 ? widget.viewPad.bottom + 8.0 : 12.0);
     final targetBottom = math.max(
       baseMargin,
-      kbInset + (isDesktopDialog ? 16.0 : 10.0),
+      kbInset + (widget.isDesktopDialog ? 16.0 : 10.0),
     );
-    final liftY = (targetBottom - baseMargin).clamp(0.0, size.height);
-    final topMargin = viewPad.top + 16.0;
-    final rawAvailableH = size.height > 88.0
-        ? (size.height - topMargin - targetBottom).clamp(88.0, size.height)
+    final liftY = (targetBottom - baseMargin).clamp(0.0, widget.size.height);
+    final topMargin = widget.viewPad.top + 16.0;
+    final rawAvailableH = widget.size.height > 88.0
+        ? (widget.size.height - topMargin - targetBottom).clamp(88.0, widget.size.height)
         : 88.0;
-    final capH = isDesktopDialog ? 700.0 : 660.0;
-    // Quantize maxHeight changes during IME animation to 64px buckets so short sheets
-    // skip RenderLiquidGlassLayer.layout() / picture.toImageSync completely and tall sheets
-    // cut matte rebuilds by ~85% while lifting smoothly via pure GPU Transform.translate!
-    final double maxH;
-    if (rawAvailableH >= capH) {
-      maxH = capH;
-    } else if (kbInset <= 0.5) {
-      maxH = rawAvailableH;
-    } else {
-      final bucket = (rawAvailableH / 64.0).floor() * 64.0;
-      maxH = bucket.clamp(88.0, rawAvailableH);
+    final capH = widget.isDesktopDialog ? 700.0 : 660.0;
+    final unclampedMaxH = math.min(capH, rawAvailableH).clamp(88.0, capH);
+    final viewportResized =
+        _lastViewportH > 0 && (widget.size.height - _lastViewportH).abs() > 1.0;
+
+    // Keep `maxHeight` rock-steady during 120Hz IME flight (eliminating both 64px stair-step
+    // snaps and per-frame `toImageSync` glass rebakes!) and settle ONCE 90ms after keyboard stops,
+    // while immediately recomputing on rotation / split-screen viewport height changes.
+    if (_settledMaxH == null || kbInset <= 0.5 || viewportResized) {
+      _settleTimer?.cancel();
+      _settledMaxH = unclampedMaxH;
+    } else if ((kbInset - _lastKbInset).abs() > 0.5) {
+      _settleTimer?.cancel();
+      final targetMaxH = unclampedMaxH;
+      _settleTimer = Timer(const Duration(milliseconds: 90), () {
+        if (mounted && _settledMaxH != targetMaxH) {
+          setState(() => _settledMaxH = targetMaxH);
+        }
+      });
     }
+    _lastKbInset = kbInset;
+    _lastViewportH = widget.size.height;
+    final effectiveMaxH = math.min(_settledMaxH ?? unclampedMaxH, capH);
+    final desktopLiftY = widget.isDesktopDialog
+        ? math.min(liftY * 0.5, math.max(0.0, (widget.size.height - topMargin - targetBottom) > 0 ? liftY : 0.0))
+        : liftY;
 
     return Align(
-      alignment: isDesktopDialog ? Alignment.center : Alignment.bottomCenter,
+      alignment: widget.isDesktopDialog ? Alignment.center : Alignment.bottomCenter,
       child: Transform.translate(
-        offset: Offset(0, -liftY),
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(16, topMargin, 16, baseMargin),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxWidth: isDesktopDialog ? 500 : 448,
-              maxHeight: maxH,
+        offset: Offset(0, -desktopLiftY),
+        child: MediaQuery.removeViewInsets(
+          context: context,
+          removeBottom: true,
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(16, topMargin, 16, baseMargin),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: widget.isDesktopDialog ? 500 : 448,
+                maxHeight: effectiveMaxH,
+              ),
+              child: widget.child,
             ),
-            child: child,
           ),
         ),
       ),
@@ -886,14 +1096,14 @@ class _SheetSectionCard extends StatelessWidget {
     return DecoratedBox(
       decoration: ShapeDecoration(
         color: t.isDark
-            ? Colors.white.withValues(alpha: 0.065)
-            : Colors.white.withValues(alpha: 0.62),
+            ? Colors.white.withValues(alpha: 0.06)
+            : Colors.white.withValues(alpha: 0.68),
         shape: RoundedSuperellipseBorder(
           borderRadius: BorderRadius.circular(18),
           side: BorderSide(
             color: t.isDark
-                ? Colors.white.withValues(alpha: 0.11)
-                : Colors.white.withValues(alpha: 0.84),
+                ? Colors.white.withValues(alpha: 0.10)
+                : const Color(0x16162E42),
             width: 0.6,
           ),
         ),
@@ -1182,7 +1392,7 @@ class _WorkspacePickerSheetBodyState extends ConsumerState<_WorkspacePickerSheet
                                           behavior: HitTestBehavior.opaque,
                                           onTap: () => _openRenameWorkspaceSheet(context, w),
                                           child: SizedBox(
-                                            width: 36,
+                                            width: 32,
                                             height: 36,
                                             child: Center(
                                               child: Icon(CupertinoIcons.pencil, size: 15, color: t.text3),
@@ -1202,7 +1412,7 @@ class _WorkspacePickerSheetBodyState extends ConsumerState<_WorkspacePickerSheet
                                             if (ok) await ctrl.deleteWorkspaceItem(w);
                                           },
                                           child: SizedBox(
-                                            width: 36,
+                                            width: 32,
                                             height: 36,
                                             child: Center(
                                               child: Icon(CupertinoIcons.trash, size: 15, color: t.err),
@@ -1291,6 +1501,9 @@ class _RenameWorkspaceSheetBodyState extends ConsumerState<_RenameWorkspaceSheet
   void initState() {
     super.initState();
     _ctrl = TextEditingController(text: widget.ws.name);
+    if (_ctrl.text.isNotEmpty) {
+      _ctrl.selection = TextSelection(baseOffset: 0, extentOffset: _ctrl.text.length);
+    }
   }
 
   @override
@@ -1308,8 +1521,8 @@ class _RenameWorkspaceSheetBodyState extends ConsumerState<_RenameWorkspaceSheet
     }
     setState(() => _saving = true);
     try {
-      await ref.read(appProvider.notifier).renameWorkspaceItem(widget.ws, clean);
-      if (mounted) Navigator.of(context).pop();
+      final ok = await ref.read(appProvider.notifier).renameWorkspaceItem(widget.ws, clean);
+      if (ok && mounted) Navigator.of(context).pop();
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -1329,6 +1542,22 @@ class _RenameWorkspaceSheetBodyState extends ConsumerState<_RenameWorkspaceSheet
           placeholder: '输入新的工作区名称…',
           insideGlass: true,
           hasError: _err != null,
+          suffix: ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _ctrl,
+            builder: (_, val, __) => val.text.isEmpty
+                ? const SizedBox.shrink()
+                : GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      _ctrl.clear();
+                      if (_err != null) setState(() => _err = null);
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(CupertinoIcons.xmark_circle_fill, size: 16, color: t.text3),
+                    ),
+                  ),
+          ),
           onChanged: (_) {
             if (_err != null) setState(() => _err = null);
           },
@@ -1490,45 +1719,47 @@ class _WorkspaceDirectoryBrowserBodyState extends ConsumerState<_WorkspaceDirect
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        GrassBagTextField(
+          controller: _pathCtrl,
+          placeholder: '输入目录路径（支持 ~/projects）并按回车跳转',
+          monospace: true,
+          fontSize: 12.5,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9.5),
+          insideGlass: true,
+          onSubmitted: (v) => _loadDir(v.trim()),
+        ),
+        const SizedBox(height: 8),
         Row(
           children: [
             Expanded(
-              child: GrassBagTextField(
-                controller: _pathCtrl,
-                placeholder: '输入目录路径（支持 ~/projects）并按回车跳转',
-                monospace: true,
-                fontSize: 12.5,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9.5),
+              child: GrassBagSecondaryGlassButton(
+                label: '主目录 ~',
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                tier: tier,
                 insideGlass: true,
-                onSubmitted: (v) => _loadDir(v.trim()),
+                accentForeground: true,
+                onTap: () => _loadDir('~'),
               ),
             ),
-            const SizedBox(width: 6),
-            GrassBagSecondaryGlassButton(
-              label: '主目录 ~',
-              height: 38,
-              padding: const EdgeInsets.symmetric(horizontal: 11),
-              tier: tier,
-              insideGlass: true,
-              accentForeground: true,
-              onTap: () => _loadDir('~'),
-            ),
-            const SizedBox(width: 6),
-            GrassBagSecondaryGlassButton(
-              label: '新建',
-              icon: CupertinoIcons.folder_badge_plus,
-              height: 38,
-              padding: const EdgeInsets.symmetric(horizontal: 11),
-              tier: tier,
-              insideGlass: true,
-              accentForeground: true,
-              enabled: !_loading && _browseError == null,
-              onTap: (_loading || _browseError != null)
-                  ? null
-                  : () => setState(() {
-                        _showNewFolderInput = !_showNewFolderInput;
-                        _newFolderErr = null;
-                      }),
+            const SizedBox(width: 8),
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '新建',
+                icon: CupertinoIcons.folder_badge_plus,
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                tier: tier,
+                insideGlass: true,
+                accentForeground: true,
+                enabled: !_loading && _browseError == null,
+                onTap: (_loading || _browseError != null)
+                    ? null
+                    : () => setState(() {
+                          _showNewFolderInput = !_showNewFolderInput;
+                          _newFolderErr = null;
+                        }),
+              ),
             ),
           ],
         ),
@@ -1774,8 +2005,10 @@ class _WorkspaceDirectoryBrowserBodyState extends ConsumerState<_WorkspaceDirect
                             : rawPath;
                         setState(() => _mounting = true);
                         try {
-                          await ref.read(appProvider.notifier).addWorkspace(_nameCtrl.text, resolved);
-                          if (context.mounted) Navigator.of(context).pop();
+                          final ok = await ref
+                              .read(appProvider.notifier)
+                              .addWorkspace(_nameCtrl.text, resolved);
+                          if (ok && context.mounted) Navigator.of(context).pop();
                         } finally {
                           if (mounted) setState(() => _mounting = false);
                         }
@@ -1856,33 +2089,60 @@ void showPermissionSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor?
         );
         final ctrl = ref.read(appProvider.notifier);
         final t = GrassBagTokens.of(ctx);
-        final iconSpecs = [
-          (CupertinoIcons.lock_shield_fill, t.isDark ? const Color(0xFF7FA3F2) : const Color(0xFF425EA8)),
-          (CupertinoIcons.checkmark_shield_fill, t.isDark ? const Color(0xFF4AC885) : const Color(0xFF1F9D63)),
-          (CupertinoIcons.bolt_circle_fill, t.isDark ? const Color(0xFFF0B24C) : const Color(0xFFB86C11)),
-          (CupertinoIcons.exclamationmark_shield_fill, t.isDark ? const Color(0xFFEA8F5C) : const Color(0xFFC2571A)),
-        ];
+        (IconData, Color) resolvePermissionVisual(PermissionTier tier) {
+          final id = tier.id.toLowerCase();
+          if (id.contains('read') || id == 'plan') {
+            return (
+              CupertinoIcons.lock_shield_fill,
+              t.isDark ? const Color(0xFF7FA3F2) : const Color(0xFF425EA8),
+            );
+          }
+          if (id.contains('danger') ||
+              id.contains('bypass') ||
+              id == 'full-access' ||
+              id == 'unrestricted' ||
+              tier.risky) {
+            return (
+              CupertinoIcons.exclamationmark_shield_fill,
+              t.isDark ? const Color(0xFFEA8F5C) : const Color(0xFFC2571A),
+            );
+          }
+          if (id.contains('auto') || id.contains('full')) {
+            return (
+              CupertinoIcons.bolt_circle_fill,
+              t.isDark ? const Color(0xFFF0B24C) : const Color(0xFFB86C11),
+            );
+          }
+          return (
+            CupertinoIcons.checkmark_shield_fill,
+            t.isDark ? const Color(0xFF4AC885) : const Color(0xFF1F9D63),
+          );
+        }
+
         final permTiers = state.permissionTiers.isNotEmpty
             ? state.permissionTiers
             : ref.read(appProvider).effectivePermissionTiers;
         return _SheetSectionCard(
           children: [
             for (int i = 0; i < permTiers.length; i++) ...[
-              _SheetOptionRow(
-                icon: iconSpecs[i % iconSpecs.length].$1,
-                iconColor: iconSpecs[i % iconSpecs.length].$2,
-                title: permTiers[i].name,
-                badge: permTiers[i].isDefault
-                    ? '默认'
-                    : (permTiers[i].risky ? '高权限' : null),
-                subtitle: permTiers[i].desc,
-                selected: state.activePermissionId == permTiers[i].id,
-                warnTone: permTiers[i].risky,
-                onTap: () {
-                  ctrl.setPermission(permTiers[i].id);
-                  Navigator.of(ctx).pop();
-                },
-              ),
+              () {
+                final visual = resolvePermissionVisual(permTiers[i]);
+                return _SheetOptionRow(
+                  icon: visual.$1,
+                  iconColor: visual.$2,
+                  title: permTiers[i].name,
+                  badge: permTiers[i].isDefault
+                      ? '默认'
+                      : (permTiers[i].risky ? '高权限' : null),
+                  subtitle: permTiers[i].desc,
+                  selected: state.activePermissionId == permTiers[i].id,
+                  warnTone: permTiers[i].risky,
+                  onTap: () {
+                    ctrl.setPermission(permTiers[i].id);
+                    Navigator.of(ctx).pop();
+                  },
+                );
+              }(),
               if (i < permTiers.length - 1)
                 Divider(height: 0.5, indent: 60, endIndent: 14, color: t.sep),
             ],
@@ -2068,9 +2328,15 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
                   '思考深度',
                   style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
                 ),
-                Text(
-                  hint,
-                  style: TextStyle(fontSize: 11.5, color: t.text3),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    hint,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.end,
+                    style: TextStyle(fontSize: 11.5, color: t.text3),
+                  ),
                 ),
               ],
             ),
@@ -2375,6 +2641,17 @@ class _SearchableModelSheetBodyState extends ConsumerState<_SearchableModelSheet
                               monoSubtitle: m.description.isEmpty,
                               selected: selected,
                               onTap: () {
+                                if (!g.routable) {
+                                  Navigator.of(context).pop();
+                                  if (g.id == 'deepseek-account') {
+                                    launchDeepSeekSignInFlow(widget.outerContext, ref);
+                                  } else if (widget.onOpenModelSettings != null) {
+                                    widget.onOpenModelSettings!();
+                                  } else {
+                                    ctrl.showToast('请先在「设置 → 模型与渠道」配置 ${g.name} 密钥', tone: ToastTone.warn);
+                                  }
+                                  return;
+                                }
                                 ctrl.setModel(
                                   m.name,
                                   m.shortLabel,
@@ -2590,6 +2867,14 @@ void showContextSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor? mo
                                 value: formatCompactTokens(tel.messageTokens),
                               ),
                             ),
+                            if (tel.remainingContextTokens > 0)
+                              Expanded(
+                                child: _LegendDot(
+                                  color: t.text3.withValues(alpha: 0.45),
+                                  label: '剩余可用',
+                                  value: formatCompactTokens(tel.remainingContextTokens),
+                                ),
+                              ),
                           ],
                         ),
                       ] else
@@ -2622,62 +2907,52 @@ void showContextSheet(BuildContext context, WidgetRef ref, {GlassMorphAnchor? mo
                 children: [
                   Padding(
                     padding: const EdgeInsets.all(14),
-                    child: Column(
-                      children: [
-                        Row(
+                    child: LayoutBuilder(
+                      builder: (ctx, box) {
+                        final cols = box.maxWidth < 310 ? 2 : 3;
+                        final cellW = (box.maxWidth - (cols - 1) * 10) / cols;
+                        final metrics = [
+                          _LegendDot(
+                            color: t.primary,
+                            label: '解码速度',
+                            value: tps != null ? '${tps.toStringAsFixed(1)} t/s' : '--',
+                          ),
+                          _LegendDot(
+                            color: t.dusk,
+                            label: '平均首字',
+                            value: avgTtft != null ? formatDurationMs(avgTtft) : '--',
+                          ),
+                          _LegendDot(
+                            color: t.ok,
+                            label: '缓存命中',
+                            value: hitRate != null
+                                ? '${(hitRate * 100).toStringAsFixed(1)}%'
+                                : '--',
+                          ),
+                          _LegendDot(
+                            color: t.ok,
+                            label: '缓存读取',
+                            value: formatCompactTokens(tel.cacheReadTokens),
+                          ),
+                          _LegendDot(
+                            color: t.primary,
+                            label: '新输入',
+                            value: formatCompactTokens(tel.uncachedInputTokens),
+                          ),
+                          _LegendDot(
+                            color: t.warn,
+                            label: '模型输出',
+                            value: formatCompactTokens(tel.outputTokens),
+                          ),
+                        ];
+                        return Wrap(
+                          spacing: 10,
+                          runSpacing: 10,
                           children: [
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.primary,
-                                label: '解码速度',
-                                value: tps != null ? '${tps.toStringAsFixed(1)} t/s' : '--',
-                              ),
-                            ),
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.dusk,
-                                label: '平均首字',
-                                value: avgTtft != null ? formatDurationMs(avgTtft) : '--',
-                              ),
-                            ),
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.ok,
-                                label: '缓存命中',
-                                value: hitRate != null
-                                    ? '${(hitRate * 100).toStringAsFixed(1)}%'
-                                    : '--',
-                              ),
-                            ),
+                            for (final m in metrics) SizedBox(width: cellW, child: m),
                           ],
-                        ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.ok,
-                                label: '缓存读取',
-                                value: formatCompactTokens(tel.cacheReadTokens),
-                              ),
-                            ),
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.primary,
-                                label: '新输入',
-                                value: formatCompactTokens(tel.uncachedInputTokens),
-                              ),
-                            ),
-                            Expanded(
-                              child: _LegendDot(
-                                color: t.warn,
-                                label: '模型输出',
-                                value: formatCompactTokens(tel.outputTokens),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
+                        );
+                      },
                     ),
                   ),
                 ],
@@ -2730,6 +3005,7 @@ void showHostQuickSheet(
   BuildContext context,
   WidgetRef ref, {
   VoidCallback? onOpenHostSettings,
+  VoidCallback? onConnected,
 }) {
   final outerCtx = context;
   showGrassBagSheet(
@@ -2777,9 +3053,9 @@ void showHostQuickSheet(
                             ? (healthy ? t.ok : (hasErr ? t.err : t.primary))
                             : (healthy
                                 ? t.ok
-                                : (needsAuth
+                                : (needsAuth || fullState.hostIsConnecting(h)
                                     ? t.primary
-                                    : (hasErr ? t.err : t.warn))),
+                                    : (hasErr ? t.err : t.text3))),
                         title: h.name,
                         badge: fullState.hostStatusBadge(h),
                         subtitle: h.isLocal
@@ -2864,8 +3140,15 @@ void showHostQuickSheet(
                           name: parsed.suggestedName,
                         );
                         if (!outerCtx.mounted) return;
-                        if (!outcome.connected) {
-                          showQuickRemoteConnectSheet(outerCtx);
+                        if (outcome.connected) {
+                          onConnected?.call();
+                        } else {
+                          showQuickRemoteConnectSheet(
+                            outerCtx,
+                            initialInput: raw.trim(),
+                            initialDiagnosis: outcome.diagnosis,
+                            onConnected: onConnected,
+                          );
                         }
                       },
                     ),
@@ -2883,7 +3166,10 @@ void showHostQuickSheet(
                       Navigator.of(ctx).pop();
                       Future<void>.delayed(const Duration(milliseconds: 160), () {
                         if (outerCtx.mounted) {
-                          showQuickRemoteConnectSheet(outerCtx);
+                          showQuickRemoteConnectSheet(
+                            outerCtx,
+                            onConnected: onConnected,
+                          );
                         }
                       });
                     },
@@ -2912,7 +3198,12 @@ void showHostQuickSheet(
 }
 
 /// Direct 1-tap remote device connection sheet launchable straight from the Chat host pill.
-void showQuickRemoteConnectSheet(BuildContext context) {
+void showQuickRemoteConnectSheet(
+  BuildContext context, {
+  String? initialInput,
+  RemoteHostDiagnosis? initialDiagnosis,
+  VoidCallback? onConnected,
+}) {
   showGrassBagSheet<void>(
     context,
     title: '连接远程电脑 / 服务器',
@@ -2920,12 +3211,16 @@ void showQuickRemoteConnectSheet(BuildContext context) {
     preferredHeight: 560,
     bodyBuilder: (sheetCtx) => RemoteHostConnectCard(
       showHeader: false,
+      embeddedInSheet: true,
       connectImmediately: true,
       initiallyShowGuide: false,
+      initialInput: initialInput,
+      initialDiagnosis: initialDiagnosis,
       onConnectedHost: (_) {
         if (sheetCtx.mounted) {
           Navigator.of(sheetCtx).pop();
         }
+        onConnected?.call();
       },
     ),
   );
@@ -3071,7 +3366,7 @@ class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBo
           title: isHtmlProxy ? '目标主机启用了网页网关认证' : '已连通目标主机，等待一次性授权',
           message: isHtmlProxy
               ? '点击下方「App 内网页登录」完成登录后，GrassBag 会自动保存 30 天会话凭证。'
-              : '直接粘贴电脑端 `dsh web` 打印的整行链接（含 ?token=...）或桌面桥接 Token 即可立即接入，后续 30 天免填。',
+              : '直接粘贴电脑端 dsh web 打印的整行链接（含 ?token=...）或桌面桥接 Token 即可立即接入，后续 30 天免填。',
           padding: const EdgeInsets.all(12),
           borderRadius: 16,
         ),
@@ -3180,50 +3475,47 @@ class _RemoteHostAuthSheetBodyState extends ConsumerState<_RemoteHostAuthSheetBo
             ),
           ),
         ),
-        AnimatedSize(
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOutCubic,
-          child: _showHelp
-              ? Container(
-                  margin: const EdgeInsets.only(top: 6),
-                  padding: const EdgeInsets.all(11),
-                  decoration: BoxDecoration(
-                    color: t.fill1,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: t.sep, width: 0.6),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Text(
-                        widget.host.isDesktopLanBridge
-                            ? '桌面端 :3081 桥接令牌保存在电脑的 ~/.dsh/gbridge-lan-token；也可点击下方复制一键指令发给电脑端 AI 自动提取完整链接。'
-                            : '在电脑端运行 dsh web --host <局域网IP> 后会打印包含 ?token=... 的完整链接；或直接把一键指令发给电脑端 DeepSeek Harness 自动生成。',
-                        style: TextStyle(fontSize: 11.5, height: 1.42, color: t.text2),
-                      ),
-                      const SizedBox(height: 8),
-                      GrassBagSecondaryGlassButton(
-                        label: '复制桌面端一键指令',
-                        icon: CupertinoIcons.sparkles,
-                        height: 34,
-                        tier: tier,
-                        insideGlass: true,
-                        accentForeground: true,
-                        onTap: () {
-                          Clipboard.setData(
-                            const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
-                          );
-                          ref.read(appProvider.notifier).showToast(
-                                '已复制一键指令，发给电脑端 DeepSeek Harness 即可获取链接',
-                                tone: ToastTone.ok,
-                              );
-                        },
-                      ),
-                    ],
-                  ),
-                )
-              : const SizedBox.shrink(),
-        ),
+        // Avoid AnimatedSize inside a GrassBagGlass sheet so toggling help triggers ONE
+        // layout pass instead of 22 consecutive `toImageSync` glass matte rebuilds.
+        if (_showHelp)
+          Container(
+            margin: const EdgeInsets.only(top: 6),
+            padding: const EdgeInsets.all(11),
+            decoration: BoxDecoration(
+              color: t.fill1,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: t.sep, width: 0.6),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  widget.host.isDesktopLanBridge
+                      ? '桌面端 :3081 桥接令牌保存在电脑的 ~/.dsh/gbridge-lan-token；也可点击下方复制一键指令发给电脑端 AI 自动提取完整链接。'
+                      : '在电脑端运行 dsh web --host <局域网IP> 后会打印包含 ?token=... 的完整链接；或直接把一键指令发给电脑端 DeepSeek Harness 自动生成。',
+                  style: TextStyle(fontSize: 11.5, height: 1.42, color: t.text2),
+                ),
+                const SizedBox(height: 8),
+                GrassBagSecondaryGlassButton(
+                  label: '复制桌面端一键指令',
+                  icon: CupertinoIcons.sparkles,
+                  height: 34,
+                  tier: tier,
+                  insideGlass: true,
+                  accentForeground: true,
+                  onTap: () {
+                    Clipboard.setData(
+                      const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
+                    );
+                    ref.read(appProvider.notifier).showToast(
+                          '已复制一键指令，发给电脑端 DeepSeek Harness 即可获取链接',
+                          tone: ToastTone.ok,
+                        );
+                  },
+                ),
+              ],
+            ),
+          ),
         const SizedBox(height: 6),
         Text(
           '目标地址：${widget.host.address}',
@@ -3260,85 +3552,210 @@ WorkspaceDiffRecord? _matchDiffRecord(List<WorkspaceDiffRecord> diffs, String fi
 }
 
 void showDiffSheet(BuildContext context, String filePath, {WorkspaceDiffRecord? record}) {
-  final container = ProviderScope.containerOf(context, listen: false);
-  final initialMatch = record ?? _matchDiffRecord(container.read(appProvider).workspaceDiffs, filePath);
-  if (initialMatch == null) {
-    unawaited(container.read(appProvider.notifier).refreshWorkspaceDiffs(silent: true));
-  }
-
   showGrassBagSheet(
     context,
     title: filePath,
-    subtitle: initialMatch != null
-        ? '改动统计 +${initialMatch.added} / -${initialMatch.removed}'
-        : '实时加载工作区 Git 差异',
+    subtitle: '工作区 Git 改动详情',
     preferredHeight: 396,
     expandable: true,
-    bodyBuilder: (ctx) => Consumer(
-      builder: (cCtx, cRef, _) {
-        final diffs = cRef.watch(appProvider.select((s) => s.workspaceDiffs));
-        final matched = record ?? _matchDiffRecord(diffs, filePath);
-        final rawDiff = matched?.unifiedDiff ?? '';
-        final rawLines = rawDiff.isNotEmpty ? rawDiff.split('\n') : const <String>[];
-        final hunkRe = RegExp(r'^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@');
-        final lines = <(String, String, String)>[];
-        var oldLine = 0;
-        var newLine = 0;
-        var inHunk = false;
-        for (var i = 0; i < rawLines.length; i++) {
-          final l = rawLines[i];
-          final m = hunkRe.firstMatch(l);
-          if (m != null) {
-            oldLine = int.tryParse(m.group(1) ?? '1') ?? 1;
-            newLine = int.tryParse(m.group(2) ?? '1') ?? 1;
-            inHunk = true;
-            lines.add(('@', '@@', l));
-            continue;
-          }
-          if (l.startsWith('diff ') ||
-              l.startsWith('index ') ||
-              l.startsWith('--- ') ||
-              l.startsWith('+++ ')) {
-            lines.add(('~', '', l));
-            continue;
-          }
-          if (l.startsWith('+')) {
-            final numStr = inHunk ? '${newLine++}' : '${i + 1}';
-            lines.add(('+', numStr, l.substring(1)));
-          } else if (l.startsWith('-')) {
-            final numStr = inHunk ? '${oldLine++}' : '${i + 1}';
-            lines.add(('-', numStr, l.substring(1)));
-          } else if (l.startsWith(r'\')) {
-            lines.add(('~', '', l));
-          } else {
-            final numStr = inHunk ? '${newLine++}' : '${i + 1}';
-            if (inHunk) oldLine++;
-            lines.add((' ', numStr, l.startsWith(' ') ? l.substring(1) : l));
-          }
-        }
-        final added = matched?.added ?? 0;
-        final removed = matched?.removed ?? 0;
-        final t = GrassBagTokens.of(cCtx);
-        if (lines.isEmpty) {
-          return Padding(
-            padding: const EdgeInsets.all(20),
-            child: Text(
+    bodyBuilder: (ctx) => _DiffSheetBody(filePath: filePath, record: record),
+  );
+}
+
+class _DiffSheetBody extends ConsumerStatefulWidget {
+  const _DiffSheetBody({required this.filePath, this.record});
+  final String filePath;
+  final WorkspaceDiffRecord? record;
+
+  @override
+  ConsumerState<_DiffSheetBody> createState() => _DiffSheetBodyState();
+}
+
+class _DiffSheetBodyState extends ConsumerState<_DiffSheetBody> {
+  static final RegExp _hunkRe = RegExp(r'^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@');
+  static const int _kDiffLinePageSize = 400;
+
+  bool _loading = false;
+  int _visibleLineCap = _kDiffLinePageSize;
+  String? _cachedRawDiff;
+  List<(String, String, String)> _cachedLines = const [];
+  int _cachedMaxVisualUnits = 40;
+
+  @override
+  void initState() {
+    super.initState();
+    final initial = widget.record ??
+        _matchDiffRecord(ref.read(appProvider).workspaceDiffs, widget.filePath);
+    if (initial == null || initial.unifiedDiff.isEmpty) {
+      _loading = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _refreshDiffs());
+    }
+  }
+
+  Future<void> _refreshDiffs() async {
+    if (mounted && !_loading) setState(() => _loading = true);
+    try {
+      await ref.read(appProvider.notifier).refreshWorkspaceDiffs(silent: true);
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  void _ensureParsed(String rawDiff) {
+    if (_cachedRawDiff == rawDiff) return;
+    _cachedRawDiff = rawDiff;
+    _visibleLineCap = _kDiffLinePageSize;
+    if (rawDiff.isEmpty) {
+      _cachedLines = const [];
+      _cachedMaxVisualUnits = 40;
+      return;
+    }
+    final rawLines = rawDiff.split('\n');
+    // Drop single phantom trailing empty line caused by trailing `\n` in unified diffs.
+    final lineLimit = rawLines.isNotEmpty && rawLines.last.isEmpty
+        ? rawLines.length - 1
+        : rawLines.length;
+    final parsed = <(String, String, String)>[];
+    var oldLine = 0;
+    var newLine = 0;
+    var inHunk = false;
+    var maxVisualUnits = 40;
+    for (var i = 0; i < lineLimit; i++) {
+      final l = rawLines[i];
+      final m = _hunkRe.firstMatch(l);
+      (String, String, String) row;
+      if (m != null) {
+        oldLine = int.tryParse(m.group(1) ?? '1') ?? 1;
+        newLine = int.tryParse(m.group(2) ?? '1') ?? 1;
+        inHunk = true;
+        row = ('@', '@@', l);
+      } else if (l.startsWith('diff ') ||
+          l.startsWith('index ') ||
+          l.startsWith('--- ') ||
+          l.startsWith('+++ ')) {
+        row = ('~', '', l);
+      } else if (l.startsWith('+')) {
+        final numStr = inHunk ? '${newLine++}' : '${i + 1}';
+        row = ('+', numStr, l.substring(1));
+      } else if (l.startsWith('-')) {
+        final numStr = inHunk ? '${oldLine++}' : '${i + 1}';
+        row = ('-', numStr, l.substring(1));
+      } else if (l.startsWith(r'\')) {
+        row = ('~', '', l);
+      } else {
+        final numStr = inHunk ? '${newLine++}' : '${i + 1}';
+        if (inHunk) oldLine++;
+        row = (' ', numStr, l.startsWith(' ') ? l.substring(1) : l);
+      }
+      parsed.add(row);
+      var units = 0;
+      for (final cu in row.$3.codeUnits) {
+        units += cu > 0x7F ? 2 : 1;
+      }
+      if (units > maxVisualUnits) maxVisualUnits = units;
+    }
+    _cachedLines = parsed;
+    _cachedMaxVisualUnits = maxVisualUnits;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final diffs = ref.watch(appProvider.select((s) => s.workspaceDiffs));
+    final matched = (widget.record != null && widget.record!.unifiedDiff.isNotEmpty)
+        ? widget.record
+        : (_matchDiffRecord(diffs, widget.filePath) ?? widget.record);
+    final rawDiff = matched?.unifiedDiff ?? '';
+    _ensureParsed(rawDiff);
+    final lines = _cachedLines;
+    final added = matched?.added ?? 0;
+    final removed = matched?.removed ?? 0;
+    final t = GrassBagTokens.of(context);
+    if (lines.isEmpty) {
+      if (_loading) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CupertinoActivityIndicator(radius: 10, color: t.primary),
+              const SizedBox(width: 10),
+              Text('正在加载工作区 Git 差异…', style: TextStyle(fontSize: 13, color: t.text2)),
+            ],
+          ),
+        );
+      }
+      return Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
               '当前工作区未检测到该文件的详细 Unified Diff。',
               style: TextStyle(fontSize: 13, color: t.text3),
             ),
-          );
-        }
-        var maxVisualUnits = 40;
-        for (final line in lines) {
-          var units = 0;
-          for (final cu in line.$3.codeUnits) {
-            units += cu > 0x7F ? 2 : 1;
-          }
-          if (units > maxVisualUnits) maxVisualUnits = units;
-        }
-        final diffContentWidth = (maxVisualUnits * 7.4 + 98.0).clamp(320.0, 3200.0);
+            const SizedBox(height: 12),
+            GrassBagSecondaryGlassButton(
+              label: '重新加载差异',
+              icon: CupertinoIcons.refresh,
+              tier: ref.read(appProvider).glassTier,
+              insideGlass: true,
+              onTap: _refreshDiffs,
+            ),
+          ],
+        ),
+      );
+    }
+    final diffContentWidth = (_cachedMaxVisualUnits * 7.4 + 98.0).clamp(320.0, 6000.0);
+    final visibleCount = math.min(lines.length, _visibleLineCap);
+    final hiddenLines = lines.length - visibleCount;
 
-        return Container(
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Row(
+            children: [
+              Text('改动统计', style: TextStyle(fontSize: 12, color: t.text3)),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: t.okSoft,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '+$added',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: t.ok,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: t.errSoft,
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '-$removed',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                    color: t.err,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
           decoration: BoxDecoration(
             color: t.codeBg,
             borderRadius: BorderRadius.circular(20),
@@ -3361,7 +3778,7 @@ void showDiffSheet(BuildContext context, String filePath, {WorkspaceDiffRecord? 
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        filePath,
+                        widget.filePath,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -3394,7 +3811,7 @@ void showDiffSheet(BuildContext context, String filePath, {WorkspaceDiffRecord? 
                     GrassBagSpringTap(
                       onTap: () {
                         Clipboard.setData(ClipboardData(text: rawDiff));
-                        cRef.read(appProvider.notifier).showToast('已复制改动补丁');
+                        ref.read(appProvider.notifier).showToast('已复制改动补丁');
                       },
                       child: const Row(
                         mainAxisSize: MainAxisSize.min,
@@ -3418,86 +3835,124 @@ void showDiffSheet(BuildContext context, String filePath, {WorkspaceDiffRecord? 
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 10),
                 child: RepaintBoundary(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: SizedBox(
-                      width: diffContentWidth,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          for (final line in lines)
-                            Container(
-                              color: switch (line.$1) {
-                                '+' => const Color(0x261F9D63),
-                                '-' => const Color(0x2AD14E4E),
-                                '@' => const Color(0x243B82F6),
-                                _ => Colors.transparent,
-                              },
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3.5),
-                              child: Row(
-                                children: [
-                                  SizedBox(
-                                    width: 44,
-                                    child: Text(
-                                      line.$2,
-                                      textAlign: TextAlign.right,
-                                      style: const TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: 11,
-                                        fontFeatures: [FontFeature.tabularFigures()],
-                                        color: Color(0xFF64748B),
+                  child: LayoutBuilder(
+                    builder: (context, box) {
+                      final effectiveW = math.max(box.maxWidth, diffContentWidth);
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: SizedBox(
+                          width: effectiveW,
+                          child: SelectionArea(
+                            contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                for (var idx = 0; idx < visibleCount; idx++)
+                                  () {
+                                    final line = lines[idx];
+                                    return Container(
+                                      color: switch (line.$1) {
+                                        '+' => const Color(0x261F9D63),
+                                        '-' => const Color(0x2AD14E4E),
+                                        '@' => const Color(0x243B82F6),
+                                        _ => Colors.transparent,
+                                      },
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 3.5),
+                                      child: Row(
+                                        children: [
+                                          SizedBox(
+                                            width: 44,
+                                            child: Text(
+                                              line.$2,
+                                              textAlign: TextAlign.right,
+                                              style: const TextStyle(
+                                                fontFamily: 'monospace',
+                                                fontSize: 11,
+                                                fontFeatures: [FontFeature.tabularFigures()],
+                                                color: Color(0xFF64748B),
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          SizedBox(
+                                            width: 14,
+                                            child: Text(
+                                              line.$1 == '@' || line.$1 == '~' ? ' ' : line.$1,
+                                              style: TextStyle(
+                                                fontFamily: 'monospace',
+                                                fontSize: 11.5,
+                                                fontWeight: FontWeight.w700,
+                                                color: switch (line.$1) {
+                                                  '+' => const Color(0xFF5DD199),
+                                                  '-' => const Color(0xFFF08A84),
+                                                  _ => const Color(0xFF64748B),
+                                                },
+                                              ),
+                                            ),
+                                          ),
+                                          Expanded(
+                                            child: Text(
+                                              line.$3,
+                                              softWrap: false,
+                                              overflow: TextOverflow.visible,
+                                              style: TextStyle(
+                                                fontFamily: 'monospace',
+                                                fontSize: 11.5,
+                                                height: 1.45,
+                                                color: line.$1 == '@'
+                                                    ? const Color(0xFF93C5FD)
+                                                    : (line.$1 == '~'
+                                                        ? const Color(0xFF64748B)
+                                                        : t.codeFg),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  SizedBox(
-                                    width: 14,
-                                    child: Text(
-                                      line.$1 == '@' || line.$1 == '~' ? ' ' : line.$1,
-                                      style: TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: 11.5,
-                                        fontWeight: FontWeight.w700,
-                                        color: switch (line.$1) {
-                                          '+' => const Color(0xFF5DD199),
-                                          '-' => const Color(0xFFF08A84),
-                                          _ => const Color(0xFF64748B),
-                                        },
-                                      ),
-                                    ),
-                                  ),
-                                  Expanded(
-                                    child: Text(
-                                      line.$3,
-                                      softWrap: false,
-                                      overflow: TextOverflow.visible,
-                                      style: TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: 11.5,
-                                        height: 1.45,
-                                        color: line.$1 == '@'
-                                            ? const Color(0xFF93C5FD)
-                                            : (line.$1 == '~'
-                                                ? const Color(0xFF64748B)
-                                                : t.codeFg),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
+                                    );
+                                  }(),
+                              ],
                             ),
-                        ],
-                      ),
-                    ),
+                          ),
+                        ),
+                      );
+                    },
                   ),
                 ),
               ),
+              if (hiddenLines > 0)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      GrassBagSpringTap(
+                        onTap: () => setState(() => _visibleLineCap += _kDiffLinePageSize),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Text(
+                            '展开更多（剩余 $hiddenLines 行）',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF93C5FD),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
             ],
           ),
-        );
-      },
-    ),
-  );
+        ),
+      ],
+    );
+  }
 }
 
 void showCommandOutputSheet(
@@ -3563,26 +4018,22 @@ void showCommandOutputSheet(
                     ),
                     ConstrainedBox(
                       constraints: const BoxConstraints(maxHeight: 340),
-                      child: SingleChildScrollView(
-                        padding: const EdgeInsets.all(14),
-                        child: SelectionArea(
-            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              for (final line in rawLines)
-                                Text(
-                                  line,
-                                  style: TextStyle(
-                                    fontFamily: 'monospace',
-                                    fontSize: 11.8,
-                                    height: 1.48,
-                                    color: failed
-                                        ? const Color(0xFFFCA5A5)
-                                        : const Color(0xFFD5DCE4),
-                                  ),
-                                ),
-                            ],
+                      child: SelectionArea(
+                        contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                        child: ListView.builder(
+                          shrinkWrap: rawLines.length <= 24,
+                          padding: const EdgeInsets.all(14),
+                          itemCount: rawLines.length,
+                          itemBuilder: (_, idx) => Text(
+                            rawLines[idx],
+                            style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11.8,
+                              height: 1.48,
+                              color: failed
+                                  ? const Color(0xFFFCA5A5)
+                                  : const Color(0xFFD5DCE4),
+                            ),
                           ),
                         ),
                       ),
@@ -3847,6 +4298,9 @@ class _RenameSessionSheetBodyState extends ConsumerState<_RenameSessionSheetBody
   void initState() {
     super.initState();
     _ctrl = TextEditingController(text: widget.session.title);
+    if (_ctrl.text.isNotEmpty) {
+      _ctrl.selection = TextSelection(baseOffset: 0, extentOffset: _ctrl.text.length);
+    }
   }
 
   @override
@@ -3879,6 +4333,22 @@ class _RenameSessionSheetBodyState extends ConsumerState<_RenameSessionSheetBody
           placeholder: '输入对话名称…',
           insideGlass: true,
           hasError: _err != null,
+          suffix: ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _ctrl,
+            builder: (_, val, __) => val.text.isEmpty
+                ? const SizedBox.shrink()
+                : GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      _ctrl.clear();
+                      if (_err != null) setState(() => _err = null);
+                    },
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(CupertinoIcons.xmark_circle_fill, size: 16, color: t.text3),
+                    ),
+                  ),
+          ),
           onChanged: (_) {
             if (_err != null) setState(() => _err = null);
           },
@@ -3966,59 +4436,73 @@ class _DeliverablePreviewBodyState extends ConsumerState<_DeliverablePreviewBody
   }
 
   Future<void> _load() async {
-    final state = ref.read(appProvider);
-    final ctrl = ref.read(appProvider.notifier);
-    String targetPath = (widget.path != null && widget.path!.trim().isNotEmpty)
-        ? widget.path!.trim()
-        : widget.name;
-    if (widget.path == null || widget.path!.trim().isEmpty) {
-      bool found = false;
-      void findFile(List<WorkspaceFileNode> nodes) {
-        for (final n in nodes) {
-          if (found) return;
-          if (!n.isDir &&
-              (n.name == widget.name ||
-                  n.path == widget.name ||
-                  n.path.endsWith('/${widget.name}'))) {
-            targetPath = n.path;
-            found = true;
-            return;
-          }
-          if (n.children.isNotEmpty) findFile(n.children);
-        }
-      }
-      findFile(state.workspaceFiles);
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _errorMsg = null;
+      });
     }
-    _resolvedPath = targetPath;
+    try {
+      final state = ref.read(appProvider);
+      final ctrl = ref.read(appProvider.notifier);
+      String targetPath = (widget.path != null && widget.path!.trim().isNotEmpty)
+          ? widget.path!.trim()
+          : widget.name;
+      if (widget.path == null || widget.path!.trim().isEmpty) {
+        bool found = false;
+        void findFile(List<WorkspaceFileNode> nodes) {
+          for (final n in nodes) {
+            if (found) return;
+            if (!n.isDir &&
+                (n.name == widget.name ||
+                    n.path == widget.name ||
+                    n.path.endsWith('/${widget.name}'))) {
+              targetPath = n.path;
+              found = true;
+              return;
+            }
+            if (n.children.isNotEmpty) findFile(n.children);
+          }
+        }
+        findFile(state.workspaceFiles);
+      }
+      _resolvedPath = targetPath;
 
-    if (_isImageName(targetPath) || _isImageName(widget.name)) {
-      final bytes = await ctrl.readWorkspaceFileBytes(targetPath);
+      if (_isImageName(targetPath) || _isImageName(widget.name)) {
+        final bytes = await ctrl.readWorkspaceFileBytes(targetPath);
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          if (bytes != null && bytes.isNotEmpty) {
+            _imageBytes = bytes;
+          } else {
+            _errorMsg = '无法从当前主机加载该图片文件内容。';
+          }
+        });
+        return;
+      }
+
+      final page = await ctrl.readWorkspaceFilePage(targetPath, offset: 1, limit: 240);
       if (!mounted) return;
       setState(() {
         _loading = false;
-        if (bytes != null && bytes.isNotEmpty) {
-          _imageBytes = bytes;
+        if (page['error'] == true) {
+          _errorMsg = page['text']?.toString() ?? '无法读取产物文件。';
+        } else if (page['binary'] == true) {
+          _errorMsg = '该产物为二进制文件，暂不支持直接文本预览。';
         } else {
-          _errorMsg = '无法从当前主机加载该图片文件内容。';
+          _textContent = page['text']?.toString() ?? '';
+          _truncated = page['truncated'] == true || page['eof'] == false;
+          _totalLines = (page['totalLines'] as num?)?.toInt() ?? 0;
         }
       });
-      return;
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _errorMsg = '读取产物失败：$e';
+      });
     }
-
-    final page = await ctrl.readWorkspaceFilePage(targetPath, offset: 1, limit: 240);
-    if (!mounted) return;
-    setState(() {
-      _loading = false;
-      if (page['error'] == true) {
-        _errorMsg = page['text']?.toString() ?? '无法读取产物文件。';
-      } else if (page['binary'] == true) {
-        _errorMsg = '该产物为二进制文件，暂不支持直接文本预览。';
-      } else {
-        _textContent = page['text']?.toString() ?? '';
-        _truncated = page['truncated'] == true;
-        _totalLines = (page['totalLines'] as num?)?.toInt() ?? 0;
-      }
-    });
   }
 
   @override
@@ -4027,6 +4511,7 @@ class _DeliverablePreviewBodyState extends ConsumerState<_DeliverablePreviewBody
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
     final ctrl = ref.read(appProvider.notifier);
     final isImage = _imageBytes != null;
+    final canCopy = !_loading && _errorMsg == null && (isImage || _textContent != null);
     final copyable = isImage
         ? (_resolvedPath.isNotEmpty ? _resolvedPath : widget.name)
         : (_textContent ?? (_resolvedPath.isNotEmpty ? _resolvedPath : widget.name));
@@ -4072,14 +4557,48 @@ class _DeliverablePreviewBodyState extends ConsumerState<_DeliverablePreviewBody
                   ),
                 )
               : isImage
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.memory(
-                        _imageBytes!,
-                        fit: BoxFit.contain,
-                        errorBuilder: (_, __, ___) => Center(
-                          child: Text('图片格式不受支持或数据损坏', style: TextStyle(fontSize: 12.5, color: t.text3)),
-                        ),
+                  ? GestureDetector(
+                      onTap: () => showImagePreviewDialog(
+                        context,
+                        bytes: _imageBytes,
+                        title: widget.name,
+                      ),
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: Image.memory(
+                              _imageBytes!,
+                              fit: BoxFit.contain,
+                              errorBuilder: (_, __, ___) => Center(
+                                child: Text('图片格式不受支持或数据损坏', style: TextStyle(fontSize: 12.5, color: t.text3)),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            right: 8,
+                            bottom: 8,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.56),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(CupertinoIcons.zoom_in, size: 12, color: Colors.white),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    '点击全屏缩放',
+                                    style: TextStyle(fontSize: 10.5, color: Colors.white),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     )
                   : _errorMsg != null
@@ -4087,7 +4606,7 @@ class _DeliverablePreviewBodyState extends ConsumerState<_DeliverablePreviewBody
                       : SingleChildScrollView(
                           child: SelectableText(
                             _textContent!.isEmpty ? '（文件内容为空）' : _textContent!,
-contextMenuBuilder: buildGrassBagEditableContextMenu,
+                            contextMenuBuilder: buildGrassBagEditableContextMenu,
                             style: TextStyle(
                               fontFamily: 'monospace',
                               fontSize: 12,
@@ -4102,16 +4621,22 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           children: [
             Expanded(
               child: GrassBagSecondaryGlassButton(
-                label: isImage ? '复制路径' : '复制内容',
+                label: isImage ? '复制路径' : (_truncated ? '复制预览内容' : '复制内容'),
                 icon: CupertinoIcons.doc_on_doc,
                 tier: tier,
                 insideGlass: true,
-                enabled: !_loading,
-                onTap: _loading
+                enabled: canCopy,
+                onTap: !canCopy
                     ? null
                     : () {
                         Clipboard.setData(ClipboardData(text: copyable));
-                        ctrl.showToast(isImage ? '已复制图片路径：$copyable' : '已复制 ${widget.name} 内容');
+                        ctrl.showToast(
+                          isImage
+                              ? '已复制图片路径：$copyable'
+                              : (_truncated
+                                  ? '已复制 ${widget.name} 前 240 行预览内容'
+                                  : '已复制 ${widget.name} 内容'),
+                        );
                       },
               ),
             ),
@@ -4119,12 +4644,12 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               const SizedBox(width: 10),
               Expanded(
                 child: GrassBagPrimaryGlassButton(
-                  label: '分享 / 导出',
+                  label: _truncated ? '分享预览' : '分享 / 导出',
                   icon: CupertinoIcons.share,
                   tier: tier,
                   insideGlass: true,
-                  enabled: !_loading && _textContent != null,
-                  onTap: (_loading || _textContent == null)
+                  enabled: !_loading && _errorMsg == null && _textContent != null,
+                  onTap: (_loading || _errorMsg != null || _textContent == null)
                       ? null
                       : () {
                           Navigator.of(context).pop();
@@ -4134,7 +4659,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           } else {
                             Clipboard.setData(ClipboardData(text: copyable));
                           }
-                          ctrl.showToast('已准备好导出 ${widget.name}');
+                          ctrl.showToast(
+                            _truncated
+                                ? '已准备好导出 ${widget.name}（前 240 行预览）'
+                                : '已准备好导出 ${widget.name}',
+                          );
                         },
                 ),
               ),
@@ -4155,10 +4684,8 @@ void showVoiceInputSheet(
   final state = ref.read(appProvider);
   showGrassBagSheet<void>(
     context,
-    title: '语音转文字输入',
-    subtitle: state.speechConfigured
-        ? '当前主机已启用语音转写服务 · 可配合系统输入法听写后一键填入'
-        : '当前主机尚未配置 DSH 语音转写后端，可使用系统输入法语音听写',
+    title: '系统语音听写',
+    subtitle: '通过系统输入法麦克风完成听写，确认后一键填入对话输入框',
     bodyBuilder: (ctx) => _VoiceInputSheetBody(
       tier: state.glassTier,
       speechConfigured: state.speechConfigured,
@@ -4278,30 +4805,171 @@ void showImagePreviewDialog(
     barrierLabel: '关闭图片预览',
     barrierColor: Colors.black.withValues(alpha: 0.90),
     transitionDuration: const Duration(milliseconds: 220),
-    transitionBuilder: (ctx, anim, _, child) {
-      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
-      return FadeTransition(
-        opacity: curved,
-        child: ScaleTransition(
-          scale: Tween<double>(begin: 0.94, end: 1.0).animate(curved),
-          child: child,
-        ),
+    transitionBuilder: (ctx, anim, _, child) => _ImageLightboxRouteTransition(
+      animation: anim,
+      child: child,
+    ),
+    pageBuilder: (ctx, _, __) {
+      return _GrassBagImageLightbox(
+        bytes: bytes,
+        url: url,
+        title: title,
       );
     },
-    pageBuilder: (ctx, _, __) {
-      final topPad = MediaQuery.paddingOf(ctx).top;
-      return Material(
-        type: MaterialType.transparency,
-        child: Stack(
-          children: [
-            Positioned.fill(
+  );
+}
+
+class _ImageLightboxRouteTransition extends StatefulWidget {
+  const _ImageLightboxRouteTransition({
+    required this.animation,
+    required this.child,
+  });
+
+  final Animation<double> animation;
+  final Widget child;
+
+  @override
+  State<_ImageLightboxRouteTransition> createState() =>
+      _ImageLightboxRouteTransitionState();
+}
+
+class _ImageLightboxRouteTransitionState
+    extends State<_ImageLightboxRouteTransition> {
+  late CurvedAnimation _curve;
+  late Animation<double> _scale;
+
+  void _init() {
+    _curve = CurvedAnimation(
+      parent: widget.animation,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+    _scale = Tween<double>(begin: 0.94, end: 1.0).animate(_curve);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ImageLightboxRouteTransition oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.animation != widget.animation) {
+      _curve.dispose();
+      _init();
+    }
+  }
+
+  @override
+  void dispose() {
+    _curve.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _curve,
+      child: ScaleTransition(
+        scale: _scale,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
+class _GrassBagImageLightbox extends StatefulWidget {
+  const _GrassBagImageLightbox({
+    required this.bytes,
+    required this.url,
+    required this.title,
+  });
+
+  final Uint8List? bytes;
+  final String? url;
+  final String? title;
+
+  @override
+  State<_GrassBagImageLightbox> createState() => _GrassBagImageLightboxState();
+}
+
+class _GrassBagImageLightboxState extends State<_GrassBagImageLightbox>
+    with SingleTickerProviderStateMixin {
+  final TransformationController _transformCtrl = TransformationController();
+  late final AnimationController _zoomCtrl;
+  Animation<Matrix4>? _zoomAnim;
+  Offset _doubleTapLocalPos = Offset.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _zoomCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+    )..addListener(() {
+        final anim = _zoomAnim;
+        if (anim != null) {
+          _transformCtrl.value = anim.value;
+        }
+      });
+  }
+
+  @override
+  void dispose() {
+    _zoomCtrl.dispose();
+    _transformCtrl.dispose();
+    super.dispose();
+  }
+
+  double get _currentScale => _transformCtrl.value.getMaxScaleOnAxis();
+
+  void _toggleZoom() {
+    final begin = Matrix4.copy(_transformCtrl.value);
+    final Matrix4 end;
+    if (_currentScale > 1.05) {
+      end = Matrix4.identity();
+    } else {
+      const targetScale = 2.4;
+      final fx = _doubleTapLocalPos.dx;
+      final fy = _doubleTapLocalPos.dy;
+      end = Matrix4.identity()
+        ..translateByDouble(-fx * (targetScale - 1.0), -fy * (targetScale - 1.0), 0.0, 1.0)
+        ..scaleByDouble(targetScale, targetScale, 1.0, 1.0);
+    }
+    _zoomAnim = Matrix4Tween(begin: begin, end: end).animate(
+      CurvedAnimation(parent: _zoomCtrl, curve: Curves.easeOutCubic),
+    );
+    _zoomCtrl.forward(from: 0.0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final topPad = MediaQuery.paddingOf(context).top;
+    return Material(
+      type: MaterialType.transparency,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                // Only dismiss when unzoomed so tapping a zoomed photo never unexpectedly exits!
+                if (_currentScale <= 1.02) {
+                  Navigator.of(context).pop();
+                }
+              },
+              onDoubleTapDown: (d) => _doubleTapLocalPos = d.localPosition,
+              onDoubleTap: _toggleZoom,
               child: InteractiveViewer(
+                transformationController: _transformCtrl,
                 minScale: 0.7,
                 maxScale: 4.0,
                 child: Center(
-                  child: bytes != null && bytes.isNotEmpty
+                  child: widget.bytes != null && widget.bytes!.isNotEmpty
                       ? Image.memory(
-                          bytes,
+                          widget.bytes!,
                           fit: BoxFit.contain,
                           errorBuilder: (_, __, ___) => const Padding(
                             padding: EdgeInsets.all(24),
@@ -4312,8 +4980,15 @@ void showImagePreviewDialog(
                           ),
                         )
                       : Image.network(
-                          url!,
+                          widget.url!,
                           fit: BoxFit.contain,
+                          loadingBuilder: (_, child, progress) {
+                            if (progress == null) return child;
+                            return const CupertinoActivityIndicator(
+                              radius: 13,
+                              color: Colors.white,
+                            );
+                          },
                           errorBuilder: (_, __, ___) => const Padding(
                             padding: EdgeInsets.all(24),
                             child: Text(
@@ -4325,40 +5000,69 @@ void showImagePreviewDialog(
                 ),
               ),
             ),
-            Positioned(
-              top: topPad + 10,
-              left: 16,
-              right: 16,
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      title ?? '图片预览',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 14.5,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
+          ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              child: Container(
+                height: topPad + 72,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withValues(alpha: 0.68),
+                      Colors.black.withValues(alpha: 0.24),
+                      Colors.transparent,
+                    ],
                   ),
-                  const SizedBox(width: 10),
-                  GrassBagGlassCircleButton(
-                    icon: CupertinoIcons.xmark,
-                    size: 38,
-                    iconSize: 16,
-                    iconColor: Colors.white,
-                    tooltip: '关闭预览',
-                    tier: GrassBagGlassTier.frosted,
-                    onTap: () => Navigator.of(ctx).pop(),
-                  ),
-                ],
+                ),
               ),
             ),
-          ],
-        ),
-      );
-    },
-  );
+          ),
+          Positioned(
+            top: topPad + 10,
+            left: 16,
+            right: 16,
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.title ?? '图片预览',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
+                      shadows: [
+                        Shadow(
+                          color: Color(0x88000000),
+                          blurRadius: 6,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                // Solid translucent close orb so FadeTransition route never wraps live GLSL shaders!
+                GrassBagGlassCircleButton(
+                  icon: CupertinoIcons.xmark,
+                  size: 38,
+                  iconSize: 16,
+                  iconColor: Colors.white,
+                  tintColor: const Color(0xCC12161E),
+                  tooltip: '关闭预览',
+                  tier: GrassBagGlassTier.solid,
+                  onTap: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

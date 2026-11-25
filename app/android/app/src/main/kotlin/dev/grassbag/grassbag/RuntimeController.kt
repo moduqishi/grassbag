@@ -7,6 +7,7 @@ import android.net.Network
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
+import android.os.SystemClock
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
@@ -20,6 +21,7 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
+import java.net.Proxy
 import java.net.URL
 import java.util.Collections
 import java.util.LinkedList
@@ -30,6 +32,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -202,6 +205,7 @@ class RuntimeController private constructor(
 
     private val homeSizeRefreshing = AtomicBoolean(false)
     private val prewarmTriggered = AtomicBoolean(false)
+    private val stopEpoch = AtomicInteger(0)
     private val networkCallbackRegistered = AtomicBoolean(false)
     private val lastNetworkNotifyMs = AtomicLong(0L)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -209,6 +213,7 @@ class RuntimeController private constructor(
     private val engineLock = Any()
     private val bootstrapLock = Any()
     private val metaLock = Any()
+    private val dnsLock = Any()
     private val readinessSignal = Object()
 
     fun addListener(listener: (String, Map<String, Any?>) -> Unit) {
@@ -358,29 +363,48 @@ class RuntimeController private constructor(
         return list.toList()
     }
 
-    private fun resolveSystemProxyUrl(): String? {
+    private fun resolveSystemProxyInfo(): Pair<String, String>? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
         return runCatching {
             val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
             val proxy = cm.defaultProxy ?: return null
             val host = proxy.host?.trim()
             val port = proxy.port
-            if (!host.isNullOrEmpty() && port > 0) "http://$host:$port" else null
+            if (host.isNullOrEmpty() || port <= 0) return null
+            val formattedHost = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+            val exclusions = LinkedHashSet<String>().apply {
+                add("127.0.0.1")
+                add("localhost")
+                add("::1")
+                proxy.exclusionList?.forEach { raw ->
+                    val cleaned = raw.trim()
+                    if (cleaned.isNotEmpty()) add(cleaned)
+                }
+            }
+            "http://$formattedHost:$port" to exclusions.joinToString(",")
         }.getOrNull()
     }
 
     private fun refreshContainerDns() {
         if (!ubuntuRoot.exists()) return
-        runCatching {
-            val etcDir = File(ubuntuRoot, "etc")
-            etcDir.mkdirs()
-            val wantResolv = resolveSystemDnsServers().joinToString("\n", postfix = "\n") { "nameserver $it" }
-            val resolv = File(etcDir, "resolv.conf")
-            val curResolv = runCatching { if (resolv.isFile) resolv.readText() else null }.getOrNull()
-            if (curResolv != wantResolv) {
-                runCatching { Os.remove(resolv.absolutePath) }
-                if (resolv.exists()) resolv.delete()
-                resolv.writeText(wantResolv)
+        synchronized(dnsLock) {
+            runCatching {
+                val etcDir = File(ubuntuRoot, "etc")
+                etcDir.mkdirs()
+                val wantResolv = resolveSystemDnsServers().joinToString("\n", postfix = "\n") { "nameserver $it" }
+                val resolv = File(etcDir, "resolv.conf")
+                val curResolv = runCatching { if (resolv.isFile) resolv.readText() else null }.getOrNull()
+                if (curResolv != wantResolv) {
+                    val tmp = File(etcDir, "resolv.conf.tmp.${Thread.currentThread().id}")
+                    tmp.writeText(wantResolv)
+                    runCatching { Os.rename(tmp.absolutePath, resolv.absolutePath) }.onFailure {
+                        runCatching { Os.remove(resolv.absolutePath) }
+                        if (!tmp.renameTo(resolv)) {
+                            resolv.writeText(wantResolv)
+                            runCatching { tmp.delete() }
+                        }
+                    }
+                }
             }
         }
     }
@@ -606,6 +630,13 @@ class RuntimeController private constructor(
         cachedMetaText = text
     }
 
+    private fun updateMeta(mutator: (JSONObject) -> Unit): JSONObject = synchronized(metaLock) {
+        val obj = readMeta()
+        mutator(obj)
+        writeMeta(obj)
+        obj
+    }
+
     fun detectExecutor(): String {
         val libs = File(ctx.applicationInfo.nativeLibraryDir)
         return when {
@@ -697,26 +728,36 @@ class RuntimeController private constructor(
         }.getOrDefault(true)
     }
 
+    private fun containerEntryExists(relPath: String): Boolean {
+        val f = File(ubuntuRoot, relPath)
+        if (f.exists()) return true
+        // Ubuntu alternatives symlinks (e.g. /usr/bin/convert -> /etc/alternatives/convert) target absolute
+        // container paths that appear broken from host File.exists(); Os.lstat detects the symlink itself.
+        return runCatching { Os.lstat(f.absolutePath) != null }.getOrDefault(false)
+    }
+
     fun detectInstalledToolkits(): List<String> {
         val found = mutableListOf<String>()
         if (isContainerExtracted()) found.add("core-node")
         // Verify full toolkit readiness (never falsely report half-installed broken apt runs as installed!)
-        if (File(ubuntuRoot, "usr/bin/python3").exists() &&
-            File(ubuntuRoot, "usr/bin/pip3").exists()
+        if (containerEntryExists("usr/bin/python3") &&
+            containerEntryExists("usr/bin/pip3")
         ) {
             found.add("python-uv")
         }
-        if (File(ubuntuRoot, "usr/bin/git").exists() &&
-            File(ubuntuRoot, "usr/bin/rg").exists() &&
-            File(ubuntuRoot, "usr/bin/jq").exists() &&
-            File(ubuntuRoot, "usr/bin/sqlite3").exists() &&
-            File(ubuntuRoot, "usr/bin/curl").exists()
+        if (containerEntryExists("usr/bin/git") &&
+            containerEntryExists("usr/bin/rg") &&
+            containerEntryExists("usr/bin/jq") &&
+            containerEntryExists("usr/bin/sqlite3") &&
+            containerEntryExists("usr/bin/curl")
         ) {
             found.add("dev-git-cli")
         }
-        if (File(ubuntuRoot, "usr/bin/ffmpeg").exists() &&
-            File(ubuntuRoot, "usr/bin/pandoc").exists() &&
-            (File(ubuntuRoot, "usr/bin/convert").exists() || File(ubuntuRoot, "usr/bin/magick").exists())
+        if (containerEntryExists("usr/bin/ffmpeg") &&
+            containerEntryExists("usr/bin/pandoc") &&
+            (containerEntryExists("usr/bin/convert") ||
+                containerEntryExists("usr/bin/convert-im6.q16") ||
+                containerEntryExists("usr/bin/magick"))
         ) {
             found.add("media-office")
         }
@@ -807,7 +848,8 @@ class RuntimeController private constructor(
                 if (!st.optBoolean("initialized", false) || !isContainerExtracted() || !isSlotExtracted(activeSlot)) {
                     return@execute
                 }
-                syncFastOverlaysIfNeeded(activeSlot)
+                // Let startEngineSync() check `hasPendingFastOverlayUpdate(activeSlot)` BEFORE syncing
+                // overlays so an APK upgrade reliably restarts an adopted stale DSH instance!
                 if (engineState == "stopped" && !isEngineAlive()) {
                     startEngineSync()
                 }
@@ -839,12 +881,23 @@ class RuntimeController private constructor(
                     bundled.openStream(art.optString("asset"))?.use { ins ->
                         TarGzExtractor.extractStream(ins, stageDir, wantSha, art.optLong("bytes", 0L), freshDir = true)
                     } ?: error("无法读取 ${art.optString("asset")}")
-                    TarGzExtractor.deleteTreeNoFollow(shimsRoot)
+                    val backupDir = File(ctx.filesDir, "shims.old-${System.currentTimeMillis()}")
+                    TarGzExtractor.deleteTreeNoFollow(backupDir)
+                    val movedOld = if (shimsRoot.exists()) shimsRoot.renameTo(backupDir) else false
                     if (!stageDir.renameTo(shimsRoot)) {
-                        stageDir.copyRecursively(shimsRoot, overwrite = true)
-                        TarGzExtractor.deleteTreeNoFollow(stageDir)
+                        TarGzExtractor.deleteTreeNoFollow(shimsRoot)
+                        try {
+                            stageDir.copyRecursively(shimsRoot, overwrite = true)
+                            TarGzExtractor.deleteTreeNoFollow(stageDir)
+                        } catch (t: Throwable) {
+                            if (movedOld && !shimsRoot.exists()) backupDir.renameTo(shimsRoot)
+                            throw t
+                        }
                     }
-                    if (wantSha.isNotEmpty()) st.put("shimsSha256", wantSha)
+                    if (movedOld) TarGzExtractor.deleteTreeNoFollow(backupDir)
+                    if (wantSha.isNotEmpty()) {
+                        updateMeta { it.put("shimsSha256", wantSha) }
+                    }
                     etcPrepared = false
                     updated = true
                 }
@@ -859,19 +912,32 @@ class RuntimeController private constructor(
                     (wantSha.isNotEmpty() && wantSha != prevSha)
                 if (needBridge) {
                     val stageDir = File(targetSlotDir, "dsh-gbridge.stage-${System.currentTimeMillis()}")
+                    val backupDir = File(targetSlotDir, "dsh-gbridge.old-${System.currentTimeMillis()}")
                     TarGzExtractor.deleteTreeNoFollow(stageDir)
+                    TarGzExtractor.deleteTreeNoFollow(backupDir)
                     bundled.openStream(art.optString("asset"))?.use { ins ->
                         TarGzExtractor.extractStream(ins, stageDir, wantSha, art.optLong("bytes", 0L), freshDir = true)
                     } ?: error("无法读取 ${art.optString("asset")}")
                     writeAndroidCordisPatch(File(stageDir, "cordis.patch.yml"))
-                    TarGzExtractor.deleteTreeNoFollow(bridgeDir)
+                    val movedOld = if (bridgeDir.exists()) bridgeDir.renameTo(backupDir) else false
                     if (!stageDir.renameTo(bridgeDir)) {
-                        stageDir.copyRecursively(bridgeDir, overwrite = true)
-                        TarGzExtractor.deleteTreeNoFollow(stageDir)
+                        TarGzExtractor.deleteTreeNoFollow(bridgeDir)
+                        try {
+                            stageDir.copyRecursively(bridgeDir, overwrite = true)
+                            TarGzExtractor.deleteTreeNoFollow(stageDir)
+                        } catch (t: Throwable) {
+                            if (movedOld && !bridgeDir.exists()) backupDir.renameTo(bridgeDir)
+                            throw t
+                        }
                     }
+                    if (movedOld) TarGzExtractor.deleteTreeNoFollow(backupDir)
+                    val bridgeVer = manifest.optString("bridgeVersion", "0.2.0")
                     if (wantSha.isNotEmpty()) {
-                        st.put("gbridgeSha256", wantSha)
-                        st.put("gbridgeSha256_$activeSlot", wantSha)
+                        updateMeta {
+                            it.put("gbridgeSha256", wantSha)
+                            it.put("gbridgeSha256_$activeSlot", wantSha)
+                            if (bridgeVer.isNotEmpty()) it.put("bridgeVersion", bridgeVer)
+                        }
                     }
                     updated = true
                 } else if (!patchFile.exists() || !runCatching { patchFile.readText().contains("grassbag-patch-v2") }.getOrDefault(false)) {
@@ -879,7 +945,6 @@ class RuntimeController private constructor(
                 }
             }
             if (updated) {
-                writeMeta(st)
                 if (ubuntuRoot.exists()) ensureContainerEtcFiles(force = true)
             }
         }
@@ -1026,8 +1091,8 @@ class RuntimeController private constructor(
         worker.execute {
             val extractedOk: Boolean
             var bootstrapErr: String? = null
+            var startedFgForBootstrap = false
             synchronized(bootstrapLock) {
-                var startedFgForBootstrap = false
                 extractedOk = try {
                     sendProgress("layout", 4, "检查设备架构与存储空间，准备物理四分离持久卷…")
                     if (!Build.SUPPORTED_ABIS.any { it.equals("arm64-v8a", ignoreCase = true) }) {
@@ -1262,12 +1327,14 @@ class RuntimeController private constructor(
                     updateRelativeSymlink(File(containersRoot, "current"), ubuntuRoot.name)
                     ensureContainerEtcFiles(force = true)
 
-                    // 3b. Fast ~60KB incremental dsh-gbridge overlay (never forces 121MB re-extraction!)
+                    // 3b. Fast ~100KB incremental dsh-gbridge overlay (MUST also re-apply whenever
+                    // engine-init.gbag was extracted so legacy v0.1.0 inside engine-init never survives!)
                     arts.optJSONObject("gbridge")?.let { art ->
                         val wantSha = art.optString("sha256", "")
                         val prevSha = st.optString("gbridgeSha256_$activeSlot", st.optString("gbridgeSha256", ""))
                         val bridgeDir = File(targetSlotDir, "dsh-gbridge")
-                        val needBridge = !File(bridgeDir, "lib/index.js").exists() ||
+                        val needBridge = needEngineCheck ||
+                            !File(bridgeDir, "lib/index.js").exists() ||
                             (wantSha.isNotEmpty() && wantSha != prevSha)
                         if (needBridge) {
                             sendProgress("gbridge", 86, "增量更新零侵入桥 dsh-gbridge…")
@@ -1292,18 +1359,36 @@ class RuntimeController private constructor(
                     phoneDaemon.start()
                     droidDaemon.start()
 
-                    st.put("initialized", true)
-                    st.put("activeSlot", activeSlot)
-                    st.put("lkgSlot", st.optString("lkgSlot", activeSlot))
-                    st.put("containerVersion", manifest.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3"))
-                    if (st.optString("dshVersion", "").isEmpty()) {
-                        st.put("dshVersion", manifestDshVer)
+                    // Merge only bootstrap-owned keys atomically so concurrent user toggles (executor/proxy/sdcard)
+                    // made during long extraction are never clobbered!
+                    updateMeta { fresh ->
+                        fresh.put("initialized", true)
+                        fresh.put("activeSlot", activeSlot)
+                        fresh.put("lkgSlot", fresh.optString("lkgSlot", st.optString("lkgSlot", activeSlot)))
+                        fresh.put("containerVersion", manifest.optString("containerVersion", "Ubuntu 24.04.5 · Node 24.22.3"))
+                        val shimsSha = st.optString("shimsSha256", "")
+                        if (shimsSha.isNotEmpty()) fresh.put("shimsSha256", shimsSha)
+                        val baseSha = st.optString("baseRootfsSha256", "")
+                        if (baseSha.isNotEmpty()) fresh.put("baseRootfsSha256", baseSha)
+                        val engSha = st.optString("engineInitSha256", "")
+                        if (engSha.isNotEmpty()) fresh.put("engineInitSha256", engSha)
+                        val gbSha = st.optString("gbridgeSha256", "")
+                        if (gbSha.isNotEmpty()) fresh.put("gbridgeSha256", gbSha)
+                        val gbSlotSha = st.optString("gbridgeSha256_$activeSlot", "")
+                        if (gbSlotSha.isNotEmpty()) fresh.put("gbridgeSha256_$activeSlot", gbSlotSha)
+                        val bundledVer = st.optString("bundledDshVersion", "")
+                        if (bundledVer.isNotEmpty()) fresh.put("bundledDshVersion", bundledVer)
+                        val dshVer = st.optString("dshVersion", "")
+                        if (dshVer.isNotEmpty()) {
+                            fresh.put("dshVersion", dshVer)
+                        } else if (fresh.optString("dshVersion", "").isEmpty()) {
+                            fresh.put("dshVersion", manifestDshVer)
+                        }
+                        fresh.put("bridgeVersion", manifest.optString("bridgeVersion", "0.1.0"))
+                        if (!fresh.optBoolean("executorModePinned", false)) {
+                            fresh.put("executorMode", detectExecutor())
+                        }
                     }
-                    st.put("bridgeVersion", manifest.optString("bridgeVersion", "0.1.0"))
-                    if (!st.optBoolean("executorModePinned", false)) {
-                        st.put("executorMode", detectExecutor())
-                    }
-                    writeMeta(st)
                     true
                 } catch (err: Throwable) {
                     Log.e(TAG, "bootstrapRuntime failed", err)
@@ -1335,6 +1420,9 @@ class RuntimeController private constructor(
                 done(mapOf("ok" to true, "engineStarted" to true, "bootMs" to bootMs, "status" to getStatus()))
             } else {
                 val errStr = engineRes["error"]?.toString() ?: "engine_start_failed"
+                if (startedFgForBootstrap && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
+                    GrassBagEngineService.stop(ctx)
+                }
                 sendProgress("error", 0, "容器已部署，但 DSH 启动失败：$errStr")
                 done(mapOf("ok" to false, "engineStarted" to false, "error" to errStr, "status" to getStatus()))
             }
@@ -1350,7 +1438,8 @@ class RuntimeController private constructor(
 
     fun restartEngine(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
-            stopEngineSync()
+            // Keep FGS alive across stop -> start so Android 12+ never rejects re-foregrounding if backgrounded!
+            stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
             val res = startEngineSync()
             done(res)
         }
@@ -1360,6 +1449,12 @@ class RuntimeController private constructor(
         stopEngineSync()
         return mapOf("ok" to true, "status" to getStatus())
     }
+
+    private fun extractProcessPid(proc: Process): Int? = runCatching {
+        val field = proc.javaClass.getDeclaredField("pid")
+        field.isAccessible = true
+        (field.get(proc) as? Number)?.toInt()
+    }.getOrNull()
 
     private fun killProcessGroupSafe(pid: Int) {
         if (!isValidEnginePid(pid)) return
@@ -1390,19 +1485,31 @@ class RuntimeController private constructor(
     }
 
     private fun stopEngineSync(keepForegroundService: Boolean = false, emitStoppedEvent: Boolean = true) {
+        if (emitStoppedEvent) {
+            stopEpoch.incrementAndGet()
+            synchronized(readinessSignal) { readinessSignal.notifyAll() }
+        }
         synchronized(engineLock) {
             dshProcess?.let { proc ->
                 appendLog("[runtime] stopping DSH engine...")
-                // Terminate child process group first (via recorded PID from setsid session) so no orphan
-                // bash / MCP / dev server child survives DSH stop/restart.
+                // Terminate child process group first (via recorded PID from setsid session, or direct
+                // proc PID if killed before pidFile was written) so no orphan worker survives stop/fallback.
                 killRecordedEnginePid()
+                extractProcessPid(proc)?.let { procPid ->
+                    if (procPid > 1) killProcessGroupSafe(procPid)
+                }
                 runCatching { proc.destroy() }
                 runCatching {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        proc.waitFor(1500, TimeUnit.MILLISECONDS)
+                        proc.waitFor(1200, TimeUnit.MILLISECONDS)
                     }
                 }
                 runCatching { proc.destroyForcibly() }
+                runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        proc.waitFor(500, TimeUnit.MILLISECONDS)
+                    }
+                }
             }
             killRecordedEnginePid()
             dshProcess = null
@@ -1421,9 +1528,9 @@ class RuntimeController private constructor(
         }
     }
 
-    private fun resolveHostDirForContainerWorkdir(workDirInsideContainer: String): File {
+    private fun mapContainerWorkdirToHost(workDirInsideContainer: String): File {
         val clean = workDirInsideContainer.trim().trimEnd('/').ifEmpty { "/root/workspace" }
-        val candidate = when {
+        return when {
             clean == "/root" -> homeDir
             clean.startsWith("/root/") -> File(homeDir, clean.removePrefix("/root/"))
             clean == "/opt/dsh-slots" -> slotsRoot
@@ -1434,6 +1541,10 @@ class RuntimeController private constructor(
             clean.startsWith("/") -> File(ubuntuRoot, clean.removePrefix("/"))
             else -> File(homeDir, "workspace")
         }
+    }
+
+    private fun resolveHostDirForContainerWorkdir(workDirInsideContainer: String): File {
+        val candidate = mapContainerWorkdirToHost(workDirInsideContainer)
         return if (candidate.isDirectory) candidate else File(homeDir, "workspace").also { it.mkdirs() }
     }
 
@@ -1546,7 +1657,7 @@ class RuntimeController private constructor(
         val dnsServers = resolveSystemDnsServers().joinToString(",")
         val containerShell = if (File(ubuntuRoot, "bin/bash").exists()) "/bin/bash" else "/bin/sh"
         val caCertExists = File(ubuntuRoot, "etc/ssl/certs/ca-certificates.crt").exists()
-        val proxyUrl = if (meta.optBoolean("useSystemProxy", false)) resolveSystemProxyUrl() else null
+        val proxyInfo = if (meta.optBoolean("useSystemProxy", false)) resolveSystemProxyInfo() else null
         pb.environment().apply {
             clear()
             if (!wantTawc) {
@@ -1583,23 +1694,57 @@ class RuntimeController private constructor(
                 put("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
                 put("GIT_SSL_CAINFO", "/etc/ssl/certs/ca-certificates.crt")
             }
-            if (proxyUrl != null) {
+            if (proxyInfo != null) {
+                val (proxyUrl, noProxyList) = proxyInfo
                 put("HTTP_PROXY", proxyUrl)
                 put("HTTPS_PROXY", proxyUrl)
                 put("http_proxy", proxyUrl)
                 put("https_proxy", proxyUrl)
-                put("NO_PROXY", "127.0.0.1,localhost,::1")
-                put("no_proxy", "127.0.0.1,localhost,::1")
+                put("NO_PROXY", noProxyList)
+                put("no_proxy", noProxyList)
             }
             if (includeBridgeSecrets) {
                 // Scope shim + V8 compile cache strictly to the DSH engine process (not shells/npm/droid scripts).
                 put("GBRIDGE_DSH_BOOT", "1")
                 put("NODE_COMPILE_CACHE", "/root/.cache/node-compile-cache")
                 put("GBRIDGE_UNIX_SOCKET", "/run/grassbag/bridge.sock")
-                put("GBRIDGE_TOKEN", bridgeToken)
                 put("GBRIDGE_PHONE_SOCKET", "/run/grassbag/phone-control.sock")
-                put("GBRIDGE_PHONE_TOKEN", phoneDaemon.bearerToken)
                 put("GBRIDGE_PID_FILE", "/run/grassbag/dsh-engine.pid")
+                // Deliver bearer tokens via a one-time 0600 file that dsh-gbridge immediately unlinks on import,
+                // so `/proc/<pid>/environ` never exposes privileged tokens to same-UID terminal/agent processes.
+                val secretFileName = ".boot-${vault.generateRandomToken(12)}.json"
+                val secretHostFile = File(runRoot, secretFileName)
+                val wroteSecretsFile = runCatching {
+                    runRoot.mkdirs()
+                    // Clean up any stale unconsumed bootstrap files from crashed starts.
+                    runRoot.listFiles()?.forEach { f ->
+                        if (f.name.startsWith(".boot-") && f.name.endsWith(".json")) {
+                            runCatching { f.delete() }
+                        }
+                    }
+                    val fd = Os.open(
+                        secretHostFile.absolutePath,
+                        OsConstants.O_CREAT or OsConstants.O_WRONLY or OsConstants.O_TRUNC,
+                        0x180 // 0600
+                    )
+                    try {
+                        val payload = JSONObject()
+                            .put("token", bridgeToken)
+                            .put("phoneToken", phoneDaemon.bearerToken)
+                            .toString()
+                            .toByteArray(Charsets.UTF_8)
+                        Os.write(fd, payload, 0, payload.size)
+                    } finally {
+                        Os.close(fd)
+                    }
+                    true
+                }.getOrDefault(false)
+                if (wroteSecretsFile) {
+                    put("GBRIDGE_SECRETS_FILE", "/run/grassbag/$secretFileName")
+                } else {
+                    put("GBRIDGE_TOKEN", bridgeToken)
+                    put("GBRIDGE_PHONE_TOKEN", phoneDaemon.bearerToken)
+                }
             }
             put("DROID_BRIDGE_SOCKET", "/run/grassbag/droid.sock")
             put("DROID_BRIDGE_TOKEN", droidDaemon.bearerToken)
@@ -1608,6 +1753,7 @@ class RuntimeController private constructor(
     }
 
     private fun startEngineSync(): Map<String, Any?> {
+        val myStartEpoch = stopEpoch.get()
         // Coalesce concurrent startup attempts atomically (MainActivity prewarm + Flutter refreshNativeStatus).
         val waitLatch: CountDownLatch? = synchronized(engineLock) {
             if (isEngineAlive() && engineState == "running") {
@@ -1624,7 +1770,7 @@ class RuntimeController private constructor(
             }
         }
         if (waitLatch != null) {
-            runCatching { waitLatch.await(180, TimeUnit.SECONDS) }
+            runCatching { waitLatch.await(300, TimeUnit.SECONDS) }
             val ok = isEngineAlive() && engineState == "running"
             return mapOf(
                 "ok" to ok,
@@ -1641,6 +1787,7 @@ class RuntimeController private constructor(
                 synchronized(engineLock) {
                     if (engineState == "starting") engineState = "stopped"
                 }
+                emit("engine_state", mapOf("state" to "stopped"))
                 return mapOf("ok" to false, "error" to "runtime_not_initialized", "status" to getStatus())
             }
 
@@ -1661,7 +1808,8 @@ class RuntimeController private constructor(
                     GrassBagEngineService.startOrUpdate(
                         ctx,
                         "GrassBag 本机引擎运行中",
-                        "DSH $lastCapabilitiesDshVersion · 后台保活中"
+                        "DSH $lastCapabilitiesDshVersion · 后台保活中",
+                        releaseWakeLock = true
                     )
                     appendLog("[runtime] adopted existing healthy DSH on :$LOCAL_DSH_PORT (version=$lastCapabilitiesDshVersion)")
                     emit(
@@ -1681,16 +1829,31 @@ class RuntimeController private constructor(
             }
 
             // Fast ~20ms atomic sync if APK shipped updated shims or dsh-gbridge.
-            runCatching { syncFastOverlaysIfNeeded(activeSlot) }
+            runCatching { syncFastOverlaysIfNeeded(activeSlot) }.onFailure { err ->
+                Log.w(TAG, "syncFastOverlaysIfNeeded failed: ${err.message}", err)
+                appendLog("[runtime] WARN: fast overlay sync failed: ${err.message}")
+            }
 
             val nativeLibDir = File(ctx.applicationInfo.nativeLibraryDir)
             val hasTawc = File(nativeLibDir, "libtawcroot.so").exists()
             val hasProot = File(nativeLibDir, "libproot.so").exists()
             if (!hasTawc && !hasProot) {
-                engineState = "error"
-                lastEngineError = "neither libtawcroot.so nor libproot.so found in ${nativeLibDir.absolutePath}"
-                return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
+                val errMsg = "neither libtawcroot.so nor libproot.so found in ${nativeLibDir.absolutePath}"
+                synchronized(engineLock) {
+                    engineState = "error"
+                    lastEngineError = errMsg
+                }
+                emit("engine_state", mapOf("state" to "error", "error" to errMsg))
+                return mapOf("ok" to false, "error" to errMsg, "status" to getStatus())
             }
+
+            // Keep Android 12-16 cached-app freezer & Doze from stalling cold V8 boot!
+            GrassBagEngineService.startOrUpdate(
+                ctx,
+                "GrassBag 正在启动本机引擎…",
+                "首次编译缓存加载中，完成后自动保活",
+                wakeLockMs = 180_000L
+            )
 
             updateRelativeSymlink(File(containersRoot, "current"), ubuntuRoot.name)
             updateRelativeSymlink(File(slotsRoot, "current"), activeSlot)
@@ -1709,31 +1872,58 @@ class RuntimeController private constructor(
             }
 
             var lastAttemptErr: String? = null
+            var tawcTimedOutNoOutput = false
             for ((idx, attempt) in attempts.withIndex()) {
+                if (stopEpoch.get() != myStartEpoch) {
+                    appendLog("[runtime] startup cancelled by stop request before attempt #${idx + 1}")
+                    return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+                }
                 val (forceProot, disableSeccomp) = attempt
-                val res = launchAndWaitForEngine(activeSlot, forceProot, disableSeccomp)
+                val res = launchAndWaitForEngine(activeSlot, forceProot, disableSeccomp, myStartEpoch)
                 if (res["ok"] == true) {
+                    // If tawcroot hung silently (timeout with zero stdout progress) while proot succeeded,
+                    // remember fallback for this OS fingerprint so subsequent launches skip the 60s hang!
+                    if (forceProot && tawcTimedOutNoOutput) {
+                        runCatching {
+                            updateMeta { it.put("tawcUnsupportedFingerprint", Build.FINGERPRINT) }
+                        }
+                        appendLog("[runtime] cached proot fallback for fingerprint after silent tawcroot hang")
+                    }
                     return res
                 }
+                if (stopEpoch.get() != myStartEpoch) {
+                    appendLog("[runtime] startup aborted by stop request")
+                    return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+                }
                 lastAttemptErr = res["error"]?.toString()
-                // Only blacklist tawcroot on true kernel/seccomp incompatibility codes (86/88/89/92/94/95/159=SIGSYS),
-                // never on transient rootfs/bind errors (90/93)!
-                if (!forceProot && lastAttemptErr != null && Regex("""code (86|88|89|92|94|95|159)\b""").containsMatchIn(lastAttemptErr)) {
-                    runCatching {
-                        val updated = readMeta().put("tawcUnsupportedFingerprint", Build.FINGERPRINT)
-                        writeMeta(updated)
+                // Cache tawcroot fallback on kernel/seccomp/loader/signal crash codes (60..79, 86/88/89/91/92/94/95,
+                // SIGILL=132, SIGABRT=134, SIGBUS=135, SIGSEGV=139, SIGSYS=159); never on transient rootfs/bind errors (90/93).
+                if (!forceProot && lastAttemptErr != null) {
+                    val isHardTawcCrash = Regex("""code (6\d|7\d|86|88|89|91|92|94|95|132|134|135|139|159)\b""")
+                        .containsMatchIn(lastAttemptErr)
+                    if (isHardTawcCrash) {
+                        runCatching {
+                            updateMeta { it.put("tawcUnsupportedFingerprint", Build.FINGERPRINT) }
+                        }
+                    } else if (res["timedOutNoOutput"] == true) {
+                        tawcTimedOutNoOutput = true
                     }
                 }
                 // Clean up failed/timed-out attempt; keep FGS & suppress stopped flicker while falling back!
                 val hasMoreAttempts = idx + 1 < attempts.size
-                stopEngineSync(keepForegroundService = hasMoreAttempts, emitStoppedEvent = !hasMoreAttempts)
+                stopEngineSync(keepForegroundService = hasMoreAttempts, emitStoppedEvent = false)
                 if (hasMoreAttempts) {
                     appendLog("[runtime] startup attempt #${idx + 1} failed ($lastAttemptErr); retrying with fallback executor...")
                 }
             }
 
-            engineState = "error"
-            lastEngineError = lastAttemptErr ?: "DSH startup failed"
+            synchronized(engineLock) {
+                engineState = "error"
+                lastEngineError = lastAttemptErr ?: "DSH startup failed"
+            }
+            if (activeToolkitInstalls.get() <= 0) {
+                GrassBagEngineService.stop(ctx)
+            }
             emit("engine_state", mapOf("state" to "error", "error" to lastEngineError))
             return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
         } finally {
@@ -1750,12 +1940,17 @@ class RuntimeController private constructor(
     private fun launchAndWaitForEngine(
         activeSlot: String,
         forceProot: Boolean,
-        disableProotSeccomp: Boolean
+        disableProotSeccomp: Boolean,
+        startEpoch: Int
     ): Map<String, Any?> {
-        val t0 = System.currentTimeMillis()
+        val t0 = SystemClock.elapsedRealtime()
         val proc: Process
         val executorTag: String
+        val sawAnyStdout = AtomicBoolean(false)
         synchronized(engineLock) {
+            if (stopEpoch.get() != startEpoch) {
+                return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+            }
             runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
             runCatching { if (pidFile.exists()) pidFile.delete() }
             engineState = "starting"
@@ -1800,6 +1995,7 @@ class RuntimeController private constructor(
                     BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
                         while (true) {
                             val line = br.readLine() ?: break
+                            sawAnyStdout.set(true)
                             var wake = false
                             DSH_WEB_URL_REGEX.find(line)?.value?.let { foundUrl ->
                                 dshWebUrl = foundUrl
@@ -1825,21 +2021,39 @@ class RuntimeController private constructor(
                         dshProcess = null
                         runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
                         runCatching { if (pidFile.exists()) pidFile.delete() }
-                        if (engineState != "stopped") {
+                        // During "starting", startEngineSync() owns fallback retries (tawcroot -> proot) and final
+                        // error reporting; preserve the stderr tail so crash diagnostics are never discarded!
+                        val tail = getEngineLogs().takeLast(6).joinToString(" | ")
+                        val formattedErr = if (tail.isNotEmpty()) "DSH ($tag) exited with code $code: $tail" else "DSH ($tag) exited with code $code"
+                        if (engineState == "starting") {
+                            lastEngineError = formattedErr
+                        } else if (engineState != "stopped") {
                             engineState = "error"
-                            lastEngineError = "DSH ($tag) exited with code $code"
-                            GrassBagEngineService.stop(ctx)
+                            lastEngineError = formattedErr
+                            if (activeToolkitInstalls.get() <= 0) {
+                                GrassBagEngineService.stop(ctx)
+                            }
+                            emit("engine_state", mapOf("state" to engineState, "exitCode" to code, "error" to lastEngineError))
                         }
-                        emit("engine_state", mapOf("state" to engineState, "exitCode" to code, "error" to lastEngineError))
                     }
                 }
             }
         }
 
-        // Executor-aware startup budget: 60s for fast tawcroot, 120s for slower PRoot on older phones.
-        val timeoutMs = if (forceProot) 120_000L else 60_000L
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
+        // Executor-aware monotonic startup budget: allow 75s on cold V8 compile-cache miss for tawcroot,
+        // 60s on warm tawcroot, and 120s for slower PRoot on older phones.
+        val compileCacheEmpty = (File(homeDir, ".cache/node-compile-cache").listFiles()?.isEmpty() != false)
+        val timeoutMs = when {
+            forceProot -> 120_000L
+            compileCacheEmpty -> 75_000L
+            else -> 60_000L
+        }
+        val deadline = t0 + timeoutMs
+        var consecutive401AfterWebUrl = 0
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (stopEpoch.get() != startEpoch) {
+                return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+            }
             if (!isEngineAlive()) {
                 runCatching { proc.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS) }
                 val exitCode = runCatching { proc.exitValue() }.getOrNull()
@@ -1850,10 +2064,16 @@ class RuntimeController private constructor(
                 )
                 return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
             }
-            // Only probe HTTP once dshWebUrl appeared or 1.8s have elapsed
-            val elapsed = System.currentTimeMillis() - t0
-            if (dshWebUrl != null || bridgeSocket.exists() || elapsed >= 1800L) {
-                val caps = probeLocalCapabilities()
+            val elapsed = SystemClock.elapsedRealtime() - t0
+            if (dshWebUrl != null || bridgeSocket.exists() || elapsed >= 2000L) {
+                val probe = probeLocalCapabilitiesWithStatus()
+                val caps = probe.first
+                if (probe.second == 401 && dshWebUrl != null) {
+                    consecutive401AfterWebUrl++
+                    if (consecutive401AfterWebUrl == 1 || consecutive401AfterWebUrl == 10) {
+                        appendLog("[runtime] WARN: capabilities probe returned HTTP 401 after dshWebUrl appeared (token mismatch / legacy plugin)")
+                    }
+                }
                 if (caps != null) {
                     // Wait briefly (up to 500ms) only for `bridge.sock` if not yet visible;
                     // `dshWebUrl` arrives asynchronously via `engine_web_url` without stalling boot!
@@ -1877,11 +2097,12 @@ class RuntimeController private constructor(
                     if (!stillValid) {
                         return mapOf("ok" to false, "error" to "engine_stopped_during_startup", "status" to getStatus())
                     }
-                    val bootMs = System.currentTimeMillis() - t0
+                    val bootMs = SystemClock.elapsedRealtime() - t0
                     GrassBagEngineService.startOrUpdate(
                         ctx,
                         "GrassBag 本机引擎运行中",
-                        "DSH $lastCapabilitiesDshVersion ($executorTag) · 后台保活中"
+                        "DSH $lastCapabilitiesDshVersion ($executorTag) · 后台保活中",
+                        releaseWakeLock = activeToolkitInstalls.get() <= 0
                     )
                     appendLog("[runtime] DSH READY in ${bootMs}ms! executor=$executorTag version=$lastCapabilitiesDshVersion endpoints=${caps.optInt("endpointsCount")} uds=${bridgeSocket.exists()} webUrl=${dshWebUrl != null} port=$LOCAL_DSH_PORT")
                     emit(
@@ -1901,32 +2122,44 @@ class RuntimeController private constructor(
                     return mapOf("ok" to true, "bootMs" to bootMs, "executorMode" to executorTag, "capabilities" to caps.toString(), "status" to getStatus())
                 }
             }
+            val waitMs = if (dshWebUrl != null || bridgeSocket.exists()) 160L else if (elapsed < 10_000L) 250L else 420L
             synchronized(readinessSignal) {
-                runCatching { readinessSignal.wait(140) }
+                runCatching { readinessSignal.wait(waitMs) }
             }
         }
 
         val tail = getEngineLogs().takeLast(6).joinToString(" | ")
         lastEngineError = "DSH ($executorTag) startup timed out (${timeoutMs / 1000}s): $tail"
         appendLog("[runtime] TIMEOUT: $lastEngineError")
-        return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
+        return mapOf(
+            "ok" to false,
+            "error" to lastEngineError,
+            "timedOutNoOutput" to (!sawAnyStdout.get() && dshWebUrl == null && !bridgeSocket.exists()),
+            "status" to getStatus()
+        )
     }
 
-    private fun probeLocalCapabilities(): JSONObject? = runCatching {
-        val conn = (URL("http://127.0.0.1:$LOCAL_DSH_PORT/gbridge/v1/capabilities").openConnection() as HttpURLConnection).apply {
+    private fun probeLocalCapabilities(): JSONObject? = probeLocalCapabilitiesWithStatus().first
+
+    private fun probeLocalCapabilitiesWithStatus(): Pair<JSONObject?, Int> = runCatching {
+        val conn = (URL("http://127.0.0.1:$LOCAL_DSH_PORT/gbridge/v1/capabilities").openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 350
             readTimeout = 800
             setRequestProperty("Authorization", "Bearer $bridgeToken")
         }
         try {
-            if (conn.responseCode in 200..299) {
-                conn.inputStream.use { JSONObject(it.bufferedReader().readText()) }
-            } else null
+            val code = conn.responseCode
+            if (code in 200..299) {
+                val obj = conn.inputStream.use { JSONObject(it.bufferedReader().readText()) }
+                obj to code
+            } else {
+                null to code
+            }
         } finally {
             conn.disconnect()
         }
-    }.getOrNull()
+    }.getOrDefault(null to -1)
 
     private fun cleanDirFilesNoFollow(dir: File, preservePrefix: String): Long {
         val st = runCatching { Os.lstat(dir.absolutePath) }.getOrNull() ?: return 0L
@@ -1980,7 +2213,12 @@ class RuntimeController private constructor(
     fun rebuildContainerPreserveHome(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
             try {
+                if (activeToolkitInstalls.get() > 0) {
+                    done(mapOf("ok" to false, "error" to "当前有工具包正在安装，请等待安装完成后再重建容器", "status" to getStatus()))
+                    return@execute
+                }
                 synchronized(bootstrapLock) {
+                    shells.keys.toList().forEach { closeLocalShell(it) }
                     stopEngineSync()
                     sendProgress("rebuild", 15, "保留 /root 数据卷，清理旧容器根文件系统…")
                     TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
@@ -2117,26 +2355,35 @@ class RuntimeController private constructor(
 
                     revertMetaFn = {
                         runCatching {
-                            st.put("activeSlot", cur)
-                            st.put("lkgSlot", prevLkgSlot)
-                            st.put("dshVersion", prevVersion)
-                            st.put("dshPrevVersion", prevDshPrevVersion)
-                            st.put("userUpgradedAb", prevUserUpgradedAb)
-                            writeMeta(st)
+                            updateMeta { fresh ->
+                                fresh.put("activeSlot", cur)
+                                fresh.put("lkgSlot", prevLkgSlot)
+                                fresh.put("dshVersion", prevVersion)
+                                fresh.put("dshPrevVersion", prevDshPrevVersion)
+                                fresh.put("userUpgradedAb", prevUserUpgradedAb)
+                            }
                             updateRelativeSymlink(File(slotsRoot, "current"), cur)
                             updateRelativeSymlink(File(slotsRoot, "lkg"), prevLkgSlot)
                         }
                     }
 
                     sendProgress("switch", 82, "预检通过 (v$installedVer)，原子切换至 $standby 并重启本机引擎…")
-                    st.put("lkgSlot", cur)
-                    st.put("dshPrevVersion", prevVersion)
-                    st.put("activeSlot", standby)
-                    st.put("dshVersion", installedVer)
-                    st.put("userUpgradedAb", true)
-                    val curBridgeSha = st.optString("gbridgeSha256_$cur", st.optString("gbridgeSha256", ""))
-                    if (curBridgeSha.isNotEmpty()) st.put("gbridgeSha256_$standby", curBridgeSha)
-                    writeMeta(st)
+                    updateMeta { fresh ->
+                        fresh.put("lkgSlot", cur)
+                        fresh.put("dshPrevVersion", prevVersion)
+                        fresh.put("activeSlot", standby)
+                        fresh.put("dshVersion", installedVer)
+                        fresh.put("userUpgradedAb", true)
+                        if (remoteBaseUrl.isNullOrBlank()) {
+                            // Local npm upgrade copied curDir/dsh-gbridge directly into standby.
+                            val curBridgeSha = fresh.optString("gbridgeSha256_$cur", fresh.optString("gbridgeSha256", ""))
+                            if (curBridgeSha.isNotEmpty()) fresh.put("gbridgeSha256_$standby", curBridgeSha)
+                        } else {
+                            // Remote engineInit bundle may contain an older dsh-gbridge; clear standby SHA so
+                            // syncFastOverlaysIfNeeded() refreshes it from the bundled APK overlay on next start.
+                            fresh.remove("gbridgeSha256_$standby")
+                        }
+                    }
                     updateRelativeSymlink(File(slotsRoot, "current"), standby)
                     updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
                     switchedMeta = true
@@ -2190,11 +2437,12 @@ class RuntimeController private constructor(
                 }
                 val prevVer = st.optString("dshPrevVersion", "")
                 val curVer = st.optString("dshVersion", "0.2.2-rc.5")
-                st.put("activeSlot", lkg)
-                st.put("lkgSlot", cur)
-                if (prevVer.isNotEmpty()) st.put("dshVersion", prevVer)
-                st.put("dshPrevVersion", curVer)
-                writeMeta(st)
+                updateMeta { fresh ->
+                    fresh.put("activeSlot", lkg)
+                    fresh.put("lkgSlot", cur)
+                    if (prevVer.isNotEmpty()) fresh.put("dshVersion", prevVer)
+                    fresh.put("dshPrevVersion", curVer)
+                }
                 updateRelativeSymlink(File(slotsRoot, "current"), lkg)
                 updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
                 stopEngineSync(keepForegroundService = true)
@@ -2209,34 +2457,34 @@ class RuntimeController private constructor(
 
     fun setExecutorMode(mode: String): Map<String, Any?> {
         val clean = if (mode == "tawcroot" || mode == "proot") mode else detectExecutor()
-        val st = readMeta()
-            .put("executorMode", clean)
-            .put("executorModePinned", true)
-        if (clean == "tawcroot") {
-            st.remove("tawcUnsupportedFingerprint")
+        updateMeta { st ->
+            st.put("executorMode", clean)
+            st.put("executorModePinned", true)
+            if (clean == "tawcroot") {
+                st.remove("tawcUnsupportedFingerprint")
+            }
         }
         ptySupportedCache = null
-        writeMeta(st)
         return mapOf("ok" to true, "status" to getStatus())
     }
 
     fun setSdcardMounted(enabled: Boolean): Map<String, Any?> {
-        val st = readMeta().put("sdcardMounted", enabled)
-        writeMeta(st)
+        updateMeta { it.put("sdcardMounted", enabled) }
         return mapOf("ok" to true, "status" to getStatus())
     }
 
     fun setSystemProxy(enabled: Boolean): Map<String, Any?> {
-        val st = readMeta().put("useSystemProxy", enabled)
-        writeMeta(st)
+        updateMeta { it.put("useSystemProxy", enabled) }
         return mapOf("ok" to true, "status" to getStatus())
     }
 
     fun installToolkit(toolkitId: String, requestedPackages: List<String>, done: (Map<String, Any?>) -> Unit) {
+        // Increment BEFORE enqueueing so queued multi-toolkit installs never stop FGS between jobs
+        // and rebuildContainerPreserveHome() accurately sees pending installs.
+        activeToolkitInstalls.incrementAndGet()
         // Serialize all toolkit installs on a dedicated single-thread executor so tapping two
         // toolkits back-to-back never races on `/var/lib/dpkg/lock-frontend`!
         toolkitExecutor.execute {
-            activeToolkitInstalls.incrementAndGet()
             var startedFg = false
             try {
                 if (!isContainerExtracted()) {
@@ -2373,15 +2621,16 @@ class RuntimeController private constructor(
                 appendLog("[toolkit:$toolkitId] ERROR: ${err.message}")
                 done(mapOf("ok" to false, "error" to (err.message ?: "toolkit_install_failed"), "status" to getStatus()))
             } finally {
-                activeToolkitInstalls.decrementAndGet()
-                if (startedFg) {
+                val remainingInstalls = activeToolkitInstalls.decrementAndGet()
+                if (startedFg && remainingInstalls <= 0) {
                     if (isEngineAlive() && engineState == "running") {
                         val ver = lastCapabilitiesDshVersion ?: readMeta().optString("dshVersion", "0.2.2-rc.5")
                         val exec = activeExecutorUsed ?: effectiveExecutorMode()
                         GrassBagEngineService.startOrUpdate(
                             ctx,
                             "GrassBag 本机引擎运行中",
-                            "DSH $ver ($exec) · 后台保活中"
+                            "DSH $ver ($exec) · 后台保活中",
+                            releaseWakeLock = true
                         )
                     } else {
                         GrassBagEngineService.stop(ctx)
@@ -2455,8 +2704,8 @@ class RuntimeController private constructor(
             var effectiveCwd = homeDir.absolutePath
             val pb = if (useContainer) {
                 val requestedCwd = if (!cwd.isNullOrBlank() && cwd.startsWith("/")) cwd else "/root/workspace"
-                val hostCwd = resolveHostDirForContainerWorkdir(requestedCwd)
-                effectiveCwd = if (hostCwd.isDirectory) requestedCwd else "/root/workspace"
+                val rawHostCwd = mapContainerWorkdirToHost(requestedCwd)
+                effectiveCwd = if (rawHostCwd.isDirectory) requestedCwd else "/root/workspace"
                 val shellBin = if (File(ubuntuRoot, "bin/bash").exists()) "/bin/bash" else "/bin/sh"
                 val hasPtyBridge = File(shimsRoot, "pty-bridge.mjs").exists() && isSlotExtracted()
                 val pair = when {
@@ -2506,7 +2755,10 @@ class RuntimeController private constructor(
             worker.execute {
                 val cbuf = CharArray(4096)
                 var handshakeHandled = !usesPtyBridge
+                var oscScanRemaining = 4096
                 val pendingOsc = StringBuilder()
+                val ptyMarker = "\u001b]777;gbmode;pty\u0007"
+                val pipeMarker = "\u001b]777;gbmode;pipe\u0007"
                 runCatching {
                     InputStreamReader(proc.inputStream, Charsets.UTF_8).use { reader ->
                         while (true) {
@@ -2516,29 +2768,45 @@ class RuntimeController private constructor(
                             if (!handshakeHandled) {
                                 pendingOsc.append(chunk)
                                 val combined = pendingOsc.toString()
-                                val hasComplete = combined.contains("\u001b]777;gbmode;pty\u0007") ||
-                                    combined.contains("\u001b]777;gbmode;pipe\u0007")
-                                if (hasComplete) {
+                                val hasPty = combined.contains(ptyMarker)
+                                val hasPipe = combined.contains(pipeMarker)
+                                if (hasPty || hasPipe) {
                                     handshakeHandled = true
-                                    val isPipeFallback = combined.contains("\u001b]777;gbmode;pipe\u0007")
                                     chunk = combined
-                                        .replace("\u001b]777;gbmode;pty\u0007", "")
-                                        .replace("\u001b]777;gbmode;pipe\u0007", "")
+                                        .replace(ptyMarker, "")
+                                        .replace(pipeMarker, "")
                                     pendingOsc.clear()
-                                    if (isPipeFallback) {
+                                    if (hasPipe) {
                                         emit("local_term_mode", mapOf("tabId" to tabId, "isPty" to false, "mode" to "pipe"))
                                     }
-                                } else if (combined.length < 32 && ("\u001b]777;gbmode;".startsWith(combined) || combined.startsWith("\u001b]777;gbmode;"))) {
-                                    continue // Wait for the rest of the OSC handshake across read chunks
                                 } else {
-                                    handshakeHandled = true
-                                    chunk = combined
-                                    pendingOsc.clear()
+                                    oscScanRemaining -= n
+                                    if (oscScanRemaining <= 0) {
+                                        handshakeHandled = true
+                                        chunk = combined
+                                        pendingOsc.clear()
+                                    } else {
+                                        // Flush safe prefix immediately (e.g. PRoot stderr warnings) while
+                                        // holding any trailing partial ESC sequence for the next read.
+                                        val lastEsc = combined.lastIndexOf('\u001b')
+                                        if (lastEsc >= 0 && combined.length - lastEsc <= 24) {
+                                            chunk = combined.substring(0, lastEsc)
+                                            pendingOsc.clear()
+                                            pendingOsc.append(combined.substring(lastEsc))
+                                        } else {
+                                            chunk = combined
+                                            pendingOsc.clear()
+                                        }
+                                    }
                                 }
                             }
                             if (chunk.isNotEmpty()) {
                                 enqueueLocalTermData(tabId, chunk)
                             }
+                        }
+                        if (pendingOsc.isNotEmpty()) {
+                            enqueueLocalTermData(tabId, pendingOsc.toString())
+                            pendingOsc.clear()
                         }
                     }
                 }
@@ -2585,7 +2853,13 @@ class RuntimeController private constructor(
         if (session.usesPtyBridge) {
             return writeLocalShell(tabId, "\u001b]777;gbsignal;$cleanSig\u0007")
         }
-        return if (cleanSig == "SIGINT") writeLocalShell(tabId, "\u0003") else false
+        if (cleanSig == "SIGTERM") {
+            extractProcessPid(session.proc)?.let { pid ->
+                if (pid > 1) return runCatching { Os.kill(pid, 15); true }.getOrDefault(false)
+            }
+            return runCatching { session.proc.destroy(); true }.getOrDefault(false)
+        }
+        return writeLocalShell(tabId, "\u0003")
     }
 
     fun closeLocalShell(tabId: String) {
@@ -2673,8 +2947,21 @@ class RuntimeController private constructor(
             val appCtx = appContext.applicationContext
             Thread({
                 runCatching {
+                    // Skip booting the local Ubuntu/DSH container on cold launch if the user's
+                    // active host is a remote desktop/server!
+                    val savedPrefsRaw = appCtx
+                        .getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                        .getString("flutter.grassbag_app_prefs_v2", null)
+                    val savedHostId = savedPrefsRaw?.let {
+                        runCatching { JSONObject(it).optString("activeHostId", "local") }.getOrNull()
+                    } ?: "local"
                     val vault = KeystoreVault.getInstance(appCtx)
-                    getInstance(appCtx, vault).prewarmIfReady()
+                    val controller = getInstance(appCtx, vault)
+                    if (savedHostId == "local" || savedHostId.isBlank()) {
+                        controller.prewarmIfReady()
+                    } else {
+                        Log.i(TAG, "prewarmInBackground: activeHostId=$savedHostId (remote), skipping local DSH prewarm")
+                    }
                 }.onFailure {
                     Log.w(TAG, "prewarmInBackground failed: ${it.message}")
                 }

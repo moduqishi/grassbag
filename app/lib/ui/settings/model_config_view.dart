@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
@@ -46,6 +47,32 @@ const _kApiProtocols = <(String, String)>[
   ('anthropic-messages', 'Anthropic'),
 ];
 
+const _kAllowedApiProtocols = <String>{
+  'openai-completions',
+  'openai-responses',
+  'anthropic-messages',
+};
+
+/// Resolves a valid DSH `llm-pi-ai` wire protocol, ignoring non-protocol
+/// labels (such as `'llm-pi-ai'`) and inferring sensible defaults for built-ins.
+String resolveProviderApiProtocol({
+  String? explicit,
+  String providerId = '',
+  String baseUrl = '',
+}) {
+  final clean = explicit?.trim() ?? '';
+  if (_kAllowedApiProtocols.contains(clean)) return clean;
+  final pid = providerId.trim().toLowerCase();
+  final url = baseUrl.trim().toLowerCase();
+  if (pid == 'anthropic' || pid.contains('claude') || url.contains('anthropic')) {
+    return 'anthropic-messages';
+  }
+  if (pid == 'openai' || (url.contains('api.openai.com') && pid.isEmpty)) {
+    return 'openai-responses';
+  }
+  return 'openai-completions';
+}
+
 String _protocolZhLabel(String? proto) => switch (proto) {
       'openai-completions' => 'OpenAI 兼容',
       'openai-responses' => 'OpenAI Responses',
@@ -77,6 +104,7 @@ class DshModelConfigView extends ConsumerStatefulWidget {
 
 class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
   int _tabIndex = 0; // 0 = 模型渠道, 1 = 全部模型
+  int _prevTabIndex = 0;
   bool _refreshing = false;
   bool _showAllBuiltin = false;
   bool _showRawSchemas = false;
@@ -85,10 +113,14 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
   String _providerSearch = '';
   String _modelSearch = '';
   String? _modelGroupFilter; // null = 全部
+  int _allModelsLimit = 60;
+  int _builtinProvidersLimit = 40;
+  Timer? _providerSearchTimer;
   Timer? _modelSearchTimer;
 
   @override
   void dispose() {
+    _providerSearchTimer?.cancel();
     _modelSearchTimer?.cancel();
     _providerSearchCtrl.dispose();
     _modelSearchCtrl.dispose();
@@ -191,6 +223,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
           modelEffort: s.modelEffort,
           modelEffortId: s.modelEffortId,
           connectionPhase: s.connectionPhase,
+          hydratingDomains: s.hydratingDomains,
           routableProviders: s.routableProviders,
         ),
       ),
@@ -209,16 +242,20 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
     final effectiveModelId = activeEntry?.id ?? state.activeModelId;
     final supportsReasoning = activeEntry != null && activeEntry.efforts.isNotEmpty;
     final effortOpts = supportsReasoning ? activeEntry.efforts : const <ModelEffortOption>[];
-    final curEffortIdx = effortOpts.isEmpty
-        ? 0
-        : effortOpts
-            .indexWhere(
-              (e) =>
-                  e.id == state.modelEffortId ||
-                  e.zhLabel == state.modelEffort ||
-                  (state.modelEffortId.isEmpty && e.id == activeEntry?.defaultEffort),
-            )
-            .clamp(0, effortOpts.length - 1);
+    int curEffortIdx = 0;
+    if (effortOpts.isNotEmpty) {
+      final matchedIdx = effortOpts.indexWhere(
+        (e) =>
+            (state.modelEffortId.isNotEmpty && e.id == state.modelEffortId) ||
+            (state.modelEffort.isNotEmpty && e.zhLabel == state.modelEffort),
+      );
+      if (matchedIdx >= 0) {
+        curEffortIdx = matchedIdx;
+      } else {
+        final defIdx = effortOpts.indexWhere((e) => e.id == activeEntry?.defaultEffort);
+        curEffortIdx = (defIdx >= 0 ? defIdx : 0).clamp(0, effortOpts.length - 1);
+      }
+    }
 
     final piAiNs = state.effectiveDshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
     final piAiProviders = piAiNs != null && piAiNs.value['providers'] is Map
@@ -326,50 +363,56 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        Text(
+                          !hasUsableModel
+                              ? (state.hydratingDomains ? '正在同步模型目录…' : '尚未配置可用模型')
+                              : effectiveModelName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 15.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.text,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
                         Row(
                           children: [
-                            Flexible(
-                              child: Text(
-                                !hasUsableModel
-                                    ? '尚未配置可用模型'
-                                    : effectiveModelName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 15.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: t.text,
-                                ),
-                              ),
-                            ),
                             if (activeEntry != null && activeEntry.providerName.isNotEmpty) ...[
-                              const SizedBox(width: 6),
                               Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 1.5),
                                 decoration: BoxDecoration(
                                   color: t.primarySoft,
                                   borderRadius: BorderRadius.circular(999),
                                 ),
                                 child: Text(
                                   activeEntry.providerName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
-                                    fontSize: 10.5,
+                                    fontSize: 10,
                                     fontWeight: FontWeight.w600,
                                     color: t.primary,
                                   ),
                                 ),
                               ),
+                              const SizedBox(width: 6),
                             ],
+                            Expanded(
+                              child: Text(
+                                hasUsableModel
+                                    ? '$effectiveProviderId / $effectiveModelId'
+                                    : '登录 DeepSeek 账号或添加自定义渠道即可开始对话',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: hasUsableModel ? 'monospace' : null,
+                                  fontSize: 11.2,
+                                  color: t.text3,
+                                ),
+                              ),
+                            ),
                           ],
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          hasUsableModel
-                              ? '$effectiveProviderId / $effectiveModelId'
-                              : '登录 DeepSeek 账号或添加自定义渠道即可开始对话',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontFamily: hasUsableModel ? 'monospace' : null, fontSize: 11.5, color: t.text3),
                         ),
                       ],
                     ),
@@ -406,7 +449,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                   ),
                 ],
               ),
-              if (!hasUsableModel && isConnected) ...[
+              if (!hasUsableModel && isConnected && !state.hydratingDomains) ...[
                 const SizedBox(height: 12),
                 Row(
                   children: [
@@ -501,35 +544,44 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
         // 2. Clean 2-Tab Switcher: Providers vs All Models
         GrassBagSegmentedControl(
           labels: [
-            '模型渠道 (${configuredProviders.length} 已就绪)',
+            '模型渠道 (${configuredProviders.length})',
             '全部模型 ($totalModels)',
           ],
           selectedIndex: _tabIndex,
           tier: state.glassTier,
           height: 38,
-          onSelected: (idx) => setState(() => _tabIndex = idx),
+          onSelected: (idx) => setState(() {
+            _prevTabIndex = _tabIndex;
+            _tabIndex = idx;
+          }),
         ),
         const SizedBox(height: 14),
 
-        if (_tabIndex == 0)
-          _buildProvidersTab(
-            context,
-            state: state,
-            t: t,
-            configured: configuredProviders,
-            unconfigured: unconfiguredProviders,
-            piAiProviders: piAiProviders,
-            llmNamespaces: llmNamespaces,
-          )
-        else
-          _buildAllModelsTab(
-            context,
-            state: state,
-            ctrl: ctrl,
-            t: t,
-            groups: groups,
-            totalModels: totalModels,
+        GrassBagDirectionalTabSwitcher(
+          direction: _tabIndex >= _prevTabIndex ? 1 : -1,
+          duration: const Duration(milliseconds: 175),
+          child: KeyedSubtree(
+            key: ValueKey('model-tab-$_tabIndex'),
+            child: _tabIndex == 0
+                ? _buildProvidersTab(
+                    context,
+                    state: state,
+                    t: t,
+                    configured: configuredProviders,
+                    unconfigured: unconfiguredProviders,
+                    piAiProviders: piAiProviders,
+                    llmNamespaces: llmNamespaces,
+                  )
+                : _buildAllModelsTab(
+                    context,
+                    state: state,
+                    ctrl: ctrl,
+                    t: t,
+                    groups: groups,
+                    totalModels: totalModels,
+                  ),
           ),
+        ),
       ],
     );
   }
@@ -617,9 +669,13 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     initialDisplayName: p.name,
                     initialBaseUrl: p.baseUrl,
                     initialEnvRef: p.envRef,
-                    initialProtocol: piAiProviders[p.id] is Map
-                        ? (piAiProviders[p.id] as Map)['api']?.toString()
-                        : null,
+                    initialProtocol: resolveProviderApiProtocol(
+                      explicit: piAiProviders[p.id] is Map
+                          ? (piAiProviders[p.id] as Map)['api']?.toString()
+                          : p.description,
+                      providerId: p.id,
+                      baseUrl: p.baseUrl,
+                    ),
                     isCustomNew: false,
                   ),
                 ),
@@ -784,15 +840,27 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text),
                   ),
                   subtitle: const Text('按名称搜索 Groq、Mistral、xAI、SiliconFlow、Bedrock 等'),
-                  trailing: Icon(
-                    _showAllBuiltin ? CupertinoIcons.chevron_up : CupertinoIcons.chevron_down,
-                    size: 14,
-                    color: t.text3,
+                  trailing: AnimatedRotation(
+                    turns: _showAllBuiltin ? 0.5 : 0.0,
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOutCubic,
+                    child: Icon(
+                      CupertinoIcons.chevron_down,
+                      size: 14,
+                      color: t.text3,
+                    ),
                   ),
                   onTap: () => setState(() => _showAllBuiltin = !_showAllBuiltin),
                 ),
-                if (_showAllBuiltin) ...[
-                  Divider(height: 0.5, color: t.sep),
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeOutCubic,
+                  alignment: Alignment.topCenter,
+                  child: _showAllBuiltin
+                      ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Divider(height: 0.5, color: t.sep),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
                     child: GrassBagGlassSearchBar(
@@ -800,7 +868,26 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                       placeholder: '搜索渠道名称或密钥标识…',
                       tier: state.glassTier,
                       insideGlass: true,
-                      onChanged: (v) => setState(() => _providerSearch = v),
+                      onChanged: (v) {
+                        _providerSearchTimer?.cancel();
+                        if (v.isEmpty) {
+                          if (_providerSearch.isNotEmpty) {
+                            setState(() {
+                              _providerSearch = '';
+                              _builtinProvidersLimit = 40;
+                            });
+                          }
+                          return;
+                        }
+                        _providerSearchTimer = Timer(const Duration(milliseconds: 120), () {
+                          if (mounted && _providerSearch != v) {
+                            setState(() {
+                              _providerSearch = v;
+                              _builtinProvidersLimit = 40;
+                            });
+                          }
+                        });
+                      },
                     ),
                   ),
                   if (filteredUnconfigured.isEmpty)
@@ -854,8 +941,8 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                         ],
                       ),
                     )
-                  else
-                    for (int i = 0; i < filteredUnconfigured.length; i++) ...[
+                  else ...[
+                    for (int i = 0; i < math.min(filteredUnconfigured.length, _builtinProvidersLimit); i++) ...[
                       Builder(
                         builder: (_) {
                           final p = filteredUnconfigured[i];
@@ -898,10 +985,29 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                           );
                         },
                       ),
-                      if (i < filteredUnconfigured.length - 1)
+                      if (i < math.min(filteredUnconfigured.length, _builtinProvidersLimit) - 1)
                         Divider(height: 0.5, indent: 15, endIndent: 15, color: t.sep),
                     ],
-                ],
+                    if (filteredUnconfigured.length > _builtinProvidersLimit) ...[
+                      Divider(height: 0.5, color: t.sep),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        child: GrassBagSecondaryGlassButton(
+                          label: '展开更多渠道（还有 ${filteredUnconfigured.length - _builtinProvidersLimit} 个）',
+                          icon: CupertinoIcons.chevron_down,
+                          height: 34,
+                          tier: state.glassTier,
+                          insideGlass: true,
+                          accentForeground: true,
+                          onTap: () => setState(() => _builtinProvidersLimit += 50),
+                        ),
+                      ),
+                    ],
+                  ],
+                          ],
+                        )
+                      : const SizedBox.shrink(),
+                ),
               ],
             ),
           ),
@@ -928,27 +1034,42 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w500, color: t.text2),
                   ),
                   subtitle: Text('${llmNamespaces.length} 个底层配置模块 · 超时、兼容性开关与源码'),
-                  trailing: Icon(
-                    _showRawSchemas ? CupertinoIcons.chevron_up : CupertinoIcons.chevron_down,
-                    size: 13.5,
-                    color: t.text3,
+                  trailing: AnimatedRotation(
+                    turns: _showRawSchemas ? 0.5 : 0.0,
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOutCubic,
+                    child: Icon(
+                      CupertinoIcons.chevron_down,
+                      size: 13.5,
+                      color: t.text3,
+                    ),
                   ),
                   onTap: () => setState(() => _showRawSchemas = !_showRawSchemas),
                 ),
-                if (_showRawSchemas) ...[
-                  Divider(height: 0.5, color: t.sep),
-                  for (int i = 0; i < llmNamespaces.length; i++) ...[
-                    GrassBagListTile(
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 9),
-                      title: Text(llmNamespaces[i].title, style: TextStyle(fontSize: 13.5, color: t.text)),
-                      subtitle: Text(llmNamespaces[i].ns, style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.text3)),
-                      showChevron: true,
-                      onTap: () => showDshNamespaceEditorSheet(context, ref, llmNamespaces[i]),
-                    ),
-                    if (i < llmNamespaces.length - 1)
-                      Divider(height: 0.5, indent: 15, endIndent: 15, color: t.sep),
-                  ],
-                ],
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeOutCubic,
+                  alignment: Alignment.topCenter,
+                  child: _showRawSchemas
+                      ? Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Divider(height: 0.5, color: t.sep),
+                            for (int i = 0; i < llmNamespaces.length; i++) ...[
+                              GrassBagListTile(
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 15, vertical: 9),
+                                title: Text(llmNamespaces[i].title, style: TextStyle(fontSize: 13.5, color: t.text)),
+                                subtitle: Text(llmNamespaces[i].ns, style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.text3)),
+                                showChevron: true,
+                                onTap: () => showDshNamespaceEditorSheet(context, ref, llmNamespaces[i]),
+                              ),
+                              if (i < llmNamespaces.length - 1)
+                                Divider(height: 0.5, indent: 15, endIndent: 15, color: t.sep),
+                            ],
+                          ],
+                        )
+                      : const SizedBox.shrink(),
+                ),
               ],
             ),
           ),
@@ -1011,6 +1132,12 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
       }
     }
 
+    // Hoist effective active model resolution ONCE outside the N-row loop (eliminates O(N^2) scan!).
+    final eff = state.effectiveActiveModelEntry;
+    final effId = eff?.id ?? state.activeModelId;
+    final effProv = eff?.providerId ?? state.activeModelProvider;
+    final shownModelsCount = math.min(visibleEntries.length, _allModelsLimit);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1022,12 +1149,20 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
           onChanged: (v) {
             _modelSearchTimer?.cancel();
             if (v.isEmpty) {
-              if (_modelSearch.isNotEmpty) setState(() => _modelSearch = '');
+              if (_modelSearch.isNotEmpty) {
+                setState(() {
+                  _modelSearch = '';
+                  _allModelsLimit = 60;
+                });
+              }
               return;
             }
             _modelSearchTimer = Timer(const Duration(milliseconds: 120), () {
               if (mounted && _modelSearch != v) {
-                setState(() => _modelSearch = v);
+                setState(() {
+                  _modelSearch = v;
+                  _allModelsLimit = 60;
+                });
               }
             });
           },
@@ -1041,14 +1176,20 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                 _FilterPill(
                   label: '全部 ($totalModels)',
                   active: activeGroupFilter == null,
-                  onTap: () => setState(() => _modelGroupFilter = null),
+                  onTap: () => setState(() {
+                    _modelGroupFilter = null;
+                    _allModelsLimit = 60;
+                  }),
                 ),
                 for (final g in groups) ...[
                   const SizedBox(width: 6),
                   _FilterPill(
                     label: '${g.name} (${g.models.length})',
                     active: activeGroupFilter == g.id,
-                    onTap: () => setState(() => _modelGroupFilter = g.id),
+                    onTap: () => setState(() {
+                      _modelGroupFilter = g.id;
+                      _allModelsLimit = 60;
+                    }),
                   ),
                 ],
               ],
@@ -1080,6 +1221,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     setState(() {
                       _modelSearch = '';
                       _modelGroupFilter = null;
+                      _allModelsLimit = 60;
                     });
                   },
                 ),
@@ -1093,14 +1235,11 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                for (int i = 0; i < visibleEntries.length; i++) ...[
+                for (int i = 0; i < shownModelsCount; i++) ...[
                   Builder(
                     builder: (_) {
                       final g = visibleEntries[i].$1;
                       final m = visibleEntries[i].$2;
-                      final eff = state.effectiveActiveModelEntry;
-                      final effId = eff?.id ?? state.activeModelId;
-                      final effProv = eff?.providerId ?? state.activeModelProvider;
                       final selected = effId == m.id &&
                           (effProv.isEmpty || effProv == g.id);
                       final cred = credById[g.id];
@@ -1159,15 +1298,26 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             if (canEditParams)
-                              GestureDetector(
-                                onTap: () => showModelParamsEditorSheet(
-                                  context,
-                                  providerId: g.id,
-                                  entry: m,
-                                ),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                                  child: Icon(CupertinoIcons.slider_horizontal_3, size: 16, color: t.text3),
+                              Tooltip(
+                                message: '编辑模型参数',
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () => showModelParamsEditorSheet(
+                                    context,
+                                    providerId: g.id,
+                                    entry: m,
+                                  ),
+                                  child: SizedBox(
+                                    width: 38,
+                                    height: 38,
+                                    child: Center(
+                                      child: Icon(
+                                        CupertinoIcons.slider_horizontal_3,
+                                        size: 16.5,
+                                        color: t.text3,
+                                      ),
+                                    ),
+                                  ),
                                 ),
                               ),
                             if (selected)
@@ -1186,8 +1336,23 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                       );
                     },
                   ),
-                  if (i < visibleEntries.length - 1)
+                  if (i < shownModelsCount - 1)
                     Divider(height: 0.5, indent: 15, endIndent: 15, color: t.sep),
+                ],
+                if (visibleEntries.length > shownModelsCount) ...[
+                  Divider(height: 0.5, color: t.sep),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    child: GrassBagSecondaryGlassButton(
+                      label: '加载更多模型（还有 ${visibleEntries.length - shownModelsCount} 个）',
+                      icon: CupertinoIcons.chevron_down,
+                      height: 34,
+                      tier: state.glassTier,
+                      insideGlass: true,
+                      accentForeground: true,
+                      onTap: () => setState(() => _allModelsLimit += 80),
+                    ),
+                  ),
                 ],
               ],
             ),
@@ -1401,6 +1566,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       if (curModel.isEmpty || curModel == _lastTplModel) {
         _newModelIdCtrl.text = tpl.sampleModel;
       }
+      if (_models.isEmpty) {
+        _showAddModel = true;
+      }
       _lastTplName = tpl.name;
       _lastTplModel = tpl.sampleModel;
     });
@@ -1421,7 +1589,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
   }
 
   Future<void> _discoverModels({bool testOnly = false}) async {
-    if (_discovering || _testingConnection) return;
+    if (_discovering || _testingConnection || _saving) return;
     final baseUrl = _baseUrlCtrl.text.trim();
     if (baseUrl.isEmpty) {
       setState(() => _errorMsg = '请先填写 API 地址 (Base URL) 后再测试或拉取模型列表');
@@ -1447,25 +1615,20 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             envRef: _derivedEnvRef(pid),
             testOnly: testOnly,
           );
-    } finally {
-      if (mounted) {
-        setState(() {
-          _testingConnection = false;
-          _discovering = false;
-        });
-      }
-    }
-    if (!mounted) return;
-    // Best-effort enrich discovered `/v1/models` items with accurate models.dev parameters!
-    if (!testOnly && discovered.isNotEmpty) {
-      final catalog = await ModelsDevCatalogService.instance.loadCatalog().catchError((_) => const <ModelsDevSpec>[]);
-      if (catalog.isNotEmpty) {
+      // Best-effort enrich discovered `/v1/models` items with accurate models.dev parameters
+      // while keeping the busy indicator active and capped to a short timeout.
+      if (!testOnly && discovered.isNotEmpty) {
+        final catalog = await ModelsDevCatalogService.instance
+            .loadCatalog()
+            .timeout(const Duration(seconds: 2), onTimeout: () => const <ModelsDevSpec>[])
+            .catchError((_) => const <ModelsDevSpec>[]);
         discovered = [
           for (final raw in discovered)
             () {
               final copy = Map<String, dynamic>.from(raw);
               final mid = copy['id']?.toString() ?? '';
-              final spec = ModelsDevCatalogService.matchInList(catalog, mid);
+              final hadLegacyReasoning = copy.remove('reasoning') == true;
+              final spec = catalog.isEmpty ? null : ModelsDevCatalogService.matchInList(catalog, mid);
               if (spec != null) {
                 if ((copy['name']?.toString().trim().isEmpty ?? true) || copy['name'] == mid) {
                   copy['name'] = spec.name;
@@ -1477,14 +1640,27 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   copy['maxTokens'] = spec.maxOutputTokens;
                 }
                 copy['input'] = spec.supportsImage ? const ['text', 'image'] : const ['text'];
-                copy.remove('reasoning');
                 if (spec.reasoning || spec.reasoningEfforts.isNotEmpty) {
                   copy['reasoningEfforts'] = _serializeEffortMap(_effortMapFromModelsDev(spec.reasoningEfforts));
                 }
+              } else if (hadLegacyReasoning && copy['reasoningEfforts'] == null) {
+                copy['reasoningEfforts'] = _serializeEffortMap(const <String, String?>{
+                  'off': null,
+                  'low': 'low',
+                  'medium': 'medium',
+                  'high': 'high',
+                });
               }
               return copy;
             }(),
         ];
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _testingConnection = false;
+          _discovering = false;
+        });
       }
     }
     if (!mounted) return;
@@ -1558,9 +1734,11 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     _baseUrlCtrl = TextEditingController(text: widget.initialBaseUrl);
     _apiKeyCtrl = TextEditingController();
     _envRefCtrl = TextEditingController(text: widget.initialEnvRef);
-    _protocol = (widget.initialProtocol != null && widget.initialProtocol!.trim().isNotEmpty)
-        ? widget.initialProtocol!.trim()
-        : 'openai-completions';
+    _protocol = resolveProviderApiProtocol(
+      explicit: widget.initialProtocol,
+      providerId: widget.providerId,
+      baseUrl: widget.initialBaseUrl,
+    );
 
     final state = ref.read(appProvider);
     if (widget.settingsNs == 'llm-deepseek') {
@@ -1594,7 +1772,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         : null;
     if (existingCfg != null && existingCfg['api'] is String) {
       final savedApi = existingCfg['api'].toString().trim();
-      if (savedApi.isNotEmpty) {
+      if (_kAllowedApiProtocols.contains(savedApi)) {
         _protocol = savedApi;
       }
     }
@@ -1722,7 +1900,16 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         .toLowerCase()
         .replaceAll(RegExp(r'[^a-z0-9_-]+'), '-')
         .replaceAll(RegExp(r'^-+|-+$'), '');
-    if (fromName.isNotEmpty) return fromName;
+    if (fromName.isNotEmpty) {
+      final existingIds = ref.read(appProvider).providerCredentials.map((p) => p.id.toLowerCase()).toSet();
+      if (!existingIds.contains(fromName)) return fromName;
+      final customCandidate = '$fromName-custom';
+      if (!existingIds.contains(customCandidate)) return customCandidate;
+      for (var i = 2; i < 100; i++) {
+        final numbered = '$fromName-$i';
+        if (!existingIds.contains(numbered)) return numbered;
+      }
+    }
     return _generatedFallbackId;
   }
 
@@ -1796,10 +1983,20 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       setState(() => _errorMsg = '请先填写模型 ID，例如 gpt-4.1 或 claude-sonnet-4-5');
       return false;
     }
-    final parsedCtx = int.tryParse(_newModelCtxCtrl.text.trim()) ?? _newModelCtx;
-    final parsedMaxTok = int.tryParse(_newModelMaxTokCtrl.text.trim()) ?? _newModelMaxTok;
-    final safeCtx = parsedCtx > 0 ? parsedCtx : 128000;
-    final safeMaxTok = parsedMaxTok > 0 ? parsedMaxTok : 16384;
+    final ctxText = _newModelCtxCtrl.text.trim();
+    final maxTokText = _newModelMaxTokCtrl.text.trim();
+    final parsedCtx = ctxText.isEmpty ? _newModelCtx : int.tryParse(ctxText);
+    final parsedMaxTok = maxTokText.isEmpty ? _newModelMaxTok : int.tryParse(maxTokText);
+    if (parsedCtx == null || parsedCtx <= 0) {
+      setState(() => _errorMsg = '上下文窗口必须为正整数');
+      return false;
+    }
+    if (parsedMaxTok == null || parsedMaxTok <= 0) {
+      setState(() => _errorMsg = '最大输出 Token 必须为正整数');
+      return false;
+    }
+    final safeCtx = parsedCtx;
+    final safeMaxTok = parsedMaxTok;
     if (safeMaxTok > safeCtx) {
       setState(() => _errorMsg = '最大输出 Token ($safeMaxTok) 不能大于上下文窗口 ($safeCtx)');
       return false;
@@ -1859,6 +2056,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
   }
 
   Future<void> _save() async {
+    if (_saving || _discovering) return;
     final pid = _derivedProviderId();
     final name = _nameCtrl.text.trim().isEmpty ? pid : _nameCtrl.text.trim();
     final baseUrl = _baseUrlCtrl.text.trim();
@@ -1869,25 +2067,36 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       setState(() => _errorMsg = '请填写 API 地址 (Base URL)，例如 https://api.example.com/v1');
       return;
     }
+    if (baseUrl.isNotEmpty) {
+      final parsedUrl = Uri.tryParse(baseUrl);
+      if (parsedUrl == null ||
+          (parsedUrl.scheme != 'http' && parsedUrl.scheme != 'https') ||
+          parsedUrl.host.isEmpty) {
+        setState(() => _errorMsg = 'API 地址格式无效，请以 http:// 或 https:// 开头并包含主机名');
+        return;
+      }
+    }
     if (widget.isCustomNew) {
       final existingIds = ref.read(appProvider).providerCredentials.map((p) => p.id.toLowerCase()).toSet();
       if (existingIds.contains(pid.toLowerCase())) {
         setState(() {
           _showAdvancedEnv = true;
-          _errorMsg = '渠道 ID「$pid」已存在，请在「变量名设置」中修改渠道 ID 或直接编辑原有渠道';
+          _errorMsg = '渠道 ID「$pid」已存在，请在「密钥标识设置」中修改渠道 ID 或直接编辑原有渠道';
         });
         return;
       }
     }
+    if (_discoveredPool.isNotEmpty && _selectedDiscoveredIds.isNotEmpty) {
+      _commitSelectedDiscoveredModels();
+    }
     if (_showAddModel && _newModelIdCtrl.text.trim().isNotEmpty) {
       if (!_addCustomModel()) return;
     }
-    if (widget.isCustomNew && _models.isEmpty) {
+    final isCustomProvider = widget.isCustomNew || !_isBuiltinProvider(pid);
+    if (isCustomProvider && widget.settingsNs == 'llm-pi-ai' && _models.isEmpty) {
       setState(() => _errorMsg = '自定义中转站请至少添加或自动拉取 1 个模型后再保存');
       return;
     }
-
-    final isCustomProvider = widget.isCustomNew || !_isBuiltinProvider(pid);
 
     setState(() {
       _saving = true;
@@ -1948,7 +2157,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     final existingCred = state.providerCredentials
         .where((p) => p.id == widget.providerId)
         .firstOrNull;
-    final alreadyHasKey = !widget.isCustomNew && (existingCred?.configured ?? false);
+    final alreadyHasKey = !widget.isCustomNew &&
+        (existingCred?.configured ?? false) &&
+        existingCred?.maskedKey != '免密钥端点';
     final liveGroup = state.modelGroups.where((g) => g.id == widget.providerId).firstOrNull;
     final piAiNs = state.effectiveDshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
     final canDeleteCustom = !widget.isCustomNew &&
@@ -2293,8 +2504,8 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
               tier: tier,
               insideGlass: true,
               accentForeground: true,
-              enabled: !_discovering && !_testingConnection,
-              onTap: (_discovering || _testingConnection)
+              enabled: !_discovering && !_testingConnection && !_saving,
+              onTap: (_discovering || _testingConnection || _saving)
                   ? null
                   : () => _discoverModels(testOnly: false),
             ),
@@ -2311,7 +2522,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             children: [
               if (state.connectionPhase == ConnectionPhase.connected) ...[
                 GrassBagSpringTap(
-                  enabled: !_testingConnection && !_discovering,
+                  enabled: !_testingConnection && !_discovering && !_saving,
                   onTap: () => _discoverModels(testOnly: true),
                   pressedScale: 0.94,
                   child: Container(
@@ -2338,7 +2549,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   ),
                 ),
                 GrassBagSpringTap(
-                  enabled: !_discovering && !_testingConnection,
+                  enabled: !_discovering && !_testingConnection && !_saving,
                   onTap: () => _discoverModels(testOnly: false),
                   pressedScale: 0.94,
                   child: Container(
@@ -2492,11 +2703,16 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                                     final short = mname.contains('/')
                                         ? mname.split('/').last
                                         : mname;
+                                    final catalogEntry = liveGroup?.models
+                                        .where((entry) => entry.id == mid)
+                                        .firstOrNull;
                                     ctrl.setModel(
                                       mname,
                                       short.length > 18 ? '${short.substring(0, 17)}…' : short,
                                       provider: widget.providerId,
                                       modelId: mid,
+                                      effortId: catalogEntry?.defaultEffort ??
+                                          (m['reasoning'] == true ? 'medium' : null),
                                     );
                                   },
                                   child: Container(
@@ -2534,17 +2750,30 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                               const SizedBox(width: 2),
                               GestureDetector(
                                 behavior: HitTestBehavior.opaque,
-                                onTap: () => setState(() {
+                                onTap: () async {
+                                  final modelLabel =
+                                      (_models[i]['name'] ?? _models[i]['id'] ?? '该模型').toString();
+                                  final ok = await showGrassBagConfirmDialog(
+                                    context,
+                                    title: '移除模型「$modelLabel」？',
+                                    message: '移除后点击底部「保存并刷新模型」即生效。',
+                                    confirmLabel: '移除',
+                                    isDestructive: true,
+                                  );
+                                  if (!ok || !mounted) return;
+                                  if (i >= _models.length) return;
                                   if (_editingModelIndex == i) {
-                                    _editingModelIndex = null;
-                                    _showAddModel = false;
-                                    _newModelIdCtrl.clear();
-                                    _newModelNameCtrl.clear();
-                                  } else if (_editingModelIndex != null && i < _editingModelIndex!) {
-                                    _editingModelIndex = _editingModelIndex! - 1;
+                                    _models.removeAt(i);
+                                    _cancelEditingModel();
+                                  } else {
+                                    setState(() {
+                                      if (_editingModelIndex != null && i < _editingModelIndex!) {
+                                        _editingModelIndex = _editingModelIndex! - 1;
+                                      }
+                                      _models.removeAt(i);
+                                    });
                                   }
-                                  _models.removeAt(i);
-                                }),
+                                },
                                 child: SizedBox(
                                   width: 34,
                                   height: 34,
@@ -2601,32 +2830,51 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     onChanged: (_) => setState(() {}),
                   ),
                   const SizedBox(height: 8),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 140),
-                    child: SingleChildScrollView(
-                      child: Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
+                  Builder(
+                    builder: (_) {
+                      final q = _discoveredFilterCtrl.text.trim().toLowerCase();
+                      final filteredDiscovered = _discoveredPool.where((m) {
+                        if (q.isEmpty) return true;
+                        return (m['id']?.toString().toLowerCase().contains(q) ?? false) ||
+                            (m['name']?.toString().toLowerCase().contains(q) ?? false);
+                      }).toList(growable: false);
+                      final visibleDiscovered = filteredDiscovered.take(40).toList(growable: false);
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        mainAxisSize: MainAxisSize.min,
                         children: [
-                          for (final dm in _discoveredPool.where((m) {
-                            final q = _discoveredFilterCtrl.text.trim().toLowerCase();
-                            if (q.isEmpty) return true;
-                            return (m['id']?.toString().toLowerCase().contains(q) ?? false) ||
-                                (m['name']?.toString().toLowerCase().contains(q) ?? false);
-                          }).take(40))
-                            _FilterPill(
-                              label: dm['id']?.toString() ?? '',
-                              active: _selectedDiscoveredIds.contains(dm['id']?.toString()),
-                              onTap: () => setState(() {
-                                final id = dm['id']?.toString() ?? '';
-                                if (!_selectedDiscoveredIds.add(id)) {
-                                  _selectedDiscoveredIds.remove(id);
-                                }
-                              }),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxHeight: 140),
+                            child: SingleChildScrollView(
+                              child: Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                children: [
+                                  for (final dm in visibleDiscovered)
+                                    _FilterPill(
+                                      label: dm['id']?.toString() ?? '',
+                                      active: _selectedDiscoveredIds.contains(dm['id']?.toString()),
+                                      onTap: () => setState(() {
+                                        final id = dm['id']?.toString() ?? '';
+                                        if (!_selectedDiscoveredIds.add(id)) {
+                                          _selectedDiscoveredIds.remove(id);
+                                        }
+                                      }),
+                                    ),
+                                ],
+                              ),
                             ),
+                          ),
+                          if (filteredDiscovered.length > 40) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              '已展示前 40 / ${filteredDiscovered.length} 个模型，输入关键词可继续筛选',
+                              style: TextStyle(fontSize: 11, color: t.text3),
+                            ),
+                          ],
                         ],
-                      ),
-                    ),
+                      );
+                    },
                   ),
                   const SizedBox(height: 8),
                   GrassBagPrimaryGlassButton(
@@ -2863,7 +3111,19 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
 
         const SizedBox(height: 16),
 
-        // 6. Primary Save + Optional Clear Key / Delete Custom Provider
+        // 6. Inline error near bottom Save CTA + Primary Save / Clear Key / Delete Custom Provider
+        if (_errorMsg != null) ...[
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: BoxDecoration(
+              color: t.errSoft,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: t.err.withValues(alpha: 0.35), width: 0.6),
+            ),
+            child: Text(_errorMsg!, style: TextStyle(fontSize: 12.5, color: t.err)),
+          ),
+          const SizedBox(height: 10),
+        ],
         Row(
           children: [
             if (alreadyHasKey && existingCred != null && existingCred.envRef.isNotEmpty) ...[
@@ -2873,7 +3133,10 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   tier: tier,
                   insideGlass: true,
                   destructive: true,
-                  onTap: () async {
+                  enabled: !_saving,
+                  onTap: _saving
+                      ? null
+                      : () async {
                     final ok = await showGrassBagConfirmDialog(
                       context,
                       title: '清除「${existingCred.name}」的 API 密钥？',
@@ -2897,8 +3160,8 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                 icon: CupertinoIcons.checkmark_alt,
                 tier: tier,
                 insideGlass: true,
-                enabled: !_saving,
-                onTap: _saving ? null : _save,
+                enabled: !_saving && !_discovering,
+                onTap: (_saving || _discovering) ? null : _save,
               ),
             ),
           ],
@@ -2910,7 +3173,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
               final isBuiltin = _isBuiltinProvider(widget.providerId);
               return Center(
                 child: GestureDetector(
-                  onTap: () async {
+                  onTap: _saving
+                      ? null
+                      : () async {
                     final ok = await showGrassBagConfirmDialog(
                       context,
                       title: isBuiltin
@@ -3129,30 +3394,61 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
         return;
       }
     }
+    if (id != widget.entry.id) {
+      final st = ref.read(appProvider);
+      final group = st.modelGroups.where((g) => g.id == widget.providerId).firstOrNull;
+      final dupInCatalog = group?.models.any((m) => m.id == id) == true;
+      final piAiNs = st.effectiveDshNamespaces.where((n) => n.ns == 'llm-pi-ai').firstOrNull;
+      final providersMap = piAiNs != null && piAiNs.value['providers'] is Map
+          ? piAiNs.value['providers'] as Map
+          : const {};
+      final provCfg = providersMap[widget.providerId] is Map ? providersMap[widget.providerId] as Map : null;
+      final rawModels = provCfg?['models'] is List ? provCfg!['models'] as List : const [];
+      final dupInConfig = rawModels.any((m) => m is Map && m['id']?.toString().trim() == id);
+      if (dupInCatalog || dupInConfig) {
+        setState(() => _err = '模型 ID「$id」已存在于当前渠道中，请勿重复命名');
+        return;
+      }
+    }
+    final normalizedEffortMap = _reasoning
+        ? <String, String?>{
+            for (final e in _orderedEffortMap(_effortMap).entries)
+              e.key: e.key == 'off'
+                  ? (e.value?.trim().isNotEmpty == true ? e.value!.trim() : null)
+                  : (e.value?.trim().isNotEmpty == true ? e.value!.trim() : e.key),
+          }
+        : null;
     setState(() {
       _saving = true;
       _err = null;
     });
-    final err = await ref.read(appProvider.notifier).saveModelParams(
-          providerId: widget.providerId,
-          modelId: id,
-          previousModelId: widget.entry.id,
-          displayName: _nameCtrl.text.trim(),
-          contextWindow: ctx,
-          maxTokens: maxTok,
-          reasoning: _reasoning,
-          reasoningEffortMap: _reasoning ? _orderedEffortMap(_effortMap) : null,
-          supportsImage: _vision,
-          setAsDefault: _setDefault,
-        );
-    if (!mounted) return;
-    if (err != null) {
-      setState(() {
-        _saving = false;
-        _err = err;
-      });
-      return;
+    String? err;
+    try {
+      err = await ref.read(appProvider.notifier).saveModelParams(
+            providerId: widget.providerId,
+            modelId: id,
+            previousModelId: widget.entry.id,
+            displayName: _nameCtrl.text.trim(),
+            contextWindow: ctx,
+            maxTokens: maxTok,
+            reasoning: _reasoning,
+            reasoningEffortMap: normalizedEffortMap,
+            supportsImage: _vision,
+            setAsDefault: _setDefault,
+          );
+    } catch (e) {
+      err = e.toString();
+    } finally {
+      if (mounted && err != null) {
+        setState(() {
+          _saving = false;
+          _err = err;
+        });
+      } else if (mounted && _saving) {
+        setState(() => _saving = false);
+      }
     }
+    if (!mounted || err != null) return;
     Navigator.of(context).pop();
   }
 
@@ -3337,6 +3633,15 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
             ),
           ],
         ),
+        if (_err != null) ...[
+          const SizedBox(height: 10),
+          GrassBagStatusBanner(
+            tone: GrassBagBannerTone.error,
+            message: _err!,
+            borderRadius: 14,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          ),
+        ],
         const SizedBox(height: 14),
         GrassBagPrimaryGlassButton(
           label: _saving ? '正在写入 DSH…' : '保存模型参数',
@@ -3620,9 +3925,7 @@ class _ReasoningEffortsEditorState extends State<_ReasoningEffortsEditor> {
                             onChanged: (val) {
                               final next = Map<String, String?>.from(ordered);
                               final trimmed = val.trim();
-                              next[entry.key] = entry.key == 'off'
-                                  ? (trimmed.isEmpty ? null : trimmed)
-                                  : (trimmed.isEmpty ? entry.key : trimmed);
+                              next[entry.key] = trimmed.isEmpty ? null : trimmed;
                               widget.onChanged(next);
                             },
                           ),
@@ -3658,15 +3961,29 @@ class _WireValueField extends StatefulWidget {
 
 class _WireValueFieldState extends State<_WireValueField> {
   late final TextEditingController _ctrl;
+  late final FocusNode _focusNode;
 
   @override
   void initState() {
     super.initState();
     _ctrl = TextEditingController(text: widget.initialValue);
+    _focusNode = FocusNode();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WireValueField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_focusNode.hasFocus && oldWidget.initialValue != widget.initialValue && _ctrl.text != widget.initialValue) {
+      _ctrl.value = TextEditingValue(
+        text: widget.initialValue,
+        selection: TextSelection.collapsed(offset: widget.initialValue.length),
+      );
+    }
   }
 
   @override
   void dispose() {
+    _focusNode.dispose();
     _ctrl.dispose();
     super.dispose();
   }
@@ -3675,6 +3992,7 @@ class _WireValueFieldState extends State<_WireValueField> {
   Widget build(BuildContext context) {
     return GrassBagTextField(
       controller: _ctrl,
+      focusNode: _focusNode,
       insideGlass: true,
       monospace: true,
       fontSize: 11.5,

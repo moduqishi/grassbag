@@ -65,16 +65,22 @@ object SafetyGate {
     private val emergencyStopped = AtomicBoolean(false)
     private val paused = AtomicBoolean(false)
     private val confirmHighRisk = AtomicBoolean(true)
+    private val autoReturnOnComplete = AtomicBoolean(true)
+    private val showEdgeAurora = AtomicBoolean(true)
+    private val showGestureFx = AtomicBoolean(true)
     private val auditLog = CopyOnWriteArrayList<AuditRecord>()
     private val auditLock = Any()
     private val emergencyStopListeners = CopyOnWriteArraySet<() -> Unit>()
+    private val pauseListeners = CopyOnWriteArraySet<(Boolean) -> Unit>()
 
     private val interactiveWriteTools = setOf(
         "phone_tap", "phone_long_press", "phone_swipe", "phone_type", "phone_open", "phone_intent"
     )
     private val packageRequiredTools = setOf(
-        "phone_screen", "phone_tap", "phone_long_press", "phone_swipe", "phone_type"
+        "phone_screen", "phone_screenshot", "phone_tap", "phone_long_press", "phone_swipe", "phone_type"
     )
+    @Volatile
+    private var allowTurnSetAtMs: Long = 0L
 
     /** Hard-denied financial/wallet/payment apps & GrassBag own UI. */
     private val hardDeniedPackages: Set<String> = setOf(
@@ -138,14 +144,24 @@ object SafetyGate {
         "确认支付", "注销", "卸载", "格式化", "恢复出厂", "send", "delete", "pay", "transfer", "purchase"
     )
 
+    @Volatile
+    private var initialized: Boolean = false
+
     fun init(ctx: Context) {
-        if (prefs != null) return
-        val p = ctx.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs = p
-        val savedPolicy = p.getString("policy", "ASK") ?: "ASK"
-        val tier = runCatching { PolicyTier.valueOf(savedPolicy) }.getOrDefault(PolicyTier.ASK)
-        policy.set(if (tier == PolicyTier.ALLOW_TURN) PolicyTier.ASK else tier)
-        confirmHighRisk.set(p.getBoolean("confirmHighRisk", true))
+        if (initialized) return
+        synchronized(this) {
+            if (initialized) return
+            val p = ctx.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs = p
+            val savedPolicy = p.getString("policy", "ASK") ?: "ASK"
+            val tier = runCatching { PolicyTier.valueOf(savedPolicy) }.getOrDefault(PolicyTier.ASK)
+            policy.set(if (tier == PolicyTier.ALLOW_TURN) PolicyTier.ASK else tier)
+            confirmHighRisk.set(p.getBoolean("confirmHighRisk", true))
+            autoReturnOnComplete.set(p.getBoolean("autoReturnOnComplete", true))
+            showEdgeAurora.set(p.getBoolean("showEdgeAurora", true))
+            showGestureFx.set(p.getBoolean("showGestureFx", true))
+            initialized = true
+        }
     }
 
     fun addEmergencyStopListener(listener: () -> Unit) {
@@ -156,12 +172,27 @@ object SafetyGate {
         emergencyStopListeners.remove(listener)
     }
 
+    fun addPauseListener(listener: (Boolean) -> Unit) {
+        pauseListeners.add(listener)
+    }
+
+    fun removePauseListener(listener: (Boolean) -> Unit) {
+        pauseListeners.remove(listener)
+    }
+
     private fun pruneExpiredTurns() {
         val now = System.currentTimeMillis()
+        val hadActive = activeTurnsBySession.isNotEmpty()
         activeTurnsBySession.entries.removeIf { now - it.value > TURN_WATCHDOG_MS }
         sessionTurnGrants.entries.removeIf { now - it.value > TURN_WATCHDOG_MS }
-        if (activeTurnsBySession.isEmpty()) {
-            policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
+        // Only revert ALLOW_TURN -> ASK when an active turn expired OR the idle policy grant itself timed out.
+        // Never wipe a freshly selected ALLOW_TURN policy while the user is still in Settings before starting a turn!
+        if (activeTurnsBySession.isEmpty() &&
+            (hadActive || (allowTurnSetAtMs > 0L && now - allowTurnSetAtMs > TURN_WATCHDOG_MS))
+        ) {
+            if (policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)) {
+                allowTurnSetAtMs = 0L
+            }
         }
     }
 
@@ -171,6 +202,7 @@ object SafetyGate {
     }
 
     fun setPolicy(tier: PolicyTier): Boolean {
+        allowTurnSetAtMs = if (tier == PolicyTier.ALLOW_TURN) System.currentTimeMillis() else 0L
         policy.set(tier)
         if (tier != PolicyTier.ALLOW_TURN) {
             prefs?.edit()?.putString("policy", tier.name)?.apply()
@@ -186,12 +218,38 @@ object SafetyGate {
 
     fun isConfirmHighRisk(): Boolean = confirmHighRisk.get()
 
+    fun setAutoReturnEnabled(enabled: Boolean) {
+        autoReturnOnComplete.set(enabled)
+        prefs?.edit()?.putBoolean("autoReturnOnComplete", enabled)?.apply()
+    }
+
+    fun isAutoReturnEnabled(): Boolean = autoReturnOnComplete.get()
+
+    fun setShowEdgeAurora(enabled: Boolean) {
+        showEdgeAurora.set(enabled)
+        prefs?.edit()?.putBoolean("showEdgeAurora", enabled)?.apply()
+    }
+
+    fun isShowEdgeAurora(): Boolean = showEdgeAurora.get()
+
+    fun setShowGestureFx(enabled: Boolean) {
+        showGestureFx.set(enabled)
+        prefs?.edit()?.putBoolean("showGestureFx", enabled)?.apply()
+    }
+
+    fun isShowGestureFx(): Boolean = showGestureFx.get()
+
     fun getPolicy(): PolicyTier = policy.get()
 
     fun isPaused(): Boolean = paused.get()
 
     fun setPaused(value: Boolean) {
-        paused.set(value)
+        val prev = paused.getAndSet(value)
+        if (prev != value) {
+            for (l in pauseListeners) {
+                runCatching { l(value) }
+            }
+        }
     }
 
     fun beginTurn(turnId: String?, sessionId: String? = null) {
@@ -217,30 +275,66 @@ object SafetyGate {
      * Ends ONLY the phone-control turn matching [sessionId]. Unrelated sessions (such as title
      * generation or another text-only chat) NEVER wipe an active phone-control turn!
      */
-    fun endTurn(sessionId: String? = null): Boolean {
+    fun endTurn(sessionId: String? = null, turnId: String? = null): Boolean {
         val key = sessionId?.takeIf { it.isNotBlank() && it != "null" }
+        val tKey = turnId?.takeIf { it.isNotBlank() && it != "null" }
         val removed = if (key != null) {
-            val hadActive = activeTurnsBySession.remove(key) != null
-            val hadGrant = sessionTurnGrants.remove(key) != null
-            hadActive || hadGrant
+            var anyRemoved = activeTurnsBySession.remove(key) != null
+            anyRemoved = (sessionTurnGrants.remove(key) != null) || anyRemoved
+            if (tKey != null && tKey != key) {
+                anyRemoved = (activeTurnsBySession.remove(tKey) != null) || anyRemoved
+                anyRemoved = (sessionTurnGrants.remove(tKey) != null) || anyRemoved
+            }
+            // Also clean up fallback "default" key when a session turn ends without an explicit sessionId match.
+            if (!anyRemoved && activeTurnsBySession.containsKey("default")) {
+                anyRemoved = (activeTurnsBySession.remove("default") != null) || anyRemoved
+                anyRemoved = (sessionTurnGrants.remove("default") != null) || anyRemoved
+            }
+            anyRemoved
         } else {
             val hadAny = activeTurnsBySession.isNotEmpty() || sessionTurnGrants.isNotEmpty()
             activeTurnsBySession.clear()
             sessionTurnGrants.clear()
             hadAny
         }
-        if (removed && activeTurnsBySession.isEmpty()) {
-            paused.set(false)
-            policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
+        pruneExpiredTurns()
+        if (activeTurnsBySession.isEmpty()) {
+            setPaused(false)
+            if (removed) {
+                allowTurnSetAtMs = 0L
+                policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
+            }
         }
         return removed
+    }
+
+    fun isNonSuccessTurnEndReason(reason: String?): Boolean {
+        if (emergencyStopped.get()) return true
+        val r = reason?.trim()?.lowercase() ?: return false
+        return r == "stopped" ||
+            r == "emergency_stop" ||
+            r == "cancelled" ||
+            r == "canceled" ||
+            r == "aborted" ||
+            r == "error" ||
+            r == "failed" ||
+            r == "interrupted" ||
+            r.contains("error") ||
+            r.contains("abort") ||
+            r.contains("cancel")
+    }
+
+    fun isTurnActiveForSession(sessionId: String?, turnId: String? = null): Boolean {
+        pruneExpiredTurns()
+        val key = sessionKey(sessionId, turnId)
+        return activeTurnsBySession.containsKey(key)
     }
 
     fun hasActiveTurn(): Boolean = isTurnLockedNow()
 
     fun triggerEmergencyStop() {
         emergencyStopped.set(true)
-        paused.set(false)
+        setPaused(false)
         activeTurnsBySession.clear()
         sessionTurnGrants.clear()
         policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
@@ -345,7 +439,7 @@ object SafetyGate {
 
         // Read-only & safe navigation tools always run cleanly
         if (tool == "phone_screen" || tool == "phone_screenshot" || tool == "phone_apps" ||
-            tool == "phone_wait" || tool == "phone_key"
+            tool == "phone_wait" || tool == "phone_key" || tool == "phone_return_app"
         ) {
             record(tool, targetPackage ?: "screen", true, "allowed:safe_tool")
             return ActionVerdict.Allow("allowed:safe_tool")
@@ -361,12 +455,9 @@ object SafetyGate {
         val isEveryWriteApp = isConfirmEveryWritePackage(targetPackage)
         val sensitiveWord = sensitiveActionHit(targetLabel)
 
-        // WeChat / every-write apps & sensitive action buttons ALWAYS confirm unless PolicyTier.ALWAYS
+        // WeChat / every-write apps & sensitive action buttons ALWAYS require native confirmation
+        // regardless of PolicyTier.ALWAYS or danger-full-access (matching hard SafetyGate contract).
         if (isEveryWriteApp || sensitiveWord != null) {
-            if (currentPolicy == PolicyTier.ALWAYS) {
-                record(tool, targetPackage ?: "screen", true, "allowed:policy_always")
-                return ActionVerdict.Allow("allowed:policy_always")
-            }
             val badge = when {
                 sensitiveWord != null -> "敏感操作「$sensitiveWord」"
                 isEveryWriteApp -> "关键应用确认"
@@ -374,7 +465,7 @@ object SafetyGate {
             }
             return ActionVerdict.NeedConfirm(
                 reason = if (sensitiveWord != null) "sensitive:$sensitiveWord" else "confirm_every_write",
-                allowTurnOption = !isEveryWriteApp,
+                allowTurnOption = false,
                 riskBadge = badge
             )
         }
@@ -439,11 +530,14 @@ object SafetyGate {
     fun statusSnapshot(): Map<String, Any> = mapOf(
         "policy" to policy.get().name.lowercase(),
         "confirmHighRisk" to confirmHighRisk.get(),
+        "autoReturnOnComplete" to autoReturnOnComplete.get(),
+        "showEdgeAurora" to showEdgeAurora.get(),
+        "showGestureFx" to showGestureFx.get(),
         "activeTurnLocked" to isTurnLockedNow(),
         "emergencyStopped" to emergencyStopped.get(),
         "paused" to paused.get(),
         "deniedPackagesCount" to hardDeniedPackages.size,
-        "audit" to recentAudit(20)
+        "audit" to recentAudit(24)
     )
 
     private fun sessionKey(sessionId: String?, turnId: String?): String =

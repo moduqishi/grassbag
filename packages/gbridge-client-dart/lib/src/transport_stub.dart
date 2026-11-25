@@ -86,6 +86,7 @@ class GbridgeStreamClient {
   Stream<StreamFrame> get frames => _framesController.stream;
   Stream<ConnectionPhase> get phases => _phaseController.stream;
   Stream<WelcomeInfo> get welcomes => _welcomeController.stream;
+  ConnectionPhase get phase => ConnectionPhase.disconnected;
   int get lastSeq => 0;
 
   void attachVanillaMux(VanillaDshMuxEngine? engine) {}
@@ -98,12 +99,17 @@ class GbridgeStreamClient {
     );
   }
 
-  void subscribe(String channel) {}
+  void subscribe(String channel, {bool force = false}) {}
   void unsubscribe(String channel) {}
   void sendTerminalInput(String terminalId, String data) {}
   void sendTerminalResize(String terminalId, int cols, int rows) {}
   void sendPing([String? id]) {}
-  Future<bool> checkLiveness({Duration timeout = const Duration(seconds: 3)}) async => false;
+  void reconnectNow() {}
+  Future<bool> checkLiveness({
+    Duration timeout = const Duration(seconds: 3),
+    bool force = false,
+  }) async =>
+      false;
   Future<void> disconnect() async {}
 
   Future<void> dispose() async {

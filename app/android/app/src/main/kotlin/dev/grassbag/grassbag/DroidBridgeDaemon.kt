@@ -33,7 +33,8 @@ class DroidBridgeDaemon(
     val bearerToken: String
 ) {
     private val running = AtomicBoolean(false)
-    private val pool = Executors.newCachedThreadPool()
+    @Volatile
+    private var pool: java.util.concurrent.ExecutorService = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var boundSocket: LocalSocket? = null
     private var serverSocket: LocalServerSocket? = null
@@ -44,6 +45,9 @@ class DroidBridgeDaemon(
     fun start(): Boolean {
         if (running.getAndSet(true)) return true
         return try {
+            if (pool.isShutdown || pool.isTerminated) {
+                pool = Executors.newCachedThreadPool()
+            }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
             val bindSocket = LocalSocket()
@@ -72,6 +76,7 @@ class DroidBridgeDaemon(
         serverSocket = null
         try { boundSocket?.close() } catch (_: Throwable) {}
         boundSocket = null
+        runCatching { pool.shutdownNow() }
         try {
             mainHandler.post {
                 runCatching { tts?.shutdown() }
@@ -110,7 +115,12 @@ class DroidBridgeDaemon(
                     PhoneControlDaemon.writeJson(out, 401, JSONObject().put("error", JSONObject().put("message", "unauthorized")))
                     return
                 }
-                val body = if (req.body.isBlank()) JSONObject() else JSONObject(req.body)
+                val body = try {
+                    if (req.body.isBlank()) JSONObject() else JSONObject(req.body)
+                } catch (_: org.json.JSONException) {
+                    PhoneControlDaemon.writeJson(out, 400, JSONObject().put("error", JSONObject().put("message", "invalid_json")))
+                    return
+                }
                 val action = body.optString("action", "")
                 val argsArr = body.optJSONArray("args")
                 val args = List(argsArr?.length() ?: 0) { argsArr!!.optString(it) }
@@ -137,41 +147,49 @@ class DroidBridgeDaemon(
                 if (rawText.isNotEmpty()) {
                     val textToSet = if (rawText.length > 262_144) rawText.substring(0, 262_144) else rawText
                     val latch = java.util.concurrent.CountDownLatch(1)
-                    var writeErr: String? = null
+                    val writeErr = java.util.concurrent.atomic.AtomicReference<String?>(null)
                     mainHandler.post {
                         try {
                             cm.setPrimaryClip(ClipData.newPlainText("GrassBag", textToSet))
                         } catch (t: Throwable) {
-                            writeErr = t.message ?: t.javaClass.simpleName
+                            writeErr.set(t.message ?: t.javaClass.simpleName)
                         } finally {
                             latch.countDown()
                         }
                     }
-                    latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
-                    if (writeErr != null) {
-                        JSONObject().put("ok", false).put("error", writeErr)
+                    val completed = runCatching { latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrDefault(false)
+                    val errMsg = writeErr.get()
+                    if (!completed) {
+                        JSONObject().put("ok", false).put("error", "clipboard_write_timeout")
+                    } else if (errMsg != null) {
+                        JSONObject().put("ok", false).put("error", errMsg)
                     } else {
                         JSONObject().put("ok", true).put("output", "copied ${textToSet.length} chars")
                     }
                 } else {
-                    var clipText = ""
+                    val clipTextRef = java.util.concurrent.atomic.AtomicReference("")
                     val latch = java.util.concurrent.CountDownLatch(1)
                     mainHandler.post {
                         try {
                             val clip = cm.primaryClip
-                            clipText = if (clip != null && clip.itemCount > 0) {
+                            val txt = if (clip != null && clip.itemCount > 0) {
                                 clip.getItemAt(0)?.coerceToText(context)?.toString() ?: ""
                             } else {
                                 ""
                             }
+                            clipTextRef.set(txt)
                         } catch (_: Throwable) {
-                            clipText = ""
+                            clipTextRef.set("")
                         } finally {
                             latch.countDown()
                         }
                     }
-                    latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
-                    JSONObject().put("ok", true).put("output", clipText)
+                    val completed = runCatching { latch.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrDefault(false)
+                    if (!completed) {
+                        JSONObject().put("ok", false).put("error", "clipboard_read_timeout")
+                    } else {
+                        JSONObject().put("ok", true).put("output", clipTextRef.get())
+                    }
                 }
             }
             "notify" -> {
@@ -187,8 +205,15 @@ class DroidBridgeDaemon(
                     putExtra(Intent.EXTRA_TEXT, text)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-                context.startActivity(Intent.createChooser(intent, "分享").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                JSONObject().put("ok", true).put("output", "shared")
+                val launchCtx: Context = GrassBagAccessibilityService.current() ?: context
+                val res = runCatching {
+                    launchCtx.startActivity(Intent.createChooser(intent, "分享").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+                if (res.isSuccess) {
+                    JSONObject().put("ok", true).put("output", "shared")
+                } else {
+                    JSONObject().put("ok", false).put("error", res.exceptionOrNull()?.message ?: "share_failed")
+                }
             }
             "vibrate" -> {
                 val ms = args.firstOrNull()?.toLongOrNull()?.coerceIn(20L, 1500L) ?: 80L
@@ -214,19 +239,28 @@ class DroidBridgeDaemon(
                             pendingTtsText = text
                             ttsReady = false
                             tts = TextToSpeech(context) { status ->
-                                if (status == TextToSpeech.SUCCESS) {
-                                    ttsReady = true
-                                    tts?.language = Locale.getDefault()
-                                    val queued = pendingTtsText
-                                    pendingTtsText = null
-                                    if (!queued.isNullOrEmpty()) {
-                                        tts?.speak(queued, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
+                                mainHandler.post {
+                                    if (!running.get()) {
+                                        runCatching { tts?.shutdown() }
+                                        tts = null
+                                        ttsReady = false
+                                        pendingTtsText = null
+                                        return@post
                                     }
-                                } else {
-                                    runCatching { tts?.shutdown() }
-                                    tts = null
-                                    ttsReady = false
-                                    pendingTtsText = null
+                                    if (status == TextToSpeech.SUCCESS) {
+                                        ttsReady = true
+                                        tts?.language = Locale.getDefault()
+                                        val queued = pendingTtsText
+                                        pendingTtsText = null
+                                        if (!queued.isNullOrEmpty()) {
+                                            tts?.speak(queued, TextToSpeech.QUEUE_FLUSH, null, "grassbag-tts")
+                                        }
+                                    } else {
+                                        runCatching { tts?.shutdown() }
+                                        tts = null
+                                        ttsReady = false
+                                        pendingTtsText = null
+                                    }
                                 }
                             }
                         } else if (ttsReady) {

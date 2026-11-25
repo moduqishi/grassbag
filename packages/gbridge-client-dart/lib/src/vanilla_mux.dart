@@ -23,12 +23,14 @@ class VanillaDshMuxEngine {
     required this.normalizer,
     this.autoReconnect = true,
     this.coalesceWindow = const Duration(milliseconds: 28),
+    this.onAutoApprove,
   });
 
   final Future<GbridgeRawWebSocket> Function(String path) openSocket;
   final VanillaDshNormalizer normalizer;
   final bool autoReconnect;
   final Duration coalesceWindow;
+  final Future<void> Function(String clientId, String eventId)? onAutoApprove;
 
   final _framesController = StreamController<StreamFrame>.broadcast();
   final _phaseController = StreamController<ConnectionPhase>.broadcast();
@@ -48,9 +50,11 @@ class VanillaDshMuxEngine {
   StreamSubscription<String>? _wsSub;
   Timer? _reconnectTimer;
   Timer? _handshakeTimer;
+  Timer? _eventsReopenTimer;
   Timer? _coalesceTimer;
   Completer<WelcomeInfo>? _pendingWelcome;
   int _lastInboundAtMs = 0;
+  int _eventsReopenAttempts = 0;
 
   ConnectionPhase _phase = ConnectionPhase.disconnected;
   String? _eventsClientId;
@@ -60,8 +64,36 @@ class VanillaDshMuxEngine {
   int _streamSeq = 0;
   int _connEpoch = 0;
   int _reconnectAttempt = 0;
+  bool _hasConnectedOnce = false;
   bool _disposed = false;
   bool _manualDisconnect = false;
+  final Map<String, Set<String>> _sessionAlwaysAllowed = <String, Set<String>>{};
+
+  static String _approvalToolKey(Map<String, dynamic> payload) {
+    final raw = (payload['tool'] ??
+            payload['toolName'] ??
+            payload['name'] ??
+            payload['kind'] ??
+            '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return raw;
+  }
+
+  void rememberSessionAlwaysAllowed(String? sessionId, Map<String, dynamic> payload) {
+    final sid = sessionId?.trim() ?? '';
+    final key = _approvalToolKey(payload);
+    if (sid.isEmpty || key.isEmpty || key.startsWith('phone_')) return;
+    _sessionAlwaysAllowed.putIfAbsent(sid, () => <String>{}).add(key);
+  }
+
+  bool _isSessionAlwaysAllowed(String? sessionId, Map<String, dynamic> payload) {
+    final sid = sessionId?.trim() ?? '';
+    final key = _approvalToolKey(payload);
+    if (sid.isEmpty || key.isEmpty || key.startsWith('phone_')) return false;
+    return _sessionAlwaysAllowed[sid]?.contains(key) == true;
+  }
 
   Stream<StreamFrame> get frames => _framesController.stream;
   Stream<ConnectionPhase> get phases => _phaseController.stream;
@@ -110,10 +142,20 @@ class VanillaDshMuxEngine {
     _reconnectTimer = null;
     final epoch = ++_connEpoch;
     _closeCurrentSocket();
-    _setPhase(_reconnectAttempt == 0 ? ConnectionPhase.connecting : ConnectionPhase.reconnecting);
+    _setPhase(_hasConnectedOnce ? ConnectionPhase.reconnecting : ConnectionPhase.connecting);
+
+    final prevPending = _pendingWelcome;
+    _pendingWelcome = null;
+    if (prevPending != null && !prevPending.isCompleted) {
+      prevPending.completeError(const GbridgeException(
+        status: 0,
+        code: 'gbridge/ws_superseded',
+        message: 'WebSocket connection superseded',
+      ));
+    }
 
     final welcomeCompleter = Completer<WelcomeInfo>();
-    _pendingWelcome = welcomeCompleter;
+    welcomeCompleter.future.ignore();
 
     try {
       final ws = await openSocket('/api/remote.mux');
@@ -125,6 +167,8 @@ class VanillaDshMuxEngine {
           message: 'WebSocket connection superseded',
         );
       }
+      _pendingWelcome = welcomeCompleter;
+      _eventsReopenAttempts = 0;
       _ws = ws;
       _wsSub = ws.messages.listen(
         (raw) {
@@ -196,6 +240,7 @@ class VanillaDshMuxEngine {
 
   void _finishHandshake(int epoch, Completer<WelcomeInfo> completer) {
     if (epoch != _connEpoch || completer.isCompleted) return;
+    _hasConnectedOnce = true;
     _setPhase(ConnectionPhase.connected);
     final welcome = WelcomeInfo(
       bootId: _bootId,
@@ -237,8 +282,16 @@ class VanillaDshMuxEngine {
       // Open a short-lived mux connection if the main stream isn't connected yet.
       final deadline = DateTime.now().add(timeout);
       GbridgeRawWebSocket? tempWs;
+      var timedOut = false;
       try {
-        tempWs = await openSocket('/api/remote.mux').timeout(timeout);
+        final openFuture = openSocket('/api/remote.mux');
+        unawaited(openFuture.then((ws) {
+          if (timedOut) unawaited(ws.close().catchError((_) {}));
+        }, onError: (_) {}));
+        tempWs = await openFuture.timeout(timeout, onTimeout: () {
+          timedOut = true;
+          throw TimeoutException('oneshot socket open timed out');
+        });
         final remaining = deadline.difference(DateTime.now());
         if (remaining <= Duration.zero) {
           throw TimeoutException('oneshot stream timed out before open');
@@ -304,10 +357,10 @@ class VanillaDshMuxEngine {
     }
   }
 
-  void subscribe(String channel) {
+  void subscribe(String channel, {bool force = false}) {
     if (channel.isEmpty) return;
     final added = _channels.add(channel);
-    if ((added || !_activeChannelStreams.containsKey(channel)) &&
+    if ((added || force || !_activeChannelStreams.containsKey(channel)) &&
         _ws != null &&
         _phase == ConnectionPhase.connected &&
         channel != 'host') {
@@ -362,7 +415,33 @@ class VanillaDshMuxEngine {
     });
   }
 
-  Future<bool> checkLiveness({Duration timeout = const Duration(seconds: 3)}) async {
+  void reconnectNow() {
+    if (_disposed || _manualDisconnect) return;
+    if (_phase == ConnectionPhase.connected && _ws != null) {
+      unawaited(checkLiveness());
+      return;
+    }
+    if (_reconnectTimer != null ||
+        _phase == ConnectionPhase.disconnected ||
+        _phase == ConnectionPhase.error) {
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
+      _reconnectAttempt = 0;
+      unawaited(connect().catchError((_) => const WelcomeInfo(
+            bootId: '',
+            currentSeq: 0,
+            resumed: false,
+            replayedCount: 0,
+            heartbeatMs: 20000,
+            pendingInteractions: [],
+          )));
+    }
+  }
+
+  Future<bool> checkLiveness({
+    Duration timeout = const Duration(seconds: 3),
+    bool force = false,
+  }) async {
     if (_disposed || _manualDisconnect) return false;
     // Never abort an in-flight handshake/reconnect!
     if (_phase == ConnectionPhase.connecting || _phase == ConnectionPhase.reconnecting) {
@@ -380,7 +459,7 @@ class VanillaDshMuxEngine {
       return false;
     }
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (nowMs - _lastInboundAtMs < 4000) return true;
+    if (!force && nowMs - _lastInboundAtMs < 4000) return true;
     final epoch = _connEpoch;
     try {
       await readFirstStreamItem('workspace/follow', const {}, timeout: timeout);
@@ -509,11 +588,35 @@ class VanillaDshMuxEngine {
     // 2) Host `$events` stream.
     if (channel == '__events__') {
       if (type == 'item' && msg['value'] is Map) {
+        _eventsReopenAttempts = 0;
         _handleHostEventFrame(_asStringMap(msg['value'] as Map), epoch);
       } else if (type == 'error' || type == 'end') {
+        _streamIdToChannel.remove(streamId);
         final pending = _pendingWelcome;
         if (pending != null && !pending.isCompleted) {
           _finishHandshake(epoch, pending);
+        } else if (epoch == _connEpoch && _phase == ConnectionPhase.connected && !_disposed && !_manualDisconnect) {
+          // `$events` closed unexpectedly while WS stays alive — reopen so approvals/questions keep arriving.
+          _eventsClientId = null;
+          _eventsReopenTimer?.cancel();
+          if (_eventsReopenAttempts < 4) {
+            final delayMs = 600 * (1 << _eventsReopenAttempts);
+            _eventsReopenAttempts++;
+            _eventsReopenTimer = Timer(Duration(milliseconds: delayMs), () {
+              _eventsReopenTimer = null;
+              if (_disposed || _manualDisconnect || epoch != _connEpoch || _ws == null) return;
+              final nextEventsId = _nextStreamId('events');
+              _streamIdToChannel[nextEventsId] = '__events__';
+              _send({
+                'type': 'open',
+                'streamId': nextEventsId,
+                'endpoint': r'$events',
+                'payload': {'args': const <String, dynamic>{}},
+              });
+            });
+          } else {
+            _handleDisconnect(epoch);
+          }
         }
       }
       return;
@@ -610,13 +713,23 @@ class VanillaDshMuxEngine {
           : (ev == 'user-questions/request' ? 'user_questions' : 'request');
       final payloadRaw = frame['request'] ?? frame['payload'] ?? frame;
       final payload = payloadRaw is Map ? _asStringMap(payloadRaw) : <String, dynamic>{};
+      final sessionId = (frame['agentId'] ?? payload['sessionId'])?.toString();
+      if (kind == 'approval' &&
+          _eventsClientId != null &&
+          onAutoApprove != null &&
+          _isSessionAlwaysAllowed(sessionId, payload)) {
+        unawaited(
+          onAutoApprove!(_eventsClientId!, eventId).catchError((_) {}),
+        );
+        return;
+      }
       final item = _PendingVanillaInteraction(
         id: eventId,
         kind: kind,
         event: ev,
         eventId: eventId,
         gatewayClientId: _eventsClientId,
-        sessionId: (frame['agentId'] ?? payload['sessionId'])?.toString(),
+        sessionId: sessionId,
         payload: payload,
         createdAt: DateTime.now().millisecondsSinceEpoch,
       );
@@ -718,8 +831,12 @@ class VanillaDshMuxEngine {
         }
       } else if (fType == 'start') {
         _flushCoalescedDelta(channel);
-        final tid = frame['turn'] != null ? 'turn-${frame['turn']}' : activeTid;
+        // Preserve an existing canonical/UUID turnId instead of overwriting with synthetic `turn-N`.
+        final tid = (activeTid != null && !activeTid.startsWith('turn-'))
+            ? activeTid
+            : (frame['turn'] != null ? 'turn-${frame['turn']}' : activeTid);
         if (tid != null) _activeTurns[targetId] = tid;
+        normalizer.observeStreamChunk(targetId, const {'type': 'step/start'});
         _publish(channel, 'turn.delta', {
           'sessionId': targetId,
           if (tid != null) 'turnId': tid,
@@ -783,7 +900,9 @@ class VanillaDshMuxEngine {
         final turnId = evData['turnId']?.toString() ??
             (evData['turn'] != null
                 ? 'turn-${evData['turn']}'
-                : 'turn-${eventSeq ?? DateTime.now().millisecondsSinceEpoch}');
+                : (ev['id']?.toString().isNotEmpty == true
+                    ? ev['id'].toString()
+                    : 'turn-${eventSeq ?? DateTime.now().millisecondsSinceEpoch}'));
         _activeTurns[targetId] = turnId;
         _publish(channel, 'turn.start', {
           'sessionId': targetId,
@@ -941,7 +1060,7 @@ class VanillaDshMuxEngine {
     Map<String, dynamic> data, {
     String op = 'event',
   }) {
-    if (_framesController.isClosed) return;
+    if (_disposed || _framesController.isClosed) return;
     _seq += 1;
     _framesController.add(StreamFrame(
       op: op,
@@ -965,6 +1084,8 @@ class VanillaDshMuxEngine {
     _flushAllCoalescedDeltas();
     _handshakeTimer?.cancel();
     _handshakeTimer = null;
+    _eventsReopenTimer?.cancel();
+    _eventsReopenTimer = null;
     _wsSub?.cancel();
     _wsSub = null;
     final old = _ws;
@@ -974,6 +1095,13 @@ class VanillaDshMuxEngine {
     }
     _activeChannelStreams.clear();
     _streamIdToChannel.clear();
+    _eventsClientId = null;
+    if (_pendingInteractions.isNotEmpty) {
+      final staleIds = _pendingInteractions.keys.toList(growable: false);
+      for (final id in staleIds) {
+        markInteractionResolved(id, reason: 'disconnected');
+      }
+    }
     for (final w in _oneShotWaiters.values) {
       if (!w.isCompleted) {
         w.completeError(const GbridgeException(

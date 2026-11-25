@@ -48,12 +48,23 @@ window.__ModuleLoader__.load({
       return carrier(url, Object.assign({ credentials: 'same-origin' }, init || {}));
     }
 
+    async function parseJsonSafe(res) {
+      var text = await res.text();
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch (_err) {
+        return null;
+      }
+    }
+
     async function fetchPairingState() {
       var res = await transportFetch(PAIRING_ROUTE, { method: 'GET' });
-      var data = await res.json();
+      var data = await parseJsonSafe(res);
       if (!res.ok) {
         throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
       }
+      if (!data) throw new Error('Invalid pairing response');
       return data;
     }
 
@@ -63,17 +74,15 @@ window.__ModuleLoader__.load({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
-      var data = await res.json();
+      var data = await parseJsonSafe(res);
       if (!res.ok) {
         throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
       }
+      if (!data) throw new Error('Invalid pairing response');
       return data;
     }
 
-    function copyTextSafe(text) {
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        return navigator.clipboard.writeText(text);
-      }
+    function copyTextViaTextarea(text) {
       return new Promise(function (resolve, reject) {
         try {
           var ta = document.createElement('textarea');
@@ -82,13 +91,23 @@ window.__ModuleLoader__.load({
           ta.style.opacity = '0';
           document.body.appendChild(ta);
           ta.select();
-          document.execCommand('copy');
+          var ok = document.execCommand('copy');
           document.body.removeChild(ta);
-          resolve();
+          if (ok) resolve();
+          else reject(new Error('copy command rejected'));
         } catch (err) {
           reject(err);
         }
       });
+    }
+
+    function copyTextSafe(text) {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        return navigator.clipboard.writeText(text).catch(function () {
+          return copyTextViaTextarea(text);
+        });
+      }
+      return copyTextViaTextarea(text);
     }
 
     function GrassBagGlyph(props) {
@@ -116,6 +135,7 @@ window.__ModuleLoader__.load({
       var qr = props.qr;
       var boxSize = props.size || 200;
       var zh = props.zh;
+      var loading = Boolean(props.loading);
       if (!qr || !qr.pathData || !qr.viewBoxSize) {
         return h(
           'div',
@@ -135,7 +155,9 @@ window.__ModuleLoader__.load({
               color: 'var(--dsw-alias-label-tertiary, #64748b)',
             },
           },
-          zh ? '开启局域网桥接后将在此显示扫码二维码' : 'Enable LAN Bridge to display QR code'
+          loading
+            ? (zh ? '正在加载配对二维码…' : 'Loading pairing QR code…')
+            : (zh ? '开启局域网桥接后将在此显示扫码二维码' : 'Enable LAN Bridge to display QR code')
         );
       }
       return h(
@@ -201,51 +223,99 @@ window.__ModuleLoader__.load({
       var portInput = portInputTuple[0];
       var setPortInput = portInputTuple[1];
 
+      var mountedRef = React.useRef(true);
+      var toastTimerRef = React.useRef(null);
+      var portInitializedRef = React.useRef(false);
+      var reqSeqRef = React.useRef(0);
+      var busyRef = React.useRef(false);
+
       var notify = useCallback(function (msg) {
+        if (!mountedRef.current) return;
         setToast(msg);
-        setTimeout(function () {
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(function () {
+          if (!mountedRef.current) return;
           setToast(function (cur) { return cur === msg ? '' : cur; });
         }, 2800);
       }, []);
 
       var reload = useCallback(async function (silent) {
-        if (!silent) setBusy(true);
+        if (silent && (busyRef.current || (typeof document !== 'undefined' && document.hidden))) {
+          return;
+        }
+        var seq = ++reqSeqRef.current;
+        if (!silent && mountedRef.current) {
+          busyRef.current = true;
+          setBusy(true);
+        }
         try {
           var next = await fetchPairingState();
+          if (!mountedRef.current || seq !== reqSeqRef.current) return;
           setData(next);
           setErrorMsg('');
-          if (next && next.lan && next.lan.port) {
+          if (next && next.lan && next.lan.port && (!silent || !portInitializedRef.current)) {
             setPortInput(String(next.lan.port));
+            portInitializedRef.current = true;
           }
         } catch (err) {
+          if (!mountedRef.current || seq !== reqSeqRef.current) return;
           setErrorMsg(err && err.message ? err.message : String(err));
         } finally {
-          if (!silent) setBusy(false);
+          if (!silent && mountedRef.current) {
+            busyRef.current = false;
+            setBusy(false);
+          }
         }
       }, []);
 
       useEffect(function () {
+        mountedRef.current = true;
         reload(false);
         var timer = setInterval(function () { reload(true); }, 10000);
-        return function () { clearInterval(timer); };
+        return function () {
+          mountedRef.current = false;
+          clearInterval(timer);
+          if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        };
       }, [reload]);
 
       var runAction = async function (payload, okMsg) {
+        var seq = ++reqSeqRef.current;
+        busyRef.current = true;
         setBusy(true);
         try {
           var next = await mutatePairingState(payload);
+          if (!mountedRef.current || seq !== reqSeqRef.current) return;
           setData(next);
           setErrorMsg('');
           if (next && next.lan && next.lan.port) {
             setPortInput(String(next.lan.port));
+            portInitializedRef.current = true;
           }
           if (okMsg) notify(okMsg);
         } catch (err) {
+          if (!mountedRef.current || seq !== reqSeqRef.current) return;
           notify((zh ? '操作失败：' : 'Failed: ') + (err && err.message ? err.message : String(err)));
         } finally {
-          setBusy(false);
+          if (mountedRef.current) {
+            busyRef.current = false;
+            setBusy(false);
+          }
         }
       };
+
+      var explicitTheme = typeof document !== 'undefined' && document.documentElement
+        ? (document.documentElement.getAttribute('data-theme') || '').toLowerCase()
+        : '';
+      var isDarkUi = typeof window !== 'undefined' && (
+        explicitTheme === 'dark' ||
+        (explicitTheme !== 'light' && (
+          (document.documentElement && document.documentElement.classList.contains('dark')) ||
+          (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        ))
+      );
+      var accentInk = isDarkUi ? '#2dd4bf' : '#0f766e';
+      var accentSoft = isDarkUi ? 'rgba(45,212,191,0.16)' : 'rgba(15,118,110,0.14)';
 
       var endpoints = (data && Array.isArray(data.endpoints)) ? data.endpoints : [];
       var safeIdx = selectedIdx < endpoints.length ? selectedIdx : 0;
@@ -400,7 +470,7 @@ window.__ModuleLoader__.load({
               alignItems: 'flex-start',
             },
           },
-          h(QrCodeBox, { qr: activeEp && activeEp.qr, size: compact ? 176 : 204, zh: zh }),
+          h(QrCodeBox, { qr: activeEp && activeEp.qr, size: compact ? 176 : 204, zh: zh, loading: !data && !errorMsg }),
           h(
             'div',
             { style: { flex: '1 1 260px', minWidth: '240px' } },
@@ -432,10 +502,10 @@ window.__ModuleLoader__.load({
                             fontWeight: 600,
                             cursor: 'pointer',
                             border: active
-                              ? '1px solid #0f766e'
+                              ? ('1px solid ' + accentInk)
                               : '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.22))',
-                            background: active ? 'rgba(15,118,110,0.14)' : 'transparent',
-                            color: active ? '#0f766e' : 'var(--dsw-alias-label-secondary, inherit)',
+                            background: active ? accentSoft : 'transparent',
+                            color: active ? accentInk : 'var(--dsw-alias-label-secondary, inherit)',
                           },
                         },
                         (ep.label || ep.iface) + ' · ' + ep.ip
@@ -516,7 +586,7 @@ window.__ModuleLoader__.load({
                     zh ? '复制令牌' : 'Copy Token'
                   )
                 : null,
-              data && data.hasBridgeToken
+              data && (data.canRotateToken !== undefined ? data.canRotateToken : data.mode === 'lan-bridge')
                 ? h(
                     'button',
                     {
@@ -625,7 +695,7 @@ window.__ModuleLoader__.load({
                       marginTop: '10px',
                       fontSize: '12px',
                       fontWeight: 600,
-                      color: '#0f766e',
+                      color: accentInk,
                     },
                   },
                   toast

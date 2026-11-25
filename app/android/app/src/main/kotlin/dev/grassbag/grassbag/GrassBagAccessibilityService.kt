@@ -3,6 +3,8 @@ package dev.grassbag.grassbag
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.app.ActivityOptions
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -32,6 +34,8 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -53,6 +57,9 @@ class GrassBagAccessibilityService : AccessibilityService() {
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val screenshotExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "gb-a11y-shot").apply { isDaemon = true }
+    }
     private val lastScreenNodes = ConcurrentHashMap<String, CachedScreenNode>()
     private var screenOffRegistered = false
 
@@ -96,7 +103,8 @@ class GrassBagAccessibilityService : AccessibilityService() {
             val pkg = event.packageName?.toString()
             if (!pkg.isNullOrBlank() &&
                 pkg != "com.android.systemui" &&
-                !pkg.contains("inputmethod", ignoreCase = true)
+                !pkg.contains("inputmethod", ignoreCase = true) &&
+                (pkg != applicationContext.packageName || MainActivity.isMainActivityResumed)
             ) {
                 lastForegroundPackage = pkg
             }
@@ -109,7 +117,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Edge beam automatically updates via onSizeChanged.
+        PhoneOverlayController.getInstance(applicationContext).onConfigurationChanged()
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
@@ -119,6 +127,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         cleanupServiceState()
+        runCatching { screenshotExecutor.shutdownNow() }
         runCatching { super.onDestroy() }
     }
 
@@ -128,8 +137,10 @@ class GrassBagAccessibilityService : AccessibilityService() {
             screenOffRegistered = false
         }
         PhoneOverlayController.getInstance(applicationContext).detachService(this)
+        lastScreenNodes.clear()
         if (activeInstance === this) {
             activeInstance = null
+            lastForegroundPackage = null
             serviceConnected.set(false)
             notifyStateChanged(false)
         }
@@ -139,11 +150,34 @@ class GrassBagAccessibilityService : AccessibilityService() {
 
     fun currentForegroundPackage(): String? {
         val root = waitForActiveRoot(retries = 2)
-        return try {
-            root?.packageName?.toString()?.takeIf { it.isNotBlank() } ?: lastForegroundPackage
+        val rootPkg = try {
+            root?.packageName?.toString()?.takeIf { it.isNotBlank() }
         } finally {
             recycleCompat(root)
         }
+        if (rootPkg != null &&
+            rootPkg != "com.android.systemui" &&
+            !rootPkg.contains("inputmethod", ignoreCase = true)
+        ) {
+            return rootPkg
+        }
+        // Ignore transient SystemUI volume/notification popups or IME overlays by inspecting top application window.
+        val topAppPkg = runCatching {
+            windows?.firstOrNull { win ->
+                win.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION &&
+                    win.root?.packageName?.toString()?.let { p ->
+                        p.isNotBlank() && p != "com.android.systemui" && !p.contains("inputmethod", ignoreCase = true)
+                    } == true
+            }?.let { win ->
+                val r = win.root
+                try {
+                    r?.packageName?.toString()
+                } finally {
+                    recycleCompat(r)
+                }
+            }
+        }.getOrNull()
+        return topAppPkg ?: lastForegroundPackage ?: rootPkg
     }
 
     fun resolveAppLabel(pkg: String?): String? {
@@ -152,6 +186,49 @@ class GrassBagAccessibilityService : AccessibilityService() {
             val ai = packageManager.getApplicationInfo(pkg, 0)
             packageManager.getApplicationLabel(ai)?.toString()?.takeIf { it.isNotBlank() }
         }.getOrNull()
+    }
+
+    /**
+     * Brings GrassBag's MainActivity cleanly back to the foreground from the AccessibilityService
+     * context (sanctioned OS exemption for Android 10-16 Background Activity Launch restrictions).
+     */
+    fun bringGrassBagToFront(preferPendingIntent: Boolean = false): Boolean {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            )
+        }
+        if (!preferPendingIntent) {
+            val directOk = runCatching {
+                startActivity(intent)
+                true
+            }.getOrDefault(false)
+            if (directOk) return true
+        }
+        return runCatching {
+            val pi = PendingIntent.getActivity(
+                this,
+                7701,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val opts = ActivityOptions.makeBasic()
+                    .setPendingIntentBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    )
+                    .toBundle()
+                pi.send(this, 0, null, null, null, null, opts)
+            } else {
+                pi.send()
+            }
+            true
+        }.getOrDefault(false)
     }
 
     private fun waitForActiveRoot(retries: Int = 3): AccessibilityNodeInfo? {
@@ -183,7 +260,10 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 val hintOrDesc = listOfNotNull(cur.contentDescription?.toString(), nodeHintCompat(cur)).joinToString(" ")
                 val isPwd = runCatching { cur.isPassword }.getOrDefault(false)
                 val editable = runCatching { cur.isEditable }.getOrDefault(false)
-                if (isPwd || (editable && SafetyGate.isSensitiveNode(false, cur.text?.toString(), hintOrDesc, cur.viewIdResourceName))) {
+                // Check ancestors (`depth > 0`) regardless of `isEditable` so Material TextInputLayout /
+                // custom PIN/OTP wrapper containers carrying "密码"/"验证码"/"银行卡号" are always caught.
+                val textForCheck = if (depth == 0 && editable) cur.text?.toString() else null
+                if (isPwd || SafetyGate.isSensitiveNode(false, textForCheck, hintOrDesc.ifBlank { null }, cur.viewIdResourceName)) {
                     return true
                 }
                 val parent = cur.parent
@@ -274,7 +354,8 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 val viewId = runCatching { node.viewIdResourceName }.getOrNull()
 
                 if (rect.contains(cx.toInt(), cy.toInt())) {
-                    if (isPwd || (editable && SafetyGate.isSensitiveNode(false, text, listOfNotNull(desc, hint).joinToString(" "), viewId))) {
+                    val hintDesc = listOfNotNull(desc, hint).joinToString(" ").ifBlank { null }
+                    if (isPwd || SafetyGate.isSensitiveNode(false, if (editable) text else null, hintDesc, viewId)) {
                         hitsSensitive = true
                     }
                     val area = rect.width().toLong() * rect.height().toLong()
@@ -348,7 +429,9 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     val hint = runCatching { nodeHintCompat(node) }.getOrNull()
                     val combinedHint = listOfNotNull(desc, hint).joinToString(" ").ifBlank { null }
                     val viewId = runCatching { node.viewIdResourceName }.getOrNull()
-                    val sensitive = parentSensitive || isPwd || (editable && SafetyGate.isSensitiveNode(false, text, combinedHint, viewId))
+                    val sensitive = parentSensitive ||
+                        isPwd ||
+                        SafetyGate.isSensitiveNode(false, if (editable) text else null, combinedHint, viewId)
                     val visible = runCatching { node.isVisibleToUser }.getOrDefault(false)
                     val clickable = runCatching { node.isClickable }.getOrDefault(false)
 
@@ -437,18 +520,24 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 .put("hint", "截屏需要 Android 11 及以上，请改用 phone_screen 读取无障碍界面树。")
         }
         val pkg = currentForegroundPackage()
-        if (SafetyGate.isPackageBlocked(pkg) || pkg == "dev.grassbag.grassbag") {
-            return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
+        val blockedMultiWin = findBlockedVisibleWindowPackage(ignoreSelf = true)
+        if (SafetyGate.isPackageBlocked(pkg) || pkg == "dev.grassbag.grassbag" || blockedMultiWin != null) {
+            return JSONObject()
+                .put("ok", false)
+                .put("blocked", true)
+                .put("reason", "blocked_sensitive_package")
+                .apply { if (blockedMultiWin != null) put("blockedPackage", blockedMultiWin) }
         }
         val overlay = PhoneOverlayController.getInstance(applicationContext)
         overlay.hideForCapture(true)
+        var captureSucceeded = false
         try {
             runCatching { Thread.sleep(60L) }
             val latch = CountDownLatch(1)
             val resultRef = AtomicReference<JSONObject?>()
             takeScreenshot(
                 Display.DEFAULT_DISPLAY,
-                mainExecutor,
+                screenshotExecutor,
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
                         try {
@@ -456,37 +545,51 @@ class GrassBagAccessibilityService : AccessibilityService() {
                             if (hw == null) {
                                 resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_wrap_failed"))
                             } else {
-                                val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
-                                hw.recycle()
-                                screenshot.hardwareBuffer.close()
-                                val scaled = if (soft.width > maxWidth && maxWidth > 120) {
-                                    val targetH = (soft.height.toFloat() * maxWidth / soft.width).toInt().coerceAtLeast(1)
-                                    Bitmap.createScaledBitmap(soft, maxWidth, targetH, true).also {
-                                        if (it !== soft) soft.recycle()
-                                    }
-                                } else {
-                                    soft
+                                val soft = try {
+                                    hw.copy(Bitmap.Config.ARGB_8888, false)
+                                } finally {
+                                    hw.recycle()
                                 }
-                                val baos = ByteArrayOutputStream()
-                                scaled.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(30, 90), baos)
-                                val w = scaled.width
-                                val h = scaled.height
-                                scaled.recycle()
-                                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                                resultRef.set(
-                                    JSONObject()
-                                        .put("ok", true)
-                                        .put("package", pkg ?: "unknown")
-                                        .put("appLabel", resolveAppLabel(pkg) ?: (pkg ?: "unknown"))
-                                        .put("mimeType", "image/jpeg")
-                                        .put("width", w)
-                                        .put("height", h)
-                                        .put("base64", b64)
-                                )
+                                if (soft == null) {
+                                    resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_copy_failed"))
+                                } else {
+                                    var scaled: Bitmap? = null
+                                    try {
+                                        scaled = if (soft.width > maxWidth && maxWidth > 120) {
+                                            val targetH = (soft.height.toFloat() * maxWidth / soft.width).toInt().coerceAtLeast(1)
+                                            Bitmap.createScaledBitmap(soft, maxWidth, targetH, true)
+                                        } else {
+                                            soft
+                                        }
+                                        val baos = ByteArrayOutputStream()
+                                        val w = scaled.width
+                                        val h = scaled.height
+                                        scaled.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(30, 90), baos)
+                                        val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                                        resultRef.set(
+                                            JSONObject()
+                                                .put("ok", true)
+                                                .put("package", pkg ?: "unknown")
+                                                .put("appLabel", resolveAppLabel(pkg) ?: (pkg ?: "unknown"))
+                                                .put("mimeType", "image/jpeg")
+                                                .put("width", w)
+                                                .put("height", h)
+                                                .put("base64", b64)
+                                        )
+                                    } finally {
+                                        if (scaled != null && scaled !== soft && !scaled.isRecycled) {
+                                            scaled.recycle()
+                                        }
+                                        if (!soft.isRecycled) {
+                                            soft.recycle()
+                                        }
+                                    }
+                                }
                             }
                         } catch (t: Throwable) {
                             resultRef.set(JSONObject().put("ok", false).put("reason", "screenshot_encode_error:${t.message}"))
                         } finally {
+                            runCatching { screenshot.hardwareBuffer.close() }
                             latch.countDown()
                         }
                     }
@@ -498,24 +601,39 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 }
             )
             val done = runCatching { latch.await(4500L, TimeUnit.MILLISECONDS) }.getOrDefault(false)
-            return resultRef.get() ?: JSONObject().put("ok", false).put("reason", if (!done) "screenshot_timeout" else "screenshot_failed")
+            val result = resultRef.get() ?: JSONObject().put("ok", false).put("reason", if (!done) "screenshot_timeout" else "screenshot_failed")
+            captureSucceeded = result.optBoolean("ok", false)
+            return result
         } finally {
             overlay.hideForCapture(false)
+            if (captureSucceeded) {
+                overlay.showScreenshotPulse()
+            }
         }
     }
 
-    fun executeTapGesture(x: Float, y: Float, durationMs: Long = 65L): JSONObject {
+    fun executeTapGesture(
+        x: Float,
+        y: Float,
+        durationMs: Long = 65L,
+        targetLabel: String? = null
+    ): JSONObject {
         val (cx, cy) = clampPoint(x, y)
+        val clampedDur = durationMs.coerceIn(40L, 1800L)
+        val overlay = PhoneOverlayController.getInstance(applicationContext)
+        overlay.showTapFx(cx, cy, label = targetLabel, isLongPress = clampedDur >= 350L, durationMs = clampedDur)
         val path = Path().apply { moveTo(cx, cy) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(40L, 1800L))
+        val stroke = GestureDescription.StrokeDescription(path, 0L, clampedDur)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        return dispatchSafeGesture(gesture, durationMs + 1500L).put("x", cx).put("y", cy)
+        return dispatchSafeGesture(gesture, clampedDur + 1500L).put("x", cx).put("y", cy)
     }
 
     fun executeSwipeGesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 300L): JSONObject {
         val (cx1, cy1) = clampPoint(x1, y1)
         val (cx2, cy2) = clampPoint(x2, y2)
         val dur = durationMs.coerceIn(80L, 2000L)
+        val overlay = PhoneOverlayController.getInstance(applicationContext)
+        overlay.showSwipeFx(cx1, cy1, cx2, cy2, durationMs = dur)
         val path = Path().apply {
             moveTo(cx1, cy1)
             lineTo(cx2, cy2)
@@ -590,7 +708,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun executeType(text: String): JSONObject {
+    fun executeType(text: String, submit: Boolean = false): JSONObject {
         val root = waitForActiveRoot(retries = 3)
             ?: return JSONObject().put("ok", false).put("reason", "active_window_unavailable")
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
@@ -608,11 +726,13 @@ class GrassBagAccessibilityService : AccessibilityService() {
             var ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
             if (!ok && text.isNotEmpty()) {
                 val clipSet = AtomicBoolean(false)
+                val previousClip = AtomicReference<ClipData?>(null)
                 val clipLatch = CountDownLatch(1)
                 mainHandler.post {
                     runCatching {
                         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         if (cm != null) {
+                            previousClip.set(runCatching { cm.primaryClip }.getOrNull())
                             cm.setPrimaryClip(ClipData.newPlainText("grassbag_input", text))
                             clipSet.set(true)
                         }
@@ -621,9 +741,28 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 }
                 if (runCatching { clipLatch.await(1500, TimeUnit.MILLISECONDS) }.getOrDefault(false) && clipSet.get()) {
                     ok = runCatching { focused.performAction(AccessibilityNodeInfo.ACTION_PASTE) }.getOrDefault(false)
+                    // Restore user's prior clipboard after target app reads it; never wipe if previousClip
+                    // was unreadable (Android 10+ background clipboard privacy returns null!).
+                    mainHandler.postDelayed({
+                        runCatching {
+                            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return@runCatching
+                            val curLabel = cm.primaryClipDescription?.label?.toString()
+                            val prev = previousClip.get()
+                            if (curLabel == "grassbag_input" && prev != null) {
+                                cm.setPrimaryClip(prev)
+                            }
+                        }
+                    }, 350L)
                 }
             }
-            return JSONObject().put("ok", ok).put("length", text.length)
+            var submitted = false
+            if (ok && submit && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                runCatching { Thread.sleep(80L) }
+                submitted = runCatching {
+                    focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }.getOrDefault(false)
+            }
+            return JSONObject().put("ok", ok).put("length", text.length).put("submitted", submitted)
         } finally {
             if (focused != null && focused !== root) recycleCompat(focused)
             recycleCompat(root)

@@ -19,9 +19,16 @@ import 'web_embed.dart';
 /// on Flutter Web + real WebViewWidget on Android/iOS/macOS, and a Pure Original
 /// toggle («纯净原版»).
 class OfficialWebPage extends ConsumerStatefulWidget {
-  const OfficialWebPage({super.key, this.initialUrl});
+  const OfficialWebPage({
+    super.key,
+    this.initialUrl,
+    this.hostName,
+    this.allowBadCertificates,
+  });
 
   final String? initialUrl;
+  final String? hostName;
+  final bool? allowBadCertificates;
 
   @override
   ConsumerState<OfficialWebPage> createState() => _OfficialWebPageState();
@@ -87,6 +94,24 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
     return 'http://127.0.0.1:3080';
   }
 
+  static String? _extractSslErrorHost(Object request) {
+    final dynamic dyn = request;
+    try {
+      final rawUrl = dyn.url;
+      if (rawUrl is String && rawUrl.isNotEmpty) {
+        final uri = Uri.tryParse(rawUrl);
+        if (uri != null && uri.host.isNotEmpty) return uri.host.toLowerCase();
+      }
+    } catch (_) {}
+    try {
+      final rawHost = dyn.host;
+      if (rawHost is String && rawHost.isNotEmpty) {
+        return rawHost.toLowerCase();
+      }
+    } catch (_) {}
+    return null;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -100,6 +125,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
           ..setNavigationDelegate(
             NavigationDelegate(
               onPageStarted: (startedUrl) {
+                if (startedUrl == 'about:blank') return;
                 if (mounted) {
                   setState(() {
                     _loading = true;
@@ -132,20 +158,30 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                 if (mounted) {
                   setState(() {
                     _loading = false;
-                    _loadError = err.description;
+                    _loadError = _localizeWebError(err.description, err.errorCode);
                   });
                 }
               },
               onSslAuthError: (request) async {
-                final allowBad = mounted && ref.read(appProvider).activeHost.allowBadCertificates;
-                if (allowBad) {
+                final allowBad = widget.allowBadCertificates ??
+                    (mounted && ref.read(appProvider).activeHost.allowBadCertificates);
+                final targetUrl = (widget.initialUrl != null && widget.initialUrl!.isNotEmpty)
+                    ? widget.initialUrl!
+                    : (mounted ? ref.read(appProvider).activeHost.address : _fallbackUrl);
+                final targetHost = Uri.tryParse(targetUrl)?.host.toLowerCase() ?? '';
+                final errHost = _extractSslErrorHost(request);
+                final hostMatches =
+                    targetHost.isNotEmpty && errHost != null && errHost == targetHost;
+                if (allowBad && hostMatches) {
                   await request.proceed();
                 } else {
                   await request.cancel();
                   if (mounted) {
                     setState(() {
                       _loading = false;
-                      _loadError = '检测到自签名或不受信任的 HTTPS 证书，请先在「主机与环境」开启「信任自签名证书」后重试。';
+                      _loadError = allowBad && !hostMatches
+                          ? '已拦截非目标主机 (${errHost ?? '未知域名'}) 的不受信任 HTTPS 证书。'
+                          : '检测到自签名或不受信任的 HTTPS 证书，请先在「主机与环境」开启「信任自签名证书」后重试。';
                     });
                   }
                 }
@@ -225,6 +261,11 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
       final uri = Uri.tryParse(urlToOpen);
       if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
         await _webController!.loadRequest(uri);
+      } else if (mounted) {
+        setState(() {
+          _loading = false;
+          _loadError = '目标网页地址格式无效，请检查当前主机配置。';
+        });
       }
     } else if (supportsWebIframeEmbed) {
       updateWebIframeUrl(_iframeViewType, urlToOpen, forceReload: forceReload);
@@ -371,14 +412,44 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
         );
   }
 
+  static String _localizeWebError(String description, int errorCode) {
+    final upper = description.toUpperCase();
+    if (upper.contains('ERR_CONNECTION_REFUSED')) {
+      return '目标主机拒绝连接，请确认 DSH 网页服务正在运行。';
+    }
+    if (upper.contains('ERR_NAME_NOT_RESOLVED')) {
+      return '无法解析主机域名，请检查网络连接或主机地址。';
+    }
+    if (upper.contains('ERR_TIMED_OUT') || upper.contains('ERR_CONNECTION_TIMED_OUT')) {
+      return '连接超时，请确认设备与目标主机处于可达网络中。';
+    }
+    if (upper.contains('ERR_INTERNET_DISCONNECTED') || upper.contains('ERR_NETWORK_CHANGED')) {
+      return '当前网络已断开，请检查 Wi-Fi 或移动数据后重试。';
+    }
+    if (upper.contains('ERR_CLEARTEXT_NOT_PERMITTED')) {
+      return '系统拦截了明文 HTTP 请求，请检查主机地址或切换 HTTPS。';
+    }
+    if (upper.contains('SSL') || upper.contains('CERT')) {
+      return 'HTTPS 安全证书校验失败，若为自签名证书请在主机设置中开启信任。';
+    }
+    return description.isNotEmpty ? '页面加载失败：$description' : '页面加载失败（错误码 $errorCode）';
+  }
+
   static String _stripTokenParam(String raw) {
     final uri = Uri.tryParse(raw);
     if (uri == null || !uri.queryParameters.containsKey('token')) return raw;
     final nextParams = Map<String, String>.from(uri.queryParameters)..remove('token');
-    return uri
-        .replace(queryParameters: nextParams.isEmpty ? null : nextParams)
-        .toString()
-        .replaceFirst(RegExp(r'\?$'), '');
+    if (nextParams.isEmpty) {
+      return Uri(
+        scheme: uri.scheme,
+        userInfo: uri.userInfo.isEmpty ? null : uri.userInfo,
+        host: uri.host,
+        port: uri.hasPort ? uri.port : null,
+        path: uri.path,
+        fragment: uri.fragment.isEmpty ? null : uri.fragment,
+      ).toString();
+    }
+    return uri.replace(queryParameters: nextParams).toString();
   }
 
   String _displayUrl(String raw) {
@@ -421,8 +492,24 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
     final t = GrassBagTokens.of(context);
     final botPad = MediaQuery.viewPaddingOf(context).bottom;
 
-    return GrassBagGlassPage(
-      child: Scaffold(
+    return PopScope(
+      canPop: !_canGoBack,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          final nav = Navigator.of(context);
+          unawaited(() async {
+            if (await _webController?.canGoBack() == true) {
+              await _webController?.goBack();
+              unawaited(_syncNavAvailability());
+            } else if (mounted) {
+              setState(() => _canGoBack = false);
+              unawaited(nav.maybePop());
+            }
+          }());
+        }
+      },
+      child: GrassBagGlassPage(
+        child: Scaffold(
         backgroundColor: Colors.transparent,
         body: Stack(
           children: [
@@ -430,7 +517,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
               children: [
                 GrassBagUnifiedHeader(
                   title: '官方网页版',
-                  subtitle: state.activeHost.name,
+                  subtitle: widget.hostName ?? state.activeHost.name,
                   tier: state.glassTier,
                   floating: false,
                   onBack: () => Navigator.of(context).pop(),
@@ -669,6 +756,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
             const GrassBagToastOverlay(bottomOffset: 28),
           ],
         ),
+      ),
       ),
     );
   }

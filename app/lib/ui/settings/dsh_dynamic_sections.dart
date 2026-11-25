@@ -155,7 +155,6 @@ class DshGeneralSettingsView extends ConsumerWidget {
           presets: s.presets,
           activePresetId: s.activePresetId,
           autoFoldSteps: s.autoFoldSteps,
-          useSystemProxy: s.useSystemProxy,
           glassTier: s.glassTier,
         ),
       ),
@@ -193,9 +192,13 @@ class DshGeneralSettingsView extends ConsumerWidget {
             for (final tierOpt in permTiers)
               GrassBagListTile(
                 leading: GrassBagSquircleIcon(
-                  icon: tierOpt.risky
-                      ? CupertinoIcons.exclamationmark_shield_fill
-                      : CupertinoIcons.checkmark_shield_fill,
+                  icon: switch (tierOpt.id.toLowerCase()) {
+                    'readonly' || 'read-only' || 'plan' => CupertinoIcons.lock_shield_fill,
+                    'workspace' || 'workspace-write' || 'edit' => CupertinoIcons.shield_lefthalf_fill,
+                    _ => tierOpt.risky
+                        ? CupertinoIcons.exclamationmark_shield_fill
+                        : CupertinoIcons.checkmark_shield_fill,
+                  },
                   color: tierOpt.risky ? t.warn : t.primary,
                   size: 32,
                   iconSize: 15,
@@ -290,7 +293,7 @@ class DshGeneralSettingsView extends ConsumerWidget {
                   value: sessionLogEnabled,
                   tier: state.glassTier,
                   activeColor: t.ok,
-                  onChanged: sessionLogNs.writable
+                  onChanged: sessionLogNs.writable && state.isDshConnected
                       ? (v) => ctrl.patchDshNamespace('session-log-deepseek', {'enabled': v})
                       : null,
                 ),
@@ -374,6 +377,7 @@ class DshWebSearchSettingsView extends ConsumerWidget {
       children: [
         if (webNs != null) ...[
           SchemasteryForm(
+            key: ValueKey('${state.activeHostId}:${webNs.ns}'),
             namespaceId: webNs.ns,
             secretPaths: webNs.secrets,
             schema: webNs.schema,
@@ -589,6 +593,7 @@ class DshMcpSettingsView extends ConsumerWidget {
         ],
         if (mcpNs != null)
           SchemasteryForm(
+            key: ValueKey('${state.activeHostId}:${mcpNs.ns}'),
             namespaceId: mcpNs.ns,
             secretPaths: mcpNs.secrets,
             schema: mcpNs.schema,

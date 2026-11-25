@@ -69,6 +69,17 @@ class GbridgeClient {
       openSocket: _transport.openRawWebSocket,
       normalizer: normalizer,
       autoReconnect: _autoReconnect,
+      onAutoApprove: (clientId, eventId) async {
+        await _transport.requestJson(
+          'POST',
+          '/api/\$events/result',
+          body: {
+            'clientId': clientId,
+            'eventId': eventId,
+            'outcome': const {'kind': 'result', 'value': 'allowed-once'},
+          },
+        );
+      },
     );
     final adapter = VanillaDshAdapter(
       transport: _transport,
@@ -693,6 +704,7 @@ class GbridgeClient {
 
   Future<Map<String, dynamic>> patchTerminal(
     String terminalId, {
+    String? sessionId,
     String? title,
     int? cols,
     int? rows,
@@ -700,12 +712,20 @@ class GbridgeClient {
   }) {
     final v = _vanilla;
     if (v != null) {
-      return v.patchTerminal(terminalId, title: title, cols: cols, rows: rows, retain: retain);
+      return v.patchTerminal(
+        terminalId,
+        sessionId: sessionId,
+        title: title,
+        cols: cols,
+        rows: rows,
+        retain: retain,
+      );
     }
     return _transport.requestJson(
       'PATCH',
       '$prefix/terminals/${Uri.encodeComponent(terminalId)}',
       body: {
+        if (sessionId != null) 'sessionId': sessionId,
         if (title != null) 'title': title,
         if (cols != null) 'cols': cols,
         if (rows != null) 'rows': rows,
@@ -751,7 +771,7 @@ class GbridgeClient {
 
   Future<Map<String, dynamic>> interruptSubagent(String subagentId, {String? parentSessionId}) {
     final v = _vanilla;
-    if (v != null) return v.interruptSubagent(subagentId);
+    if (v != null) return v.interruptSubagent(subagentId, parentSessionId: parentSessionId);
     return _transport.requestJson(
       'POST',
       '$prefix/subagents/${Uri.encodeComponent(subagentId)}/interrupt',
@@ -836,13 +856,20 @@ class GbridgeClient {
     );
   }
 
-  Future<Map<String, dynamic>> getWorkspaceFileTree(String workspaceId, {String? path}) {
+  Future<Map<String, dynamic>> getWorkspaceFileTree(
+    String workspaceId, {
+    String? path,
+    String? sessionId,
+  }) {
     final v = _vanilla;
-    if (v != null) return v.getWorkspaceFileTree(workspaceId, path: path);
+    if (v != null) return v.getWorkspaceFileTree(workspaceId, path: path, sessionId: sessionId);
     return _transport.requestJson(
       'GET',
       '$prefix/workspaces/${Uri.encodeComponent(workspaceId)}/files/tree',
-      query: {if (path != null) 'path': path},
+      query: {
+        if (path != null) 'path': path,
+        if (sessionId != null) 'sessionId': sessionId,
+      },
     );
   }
 
@@ -1035,9 +1062,9 @@ class GbridgeClient {
     return _transport.requestJson('POST', '$prefix/presets/select', body: body);
   }
 
-  Future<Map<String, dynamic>> getSettingsSchema() {
+  Future<Map<String, dynamic>> getSettingsSchema({bool forceFresh = false}) {
     final v = _vanilla;
-    if (v != null) return v.getSettingsSchema();
+    if (v != null) return v.getSettingsSchema(forceFresh: forceFresh);
     return _transport.requestJson('GET', '$prefix/settings/schema');
   }
 

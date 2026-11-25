@@ -393,10 +393,22 @@ export function registerSystemDomain(router, { ctx, gateway }) {
       ? body.query
       : (typeof body.q === 'string' ? body.q : String(body.query?.text ?? ''));
     const text = rawQuery.trim();
-    const limit = Math.max(1, Math.min(50, Number(body.limit ?? body.query?.limit ?? 20)));
+    const rawLimit = Number(body.limit ?? body.query?.limit ?? 20);
+    const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(50, Math.round(rawLimit))) : 20;
 
     if (gateway.has('pluginMarket/search')) {
       let url = typeof body.url === 'string' && body.url.trim() ? body.url.trim() : null;
+      if (url) {
+        try {
+          const parsedUrl = new URL(url);
+          if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+            throw new GbridgeError(400, 'gbridge/validation_error', 'market index URL must use http or https');
+          }
+        } catch (err) {
+          if (err instanceof GbridgeError) throw err;
+          throw new GbridgeError(400, 'gbridge/validation_error', 'invalid market index URL');
+        }
+      }
       if (!url && gateway.has('pluginMarket/listIndexes')) {
         const indexes = await gateway.call('pluginMarket/listIndexes', {}, { peer }).catch(() => []);
         if (Array.isArray(indexes) && indexes.length > 0) {
@@ -405,16 +417,18 @@ export function registerSystemDomain(router, { ctx, gateway }) {
       }
       if (url) {
         try {
+          const rawOff = Number(typeof body.query === 'object' && body.query !== null ? (body.query.offset ?? 0) : (body.offset ?? 0));
+          const offset = Number.isFinite(rawOff) ? Math.max(0, Math.round(rawOff)) : 0;
           const queryObj = (typeof body.query === 'object' && body.query !== null)
             ? {
                 sort: body.query.sort ?? (text ? { kind: 'relevance' } : { kind: 'index' }),
-                offset: Number(body.query.offset ?? 0),
+                offset,
                 limit,
                 ...(text ? { text } : {}),
               }
             : {
                 sort: text ? { kind: 'relevance' } : { kind: 'index' },
-                offset: Number(body.offset ?? 0),
+                offset,
                 limit,
                 ...(text ? { text } : {}),
               };
@@ -797,26 +811,27 @@ export function registerSystemDomain(router, { ctx, gateway }) {
 
   router.patch('/settings', async (req, res, { peer }) => {
     const body = await readJsonBody(req);
+    const ns = body.ns ?? body.namespace;
     let ep;
     let args;
     if (Array.isArray(body.ops) && gateway.has('settings/mutate')) {
       ep = 'settings/mutate';
       args = {
-        ns: body.ns ?? body.namespace,
+        ns,
         ops: body.ops,
         ...(body.expectedRevision !== undefined ? { expectedRevision: body.expectedRevision } : {}),
       };
     } else if (body.section !== undefined && gateway.has('settings/replace')) {
       ep = 'settings/replace';
       args = {
-        ns: body.ns ?? body.namespace,
+        ns,
         section: body.section,
         ...(body.expectedRevision !== undefined ? { expectedRevision: body.expectedRevision } : {}),
       };
     } else if (gateway.has('settings/update')) {
       ep = 'settings/update';
       args = {
-        ns: body.ns ?? body.namespace,
+        ns,
         patch: body.patch ?? body.value ?? {},
         ...(body.expectedRevision !== undefined ? { expectedRevision: body.expectedRevision } : {}),
       };
@@ -824,8 +839,31 @@ export function registerSystemDomain(router, { ctx, gateway }) {
       ep = 'settings/mutate';
       args = body;
     }
-    const result = await gateway.call(ep, args, { peer });
-    sendJson(res, 200, { v: 1, result });
+    try {
+      const result = await gateway.call(ep, args, { peer });
+      sendJson(res, 200, { v: 1, result });
+    } catch (err) {
+      // Path-addressed `settings/mutate` and partial `settings/update` are applied by DSH
+      // against the latest stored section inside `configEditor.edit`. When a caller supplies
+      // a stale `expectedRevision` (e.g. after `session/selectModel` asynchronously bumped
+      // `agent-default-model`), safely retry once without `expectedRevision` instead of
+      // failing with a spurious HTTP 409 conflict. Keep strict conflict checks for `replace`.
+      const upCode = String(err?.details?.upstreamCode || err?.code || '').toLowerCase();
+      const msg = String(err?.message || '').toLowerCase();
+      const isConflict =
+        (err?.status === 409 ||
+          upCode.includes('settings/conflict') ||
+          upCode.includes('settings_conflict') ||
+          msg.includes('changed since it was read')) &&
+        args &&
+        args.expectedRevision !== undefined &&
+        (ep === 'settings/mutate' || ep === 'settings/update');
+      if (!isConflict) throw err;
+      const retryArgs = { ...args };
+      delete retryArgs.expectedRevision;
+      const result = await gateway.call(ep, retryArgs, { peer });
+      sendJson(res, 200, { v: 1, result, conflictRecovered: true });
+    }
   }, { domain: 'settings' });
 
   router.get('/presets', async (_req, res, { peer }) => {

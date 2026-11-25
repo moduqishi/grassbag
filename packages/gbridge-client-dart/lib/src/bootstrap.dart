@@ -346,6 +346,24 @@ class RemoteBootstrapClient {
         if (!_isRetryableMirrorError(e) || i == candidateSpecs.length - 1) {
           rethrow;
         }
+      } on TimeoutException catch (e) {
+        lastFailure = GbridgeException(
+          status: 504,
+          code: 'gbridge/timeout',
+          message: '安装连接助手请求超时 (${e.message ?? 'timeout'})',
+        );
+        if (i == candidateSpecs.length - 1) {
+          throw lastFailure;
+        }
+      } catch (e) {
+        lastFailure = GbridgeException(
+          status: 502,
+          code: 'bootstrap/transport_error',
+          message: '安装连接助手网络异常：$e',
+        );
+        if (i == candidateSpecs.length - 1) {
+          throw lastFailure;
+        }
       }
     }
 
@@ -448,6 +466,8 @@ class RemoteBootstrapClient {
     };
     try {
       return await _typertRpc('pluginManager/installBundle', args);
+    } on TimeoutException {
+      return _typertRpc('pluginManager/waitForInstall', {'requestId': requestId});
     } on GbridgeException catch (e) {
       // If the initial HTTP request timed out while DSH's pnpm download was still running,
       // recover the in-flight operation cleanly via `pluginManager/waitForInstall({ requestId })`!

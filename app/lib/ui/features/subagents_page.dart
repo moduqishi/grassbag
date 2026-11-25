@@ -65,6 +65,7 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
     final runningCount = state.subagents
         .where((s) => s.status.toLowerCase() == 'running')
         .length;
+    final sessionIdSet = {for (final s in state.sessions) s.id};
 
     return GrassBagGlassPage(
       child: Scaffold(
@@ -75,108 +76,131 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
               child: Center(
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
-                  child: ListView(
-                    physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-                    padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
-                    children: [
-                      if (state.connectionPhase != ConnectionPhase.connected) ...[
-                        GrassBagStatusBanner(
-                          tone: GrassBagBannerTone.warn,
-                          icon: CupertinoIcons.wifi_exclamationmark,
-                          title: '未连接到 DSH 主机',
-                          message: '子代理协作任务实时同步自运行中的 DSH 引擎，恢复连接后自动刷新。',
-                          borderRadius: 18,
-                          padding: const EdgeInsets.all(12),
-                          trailing: GrassBagSecondaryGlassButton(
-                            label: '重试连接',
-                            height: 30,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            tier: state.glassTier,
-                            insideGlass: true,
-                            accentForeground: true,
-                            onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                      if (state.subagents.isEmpty)
-                        GrassBagCard(
-                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
-                          child: Column(
-                            children: [
-                              Icon(CupertinoIcons.arrow_branch, size: 32, color: t.text3),
-                              const SizedBox(height: 10),
-                              Text(
-                                '当前对话暂无并行子代理',
-                                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '使用多任务拆解或 /teamwork 时会在此显示子代理协作任务与独立分支',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(fontSize: 12, color: t.text3),
-                              ),
-                              const SizedBox(height: 14),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 8,
-                                alignment: WrapAlignment.center,
-                                children: [
-                                  GrassBagPrimaryGlassButton(
-                                    label: '复制 /teamwork 示例',
-                                    icon: CupertinoIcons.doc_on_doc,
-                                    tier: state.glassTier,
-                                    insideGlass: true,
-                                    height: 38,
-                                    onTap: () {
-                                      Clipboard.setData(
-                                        const ClipboardData(
-                                          text: '/teamwork 并行分析项目结构、找出关键瓶颈并整理修复方案',
+                  child: RefreshIndicator.adaptive(
+                    edgeOffset: topPad + 64,
+                    onRefresh: () => ctrl.refreshSubagentsOnly(silent: true),
+                    child: CustomScrollView(
+                      physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                      slivers: [
+                        SliverPadding(
+                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          sliver: SliverMainAxisGroup(
+                            slivers: [
+                              if (state.connectionPhase != ConnectionPhase.connected)
+                                SliverToBoxAdapter(
+                                  child: Padding(
+                                    padding: const EdgeInsets.only(bottom: 12),
+                                    child: GrassBagStatusBanner(
+                                      tone: GrassBagBannerTone.warn,
+                                      icon: CupertinoIcons.wifi_exclamationmark,
+                                      title: '未连接到 DSH 主机',
+                                      message: '子代理协作任务实时同步自运行中的 DSH 引擎，恢复连接后自动刷新。',
+                                      borderRadius: 18,
+                                      padding: const EdgeInsets.all(12),
+                                      trailing: GrassBagSecondaryGlassButton(
+                                        label: '重试连接',
+                                        height: 30,
+                                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                                        tier: state.glassTier,
+                                        insideGlass: true,
+                                        accentForeground: true,
+                                        onTap: () => unawaited(ctrl.probeAndRefreshHost(state.activeHostId)),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              if (state.subagents.isEmpty)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
+                                    child: Column(
+                                      children: [
+                                        Icon(CupertinoIcons.arrow_branch, size: 32, color: t.text3),
+                                        const SizedBox(height: 10),
+                                        Text(
+                                          '当前对话暂无并行子代理',
+                                          style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2),
                                         ),
-                                      );
-                                      ctrl.showToast('已复制 /teamwork 示例，可粘贴到对话框发送', tone: ToastTone.ok);
-                                    },
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          '使用多任务拆解或 /teamwork 时会在此显示子代理协作任务与独立分支',
+                                          textAlign: TextAlign.center,
+                                          style: TextStyle(fontSize: 12, color: t.text3),
+                                        ),
+                                        const SizedBox(height: 14),
+                                        Wrap(
+                                          spacing: 8,
+                                          runSpacing: 8,
+                                          alignment: WrapAlignment.center,
+                                          children: [
+                                            GrassBagPrimaryGlassButton(
+                                              label: '复制 /teamwork 示例',
+                                              icon: CupertinoIcons.doc_on_doc,
+                                              tier: state.glassTier,
+                                              insideGlass: true,
+                                              height: 38,
+                                              onTap: () {
+                                                Clipboard.setData(
+                                                  const ClipboardData(
+                                                    text: '/teamwork 并行分析项目结构、找出关键瓶颈并整理修复方案',
+                                                  ),
+                                                );
+                                                ctrl.showToast('已复制 /teamwork 示例，可粘贴到对话框发送', tone: ToastTone.ok);
+                                              },
+                                            ),
+                                            GrassBagSecondaryGlassButton(
+                                              label: '刷新状态',
+                                              icon: CupertinoIcons.refresh,
+                                              tier: state.glassTier,
+                                              insideGlass: true,
+                                              height: 38,
+                                              onTap: () => unawaited(ctrl.refreshSubagentsOnly()),
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                  GrassBagSecondaryGlassButton(
-                                    label: '刷新状态',
-                                    icon: CupertinoIcons.refresh,
-                                    tier: state.glassTier,
-                                    insideGlass: true,
-                                    height: 38,
-                                    onTap: () => unawaited(ctrl.refreshSubagentsOnly()),
-                                  ),
-                                ],
-                              ),
+                                )
+                              else
+                                SliverList.builder(
+                                  itemCount: state.subagents.length,
+                                  itemBuilder: (_, idx) {
+                                    final sub = state.subagents[idx];
+                                    return Padding(
+                                      padding: const EdgeInsets.only(bottom: 12),
+                                      child: RepaintBoundary(
+                                        child: SubagentLineageCard(
+                                          item: sub,
+                                          onPrompt: () => _openPromptSheet(context, sub),
+                                          onInterrupt: sub.status.toLowerCase() == 'running'
+                                              ? () async {
+                                                  final ok = await showGrassBagConfirmDialog(
+                                                    context,
+                                                    title: '中断子代理「${sub.name}」？',
+                                                    message: '确定强制中断该正在执行的子代理任务吗？',
+                                                    confirmLabel: '确认中断',
+                                                    isDestructive: true,
+                                                  );
+                                                  if (ok) ctrl.interruptSubagent(sub.id);
+                                                }
+                                              : null,
+                                          onInspect: sessionIdSet.contains(sub.id)
+                                              ? () {
+                                                  ctrl.selectSession(sub.id);
+                                                  Navigator.of(context).pop();
+                                                }
+                                              : null,
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
                             ],
                           ),
-                        )
-                      else
-                        for (final sub in state.subagents) ...[
-                          SubagentLineageCard(
-                            item: sub,
-                            onPrompt: () => _openPromptSheet(context, sub),
-                            onInterrupt: sub.status.toLowerCase() == 'running'
-                                ? () async {
-                                    final ok = await showGrassBagConfirmDialog(
-                                      context,
-                                      title: '中断子代理「${sub.name}」？',
-                                      message: '确定强制中断该正在执行的子代理任务吗？',
-                                      confirmLabel: '确认中断',
-                                      isDestructive: true,
-                                    );
-                                    if (ok) ctrl.interruptSubagent(sub.id);
-                                  }
-                                : null,
-                            onInspect: state.sessions.any((s) => s.id == sub.id)
-                                ? () {
-                                    ctrl.selectSession(sub.id);
-                                    Navigator.of(context).pop();
-                                  }
-                                : null,
-                          ),
-                          const SizedBox(height: 12),
-                        ],
-                    ],
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -227,16 +251,22 @@ class SubagentLineageCard extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final st = item.status.toLowerCase();
     final isRunning = st == 'running';
+    final isPending = st == 'pending' || st == 'queued' || st == 'waiting';
     final isFailed = st == 'failed' || st == 'error';
     final isInterrupted = st == 'interrupted' || st == 'cancelled' || st == 'canceled';
     final statusColor = isRunning
         ? t.primary
-        : (isFailed ? t.err : (isInterrupted ? t.warn : t.ok));
+        : (isPending
+            ? t.warn
+            : (isFailed ? t.err : (isInterrupted ? t.warn : t.ok)));
     final statusLabel = isRunning
         ? '执行中'
-        : (isFailed ? '失败' : (isInterrupted ? '已中断' : '已完成'));
+        : (isPending
+            ? '排队中'
+            : (isFailed ? '失败' : (isInterrupted ? '已中断' : '已完成')));
+    final roleLabel = item.role.trim().toLowerCase() == 'subagent' ? '协作子代理' : item.role.trim();
     final metaLine = [
-      if (item.role.isNotEmpty) item.role,
+      if (roleLabel.isNotEmpty) roleLabel,
       if (item.model.isNotEmpty) item.model,
       if (item.durationLabel.isNotEmpty) item.durationLabel,
     ].join(' · ');
@@ -338,14 +368,18 @@ class SubagentLineageCard extends StatelessWidget {
             const SizedBox(height: 9),
             Container(
               width: double.infinity,
+              constraints: const BoxConstraints(maxHeight: 140),
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(
                 color: t.fill1,
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: Text(
-                item.outputPreview,
-                style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+              child: SingleChildScrollView(
+                child: SelectableText(
+                  item.outputPreview,
+                  contextMenuBuilder: buildGrassBagEditableContextMenu,
+                  style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+                ),
               ),
             ),
           ],
@@ -440,6 +474,7 @@ class _SubagentPromptDialogBody extends ConsumerStatefulWidget {
 
 class _SubagentPromptDialogBodyState extends ConsumerState<_SubagentPromptDialogBody> {
   final _textCtrl = TextEditingController();
+  bool _sending = false;
   String? _err;
 
   @override
@@ -448,14 +483,27 @@ class _SubagentPromptDialogBodyState extends ConsumerState<_SubagentPromptDialog
     super.dispose();
   }
 
-  void _submit() {
+  Future<void> _submit() async {
+    if (_sending) return;
     final msg = _textCtrl.text.trim();
     if (msg.isEmpty) {
       setState(() => _err = '请输入要发送给子代理的指令');
       return;
     }
-    ref.read(appProvider.notifier).promptSubagent(widget.sub.id, msg);
-    Navigator.of(context).pop();
+    setState(() {
+      _sending = true;
+      _err = null;
+    });
+    final ok = await ref.read(appProvider.notifier).promptSubagent(widget.sub.id, msg);
+    if (!mounted) return;
+    if (ok) {
+      Navigator.of(context).pop();
+    } else {
+      setState(() {
+        _sending = false;
+        _err = '发送失败，请检查主机连接状态后重试';
+      });
+    }
   }
 
   @override
@@ -492,16 +540,17 @@ class _SubagentPromptDialogBodyState extends ConsumerState<_SubagentPromptDialog
                 label: '取消',
                 tier: tier,
                 insideGlass: true,
-                onTap: () => Navigator.of(context).pop(),
+                onTap: _sending ? null : () => Navigator.of(context).pop(),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '发送指令',
+                label: _sending ? '发送中…' : '发送指令',
                 tier: tier,
                 insideGlass: true,
-                onTap: _submit,
+                enabled: !_sending,
+                onTap: _sending ? null : _submit,
               ),
             ),
           ],

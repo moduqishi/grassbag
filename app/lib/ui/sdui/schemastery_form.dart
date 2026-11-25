@@ -376,20 +376,27 @@ Map<String, dynamic> _resolveSchemasteryRef(
 
       if (nullable) out['nullable'] = true;
 
+      void mergePreservingOuter(Map<String, dynamic> child) {
+        final merged = <String, dynamic>{...child, ...out};
+        out
+          ..clear()
+          ..addAll(merged);
+      }
+
       if (objectVariants.length >= 2) {
         out['type'] = 'oneOf';
         out['variants'] = objectVariants;
       } else if (objectVariants.length == 1 && constValues.isEmpty) {
-        out.addAll(objectVariants.first);
+        mergePreservingOuter(objectVariants.first);
         if (nullable) out['nullable'] = true;
       } else if (objectVariants.length == 1 && constValues.isNotEmpty) {
         // e.g. `reasoningEfforts`: `false | Record<...>` -> favor object/dict editor with optional const toggle
-        out.addAll(objectVariants.first);
+        mergePreservingOuter(objectVariants.first);
         out['altConsts'] = constValues;
       } else if (singleNonNullSchema != null &&
           (singleNonNullSchema!['type'] == 'dict' || singleNonNullSchema!['type'] == 'array') &&
           constValues.isNotEmpty) {
-        out.addAll(singleNonNullSchema!);
+        mergePreservingOuter(singleNonNullSchema!);
         out['altConsts'] = constValues;
       } else if (constValues.isNotEmpty) {
         out['type'] = constValues.every((v) => v is bool)
@@ -400,7 +407,7 @@ Map<String, dynamic> _resolveSchemasteryRef(
           out['allowCustom'] = true;
         }
       } else if (singleNonNullSchema != null) {
-        out.addAll(singleNonNullSchema!);
+        mergePreservingOuter(singleNonNullSchema!);
         if (nullable) out['nullable'] = true;
       } else {
         out['type'] = fallbackType ?? 'string';
@@ -525,6 +532,68 @@ dynamic _deepCopyDynamic(dynamic src) {
   return src;
 }
 
+const Set<String> _kForbiddenDictKeys = {
+  '__proto__',
+  'constructor',
+  'prototype',
+};
+
+/// Validates a dictionary entry key for Schemastery configs so prototype
+/// pollution keys, dot-path separators, and control characters cannot corrupt
+/// DSH `settings/mutate` paths.
+String? validateSchemasteryDictKey(String rawKey) {
+  final k = rawKey.trim();
+  if (k.isEmpty) return '请输入唯一的条目名称';
+  if (_kForbiddenDictKeys.contains(k)) {
+    return '名称「$k」为保留关键字，请更换其他名称';
+  }
+  if (k.contains('.')) {
+    return '条目名称不能包含小数点 (.)';
+  }
+  for (final cu in k.codeUnits) {
+    if (cu <= 0x1F || cu == 0x7F) {
+      return '条目名称不能包含不可见控制字符';
+    }
+  }
+  return null;
+}
+
+/// Parses an integer or finite floating-point number (rejecting `NaN`,
+/// `Infinity`, and `-Infinity` which break JSON encoding).
+num? parseFiniteSchemaNumber(String raw, {required bool isInteger}) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return null;
+  if (isInteger) return int.tryParse(trimmed);
+  final asInt = int.tryParse(trimmed);
+  if (asInt != null) return asInt;
+  final asDouble = double.tryParse(trimmed);
+  if (asDouble == null || !asDouble.isFinite) return null;
+  return asDouble;
+}
+
+/// Matches a concrete path (e.g. `['providers', 'myRelay', 'apiKey']`) against
+/// DSH `secrets` path specs including `*` wildcard segments (`providers.*.apiKey`).
+bool matchesSchemasterySecretPath(List<String> path, Iterable<String> secretPaths) {
+  if (path.isEmpty) return false;
+  final dotted = path.join('.');
+  final last = path.last;
+  for (final pattern in secretPaths) {
+    if (pattern == dotted || pattern == last) return true;
+    if (!pattern.contains('*')) continue;
+    final segs = pattern.split('.');
+    if (segs.length != path.length) continue;
+    var ok = true;
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] != '*' && segs[i] != path[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
 /// Compute minimal DSH `settings/mutate` patch ops (`set` / `unset`) between [before] and [after]
 /// so untouched redacted `role('secret')` paths are NEVER overwritten or wiped on save.
 List<Map<String, dynamic>> computeSchemasteryMutationOps(
@@ -557,12 +626,11 @@ List<Map<String, dynamic>> computeSchemasteryMutationOps(
     final allKeys = <String>{...oldM.keys, ...newM.keys};
     for (final k in allKeys) {
       final path = [...prefix, k];
-      final dotted = path.join('.');
       final hadOld = oldM.containsKey(k);
       final hasNew = newM.containsKey(k);
       final oldV = oldM[k];
       final newV = newM[k];
-      final isSecretPath = secretPaths.contains(dotted) || secretPaths.contains(k);
+      final isSecretPath = matchesSchemasterySecretPath(path, secretPaths);
       if (isSecretPath && (!hasNew || newV == null || (newV is String && newV.isEmpty))) {
         // Leave redacted secret untouched unless explicitly replaced with a new non-empty value.
         continue;
@@ -638,17 +706,26 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
   late Map<String, dynamic> _values;
   late Map<String, dynamic> _normalizedSchema;
   bool _dirty = false;
+  int _editSeq = 0;
   bool _saving = false;
   bool _jsonMode = false;
+  bool _userToggledJsonMode = false;
   bool _copiedError = false;
   String? _saveError;
   String? _jsonParseError;
   final Map<String, String> _fieldErrors = <String, String>{};
   final Map<String, String> _pendingFieldErrors = <String, String>{};
   Timer? _jsonValidateTimer;
-  Timer? _numValidateTimer;
+  final Map<String, Timer> _numValidateTimers = <String, Timer>{};
   final TextEditingController _jsonCtrl = TextEditingController();
   final FocusNode _jsonFocusNode = FocusNode();
+
+  void _cancelAllNumValidateTimers() {
+    for (final t in _numValidateTimers.values) {
+      t.cancel();
+    }
+    _numValidateTimers.clear();
+  }
 
   bool _hasStructuredProperties() {
     final props = _normalizedSchema['properties'];
@@ -675,9 +752,20 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.schema != widget.schema) {
       _normalizedSchema = normalizeSchemasteryToJsonSchema(widget.schema);
+      final hasStruct = _hasStructuredProperties();
+      if (hasStruct && _jsonMode && !_userToggledJsonMode) {
+        _jsonMode = false;
+        _jsonParseError = null;
+      } else if (!hasStruct && !_jsonMode) {
+        _jsonMode = true;
+        _syncJsonText(force: true);
+      }
     }
     if (oldWidget.initialValues != widget.initialValues && !_dirty) {
       _values = _deepCopyMap(widget.initialValues);
+      _cancelAllNumValidateTimers();
+      _pendingFieldErrors.clear();
+      _fieldErrors.clear();
       if (_jsonMode && !_jsonFocusNode.hasFocus) _syncJsonText();
     }
   }
@@ -685,10 +773,22 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
   @override
   void dispose() {
     _jsonValidateTimer?.cancel();
-    _numValidateTimer?.cancel();
+    _cancelAllNumValidateTimers();
     _jsonFocusNode.dispose();
     _jsonCtrl.dispose();
     super.dispose();
+  }
+
+  dynamic _readRawPath(List<String> path) {
+    dynamic cur = _values;
+    for (final seg in path) {
+      if (cur is Map && cur.containsKey(seg)) {
+        cur = cur[seg];
+      } else {
+        return null;
+      }
+    }
+    return cur;
   }
 
   void _syncJsonText({bool force = false}) {
@@ -724,6 +824,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
     if (widget.readOnly) return;
     void applyMutation() {
       _dirty = true;
+      _editSeq++;
       _saveError = null;
       Map<String, dynamic> cur = _values;
       for (var i = 0; i < path.length - 1; i++) {
@@ -774,12 +875,13 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
         return;
       }
     } else if (_fieldErrors.isNotEmpty || _pendingFieldErrors.isNotEmpty) {
-      _numValidateTimer?.cancel();
+      _cancelAllNumValidateTimers();
       _fieldErrors.addAll(_pendingFieldErrors);
       setState(() => _saveError = _fieldErrors.values.first);
       return;
     }
     HapticFeedback.lightImpact();
+    final seqAtSave = _editSeq;
     setState(() {
       _saving = true;
       _saveError = null;
@@ -794,13 +896,15 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
         setState(() {
           _saving = false;
           if (err == null) {
-            _dirty = false;
+            if (_editSeq == seqAtSave) {
+              _dirty = false;
+              _fieldErrors.clear();
+              _pendingFieldErrors.clear();
+              // Keep the freshly submitted `_values` (do NOT overwrite with stale `widget.initialValues`
+              // before the parent finishes rebuilding with the persisted config!).
+              if (_jsonMode) _syncJsonText();
+            }
             _saveError = null;
-            _fieldErrors.clear();
-            _pendingFieldErrors.clear();
-            // Keep the freshly submitted `_values` (do NOT overwrite with stale `widget.initialValues`
-            // before the parent finishes rebuilding with the persisted config!).
-            if (_jsonMode) _syncJsonText();
           } else {
             _saveError = err;
           }
@@ -858,21 +962,25 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                   height: 34,
                   onSelected: (idx) {
                       if (idx == 1 && !_jsonMode) {
-                        _numValidateTimer?.cancel();
+                        _cancelAllNumValidateTimers();
                         _pendingFieldErrors.clear();
                         _fieldErrors.clear();
                         _syncJsonText(force: true);
-                        setState(() => _jsonMode = true);
+                        setState(() {
+                          _userToggledJsonMode = true;
+                          _jsonMode = true;
+                        });
                       } else if (idx == 0 && _jsonMode) {
                         try {
                           final parsed = jsonDecode(_jsonCtrl.text);
                           if (parsed is Map) {
-                            _numValidateTimer?.cancel();
+                            _cancelAllNumValidateTimers();
                             _pendingFieldErrors.clear();
                             setState(() {
                               _values = _deepCopyMap(Map<String, dynamic>.from(parsed));
                               _fieldErrors.clear();
                               _jsonParseError = null;
+                              _userToggledJsonMode = true;
                               _jsonMode = false;
                             });
                           } else {
@@ -990,6 +1098,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           padding: const EdgeInsets.all(12),
           hasError: _jsonParseError != null,
           onChanged: (v) {
+            _editSeq++;
             if (!_dirty) {
               setState(() => _dirty = true);
             }
@@ -1107,12 +1216,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                 }
                               }
                             }
-                            _numValidateTimer?.cancel();
+                            _cancelAllNumValidateTimers();
                             _pendingFieldErrors.clear();
                             setState(() {
                               _values = nextMap;
                               _fieldErrors.clear();
                               _dirty = true;
+                              _editSeq++;
                               _saveError = null;
                             });
                           },
@@ -1315,7 +1425,9 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
       final allowCustom = schema['allowCustom'] == true;
       final isNumericEnum = type == 'integer' || type == 'number';
       final options = enumVals.map((e) => e.toString()).toList(growable: false);
-      final curStr = current?.toString();
+      // For nullable enums, respect explicit absence/null without snapping back to `default`.
+      final effectiveEnumVal = isNullable ? _readRawPath(path) : current;
+      final curStr = effectiveEnumVal?.toString();
       return Padding(
         padding: const EdgeInsets.fromLTRB(15, 12, 15, 13),
         child: Column(
@@ -1368,9 +1480,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     return;
                   }
                   if (isNumericEnum) {
-                    final parsed = type == 'integer'
-                        ? int.tryParse(v.trim())
-                        : (int.tryParse(v.trim()) ?? double.tryParse(v.trim()));
+                    final parsed = parseFiniteSchemaNumber(v, isInteger: type == 'integer');
                     if (parsed != null) _writePath(path, parsed);
                   } else {
                     _writePath(path, v);
@@ -1390,7 +1500,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
       final isBoundedSlider =
           rawMin != null && rawMax != null && rawMax > rawMin && (rawMax - rawMin) <= 100;
       if (isBoundedSlider) {
-        final numCur = ((current as num?)?.toDouble() ?? rawMin).clamp(rawMin, rawMax);
+        final rawNum = current is num
+            ? current.toDouble()
+            : double.tryParse(current?.toString() ?? '');
+        final numCur = (rawNum != null && rawNum.isFinite ? rawNum : rawMin).clamp(rawMin, rawMax);
         final isInt = type == 'integer' || (schema['step'] as num?)?.toDouble() == 1.0;
         return Padding(
           padding: const EdgeInsets.fromLTRB(15, 12, 15, 8),
@@ -1435,6 +1548,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     min: rawMin,
                     max: rawMax,
                     divisions: isInt && divs > 0 && divs <= 100 ? divs : null,
+                    tier: widget.tier,
                     activeColor: t.primary,
                     onChanged: widget.readOnly
                         ? null
@@ -1479,16 +1593,14 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               readOnly: widget.readOnly,
               onChanged: (v) {
                 final trimmed = v.trim();
-                _numValidateTimer?.cancel();
+                _numValidateTimers.remove(numPathKey)?.cancel();
                 if (trimmed.isEmpty) {
                   _pendingFieldErrors.remove(numPathKey);
                   final hadErr = _fieldErrors.remove(numPathKey) != null;
                   _writePath(path, null, removeIfNull: true, rebuild: hadErr);
                   return;
                 }
-                final parsed = type == 'integer'
-                    ? int.tryParse(trimmed)
-                    : (int.tryParse(trimmed) ?? double.tryParse(trimmed));
+                final parsed = parseFiniteSchemaNumber(trimmed, isInteger: type == 'integer');
                 String? pendingErr;
                 if (parsed == null) {
                   pendingErr = '$title 需要有效的${type == 'integer' ? '整数' : '数字'}';
@@ -1506,7 +1618,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   // while debouncing the inline banner so multi-digit typing doesn't bounce layout.
                   final errMsg = pendingErr;
                   _pendingFieldErrors[numPathKey] = errMsg;
-                  _numValidateTimer = Timer(const Duration(milliseconds: 450), () {
+                  _numValidateTimers[numPathKey] = Timer(const Duration(milliseconds: 450), () {
+                    _numValidateTimers.remove(numPathKey);
                     if (!mounted) return;
                     if (_pendingFieldErrors[numPathKey] == errMsg &&
                         _fieldErrors[numPathKey] != errMsg) {
@@ -1523,6 +1636,94 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               ),
           ],
         ),
+      );
+    }
+
+    // 6b. Optional const alternatives for object/dict/array unions (e.g. `false | Record<...>`)
+    final altConsts = schema['altConsts'];
+    if ((type == 'object' || type == 'dict' || type == 'array') &&
+        altConsts is List &&
+        altConsts.isNotEmpty) {
+      final rawCur = _readRawPath(path);
+      final isAltConst = altConsts.any((c) => rawCur == c);
+      Widget buildStructuredBody() {
+        if (type == 'object' && schema['properties'] is Map<String, dynamic>) {
+          final nestedProps = schema['properties'] as Map<String, dynamic>;
+          final mapVal = current is Map ? Map<String, dynamic>.from(current) : <String, dynamic>{};
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(15, 0, 15, 12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text('自定义对象 (${nestedProps.length} 项)', style: TextStyle(fontSize: 12.5, color: t.text2)),
+                ),
+                GrassBagSpringTap(
+                  onTap: () => _openNestedObjectSheet(
+                    context,
+                    title: title,
+                    schema: schema,
+                    initialValue: mapVal,
+                    pathPrefix: path,
+                    onApply: (updated) => _writePath(path, updated),
+                  ),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                    decoration: BoxDecoration(color: t.primarySoft, borderRadius: BorderRadius.circular(999)),
+                    child: Text('编辑', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary)),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+        if (type == 'array') {
+          return _buildArrayField(context, path, title, desc, schema, current);
+        }
+        return _buildDictField(context, path, title, desc, schema, current);
+      }
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(15, 12, 15, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500, color: t.text)),
+                if (desc != null) ...[
+                  const SizedBox(height: 2),
+                  Text(desc, style: TextStyle(fontSize: 12, color: t.text3)),
+                ],
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _EnumChip(
+                      label: '自定义配置',
+                      selected: !isAltConst,
+                      onTap: () {
+                        if (widget.readOnly || !isAltConst) return;
+                        _writePath(path, buildDefaultValueForSchema(schema));
+                      },
+                    ),
+                    for (final c in altConsts)
+                      _EnumChip(
+                        label: c == false ? '禁用 (false)' : (c == true ? '启用 (true)' : _labelForOption(c)),
+                        selected: rawCur == c,
+                        onTap: () {
+                          if (widget.readOnly) return;
+                          _writePath(path, c);
+                        },
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          if (!isAltConst) buildStructuredBody(),
+        ],
       );
     }
 
@@ -1587,7 +1788,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
 
     // 10. String / Secret / Credential-ref / Any fallback
     final dottedPath = path.join('.');
-    final isRedactedSecret = widget.secretPaths.contains(dottedPath) || widget.secretPaths.contains(key);
+    final isRedactedSecret = matchesSchemasterySecretPath(path, widget.secretPaths);
     final isSecret = schema['format'] == 'password' || schema['secret'] == true || isRedactedSecret;
     final isCredRef = schema['role'] == 'credential-ref';
     final isTextarea = schema['role'] == 'textarea';
@@ -1670,6 +1871,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
     final variants = (schema['variants'] as List)
         .whereType<Map<String, dynamic>>()
         .toList(growable: false);
+    if (variants.isEmpty) return const SizedBox.shrink();
     final curMap = current is Map ? Map<String, dynamic>.from(current) : <String, dynamic>{};
 
     // Detect discriminator key (a property whose schema is `type: const`)
@@ -1847,8 +2049,15 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       initialValue: itemMap,
                       pathPrefix: [...path, '$i'],
                       onApply: (updated) {
-                        final next = List<dynamic>.from(list);
-                        next[i] = updated;
+                        final rawCur = _readRawPath(path);
+                        final next = rawCur is List
+                            ? List<dynamic>.from(rawCur)
+                            : List<dynamic>.from(list);
+                        if (i >= 0 && i < next.length) {
+                          next[i] = updated;
+                        } else {
+                          next.add(updated);
+                        }
                         _writePath(path, next);
                       },
                     );
@@ -1895,7 +2104,9 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           initialValue: map,
                           pathPrefix: [...path, '*'],
                           onApply: (created) {
-                            _writePath(path, [...list, created]);
+                            final rawCur = _readRawPath(path);
+                            final base = rawCur is List ? rawCur : list;
+                            _writePath(path, [...base, created]);
                           },
                         );
                       },
@@ -2006,9 +2217,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               numeric: isNumericItem,
               onAdd: (val) {
                 if (isNumericItem) {
-                  final parsed = itemType == 'integer'
-                      ? int.tryParse(val)
-                      : (int.tryParse(val) ?? double.tryParse(val));
+                  final parsed = parseFiniteSchemaNumber(val, isInteger: itemType == 'integer');
                   if (parsed == null) return false;
                   _writePath(path, [...list, parsed]);
                   return true;
@@ -2088,7 +2297,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       initialValue: itemMap,
                       pathPrefix: [...path, entry.key],
                       onApply: (updated) {
-                        final next = Map<String, dynamic>.from(map);
+                        final rawCur = _readRawPath(path);
+                        final next = rawCur is Map
+                            ? Map<String, dynamic>.from(rawCur)
+                            : Map<String, dynamic>.from(map);
                         next[entry.key] = updated;
                         _writePath(path, next);
                       },
@@ -2212,7 +2424,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               _QuickAddChipInput(
                 placeholder: '输入键名后添加开关…',
                 onAdd: (k) {
-                  final next = Map<String, dynamic>.from(map);
+                  if (validateSchemasteryDictKey(k) != null) return false;
+                  final rawCur = _readRawPath(path);
+                  final next = rawCur is Map
+                      ? Map<String, dynamic>.from(rawCur)
+                      : Map<String, dynamic>.from(map);
                   next[k] = true;
                   _writePath(path, next);
                   return true;
@@ -2307,16 +2523,21 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               valPlaceholder: isNumVal ? '数值' : '值',
               numericValue: isNumVal,
               onAdd: (k, v) {
-                final next = Map<String, dynamic>.from(map);
+                final keyErr = validateSchemasteryDictKey(k);
+                if (keyErr != null) return keyErr;
+                final rawCur = _readRawPath(path);
+                final next = rawCur is Map
+                    ? Map<String, dynamic>.from(rawCur)
+                    : Map<String, dynamic>.from(map);
                 if (isNumVal) {
-                  final parsed = int.tryParse(v) ?? double.tryParse(v);
-                  if (parsed == null) return false;
+                  final parsed = parseFiniteSchemaNumber(v, isInteger: valType == 'integer');
+                  if (parsed == null) return valType == 'integer' ? '请输入有效整数' : '请输入有效数值';
                   next[k] = parsed;
                 } else {
                   next[k] = v;
                 }
                 _writePath(path, next);
-                return true;
+                return null;
               },
             ),
         ],
@@ -2408,7 +2629,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               initialValue: initMap,
               pathPrefix: [...path, k],
               onApply: (created) {
-                final next = Map<String, dynamic>.from(currentMap);
+                final rawCur = _readRawPath(path);
+                final next = rawCur is Map
+                    ? Map<String, dynamic>.from(rawCur)
+                    : Map<String, dynamic>.from(currentMap);
                 next[k] = created;
                 _writePath(path, next);
               },
@@ -2628,8 +2852,9 @@ class _AddDictObjectKeyBodyState extends State<_AddDictObjectKeyBody> {
 
   void _submit() {
     final k = _keyCtrl.text.trim();
-    if (k.isEmpty) {
-      setState(() => _error = '请输入唯一的条目名称');
+    final keyErr = validateSchemasteryDictKey(k);
+    if (keyErr != null) {
+      setState(() => _error = keyErr);
       return;
     }
     if (widget.existingKeys.contains(k)) {
@@ -2886,7 +3111,7 @@ class _QuickAddKeyValueInput extends StatefulWidget {
 
   final String keyPlaceholder;
   final String valPlaceholder;
-  final bool Function(String key, String val) onAdd;
+  final String? Function(String key, String val) onAdd;
   final bool numericValue;
 
   @override
@@ -2911,13 +3136,13 @@ class _QuickAddKeyValueInputState extends State<_QuickAddKeyValueInput> {
     final k = _kCtrl.text.trim();
     final v = _vCtrl.text.trim();
     if (k.isEmpty) return;
-    final ok = widget.onAdd(k, v);
-    if (ok) {
+    final err = widget.onAdd(k, v);
+    if (err == null) {
       _kCtrl.clear();
       _vCtrl.clear();
       if (_err != null) setState(() => _err = null);
     } else {
-      setState(() => _err = '数值格式无效');
+      setState(() => _err = err);
     }
   }
 
@@ -2937,6 +3162,9 @@ class _QuickAddKeyValueInputState extends State<_QuickAddKeyValueInput> {
                 insideGlass: true,
                 monospace: true,
                 textInputAction: TextInputAction.next,
+                onChanged: (_) {
+                  if (_err != null) setState(() => _err = null);
+                },
                 onSubmitted: (_) => _vFocus.requestFocus(),
                 fontSize: 12,
                 borderRadius: 12,

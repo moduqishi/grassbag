@@ -2048,9 +2048,8 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Authentic Apple iOS 26/27 Liquid Glass optics: spherical lens with zero CA on
-      //    zero-frost floating chrome (avoids shader `isClearIndicator` dark rim burn in Light Mode)
-      //    and paraxial fast-path iOS 27 frost bokeh (blur == 0.0) on modal sheets!
+      // 3) Crystal-clear translucent Liquid Glass optics: ultra-low veil spherical lens
+      //    with prismatic chromatic rim on floating chrome & silky crystal bokeh on modal sheets!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
@@ -2061,16 +2060,19 @@ void main() {
         expect(surf.lensModel, GlassLensModel.spherical);
         expect(surf.frost, 0.0);
         expect(surf.ambientRim, 0.0);
-        expect(surf.rimLight, greaterThan(0.5));
-        expect(surf.chromaticAberration, 0.0);
-        expect(surf.blur, inInclusiveRange(3.0, 5.5));
-        expect(surf.lightIntensity, lessThanOrEqualTo(0.3));
-        expect(sheet.lensModel, GlassLensModel.paraxial);
-        expect(sheet.blur, 0.0);
-        expect(sheet.frost, greaterThanOrEqualTo(12.0));
-        expect(sheet.frostOpacity, 1.0);
-        expect(sheet.rimLight, greaterThan(0.5));
-        expect(sheet.chromaticAberration, 0.0);
+        expect(surf.rimShade, 0.0);
+        expect(surf.rimLight, greaterThan(0.8));
+        expect(surf.chromaticAberration, greaterThan(0.0));
+        expect(surf.blur, inInclusiveRange(1.0, 2.5));
+        expect(surf.lightIntensity, greaterThanOrEqualTo(0.8));
+        expect(surf.glassColor.a, lessThanOrEqualTo(0.10));
+        expect(sheet.lensModel, GlassLensModel.spherical);
+        expect(sheet.blur, inInclusiveRange(3.5, 5.5));
+        expect(sheet.frost, 0.0);
+        expect(sheet.frostOpacity, 0.0);
+        expect(sheet.rimLight, greaterThan(0.8));
+        expect(sheet.chromaticAberration, greaterThan(0.0));
+        expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
       }
 
       // 4) RemoteHostConnectCard shows Desktop GUI (免命令) 1-click prompt + concrete-IP CLI tab (zero 0.0.0.0)
@@ -2320,8 +2322,9 @@ void main() {
   testWidgets(
     'v12 regression: Liquid Glass optics calibration, nested italic+bold, streaming code stability, fractional slider & Cron weekdays',
     (tester) async {
-      // 1) Authentic Apple iOS 26/27 Liquid Glass calibration: spherical lens on zero-frost chrome
-      //    (zero CA, zero ambientRim, clean achromatic tint) and paraxial fast-path frost bokeh on sheets.
+      // 1) Crystal-clear Kyant0-grade translucent Liquid Glass calibration:
+      //    ultra-low white veil + razor-crisp blur (`1.5dp`) + vivid refraction (`n>=1.30`, CA>0)
+      //    on chrome, and crystal bokeh (`blur: 4.6`, `frost: 0.0`) on sheets/dialogs (NEVER milky!).
       for (final brightness in Brightness.values) {
         final t = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
         final norm = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: false);
@@ -2329,19 +2332,24 @@ void main() {
         final sheet = GrassBagGlassConfig.sheetSettings(t, GrassBagGlassTier.liquid);
         expect(norm.lensModel, GlassLensModel.spherical);
         expect(elev.lensModel, GlassLensModel.spherical);
-        expect(sheet.lensModel, GlassLensModel.paraxial);
-        expect(norm.chromaticAberration, 0.0);
-        expect(elev.chromaticAberration, 0.0);
-        expect(sheet.chromaticAberration, 0.0);
+        expect(sheet.lensModel, GlassLensModel.spherical);
+        expect(norm.chromaticAberration, greaterThan(0.0));
+        expect(elev.chromaticAberration, greaterThan(0.0));
+        expect(sheet.chromaticAberration, greaterThan(0.0));
         expect(norm.ambientRim, 0.0);
-        expect(norm.rimLight, greaterThan(0.5));
+        expect(norm.rimShade, 0.0);
+        expect(norm.rimLight, greaterThan(0.8));
         expect(sheet.ambientRim, 0.0);
-        expect(sheet.rimLight, greaterThan(0.5));
-        expect(sheet.blur, 0.0);
-        expect(sheet.frost, greaterThanOrEqualTo(12.0));
-        expect(sheet.frostOpacity, 1.0);
-        expect(norm.blur, inInclusiveRange(3.0, 5.5));
-        expect(elev.blur, inInclusiveRange(3.0, 5.5));
+        expect(sheet.rimShade, 0.0);
+        expect(sheet.rimLight, greaterThan(0.8));
+        expect(sheet.frost, 0.0);
+        expect(sheet.frostOpacity, 0.0);
+        expect(sheet.blur, inInclusiveRange(3.5, 5.5));
+        expect(norm.blur, inInclusiveRange(1.0, 2.5));
+        expect(elev.blur, inInclusiveRange(1.0, 2.5));
+        expect(norm.glassColor.a, lessThanOrEqualTo(0.10));
+        expect(elev.glassColor.a, lessThanOrEqualTo(0.16));
+        expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
         expect(norm.glassColor.r, closeTo(1.0, 0.02));
         expect(norm.glassColor.g, closeTo(1.0, 0.02));
         expect(norm.glassColor.b, closeTo(1.0, 0.02));

@@ -448,21 +448,23 @@ void main() {
     );
 
     testWidgets(
-      'Model pill NEVER flashes 未连接 during ConnectionPhase.reconnecting & iOS 26/27 spherical-chrome / paraxial-sheet glass optics contract holds',
+      'Model pill NEVER flashes 未连接 during ConnectionPhase.reconnecting & crystal-clear Liquid Glass optics contract holds',
       (tester) async {
-        // 1. iOS 26/27 spherical zero-frost chrome (zero isClearIndicator dark-rim burn) &
-        //    iOS 27 paraxial frosted sheet cloud (zero wasted double backdrop blur) contracts
+        // 1. Crystal-clear Kyant0-grade translucent Liquid Glass contract (zero milky frost slab!)
         for (final brightness in [Brightness.light, Brightness.dark]) {
           final tok = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
           final surf = GrassBagGlassConfig.surfaceSettings(tok, GrassBagGlassTier.liquid);
           final sheet = GrassBagGlassConfig.sheetSettings(tok, GrassBagGlassTier.liquid);
           expect(surf.lensModel, GlassLensModel.spherical);
-          expect(surf.chromaticAberration, 0.0);
-          expect(sheet.lensModel, GlassLensModel.paraxial);
-          expect(sheet.blur, 0.0);
-          expect(sheet.frostOpacity, 1.0);
-          expect(sheet.frost, greaterThanOrEqualTo(14.0));
-          expect(surf.lightIntensity, lessThanOrEqualTo(0.25));
+          expect(surf.chromaticAberration, greaterThan(0.0));
+          expect(surf.blur, inInclusiveRange(1.0, 2.5));
+          expect(surf.glassColor.a, lessThanOrEqualTo(0.10));
+          expect(surf.lightIntensity, greaterThanOrEqualTo(0.8));
+          expect(sheet.lensModel, GlassLensModel.spherical);
+          expect(sheet.frost, 0.0);
+          expect(sheet.frostOpacity, 0.0);
+          expect(sheet.blur, inInclusiveRange(3.5, 5.5));
+          expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
         }
 
         // 2. Composer model pill during ConnectionPhase.reconnecting keeps showing cached model

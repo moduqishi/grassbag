@@ -137,51 +137,51 @@ abstract final class GrassBagGlassConfig {
 
     if (t.isDark) {
       return LiquidGlassSettings(
-        glassColor: Colors.white.withValues(alpha: elevated ? 0.13 : 0.09),
-        blur: 4.0,
+        glassColor: Colors.white.withValues(alpha: elevated ? 0.09 : 0.06),
+        blur: 1.5,
         frost: 0.0,
         frostOpacity: 0.0,
-        thickness: 24.0,
-        refractiveIndex: 1.24,
+        thickness: 30.0,
+        refractiveIndex: 1.34,
         lensModel: GlassLensModel.spherical,
-        chromaticAberration: 0.0,
-        saturation: 1.28,
+        chromaticAberration: 0.14,
+        saturation: 1.62,
         lightAngle: 0.75 * math.pi,
-        lightIntensity: 0.20,
-        ambientStrength: 0.08,
+        lightIntensity: 1.15,
+        ambientStrength: 0.18,
         ambientRim: 0.0,
-        fresnelStrength: 0.26,
+        fresnelStrength: 1.35,
         edgeAbsorption: 0.035,
-        rimShade: 0.22,
-        rimLight: 0.58,
-        bodyShade: elevated ? 0.14 : 0.10,
-        specularSharpness: GlassSpecularSharpness.medium,
+        rimShade: 0.0,
+        rimLight: 1.05,
+        bodyShade: elevated ? 0.06 : 0.03,
+        specularSharpness: GlassSpecularSharpness.sharp,
         shadow: const [],
       );
     }
 
     return LiquidGlassSettings(
-      glassColor: Colors.white.withValues(alpha: elevated ? 0.30 : 0.22),
-      blur: 4.0,
+      glassColor: Colors.white.withValues(alpha: elevated ? 0.14 : 0.08),
+      blur: 1.5,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 24.0,
-      refractiveIndex: 1.24,
+      thickness: 30.0,
+      refractiveIndex: 1.32,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.0,
-      saturation: 1.32,
+      chromaticAberration: 0.12,
+      saturation: 1.85,
       lightAngle: 0.75 * math.pi,
-      lightIntensity: 0.14,
-      ambientStrength: 0.06,
+      lightIntensity: 0.95,
+      ambientStrength: 0.12,
       ambientRim: 0.0,
-      fresnelStrength: 0.18,
-      whitenStrength: 0.14,
+      fresnelStrength: 1.18,
+      whitenStrength: 0.0,
       whitenGated: true,
-      edgeAbsorption: 0.02,
-      rimShade: 0.10,
-      rimLight: 0.90,
+      edgeAbsorption: 0.025,
+      rimShade: 0.0,
+      rimLight: 0.92,
       bodyShade: 0.0,
-      specularSharpness: GlassSpecularSharpness.medium,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: [
         BoxShadow(
           color: const Color(0x14000000),
@@ -192,11 +192,10 @@ abstract final class GrassBagGlassConfig {
     );
   }
 
-  /// Authentic Apple iOS 26/27 frosted Liquid Glass for modal sheets, '+' deck, menus,
-  /// dialogs, drawer, and toasts: uses the fast-path iOS 27 interleaved-row frost cloud
-  /// (`blur: 0.0`, `frost: 14–16`, `frostOpacity: 1.0`) + thin-prism paraxial rim fold
-  /// (`thickness: 30`, `n: 1.20`) — single backdrop blur pass (ZERO double-blur waste!)
-  /// so dense chat text underneath melts into silk bokeh with crystal legibility!
+  /// Crystal-clear sculpted Liquid Glass for modal sheets, '+' deck, menus, dialogs, and drawer:
+  /// silky low-haze bokeh (`4.6dp`, zero opaque frost slab!) + lush spherical refraction
+  /// (`thickness: 32`, `n: 1.28`) with crisp dual-lobe `rimLight`, subtle Kyant0 chromatic
+  /// dispersion, and ZERO milky wash so underlying icons & cards shine through luminously!
   static LiquidGlassSettings sheetSettings(GrassBagTokens t, GrassBagGlassTier tier) {
     final base = surfaceSettings(t, tier, elevated: true);
     if (tier == GrassBagGlassTier.solid) {
@@ -204,8 +203,10 @@ abstract final class GrassBagGlassConfig {
     }
     if (tier != GrassBagGlassTier.liquid || kIsWeb) {
       return base.copyWith(
-        glassColor: t.sheetTop.withValues(alpha: t.isDark ? 0.64 : 0.66),
-        blur: kIsWeb ? 14.0 : 13.0,
+        glassColor: t.isDark
+            ? Colors.white.withValues(alpha: 0.14)
+            : Colors.white.withValues(alpha: 0.54),
+        blur: kIsWeb ? 8.5 : 7.0,
         frost: 0.0,
         frostOpacity: 0.0,
         thickness: 1.0,
@@ -213,42 +214,43 @@ abstract final class GrassBagGlassConfig {
         lensModel: GlassLensModel.spherical,
         saturation: 1.0,
         rimLight: t.isDark ? 0.36 : 0.46,
-        rimShade: t.isDark ? 0.14 : 0.06,
+        rimShade: 0.0,
         ambientRim: 0.0,
         chromaticAberration: 0.0,
-        bodyShade: t.isDark ? 0.24 : 0.0,
+        bodyShade: t.isDark ? 0.18 : 0.0,
       );
     }
     return base.copyWith(
-      glassColor: t.sheetTop.withValues(alpha: t.isDark ? 0.56 : 0.52),
-      blur: 0.0,
-      frost: t.isDark ? 16.0 : 14.0,
-      frostOpacity: 1.0,
-      frostClamp: 0.0,
-      thickness: 30.0,
-      refractiveIndex: 1.20,
-      lensModel: GlassLensModel.paraxial,
-      chromaticAberration: 0.0,
-      saturation: t.isDark ? 1.22 : 1.24,
-      bodyShade: t.isDark ? 0.22 : 0.0,
-      whitenStrength: t.isDark ? 0.0 : 0.20,
+      glassColor: t.isDark
+          ? Colors.white.withValues(alpha: 0.11)
+          : Colors.white.withValues(alpha: 0.34),
+      blur: 4.6,
+      frost: 0.0,
+      frostOpacity: 0.0,
+      thickness: 32.0,
+      refractiveIndex: 1.28,
+      lensModel: GlassLensModel.spherical,
+      chromaticAberration: 0.10,
+      saturation: t.isDark ? 1.56 : 1.72,
+      bodyShade: t.isDark ? 0.12 : 0.0,
+      whitenStrength: t.isDark ? 0.0 : 0.05,
       whitenGated: true,
       lightAngle: 0.75 * math.pi,
-      lightIntensity: t.isDark ? 0.16 : 0.08,
-      ambientStrength: t.isDark ? 0.08 : 0.06,
+      lightIntensity: t.isDark ? 1.05 : 0.88,
+      ambientStrength: t.isDark ? 0.16 : 0.12,
       ambientRim: 0.0,
-      fresnelStrength: t.isDark ? 0.22 : 0.12,
-      edgeAbsorption: t.isDark ? 0.035 : 0.02,
-      rimLight: t.isDark ? 0.52 : 0.95,
-      rimShade: t.isDark ? 0.20 : 0.10,
-      specularSharpness: GlassSpecularSharpness.medium,
+      fresnelStrength: t.isDark ? 1.25 : 1.08,
+      edgeAbsorption: t.isDark ? 0.03 : 0.025,
+      rimLight: t.isDark ? 0.96 : 0.86,
+      rimShade: 0.0,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: t.isDark
           ? const []
           : const [
               BoxShadow(
-                color: Color(0x18000000),
-                blurRadius: 22,
-                offset: Offset(0, 8),
+                color: Color(0x16000000),
+                blurRadius: 18,
+                offset: Offset(0, 7),
               ),
             ],
     );
@@ -274,38 +276,37 @@ abstract final class GrassBagGlassConfig {
     final indicatorTheme = isFrosted
         ? null
         : const GlassThemeSettings(
-            lensModel: GlassLensModel.paraxial,
-            refractiveIndex: 1.22,
-            chromaticAberration: 0.04,
-            lightIntensity: 0.0,
-            ambientStrength: 0.0,
-            fresnelStrength: 0.0,
+            refractiveIndex: 1.32,
+            chromaticAberration: 0.14,
+            lightIntensity: 0.55,
+            ambientStrength: 0.10,
+            fresnelStrength: 0.85,
             rimLight: 1.0,
-            rimShade: 0.85,
           );
 
     return GlassThemeData(
       style: GlassStyle.ios27,
       light: GlassThemeVariant.ios27Light.copyWith(
         settings: GlassThemeSettings.ios27Light.copyWith(
-          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.44 : 0.22),
-          blur: isFrosted ? 8.0 : 4.0,
+          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.40 : 0.08),
+          blur: isFrosted ? 8.0 : 1.5,
           frost: 0.0,
           frostOpacity: 0.0,
-          thickness: isFrosted ? 1.0 : 24.0,
-          refractiveIndex: isFrosted ? 1.01 : 1.24,
+          thickness: isFrosted ? 1.0 : 30.0,
+          refractiveIndex: isFrosted ? 1.01 : 1.32,
           lensModel: GlassLensModel.spherical,
-          chromaticAberration: 0.0,
-          saturation: isFrosted ? 1.0 : 1.32,
+          chromaticAberration: isFrosted ? 0.0 : 0.12,
+          saturation: isFrosted ? 1.0 : 1.85,
           lightAngle: 0.75 * math.pi,
-          lightIntensity: isFrosted ? 0.08 : 0.14,
-          ambientStrength: isFrosted ? 0.05 : 0.06,
-          fresnelStrength: isFrosted ? 0.12 : 0.18,
-          edgeAbsorption: isFrosted ? 0.015 : 0.02,
-          rimShade: isFrosted ? 0.06 : 0.10,
-          rimLight: isFrosted ? 0.44 : 0.90,
+          lightIntensity: isFrosted ? 0.12 : 0.95,
+          ambientStrength: isFrosted ? 0.06 : 0.12,
+          fresnelStrength: isFrosted ? 0.16 : 1.18,
+          edgeAbsorption: isFrosted ? 0.015 : 0.025,
+          rimShade: 0.0,
+          rimLight: isFrosted ? 0.44 : 0.92,
           bodyShade: 0.0,
-          specularSharpness: GlassSpecularSharpness.medium,
+          specularSharpness:
+              isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
         ),
         indicatorSettings: indicatorTheme,
         glowColors: GlassGlowColors(
@@ -321,24 +322,25 @@ abstract final class GrassBagGlassConfig {
       ),
       dark: GlassThemeVariant.ios27Dark.copyWith(
         settings: GlassThemeSettings.ios27Dark.copyWith(
-          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.10 : 0.09),
-          blur: isFrosted ? 8.0 : 4.0,
+          glassColor: Colors.white.withValues(alpha: isFrosted ? 0.10 : 0.06),
+          blur: isFrosted ? 8.0 : 1.5,
           frost: 0.0,
           frostOpacity: 0.0,
-          thickness: isFrosted ? 1.0 : 24.0,
-          refractiveIndex: isFrosted ? 1.01 : 1.24,
+          thickness: isFrosted ? 1.0 : 30.0,
+          refractiveIndex: isFrosted ? 1.01 : 1.34,
           lensModel: GlassLensModel.spherical,
-          chromaticAberration: 0.0,
-          saturation: isFrosted ? 1.0 : 1.28,
+          chromaticAberration: isFrosted ? 0.0 : 0.14,
+          saturation: isFrosted ? 1.0 : 1.62,
           lightAngle: 0.75 * math.pi,
-          lightIntensity: isFrosted ? 0.14 : 0.20,
-          ambientStrength: isFrosted ? 0.07 : 0.08,
-          fresnelStrength: isFrosted ? 0.18 : 0.26,
+          lightIntensity: isFrosted ? 0.18 : 1.15,
+          ambientStrength: isFrosted ? 0.08 : 0.18,
+          fresnelStrength: isFrosted ? 0.22 : 1.35,
           edgeAbsorption: isFrosted ? 0.02 : 0.035,
-          rimShade: isFrosted ? 0.14 : 0.22,
-          rimLight: isFrosted ? 0.38 : 0.58,
-          bodyShade: isFrosted ? 0.14 : 0.10,
-          specularSharpness: GlassSpecularSharpness.medium,
+          rimShade: 0.0,
+          rimLight: isFrosted ? 0.38 : 1.05,
+          bodyShade: isFrosted ? 0.14 : 0.03,
+          specularSharpness:
+              isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
         ),
         indicatorSettings: indicatorTheme,
         glowColors: GlassGlowColors(
@@ -924,10 +926,10 @@ class GrassBagGlassPillButton extends StatelessWidget {
                 bodyMode: GlassBodyMode.clear,
                 glassColor: (tintColor ?? t.primary).withValues(alpha: t.isDark ? 0.80 : 0.86),
                 thickness: tier == GrassBagGlassTier.liquid && !kIsWeb ? 22.0 : 1.0,
-                refractiveIndex: tier == GrassBagGlassTier.liquid && !kIsWeb ? 1.24 : 1.01,
+                refractiveIndex: tier == GrassBagGlassTier.liquid && !kIsWeb ? 1.28 : 1.01,
                 lensModel: GlassLensModel.spherical,
-                chromaticAberration: 0.0,
-                rimLight: tier == GrassBagGlassTier.liquid && !kIsWeb ? 0.88 : 0.36,
+                chromaticAberration: tier == GrassBagGlassTier.liquid && !kIsWeb ? 0.08 : 0.0,
+                rimLight: tier == GrassBagGlassTier.liquid && !kIsWeb ? 0.92 : 0.36,
               )
             : baseSettings);
     return GlassButton.custom(
@@ -1048,30 +1050,25 @@ class _GrassBagLensScope extends StatelessWidget {
   }
 }
 
-/// Calibrated Apple iOS 26/27 paraxial refractive lens settings for interactive
-/// switch/slider/segmented-control thumbs (0 shaders at rest; silky ramp 0→1 on touch/drag
-/// with ZERO frame-1 specular pop-in because `lightIntensity` & `fresnelStrength` stay 0!).
+/// Calibrated Apple iOS 26/27 + Kyant0 chromatic refractive lens settings for interactive
+/// switch/slider/segmented-control thumbs (0 shaders at rest; full 3D GPU lens on press/drag).
 LiquidGlassSettings _interactiveLensSettings(
   GrassBagGlassTier tier, {
-  double refractiveIndex = 1.22,
-  double chromaticAberration = 0.04,
+  double refractiveIndex = 1.38,
+  double chromaticAberration = 0.15,
 }) {
   if (tier != GrassBagGlassTier.liquid || kIsWeb) {
     return LiquidGlassSettings.ios27Indicator.copyWith(
-      lensModel: GlassLensModel.paraxial,
-      refractiveIndex: 1.12,
+      refractiveIndex: 1.18,
       chromaticAberration: 0.0,
-      lightIntensity: 0.0,
-      fresnelStrength: 0.0,
     );
   }
   return LiquidGlassSettings.ios27Indicator.copyWith(
-    lensModel: GlassLensModel.paraxial,
     refractiveIndex: refractiveIndex,
     chromaticAberration: chromaticAberration,
-    lightIntensity: 0.0,
-    ambientStrength: 0.0,
-    fresnelStrength: 0.0,
+    lightIntensity: 0.55,
+    ambientStrength: 0.10,
+    fresnelStrength: 0.85,
     rimLight: 1.0,
     rimShade: 0.85,
   );
@@ -1130,8 +1127,8 @@ class GrassBagGlassSwitch extends StatelessWidget {
         quality: lensQuality,
         settings: _interactiveLensSettings(
           tier,
-          refractiveIndex: 1.24,
-          chromaticAberration: 0.04,
+          refractiveIndex: 1.40,
+          chromaticAberration: 0.16,
         ),
         enableHaptics: true,
       ),
@@ -1542,8 +1539,8 @@ class GrassBagSegmentedControl extends StatelessWidget {
         : GlassQuality.standard;
     final lensSettings = _interactiveLensSettings(
       tier,
-      refractiveIndex: 1.22,
-      chromaticAberration: 0.04,
+      refractiveIndex: 1.32,
+      chromaticAberration: 0.14,
     );
 
     final control = labels.length > 6
@@ -1669,8 +1666,8 @@ class GrassBagGlassSlider extends StatelessWidget {
         quality: lensQuality,
         settings: _interactiveLensSettings(
           tier,
-          refractiveIndex: 1.10,
-          chromaticAberration: 0.03,
+          refractiveIndex: 1.38,
+          chromaticAberration: 0.16,
         ),
       ),
     );
@@ -1774,11 +1771,11 @@ class GrassBagGroupedSection extends StatelessWidget {
     final borderCol = isSolid
         ? t.sep
         : (t.isDark
-            ? Colors.white.withValues(alpha: 0.09)
-            : Colors.white.withValues(alpha: 0.72));
+            ? Colors.white.withValues(alpha: 0.11)
+            : Colors.white.withValues(alpha: 0.88));
     final superellipse = RoundedSuperellipseBorder(
       borderRadius: BorderRadius.circular(24),
-      side: BorderSide(color: borderCol, width: 0.65),
+      side: BorderSide(color: borderCol, width: 0.75),
     );
     final innerColumn = Column(
       mainAxisSize: MainAxisSize.min,
@@ -1797,12 +1794,12 @@ class GrassBagGroupedSection extends StatelessWidget {
                   end: Alignment.bottomCenter,
                   colors: t.isDark
                       ? [
-                          Color.lerp(t.cardSolid, Colors.white, 0.06)!.withValues(alpha: 0.86),
-                          t.cardSolid.withValues(alpha: 0.78),
+                          Color.lerp(t.cardSolid, Colors.white, 0.07)!.withValues(alpha: 0.80),
+                          t.cardSolid.withValues(alpha: 0.72),
                         ]
                       : [
-                          Colors.white.withValues(alpha: 0.88),
-                          Colors.white.withValues(alpha: 0.80),
+                          Colors.white.withValues(alpha: 0.82),
+                          Colors.white.withValues(alpha: 0.72),
                         ],
                 ),
           shape: superellipse,
@@ -2504,29 +2501,30 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
             bodyMode: GlassBodyMode.clear,
             glassColor: bg.withValues(
               alpha: inRefractiveGlass
-                  ? (t.isDark ? 0.84 : 0.90)
-                  : (t.isDark ? 0.80 : 0.86),
+                  ? (t.isDark ? 0.82 : 0.86)
+                  : (t.isDark ? 0.76 : 0.82),
             ),
-            blur: isFrosted ? 8.0 : 4.0,
+            blur: isFrosted ? 6.0 : 2.0,
             frost: 0.0,
             frostOpacity: 0.0,
-            thickness: isFrosted ? 1.0 : 22.0,
-            refractiveIndex: isFrosted ? 1.01 : 1.22,
+            thickness: isFrosted ? 1.0 : 20.0,
+            refractiveIndex: isFrosted ? 1.01 : 1.28,
             lensModel: GlassLensModel.spherical,
-            chromaticAberration: 0.0,
-            saturation: isFrosted ? 1.0 : 1.28,
+            chromaticAberration: isFrosted ? 0.0 : 0.08,
+            saturation: isFrosted ? 1.0 : 1.48,
             lightAngle: 0.75 * math.pi,
-            lightIntensity: 0.16,
-            ambientStrength: 0.08,
-            fresnelStrength: 0.22,
+            lightIntensity: isFrosted ? 0.20 : 0.90,
+            ambientStrength: isFrosted ? 0.08 : 0.14,
+            fresnelStrength: isFrosted ? 0.24 : 1.05,
             edgeAbsorption: 0.02,
-            rimLight: isFrosted ? 0.38 : 0.86,
-            rimShade: 0.08,
+            rimLight: isFrosted ? 0.38 : 0.92,
+            rimShade: 0.0,
             bodyShade: 0.0,
-            specularSharpness: GlassSpecularSharpness.medium,
+            specularSharpness:
+                isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
             shadow: [
               BoxShadow(
-                color: bg.withValues(alpha: t.isDark ? 0.34 : 0.22),
+                color: bg.withValues(alpha: t.isDark ? 0.34 : 0.24),
                 blurRadius: 14,
                 offset: const Offset(0, 4),
               ),
@@ -2606,13 +2604,22 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
     final renderAsSolidCapsule = isSolid || insideGlass || inSolidCard;
     final useOwn = !renderAsSolidCapsule && !inRefractiveGlass;
 
+    final bool translucentInsideGlass = insideGlass && !isSolid && !inSolidCard;
     final Color solidBg = destructive
         ? t.errSoft
         : (accentForeground
-            ? t.primarySoft
-            : (t.isDark
-                ? Colors.white.withValues(alpha: 0.11)
-                : const Color(0x14162E42)));
+            ? (translucentInsideGlass
+                ? (t.isDark
+                    ? t.primary.withValues(alpha: 0.22)
+                    : Color.lerp(Colors.white, t.primary, 0.12)!.withValues(alpha: 0.46))
+                : t.primarySoft)
+            : (translucentInsideGlass
+                ? (t.isDark
+                    ? Colors.white.withValues(alpha: 0.13)
+                    : Colors.white.withValues(alpha: 0.44))
+                : (t.isDark
+                    ? Colors.white.withValues(alpha: 0.11)
+                    : const Color(0x14162E42))));
 
     final Color glassTint;
     if (destructive) {
@@ -2621,11 +2628,11 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
       glassTint = t.isDark
           ? t.primary.withValues(alpha: inRefractiveGlass ? 0.22 : 0.20)
           : Color.lerp(Colors.white, t.primary, 0.14)!
-              .withValues(alpha: inRefractiveGlass ? 0.72 : 0.56);
+              .withValues(alpha: inRefractiveGlass ? 0.56 : 0.44);
     } else if (t.isDark) {
-      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.14 : 0.11);
+      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.14 : 0.09);
     } else {
-      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.74 : 0.50);
+      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.54 : 0.36);
     }
 
     final compact = height <= 34;
@@ -2662,23 +2669,24 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
         : LiquidGlassSettings(
             bodyMode: GlassBodyMode.clear,
             glassColor: glassTint,
-            blur: isFrosted ? 8.0 : 4.0,
+            blur: isFrosted ? 6.5 : 2.0,
             frost: 0.0,
             frostOpacity: 0.0,
             thickness: isFrosted ? 1.0 : 22.0,
-            refractiveIndex: isFrosted ? 1.01 : 1.22,
+            refractiveIndex: isFrosted ? 1.01 : 1.28,
             lensModel: GlassLensModel.spherical,
-            chromaticAberration: 0.0,
-            saturation: isFrosted ? 1.0 : 1.30,
+            chromaticAberration: isFrosted ? 0.0 : 0.08,
+            saturation: isFrosted ? 1.0 : 1.62,
             lightAngle: 0.75 * math.pi,
-            lightIntensity: t.isDark ? 0.18 : 0.12,
-            ambientStrength: t.isDark ? 0.08 : 0.06,
-            fresnelStrength: t.isDark ? 0.24 : 0.16,
+            lightIntensity: isFrosted ? 0.16 : (t.isDark ? 0.96 : 0.86),
+            ambientStrength: isFrosted ? 0.08 : (t.isDark ? 0.16 : 0.14),
+            fresnelStrength: isFrosted ? 0.20 : (t.isDark ? 1.12 : 0.98),
             edgeAbsorption: 0.02,
-            rimLight: isFrosted ? 0.38 : (t.isDark ? 0.56 : 0.86),
-            rimShade: t.isDark ? 0.16 : 0.09,
+            rimLight: isFrosted ? 0.38 : 0.92,
+            rimShade: 0.0,
             bodyShade: 0.0,
-            specularSharpness: GlassSpecularSharpness.medium,
+            specularSharpness:
+                isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
             shadow: t.isDark
                 ? const []
                 : const [
@@ -2691,14 +2699,18 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
           );
 
     // Keep subtle capsule contour INSIDE the stretched button so press-scale never
-    // overflows a static outer border (and solid neutral buttons stay crisp on Light cards).
+    // overflows a static outer border (and crystal buttons inside sheets have a bright rim).
     final needsInnerRim =
         (inRefractiveGlass && !t.isDark && !isSolid) || (renderAsSolidCapsule && !destructive);
     final innerRimColor = destructive
         ? t.err.withValues(alpha: 0.22)
-        : (accentForeground
-            ? t.primary.withValues(alpha: t.isDark ? 0.30 : 0.22)
-            : (t.isDark ? Colors.white.withValues(alpha: 0.14) : const Color(0x1C162E42)));
+        : (translucentInsideGlass
+            ? (t.isDark
+                ? Colors.white.withValues(alpha: 0.22)
+                : Colors.white.withValues(alpha: 0.82))
+            : (accentForeground
+                ? t.primary.withValues(alpha: t.isDark ? 0.30 : 0.22)
+                : (t.isDark ? Colors.white.withValues(alpha: 0.14) : const Color(0x1C162E42))));
     Widget buildGlassButton(Widget content) => GlassButton.custom(
           onTap: () {
             if (!active) return;
@@ -2957,13 +2969,14 @@ class GrassBagUnifiedHeader extends StatelessWidget {
 
     if (platformViewBackdrop || !floating) return headerRow;
 
-    // 100% opaque `t.bgTop` across the OS status bar (0% ghosting under clock/battery!),
-    // then silky progressive feather below `topPad` behind floating Liquid Glass pills!
-    final capH = topPad + 76.0;
-    final solidStop = topPad > 0
-        ? ((topPad + 2.0) / capH).clamp(0.18, 0.58)
-        : 0.16;
-    final midStop = ((topPad + 38.0) / capH).clamp(solidStop + 0.14, 0.84);
+    // Crisp status-bar-only cap (`topPad + 42dp`):
+    // 100% solid `t.bgTop` across the OS status bar (0% text ghosting under clock/battery!),
+    // then feathers cleanly to 0% right at the floating Liquid Glass pills so scrolled cards
+    // and ambient aurora pass at full vibrant contrast underneath for true crystal refraction!
+    if (topPad <= 4.0) return headerRow;
+    final capH = topPad + 42.0;
+    final solidStop = ((topPad - 2.0) / capH).clamp(0.32, 0.72);
+    final midStop = ((topPad + 16.0) / capH).clamp(solidStop + 0.08, 0.88);
     return Stack(
       children: [
         Positioned(
@@ -2979,8 +2992,8 @@ class GrassBagUnifiedHeader extends StatelessWidget {
                   end: Alignment.bottomCenter,
                   colors: [
                     t.bgTop,
-                    t.bgTop,
-                    t.bgTop.withValues(alpha: t.isDark ? 0.60 : 0.56),
+                    t.bgTop.withValues(alpha: 0.92),
+                    t.bgTop.withValues(alpha: 0.42),
                     t.bgTop.withValues(alpha: 0.0),
                   ],
                   stops: [0.0, solidStop, midStop, 1.0],
@@ -3189,9 +3202,9 @@ class GrassBagCard extends StatelessWidget {
         color: isSolid
             ? t.sep
             : (t.isDark
-                ? Colors.white.withValues(alpha: 0.09)
-                : Colors.white.withValues(alpha: 0.72)),
-        width: 0.65,
+                ? Colors.white.withValues(alpha: 0.11)
+                : Colors.white.withValues(alpha: 0.88)),
+        width: 0.75,
       ),
     );
     return InheritedGlassSurfaceStyle(
@@ -3206,12 +3219,12 @@ class GrassBagCard extends StatelessWidget {
                   end: Alignment.bottomCenter,
                   colors: t.isDark
                       ? [
-                          Color.lerp(t.cardSolid, Colors.white, 0.06)!.withValues(alpha: 0.86),
-                          t.cardSolid.withValues(alpha: 0.78),
+                          Color.lerp(t.cardSolid, Colors.white, 0.07)!.withValues(alpha: 0.80),
+                          t.cardSolid.withValues(alpha: 0.72),
                         ]
                       : [
-                          Colors.white.withValues(alpha: 0.88),
-                          Colors.white.withValues(alpha: 0.80),
+                          Colors.white.withValues(alpha: 0.82),
+                          Colors.white.withValues(alpha: 0.72),
                         ],
                 )
               : null,
@@ -3291,11 +3304,16 @@ class GrassBagSheetSection extends StatelessWidget {
     final surface = DecoratedBox(
       decoration: ShapeDecoration(
         color: t.isDark
-            ? Colors.white.withValues(alpha: 0.055)
-            : Colors.white.withValues(alpha: 0.72),
+            ? Colors.white.withValues(alpha: 0.065)
+            : Colors.white.withValues(alpha: 0.52),
         shape: RoundedSuperellipseBorder(
           borderRadius: BorderRadius.circular(borderRadius),
-          side: BorderSide(color: t.sep, width: 0.65),
+          side: BorderSide(
+            color: t.isDark
+                ? Colors.white.withValues(alpha: 0.11)
+                : Colors.white.withValues(alpha: 0.72),
+            width: 0.7,
+          ),
         ),
       ),
       child: clipBehavior == Clip.none

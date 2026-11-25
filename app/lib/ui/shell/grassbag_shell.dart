@@ -1350,45 +1350,43 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
             child: GlassBackdropGroup(
               child: Stack(
                 children: [
-                  // Silky progressive top feather dynamically covering BOTH the floating header
-                  // AND any mounted top status/phone-control banner stack so scrolled chat text
-                  // never clashes visually behind translucent floating chrome!
-                  Positioned(
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                    child: IgnorePointer(
-                      child: ValueListenableBuilder<double>(
-                        valueListenable: _topBannerStackHeight,
-                        builder: (_, bannerH, __) {
-                          final capH = topPad + 86.0 + (bannerH > 0.5 ? bannerH + 14.0 : 0.0);
-                          final solidStop = topPad > 0
-                              ? ((topPad + 10.0) / capH).clamp(0.18, 0.56)
-                              : 0.14;
-                          final midStop = ((topPad + 48.0 + (bannerH > 0.5 ? bannerH : 0.0)) / capH)
-                              .clamp(solidStop + 0.16, 0.86);
-                          return SizedBox(
-                            height: capH,
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                gradient: LinearGradient(
-                                  begin: Alignment.topCenter,
-                                  end: Alignment.bottomCenter,
-                                  colors: [
-                                    t.bgTop,
-                                    t.bgTop,
-                                    t.bgTop.withValues(alpha: t.isDark ? 0.80 : 0.82),
-                                    t.bgTop.withValues(alpha: 0.0),
-                                  ],
-                                  stops: [0.0, solidStop, midStop, 1.0],
+                  // Crisp status-bar-only cap (`topPad + 16dp`):
+                  // 100% solid `t.bgTop` across the OS status bar (zero text ghosting under clock/battery)
+                  // while ending right above the floating Liquid Glass header pills (`topPad + 12..56`)
+                  // so the ocean aurora and scrolled chat messages glide underneath at full contrast!
+                  if (topPad > 4.0)
+                    Positioned(
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Builder(
+                          builder: (_) {
+                            final capH = topPad + 18.0;
+                            final solidStop = ((topPad - 2.0) / capH).clamp(0.32, 0.72);
+                            final midStop = ((topPad + 6.0) / capH).clamp(solidStop + 0.08, 0.90);
+                            return SizedBox(
+                              height: capH,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      t.bgTop,
+                                      t.bgTop,
+                                      t.bgTop.withValues(alpha: 0.42),
+                                      t.bgTop.withValues(alpha: 0.0),
+                                    ],
+                                    stops: [0.0, solidStop, midStop, 1.0],
+                                  ),
                                 ),
                               ),
-                            ),
-                          );
-                        },
+                            );
+                          },
+                        ),
                       ),
                     ),
-                  ),
                   // Smooth bottom progressive feather behind the composer that tracks real
                   // composer height AND lifts smoothly with soft keyboard insets!
                   Positioned(
@@ -2890,17 +2888,18 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final ime = _ImeMotionScope.of(context);
+    // Whisper-light bottom edge feather strictly below the floating composer so the
+    // Liquid Glass composer dock refracts full-contrast aurora & chat content underneath!
     final scrimDecoration = BoxDecoration(
       gradient: LinearGradient(
         begin: Alignment.bottomCenter,
         end: Alignment.topCenter,
         colors: [
-          t.bgSolid.withValues(alpha: t.isDark ? 0.95 : 0.94),
-          t.bgSolid.withValues(alpha: t.isDark ? 0.78 : 0.74),
-          t.bgSolid.withValues(alpha: t.isDark ? 0.28 : 0.24),
+          t.bgSolid.withValues(alpha: t.isDark ? 0.52 : 0.42),
+          t.bgSolid.withValues(alpha: t.isDark ? 0.16 : 0.12),
           t.bgSolid.withValues(alpha: 0.0),
         ],
-        stops: const [0.0, 0.36, 0.72, 1.0],
+        stops: const [0.0, 0.45, 1.0],
       ),
     );
 
@@ -2910,7 +2909,7 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
       return ValueListenableBuilder<double>(
         valueListenable: composerHeightNotifier,
         builder: (_, compH, __) {
-          final restingH = baseComposerBottom + compH + 34.0;
+          final restingH = baseComposerBottom + math.min(compH * 0.45, 44.0);
           return Transform.translate(
             offset: Offset(0, -lift),
             child: IgnorePointer(

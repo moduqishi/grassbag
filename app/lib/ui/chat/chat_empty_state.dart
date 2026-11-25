@@ -257,16 +257,16 @@ class ChatEmptyState extends ConsumerWidget {
                         Colors.white.withValues(alpha: 0.06),
                       ]
                     : [
-                        Colors.white.withValues(alpha: 0.88),
-                        Colors.white.withValues(alpha: 0.72),
+                        Colors.white.withValues(alpha: 0.68),
+                        Colors.white.withValues(alpha: 0.48),
                       ],
               ),
               shape: StadiumBorder(
                 side: BorderSide(
                   color: t.isDark
-                      ? Colors.white.withValues(alpha: 0.20)
-                      : Colors.white.withValues(alpha: 0.94),
-                  width: 0.75,
+                      ? Colors.white.withValues(alpha: 0.22)
+                      : Colors.white.withValues(alpha: 0.92),
+                  width: 0.8,
                 ),
               ),
               shadows: [

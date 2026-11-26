@@ -2,12 +2,15 @@ import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../settings/dsh_settings_sheets.dart';
+import 'sdui_extensions_page.dart';
 
 class PluginsCenterPage extends ConsumerStatefulWidget {
   const PluginsCenterPage({super.key});
@@ -19,7 +22,10 @@ class PluginsCenterPage extends ConsumerStatefulWidget {
 class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
   int _tab = 0; // 0: 已安装, 1: 插件市场, 2: 动态 Cordis
   String _marketQuery = '';
+  String _installedQuery = '';
   final TextEditingController _marketSearchCtrl = TextEditingController();
+  final TextEditingController _installedSearchCtrl = TextEditingController();
+  final Set<String> _busyPluginIds = <String>{};
   Timer? _filterTimer;
   Timer? _searchTimer;
   bool _initialMarketLoaded = false;
@@ -50,6 +56,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
     _filterTimer?.cancel();
     _searchTimer?.cancel();
     _marketSearchCtrl.dispose();
+    _installedSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -69,9 +76,11 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
         _filterTimer?.cancel();
         _searchTimer?.cancel();
         _marketSearchCtrl.clear();
+        _installedSearchCtrl.clear();
         final connected = ref.read(appProvider).connectionPhase == ConnectionPhase.connected;
         setState(() {
           _marketQuery = '';
+          _installedQuery = '';
           _lastServerQuery = null;
           _initialMarketLoaded = _tab == 1 && connected;
         });
@@ -108,6 +117,8 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
           connectionPhase: s.connectionPhase,
           activeHostBridged: s.activeHost.bridged,
           activeHostDirectMode: s.activeHost.directMode,
+          dshNamespaces: s.dshNamespaces,
+          sduiSurfaces: s.sduiSurfaces,
         ),
       ),
     );
@@ -128,7 +139,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
                   child: RefreshIndicator.adaptive(
-                    edgeOffset: topPad + 64,
+                    edgeOffset: topPad + 74,
                     onRefresh: () async {
                       if (_tab == 1) {
                         await _runMarketSearch(_marketQuery);
@@ -141,7 +152,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                       slivers: [
                         SliverPadding(
-                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          padding: EdgeInsets.fromLTRB(16, topPad + 76, 16, 40 + botPad),
                           sliver: SliverMainAxisGroup(
                             slivers: [
                               SliverToBoxAdapter(
@@ -180,6 +191,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                                         setState(() => _tab = i);
                                         if (i == 1 &&
                                             !_initialMarketLoaded &&
+                                            state.connectionPhase == ConnectionPhase.connected &&
                                             state.marketPlugins.isEmpty &&
                                             !state.searchingMarket) {
                                           _initialMarketLoaded = true;
@@ -239,7 +251,13 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                       tooltip: '安装自定义插件',
                       tier: state.glassTier,
                       useOwnLayer: false,
-                      onTap: () => _openCustomInstallSheet(context),
+                      onTap: () {
+                        if (!state.isDshConnected) {
+                          ctrl.showToast('当前未连接到 DSH 主机，请先恢复连接后再安装插件', tone: ToastTone.warn);
+                          return;
+                        }
+                        _openCustomInstallSheet(context);
+                      },
                     ),
                   ],
                 ),
@@ -286,7 +304,9 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                   height: 36,
                   onTap: () {
                     setState(() => _tab = 1);
-                    if (!_initialMarketLoaded && !state.searchingMarket) {
+                    if (!_initialMarketLoaded &&
+                        !state.searchingMarket &&
+                        state.connectionPhase == ConnectionPhase.connected) {
                       _initialMarketLoaded = true;
                       unawaited(_runMarketSearch(_marketQuery));
                     }
@@ -307,94 +327,256 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
       );
     }
 
-    return GrassBagGroupedSection(
-      header: '当前主机已安装的插件与能力',
-      footer: '内置核心模块常驻运行；可选模块可随时启停，已安装的外部插件支持卸载。',
+    final iq = _installedQuery.trim().toLowerCase();
+    final visiblePlugins = iq.isEmpty
+        ? state.plugins
+        : state.plugins
+            .where((p) =>
+                '${p.name} ${p.id} ${p.desc}'.toLowerCase().contains(iq))
+            .toList(growable: false);
+    final namespaces = state.effectiveDshNamespaces;
+    final hasSdui = state.sduiSurfaces.isNotEmpty;
+
+    DshSettingsNamespace? matchNamespace(PluginItem p) {
+      final tail = p.id.split('/').last.toLowerCase();
+      final short = tail.startsWith('dsh-') ? tail.substring(4) : tail;
+      for (final ns in namespaces) {
+        final n = ns.ns.toLowerCase();
+        if (n.length < 3) continue;
+        if (n == p.id.toLowerCase() || n == tail || n == short) {
+          return ns;
+        }
+      }
+      return null;
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final p in state.plugins)
-          GrassBagListTile(
-            leading: GrassBagSquircleIcon(
-              icon: CupertinoIcons.square_stack_3d_up_fill,
-              color: p.enabled ? t.ok : t.text3,
-              size: 34,
-              iconSize: 17,
-            ),
-            title: Row(
+        if (state.plugins.length > 5) ...[
+          GrassBagGlassSearchBar(
+            controller: _installedSearchCtrl,
+            placeholder: '筛选已安装插件…',
+            tier: state.glassTier,
+            insideGlass: true,
+            onChanged: (v) => setState(() => _installedQuery = v),
+            onSubmitted: (v) => setState(() => _installedQuery = v),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (hasSdui) ...[
+          GrassBagCard(
+            borderRadius: 20,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+            child: Row(
               children: [
-                Flexible(child: Text(p.name, maxLines: 1, overflow: TextOverflow.ellipsis)),
-                const SizedBox(width: 6),
-                Text(
-                  p.version,
-                  style: TextStyle(fontSize: 11, fontFamily: 'monospace', color: t.text3),
+                GrassBagSquircleIcon(
+                  icon: CupertinoIcons.square_grid_2x2_fill,
+                  color: t.dusk,
+                  size: 30,
+                  iconSize: 15,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '已注册 ${state.sduiSurfaces.length} 个插件动态扩展面板',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.text),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                GrassBagSecondaryGlassButton(
+                  label: '打开面板',
+                  height: 30,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  tier: state.glassTier,
+                  insideGlass: true,
+                  accentForeground: true,
+                  onTap: () => Navigator.of(context).push(
+                    GrassBagPageRoute<void>(builder: (_) => const SduiExtensionsPage()),
+                  ),
                 ),
               ],
             ),
-            subtitle: Text(
-              p.readOnlyReason != null && p.readOnlyReason!.isNotEmpty
-                  ? '${p.desc} · ${p.readOnlyReason}'
-                  : p.desc,
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (p.removable)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: Tooltip(
-                      message: '卸载插件',
-                      child: GrassBagSpringTap(
-                        pressedScale: 0.88,
-                        haptic: true,
-                        onTap: () async {
-                          final ok = await showGrassBagConfirmDialog(
-                            context,
-                            title: '卸载插件',
-                            message: '确认从当前主机卸载「${p.name}」吗？',
-                            confirmLabel: '确认卸载',
-                            isDestructive: true,
-                          );
-                          if (ok) {
-                            unawaited(ctrl.removePluginBundle(p.id));
-                          }
-                        },
-                        child: Container(
-                          width: 34,
-                          height: 34,
-                          decoration: BoxDecoration(
-                            color: t.errSoft,
-                            shape: BoxShape.circle,
-                          ),
-                          child: Icon(CupertinoIcons.trash, size: 15, color: t.err),
-                        ),
-                      ),
-                    ),
-                  ),
-                if (!p.optional ||
-                    p.id.toLowerCase().endsWith('dsh-base') ||
-                    p.id.toLowerCase().endsWith('dsh-web-app') ||
-                    p.id.toLowerCase().endsWith('dsh-headless') ||
-                    p.id.toLowerCase().endsWith('dsh-gbridge') ||
-                    p.id.toLowerCase() == 'base')
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Text(
-                      '内置核心',
-                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.text3),
-                    ),
-                  )
-                else
-                  GrassBagGlassSwitch(
-                    value: p.enabled,
-                    tier: state.glassTier,
-                    onChanged: (_) => ctrl.togglePlugin(p.id),
-                  ),
-              ],
-            ),
           ),
+          const SizedBox(height: 10),
+        ],
+        GrassBagGroupedSection(
+          header: '当前主机已安装的插件与能力 (${visiblePlugins.length})',
+          footer: '内置核心模块常驻运行；可选模块可随时启停，支持配置的插件可直接点按「配置」调整参数。',
+          children: visiblePlugins.isEmpty
+              ? [
+                  GrassBagListTile(
+                    title: Text('未找到匹配「$_installedQuery」的插件',
+                        style: TextStyle(color: t.text2)),
+                    trailing: Text('清空', style: TextStyle(fontSize: 12, color: t.primary)),
+                    onTap: () {
+                      _installedSearchCtrl.clear();
+                      setState(() => _installedQuery = '');
+                    },
+                  ),
+                ]
+              : [
+                  for (final p in visiblePlugins)
+                    () {
+                      final busy = _busyPluginIds.contains(p.id);
+                      final matchedNs = matchNamespace(p);
+                      return GrassBagListTile(
+                        leading: GrassBagSquircleIcon(
+                          icon: CupertinoIcons.square_stack_3d_up_fill,
+                          color: p.enabled ? t.ok : t.text3,
+                          size: 34,
+                          iconSize: 17,
+                        ),
+                        title: Text(
+                          p.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (p.version.trim().isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 2),
+                                child: Text(
+                                  p.version.trim().startsWith('v')
+                                      ? p.version.trim()
+                                      : 'v${p.version.trim()}',
+                                  maxLines: 1,
+                                  softWrap: false,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontFamily: 'monospace',
+                                    color: t.text3,
+                                  ),
+                                ),
+                              ),
+                            Text(
+                              p.readOnlyReason != null && p.readOnlyReason!.isNotEmpty
+                                  ? '${p.desc} · ${p.readOnlyReason}'
+                                  : p.desc,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (matchedNs != null)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 6),
+                                child: GrassBagSpringTap(
+                                  enablePointerGlow: false,
+                                  haptic: true,
+                                  onTap: () => showDshNamespaceEditorSheet(context, ref, matchedNs),
+                                  child: GrassBagFresnelGlassSurface(
+                                    isPill: true,
+                                    innerWell: true,
+                                    interactive: true,
+                                    tintColor: t.primarySoft,
+                                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                                    child: Text(
+                                      '配置',
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (p.removable)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: Tooltip(
+                                  message: '卸载插件',
+                                  child: GrassBagSpringTap(
+                                    enabled: !busy,
+                                    pressedScale: 0.88,
+                                    enablePointerGlow: false,
+                                    haptic: true,
+                                    onTap: () async {
+                                      final ok = await showGrassBagConfirmDialog(
+                                        context,
+                                        title: '卸载插件',
+                                        message: '确认从当前主机卸载「${p.name}」吗？',
+                                        confirmLabel: '确认卸载',
+                                        isDestructive: true,
+                                      );
+                                      if (!ok || !mounted) return;
+                                      setState(() => _busyPluginIds.add(p.id));
+                                      try {
+                                        await ctrl.removePluginBundle(p.id);
+                                      } finally {
+                                        if (mounted) {
+                                          setState(() => _busyPluginIds.remove(p.id));
+                                        }
+                                      }
+                                    },
+                                    child: GrassBagFresnelGlassSurface(
+                                      isCircle: true,
+                                      innerWell: true,
+                                      interactive: !busy,
+                                      tintColor: t.errSoft,
+                                      width: 38,
+                                      height: 38,
+                                      alignment: Alignment.center,
+                                      child: busy
+                                          ? GrassBagActivityIndicator(radius: 6.5, color: t.err)
+                                          : Icon(CupertinoIcons.trash, size: 15.5, color: t.err),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            if (!p.optional ||
+                                p.id.toLowerCase().endsWith('dsh-base') ||
+                                p.id.toLowerCase().endsWith('dsh-web-app') ||
+                                p.id.toLowerCase().endsWith('dsh-headless') ||
+                                p.id.toLowerCase().endsWith('dsh-gbridge') ||
+                                p.id.toLowerCase() == 'base')
+                              GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 4),
+                                child: Text(
+                                  '内置核心',
+                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.text3),
+                                ),
+                              )
+                            else if (busy)
+                              SizedBox(
+                                width: 60,
+                                child: Center(
+                                  child: GrassBagActivityIndicator(radius: 7.5, color: t.primary),
+                                ),
+                              )
+                            else
+                              GrassBagGlassSwitch(
+                                value: p.enabled,
+                                tier: state.glassTier,
+                                onChanged: !state.isDshConnected
+                                    ? null
+                                    : (_) async {
+                                        setState(() => _busyPluginIds.add(p.id));
+                                        try {
+                                          await ctrl.togglePlugin(p.id);
+                                        } finally {
+                                          if (mounted) {
+                                            setState(() => _busyPluginIds.remove(p.id));
+                                          }
+                                        }
+                                      },
+                              ),
+                          ],
+                        ),
+                      );
+                    }(),
+                ],
+        ),
       ],
     );
   }
@@ -441,6 +623,13 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
               placeholder: '搜索 DSH 插件市场（支持包名与关键词）…',
               tier: state.glassTier,
               insideGlass: true,
+              onSubmitted: (v) {
+                _filterTimer?.cancel();
+                _searchTimer?.cancel();
+                final trimmed = v.trim();
+                setState(() => _marketQuery = trimmed);
+                unawaited(_runMarketSearch(trimmed));
+              },
               onChanged: (v) {
                 _filterTimer?.cancel();
                 if (v.isEmpty) {
@@ -475,7 +664,10 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                       _filterTimer?.cancel();
                       _searchTimer?.cancel();
                       final nextKw = _marketQuery.trim().toLowerCase() == kw ? '' : kw;
-                      _marketSearchCtrl.text = nextKw;
+                      _marketSearchCtrl.value = TextEditingValue(
+                        text: nextKw,
+                        selection: TextSelection.collapsed(offset: nextKw.length),
+                      );
                       setState(() => _marketQuery = nextKw);
                       unawaited(_runMarketSearch(nextKw));
                     },
@@ -489,7 +681,7 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    CupertinoActivityIndicator(radius: 8, color: t.primary),
+                    GrassBagActivityIndicator(radius: 8, color: t.primary),
                     const SizedBox(width: 8),
                     Text('正在检索插件市场…', style: TextStyle(fontSize: 12, color: t.text3)),
                   ],
@@ -503,21 +695,14 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                   message: state.marketError!,
                   borderRadius: 16,
                   padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
-                  trailing: GrassBagSpringTap(
+                  trailing: GrassBagSecondaryGlassButton(
+                    label: '重试',
+                    height: 30,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    tier: state.glassTier,
+                    insideGlass: true,
+                    destructive: true,
                     onTap: () => unawaited(_runMarketSearch(_marketQuery)),
-                    pressedScale: 0.92,
-                    haptic: true,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: t.err.withValues(alpha: 0.16),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        '重试',
-                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.err),
-                      ),
-                    ),
                   ),
                 ),
               ),
@@ -629,26 +814,37 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                           ),
                           const SizedBox(width: 8),
                           if (m.installed)
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: t.okSoft,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Text(
-                                '已安装',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.ok),
+                            Tooltip(
+                              message: '切换到已安装列表',
+                              child: GrassBagSpringTap(
+                                enablePointerGlow: false,
+                                haptic: true,
+                                onTap: () => setState(() => _tab = 0),
+                                child: GrassBagFresnelGlassSurface(
+                                  isPill: true,
+                                  innerWell: true,
+                                  interactive: true,
+                                  tintColor: t.okSoft,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5),
+                                  child: Text(
+                                    '已安装',
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.ok),
+                                  ),
+                                ),
                               ),
                             )
                           else
                             GrassBagPrimaryGlassButton(
                               label: m.installing ? '安装中…' : '获取',
+                              icon: m.installing ? CupertinoIcons.hourglass : null,
                               height: 32,
                               padding: const EdgeInsets.symmetric(horizontal: 14),
                               tier: state.glassTier,
                               insideGlass: true,
-                              enabled: !m.installing,
-                              onTap: m.installing ? null : () => ctrl.installMarketPlugin(m.name),
+                              enabled: !m.installing && state.isDshConnected,
+                              onTap: (m.installing || !state.isDshConnected)
+                                  ? null
+                                  : () => ctrl.installMarketPlugin(m.name),
                             ),
                         ],
                       ),
@@ -659,24 +855,59 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                       ),
                       if (m.installLogs.isNotEmpty) ...[
                         const SizedBox(height: 9),
-                        Container(
+                        GrassBagFresnelGlassSurface(
+                          borderRadius: 12,
+                          innerWell: true,
+                          paintTopSheen: false,
+                          tintColor: t.codeBg,
                           width: double.infinity,
                           padding: const EdgeInsets.all(10),
-                          decoration: ShapeDecoration(
-                            color: t.codeBg,
-                            shape: RoundedSuperellipseBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              side: BorderSide(color: Colors.white.withValues(alpha: 0.08), width: 0.6),
-                            ),
-                          ),
-                          child: Text(
-                            m.installLogs.join('\n'),
-                            style: const TextStyle(
-                              fontSize: 11,
-                              height: 1.45,
-                              fontFamily: 'monospace',
-                              color: Color(0xFFDDE3EA),
-                            ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Row(
+                                children: [
+                                  Text(
+                                    '安装日志 (${m.installLogs.length} 行)',
+                                    style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.text3),
+                                  ),
+                                  const Spacer(),
+                                  GrassBagSpringTap(
+                                    enablePointerGlow: false,
+                                    haptic: true,
+                                    onTap: () {
+                                      Clipboard.setData(ClipboardData(text: m.installLogs.join('\n')));
+                                      ctrl.showToast('已复制安装日志', tone: ToastTone.ok);
+                                    },
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                      child: Text(
+                                        '复制',
+                                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(maxHeight: 160),
+                                child: SingleChildScrollView(
+                                  physics: const BouncingScrollPhysics(),
+                                  child: SelectableText(
+                                    m.installLogs.join('\n'),
+                                    contextMenuBuilder: buildGrassBagEditableContextMenu,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      height: 1.45,
+                                      fontFamily: 'monospace',
+                                      color: t.codeFg,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -785,65 +1016,60 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                     const SizedBox(height: 8),
                     Text(c.description, style: TextStyle(fontSize: 12.5, height: 1.4, color: t.text2)),
                     const SizedBox(height: 10),
-                    Row(
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
                       children: [
-                        if (isRun) ...[
-                          GrassBagSpringTap(
-                            onTap: () => ctrl.cordisAction(c.id, 'stop'),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: t.fill1,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Text(
-                                '暂停模块',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text),
-                              ),
-                            ),
+                        if (isRun)
+                          GrassBagSecondaryGlassButton(
+                            label: '暂停模块',
+                            icon: CupertinoIcons.pause_fill,
+                            height: 34,
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            tier: state.glassTier,
+                            insideGlass: true,
+                            enabled: state.isDshConnected,
+                            onTap: !state.isDshConnected
+                                ? null
+                                : () => ctrl.cordisAction(c.id, 'stop'),
+                          )
+                        else
+                          GrassBagSecondaryGlassButton(
+                            label: '启动模块',
+                            icon: CupertinoIcons.play_fill,
+                            height: 34,
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            tier: state.glassTier,
+                            insideGlass: true,
+                            accentForeground: true,
+                            enabled: state.isDshConnected,
+                            onTap: !state.isDshConnected
+                                ? null
+                                : () => ctrl.cordisAction(c.id, 'start'),
                           ),
-                          const SizedBox(width: 8),
-                        ] else ...[
-                          GrassBagSpringTap(
-                            onTap: () => ctrl.cordisAction(c.id, 'start'),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: t.primarySoft,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Text(
-                                '启动模块',
-                                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                        ],
-                        GrassBagSpringTap(
-                          onTap: () async {
-                            final ok = await showGrassBagConfirmDialog(
-                              context,
-                              title: '卸载动态模块',
-                              message: '确认卸载动态扩展模块「${c.name}」吗？',
-                              confirmLabel: '确认卸载',
-                              isDestructive: true,
-                            );
-                            if (ok) {
-                              unawaited(ctrl.cordisAction(c.id, 'undefine'));
-                            }
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-                            decoration: BoxDecoration(
-                              color: t.errSoft,
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                            child: Text(
-                              '卸载定义',
-                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.err),
-                            ),
-                          ),
+                        GrassBagSecondaryGlassButton(
+                          label: '卸载定义',
+                          icon: CupertinoIcons.trash,
+                          height: 34,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          tier: state.glassTier,
+                          insideGlass: true,
+                          destructive: true,
+                          enabled: state.isDshConnected,
+                          onTap: !state.isDshConnected
+                              ? null
+                              : () async {
+                                  final ok = await showGrassBagConfirmDialog(
+                                    context,
+                                    title: '卸载动态模块',
+                                    message: '确认卸载动态扩展模块「${c.name}」吗？',
+                                    confirmLabel: '确认卸载',
+                                    isDestructive: true,
+                                  );
+                                  if (ok) {
+                                    unawaited(ctrl.cordisAction(c.id, 'undefine'));
+                                  }
+                                },
                         ),
                       ],
                     ),

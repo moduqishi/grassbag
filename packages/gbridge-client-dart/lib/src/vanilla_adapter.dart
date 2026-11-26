@@ -396,10 +396,14 @@ class VanillaDshAdapter {
     String? before,
     bool withProjections = true,
   }) async {
+    final beforeSeq = before != null ? int.tryParse(before) : null;
     final req = <String, dynamic>{
       'address': {'kind': 'session', 'sessionId': sessionId},
       'maxMessages': limit,
-      if (before != null && int.tryParse(before) != null) 'beforeSeq': int.parse(before),
+      if (beforeSeq != null)
+        'beforeSeq': beforeSeq
+      else if (before != null && before.isNotEmpty)
+        'cursor': before,
     };
     dynamic pageRaw;
     try {
@@ -409,7 +413,10 @@ class VanillaDshAdapter {
         pageRaw = await rpc('session/events', {
           'request': {
             'address': {'kind': 'session', 'sessionId': sessionId},
-            if (before != null && int.tryParse(before) != null) 'beforeSeq': int.parse(before),
+            if (beforeSeq != null)
+              'beforeSeq': beforeSeq
+            else if (before != null && before.isNotEmpty)
+              'cursor': before,
           },
         });
       } else {
@@ -873,6 +880,7 @@ class VanillaDshAdapter {
       );
     }
 
+    var rememberAlways = false;
     Map<String, dynamic> effectiveOutcome;
     if (outcome != null) {
       effectiveOutcome = outcome;
@@ -927,9 +935,7 @@ class VanillaDshAdapter {
           : (d == 'cancel' || d == 'cancelled')
               ? 'cancelled'
               : 'rejected';
-      if (d == 'always') {
-        mux.rememberSessionAlwaysAllowed(pending.sessionId, pending.payload);
-      }
+      rememberAlways = d == 'always';
       effectiveOutcome = {'kind': 'result', 'value': mapped};
     } else {
       effectiveOutcome = {'kind': 'result', 'value': decision ?? answers};
@@ -940,6 +946,9 @@ class VanillaDshAdapter {
       'eventId': pending.eventId,
       'outcome': effectiveOutcome,
     });
+    if (rememberAlways) {
+      mux.rememberSessionAlwaysAllowed(pending.sessionId, pending.payload);
+    }
     mux.markInteractionResolved(interactionId);
     return {'v': 1, 'ok': true};
   }
@@ -1319,7 +1328,7 @@ class VanillaDshAdapter {
     final req = body['request'] is Map
         ? _asMap(body['request'])
         : <String, dynamic>{
-            for (final k in const ['provider', 'baseURL', 'api', 'apiKey'])
+            for (final k in const ['provider', 'baseURL', 'api', 'apiKey', 'apiKeyEnv'])
               if (body[k] != null && body[k].toString().isNotEmpty) k: body[k],
           };
     final res = await rpc('llm/discoverModels', {
@@ -2116,7 +2125,15 @@ class VanillaDshAdapter {
     });
     final m = _asMap(res);
     final data = m['data'];
-    if (data is String && data.isNotEmpty) return base64Decode(data);
+    if (data is String && data.isNotEmpty) {
+      var clean = data.trim();
+      final commaIdx = clean.indexOf(',');
+      if (clean.startsWith('data:') && commaIdx > 0) {
+        clean = clean.substring(commaIdx + 1);
+      }
+      clean = clean.replaceAll(RegExp(r'\s+'), '');
+      if (clean.isNotEmpty) return base64Decode(clean);
+    }
     return Uint8List(0);
   }
 }

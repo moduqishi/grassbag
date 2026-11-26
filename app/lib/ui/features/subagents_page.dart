@@ -18,20 +18,53 @@ class SubagentsPage extends ConsumerStatefulWidget {
 }
 
 class _SubagentsPageState extends ConsumerState<SubagentsPage> {
+  bool _initialLoading = false;
+
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(ref.read(appProvider.notifier).refreshSubagentsOnly(silent: true));
+    final initState = ref.read(appProvider);
+    if (initState.subagents.isEmpty &&
+        initState.connectionPhase == ConnectionPhase.connected) {
+      _initialLoading = true;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      try {
+        await ref.read(appProvider.notifier).refreshSubagentsOnly(silent: true);
+      } finally {
+        if (mounted && _initialLoading) setState(() => _initialLoading = false);
+      }
     });
   }
 
   void _openPromptSheet(BuildContext context, SubagentItem sub) {
+    if (!ref.read(appProvider).isDshConnected) {
+      ref.read(appProvider.notifier).showToast(
+            '当前未连接到 DSH 主机，请先恢复连接后再发送补充指令',
+            tone: ToastTone.warn,
+          );
+      return;
+    }
+    var hasDraft = false;
     showGrassBagSheet<void>(
       context,
       title: '向 ${sub.name} 发送补充指令',
       subtitle: '${sub.role} · ${sub.model}',
-      bodyBuilder: (sheetCtx) => _SubagentPromptDialogBody(sub: sub),
+      onWillDismiss: () async {
+        if (!hasDraft || !context.mounted) return true;
+        return showGrassBagConfirmDialog(
+          context,
+          title: '放弃已输入的补充指令？',
+          message: '关闭后当前未发送的指令内容将不会保留。',
+          confirmLabel: '放弃并关闭',
+          isDestructive: true,
+        );
+      },
+      bodyBuilder: (sheetCtx) => _SubagentPromptDialogBody(
+        sub: sub,
+        onDraftChanged: (dirty) => hasDraft = dirty,
+      ),
     );
   }
 
@@ -41,6 +74,14 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
       appProvider.select((s) => '${s.activeHostId}:${s.activeSessionId}'),
       (prev, next) {
         if (prev != null && prev != next && mounted) {
+          unawaited(ref.read(appProvider.notifier).refreshSubagentsOnly(silent: true));
+        }
+      },
+    );
+    ref.listen<ConnectionPhase>(
+      appProvider.select((s) => s.connectionPhase),
+      (prev, next) {
+        if (prev != ConnectionPhase.connected && next == ConnectionPhase.connected && mounted) {
           unawaited(ref.read(appProvider.notifier).refreshSubagentsOnly(silent: true));
         }
       },
@@ -77,13 +118,15 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
                   child: RefreshIndicator.adaptive(
-                    edgeOffset: topPad + 64,
-                    onRefresh: () => ctrl.refreshSubagentsOnly(silent: true),
+                    edgeOffset: topPad + 74,
+                    onRefresh: () => ctrl.refreshSubagentsOnly(
+                      silent: state.connectionPhase == ConnectionPhase.connected,
+                    ),
                     child: CustomScrollView(
                       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                       slivers: [
                         SliverPadding(
-                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          padding: EdgeInsets.fromLTRB(16, topPad + 76, 16, 40 + botPad),
                           sliver: SliverMainAxisGroup(
                             slivers: [
                               if (state.connectionPhase != ConnectionPhase.connected)
@@ -109,7 +152,16 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
                                     ),
                                   ),
                                 ),
-                              if (state.subagents.isEmpty)
+                              if (state.subagents.isEmpty && _initialLoading)
+                                SliverToBoxAdapter(
+                                  child: GrassBagCard(
+                                    padding: const EdgeInsets.symmetric(vertical: 34),
+                                    child: Center(
+                                      child: GrassBagActivityIndicator(radius: 11, color: t.primary),
+                                    ),
+                                  ),
+                                )
+                              else if (state.subagents.isEmpty)
                                 SliverToBoxAdapter(
                                   child: GrassBagCard(
                                     padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 32),
@@ -173,7 +225,8 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
                                         child: SubagentLineageCard(
                                           item: sub,
                                           onPrompt: () => _openPromptSheet(context, sub),
-                                          onInterrupt: sub.status.toLowerCase() == 'running'
+                                          onInterrupt: (state.isDshConnected &&
+                                                  sub.status.toLowerCase() == 'running')
                                               ? () async {
                                                   final ok = await showGrassBagConfirmDialog(
                                                     context,
@@ -305,12 +358,11 @@ class SubagentLineageCard extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(width: 7),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: statusColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
+                        GrassBagFresnelGlassSurface(
+                          isPill: true,
+                          innerWell: true,
+                          tintColor: statusColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
                           child: Text(
                             statusLabel,
                             style: TextStyle(
@@ -322,31 +374,33 @@ class SubagentLineageCard extends StatelessWidget {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      metaLine,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11.5, color: t.text3),
-                    ),
+                    if (metaLine.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        metaLine,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11.5, color: t.text3),
+                      ),
+                    ],
                   ],
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Text(
-            item.taskSummary,
-            style: TextStyle(fontSize: 13.5, height: 1.42, color: t.text),
-          ),
+          if (item.taskSummary.trim().isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Text(
+              item.taskSummary,
+              style: TextStyle(fontSize: 13.5, height: 1.42, color: t.text),
+            ),
+          ],
           if (item.worktreeBranch != null && item.worktreeBranch!.isNotEmpty) ...[
             const SizedBox(height: 8),
-            Container(
+            GrassBagFresnelGlassSurface(
+              isPill: true,
+              innerWell: true,
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: t.fill1,
-                borderRadius: BorderRadius.circular(999),
-              ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -366,19 +420,20 @@ class SubagentLineageCard extends StatelessWidget {
           ],
           if (item.outputPreview.isNotEmpty) ...[
             const SizedBox(height: 9),
-            Container(
-              width: double.infinity,
+            ConstrainedBox(
               constraints: const BoxConstraints(maxHeight: 140),
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: t.fill1,
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  item.outputPreview,
-                  contextMenuBuilder: buildGrassBagEditableContextMenu,
-                  style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+              child: GrassBagFresnelGlassSurface(
+                borderRadius: 12,
+                innerWell: true,
+                width: double.infinity,
+                clipBehavior: Clip.antiAlias,
+                padding: const EdgeInsets.all(10),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    item.outputPreview,
+                    contextMenuBuilder: buildGrassBagEditableContextMenu,
+                    style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+                  ),
                 ),
               ),
             ),
@@ -390,13 +445,14 @@ class SubagentLineageCard extends StatelessWidget {
             children: [
               GrassBagSpringTap(
                 onTap: onPrompt,
+                enablePointerGlow: false,
                 haptic: true,
-                child: Container(
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  tintColor: t.primarySoft,
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -413,13 +469,13 @@ class SubagentLineageCard extends StatelessWidget {
               if (onInspect != null)
                 GrassBagSpringTap(
                   onTap: onInspect!,
+                  enablePointerGlow: false,
                   haptic: true,
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -436,13 +492,14 @@ class SubagentLineageCard extends StatelessWidget {
               if (onInterrupt != null)
                 GrassBagSpringTap(
                   onTap: onInterrupt!,
+                  enablePointerGlow: false,
                   haptic: true,
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.errSoft,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: t.errSoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -465,8 +522,9 @@ class SubagentLineageCard extends StatelessWidget {
 }
 
 class _SubagentPromptDialogBody extends ConsumerStatefulWidget {
-  const _SubagentPromptDialogBody({required this.sub});
+  const _SubagentPromptDialogBody({required this.sub, this.onDraftChanged});
   final SubagentItem sub;
+  final ValueChanged<bool>? onDraftChanged;
 
   @override
   ConsumerState<_SubagentPromptDialogBody> createState() => _SubagentPromptDialogBodyState();
@@ -497,6 +555,7 @@ class _SubagentPromptDialogBodyState extends ConsumerState<_SubagentPromptDialog
     final ok = await ref.read(appProvider.notifier).promptSubagent(widget.sub.id, msg);
     if (!mounted) return;
     if (ok) {
+      widget.onDraftChanged?.call(false);
       Navigator.of(context).pop();
     } else {
       setState(() {
@@ -521,7 +580,8 @@ class _SubagentPromptDialogBodyState extends ConsumerState<_SubagentPromptDialog
           minLines: 2,
           maxLines: 4,
           hasError: _err != null,
-          onChanged: (_) {
+          onChanged: (v) {
+            widget.onDraftChanged?.call(v.trim().isNotEmpty);
             if (_err != null) setState(() => _err = null);
           },
           placeholder: '例如：顺便检查边界条件并补一条回归单测…',

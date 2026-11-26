@@ -442,21 +442,39 @@ export function registerSystemDomain(router, { ctx, gateway }) {
       }
     }
 
-    // Live npm registry fallback when DSH host does not mount pluginMarket indexes
+    // Live npm registry fallback (China npmmirror first -> official npmjs fallback)
     const searchTerm = text || '@deepseek-ai/dsh';
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const searchRegistries = [
+      'https://registry.npmmirror.com',
+      'https://registry.npmjs.org',
+    ];
+    let lastSearchError = null;
     try {
-      const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(searchTerm)}&size=${limit}`;
-      const resp = await fetch(npmUrl, {
-        headers: { accept: 'application/json' },
-        signal: controller.signal,
-      });
-      if (!resp.ok) {
-        sendJson(res, 200, { v: 1, result: { source: 'npm-registry', items: [], error: `HTTP ${resp.status}` } });
+      let data = null;
+      for (const regBase of searchRegistries) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5000);
+        try {
+          const npmUrl = `${regBase}/-/v1/search?text=${encodeURIComponent(searchTerm)}&size=${limit}`;
+          const resp = await fetch(npmUrl, {
+            headers: { accept: 'application/json' },
+            signal: controller.signal,
+          });
+          if (resp.ok) {
+            data = await resp.json();
+            break;
+          }
+          lastSearchError = `HTTP ${resp.status}`;
+        } catch (err) {
+          lastSearchError = err?.name === 'AbortError' ? '搜索插件市场超时' : String(err?.message || err);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      if (!data) {
+        sendJson(res, 200, { v: 1, result: { source: 'npm-registry', items: [], error: lastSearchError || '无法连接插件仓库' } });
         return;
       }
-      const data = await resp.json();
       const objects = Array.isArray(data?.objects) ? data.objects : [];
       const items = objects.map((o) => {
         const pkg = o?.package ?? {};
@@ -482,8 +500,6 @@ export function registerSystemDomain(router, { ctx, gateway }) {
           error: err?.name === 'AbortError' ? '搜索插件市场超时' : String(err?.message || err),
         },
       });
-    } finally {
-      clearTimeout(timer);
     }
   }, { domain: 'plugins' });
 
@@ -754,47 +770,42 @@ export function registerSystemDomain(router, { ctx, gateway }) {
 
   router.get('/system/check-update', async (_req, res) => {
     const currentVersion = detectDshVersion(ctx);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    try {
-      const resp = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh', {
-        headers: { accept: 'application/vnd.npm.install-v1+json, application/json' },
-        signal: controller.signal,
-      });
-      if (!resp.ok) {
-        sendJson(res, 200, {
-          v: 1,
-          currentVersion,
-          latestVersion: currentVersion,
-          nextVersion: null,
-          hasUpdate: false,
-          checkedAt: Date.now(),
-          error: `npm registry returned HTTP ${resp.status}`,
+    const updateSources = [
+      { label: 'npmmirror', url: 'https://registry.npmmirror.com/-/package/%40deepseek-ai%2Fdsh/dist-tags', isDistTags: true },
+      { label: 'npmjs', url: 'https://registry.npmjs.org/@deepseek-ai/dsh', isDistTags: false },
+    ];
+    let distTags = null;
+    let lastError = null;
+    let sourceUsed = '';
+    for (const src of updateSources) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const resp = await fetch(src.url, {
+          headers: { accept: 'application/vnd.npm.install-v1+json, application/json' },
+          signal: controller.signal,
         });
-        return;
+        if (!resp.ok) {
+          lastError = `${src.label} returned HTTP ${resp.status}`;
+          continue;
+        }
+        const data = await resp.json();
+        const candidateTags = src.isDistTags
+          ? (data && typeof data === 'object' ? data : null)
+          : (data && typeof data['dist-tags'] === 'object' ? data['dist-tags'] : null);
+        if (candidateTags && (typeof candidateTags.latest === 'string' || typeof candidateTags.next === 'string')) {
+          distTags = candidateTags;
+          sourceUsed = src.label;
+          break;
+        }
+        lastError = `${src.label} returned empty dist-tags`;
+      } catch (err) {
+        lastError = err?.name === 'AbortError' ? '检查更新超时，请检查网络连接' : String(err?.message || err);
+      } finally {
+        clearTimeout(timer);
       }
-      const data = await resp.json();
-      const distTags = data && typeof data['dist-tags'] === 'object' ? data['dist-tags'] : {};
-      const latestTag = typeof distTags.latest === 'string' ? distTags.latest : null;
-      const nextTag = typeof distTags.next === 'string' ? distTags.next : null;
-      const isPrerelease = currentVersion.includes('-');
-      const candidates = [latestTag, ...(isPrerelease ? [nextTag] : [])].filter(Boolean);
-      let recommended = currentVersion;
-      for (const c of candidates) {
-        if (compareSemver(c, recommended) > 0) recommended = c;
-      }
-      const hasUpdate = compareSemver(recommended, currentVersion) > 0;
-      sendJson(res, 200, {
-        v: 1,
-        currentVersion,
-        latestVersion: latestTag ?? currentVersion,
-        nextVersion: nextTag,
-        recommendedVersion: recommended,
-        distTags,
-        hasUpdate,
-        checkedAt: Date.now(),
-      });
-    } catch (err) {
+    }
+    if (!distTags) {
       sendJson(res, 200, {
         v: 1,
         currentVersion,
@@ -802,11 +813,30 @@ export function registerSystemDomain(router, { ctx, gateway }) {
         nextVersion: null,
         hasUpdate: false,
         checkedAt: Date.now(),
-        error: err?.name === 'AbortError' ? '检查更新超时，请检查网络连接' : String(err?.message || err),
+        error: lastError || '检查更新失败，请检查网络连接',
       });
-    } finally {
-      clearTimeout(timer);
+      return;
     }
+    const latestTag = typeof distTags.latest === 'string' ? distTags.latest : null;
+    const nextTag = typeof distTags.next === 'string' ? distTags.next : null;
+    const isPrerelease = currentVersion.includes('-');
+    const candidates = [latestTag, ...(isPrerelease ? [nextTag] : [])].filter(Boolean);
+    let recommended = currentVersion;
+    for (const c of candidates) {
+      if (compareSemver(c, recommended) > 0) recommended = c;
+    }
+    const hasUpdate = compareSemver(recommended, currentVersion) > 0;
+    sendJson(res, 200, {
+      v: 1,
+      currentVersion,
+      latestVersion: latestTag ?? currentVersion,
+      nextVersion: nextTag,
+      recommendedVersion: recommended,
+      distTags,
+      source: sourceUsed,
+      hasUpdate,
+      checkedAt: Date.now(),
+    });
   }, { domain: 'meta' });
 
   router.patch('/settings', async (req, res, { peer }) => {

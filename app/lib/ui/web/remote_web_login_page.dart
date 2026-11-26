@@ -54,10 +54,7 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
   String? _lastCheckedCookie;
 
   bool get _supportsNativeWebView =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS ||
-          defaultTargetPlatform == TargetPlatform.macOS);
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   static String _localizeWebError(String description, int errorCode) {
     final upper = description.toUpperCase();
@@ -122,77 +119,91 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
     super.initState();
     _currentUrl = widget.baseAddress;
     if (_supportsNativeWebView) {
-      final ctrl = WebViewController()
-        ..setJavaScriptMode(JavaScriptMode.unrestricted)
-        ..setBackgroundColor(Colors.transparent)
-        ..setNavigationDelegate(
-          NavigationDelegate(
-            onProgress: (p) {
-              if (!mounted) return;
-              _progress.value = (p / 100.0).clamp(0.0, 1.0);
-            },
-            onPageStarted: (url) {
-              if (mounted) {
-                setState(() {
-                  _currentUrl = url;
-                  if (_hasLoadError) {
-                    _hasLoadError = false;
-                    if (!_manualVerifying) {
-                      _statusText = _defaultStatusText;
-                    }
-                  }
-                });
-              }
-              unawaited(_syncCanGoBack());
-            },
-            onPageFinished: (url) {
-              if (!mounted) return;
-              _progress.value = 1.0;
-              setState(() => _currentUrl = url);
-              unawaited(_syncCanGoBack());
-              unawaited(_checkCookiesAndComplete(silent: true));
-            },
-            onWebResourceError: (err) {
-              if (err.isForMainFrame == false || !mounted) return;
-              setState(() {
-                _hasLoadError = true;
-                _progress.value = 1.0;
-                _statusText = _localizeWebError(err.description, err.errorCode);
-              });
-            },
-            onSslAuthError: (request) async {
-              final targetUri = Uri.tryParse(widget.baseAddress);
-              final targetHost = targetUri?.host.toLowerCase() ?? '';
-              final errHost = _extractSslErrorHost(request);
-              final hostMatches =
-                  targetHost.isNotEmpty && errHost != null && errHost == targetHost;
-              if (widget.allowBadCertificates && hostMatches) {
-                await request.proceed();
-              } else {
-                await request.cancel();
+      final isDarkNow = ref.read(appProvider).isDark;
+      try {
+        final ctrl = WebViewController()
+          ..setJavaScriptMode(JavaScriptMode.unrestricted)
+          ..setBackgroundColor(
+            isDarkNow ? const Color(0xFF141B26) : const Color(0xFFF6F9FC),
+          )
+          ..setNavigationDelegate(
+            NavigationDelegate(
+              onProgress: (p) {
+                if (!mounted) return;
+                _progress.value = (p / 100.0).clamp(0.0, 1.0);
+              },
+              onPageStarted: (url) {
                 if (mounted) {
                   setState(() {
-                    _hasLoadError = true;
-                    _progress.value = 1.0;
-                    _statusText = widget.allowBadCertificates && !hostMatches
-                        ? '已拦截第三方域名 (${errHost ?? '未知'}) 的不受信任 HTTPS 证书'
-                        : '检测到自签名 HTTPS 证书，请先开启「信任自签名证书」后再重试登录';
+                    _currentUrl = url;
+                    if (_hasLoadError) {
+                      _hasLoadError = false;
+                      if (!_manualVerifying) {
+                        _statusText = _defaultStatusText;
+                      }
+                    }
                   });
                 }
-              }
-            },
-          ),
-        );
-      final parsed = Uri.tryParse(widget.baseAddress);
-      if (parsed != null && (parsed.scheme == 'http' || parsed.scheme == 'https')) {
-        unawaited(ctrl.loadRequest(parsed));
-      } else {
-        _statusText = '远程主机地址格式无效，请检查后重试：${widget.baseAddress}';
+                unawaited(_syncCanGoBack());
+              },
+              onPageFinished: (url) {
+                if (!mounted) return;
+                _progress.value = 1.0;
+                setState(() => _currentUrl = url);
+                unawaited(_syncCanGoBack());
+                if (!_hasLoadError) {
+                  unawaited(_checkCookiesAndComplete(silent: true));
+                }
+              },
+              onWebResourceError: (err) {
+                if (err.isForMainFrame == false || !mounted) return;
+                setState(() {
+                  _hasLoadError = true;
+                  _progress.value = 1.0;
+                  _statusText = _localizeWebError(err.description, err.errorCode);
+                });
+              },
+              onSslAuthError: (request) async {
+                final targetUri = Uri.tryParse(widget.baseAddress);
+                final targetHost = targetUri?.host.toLowerCase() ?? '';
+                final errHost = _extractSslErrorHost(request);
+                final hostMatches =
+                    targetHost.isNotEmpty && errHost != null && errHost == targetHost;
+                if (widget.allowBadCertificates && hostMatches) {
+                  await request.proceed();
+                } else {
+                  await request.cancel();
+                  if (mounted) {
+                    setState(() {
+                      _hasLoadError = true;
+                      _progress.value = 1.0;
+                      _statusText = widget.allowBadCertificates && !hostMatches
+                          ? '已拦截第三方域名 (${errHost ?? '未知'}) 的不受信任 HTTPS 证书'
+                          : '检测到自签名 HTTPS 证书，请先开启「信任自签名证书」后再重试登录';
+                    });
+                  }
+                }
+              },
+            ),
+          );
+        final parsed = Uri.tryParse(widget.baseAddress);
+        if (parsed != null && (parsed.scheme == 'http' || parsed.scheme == 'https')) {
+          unawaited(ctrl.loadRequest(parsed));
+        } else {
+          _hasLoadError = true;
+          _statusText = '远程主机地址格式无效，请检查后重试：${widget.baseAddress}';
+        }
+        _controller = ctrl;
+        _pollTimer = Timer.periodic(const Duration(milliseconds: 2400), (_) {
+          if (!_hasLoadError) {
+            unawaited(_checkCookiesAndComplete(silent: true));
+          }
+        });
+      } catch (e) {
+        _controller = null;
+        _hasLoadError = true;
+        _statusText = '内置 WebView 初始化失败：$e';
       }
-      _controller = ctrl;
-      _pollTimer = Timer.periodic(const Duration(milliseconds: 2400), (_) {
-        unawaited(_checkCookiesAndComplete(silent: true));
-      });
     }
   }
 
@@ -253,6 +264,7 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
         _lastCheckedCookie = merged;
         _completed = true;
         _pollTimer?.cancel();
+        HapticFeedback.mediumImpact();
         Navigator.of(context).pop<String>(merged);
         return;
       }
@@ -296,6 +308,13 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
             queryParameters: {...baseUri.queryParameters, 'token': parsed.token!},
           )
         : baseUri;
+    if (!_isSameHostPort(target.toString(), widget.baseAddress)) {
+      ref.read(appProvider.notifier).showToast(
+            '粘贴链接的主机地址与当前目标「${widget.hostName}」不一致，已取消跳转',
+            tone: ToastTone.warn,
+          );
+      return;
+    }
     if (_controller != null) {
       setState(() => _statusText = '正在加载粘贴的认证链接…');
       await _controller!.loadRequest(target);
@@ -316,11 +335,40 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
     return map.entries.map((e) => '${e.key}=${e.value}').join('; ');
   }
 
+  void _reloadOrRetry() {
+    final ctrl = _controller;
+    if (ctrl == null) return;
+    if (_hasLoadError) {
+      final baseUri = Uri.tryParse(widget.baseAddress);
+      if (baseUri != null && (baseUri.scheme == 'http' || baseUri.scheme == 'https')) {
+        _progress.value = 0.1;
+        setState(() {
+          _hasLoadError = false;
+          _statusText = _defaultStatusText;
+        });
+        unawaited(ctrl.loadRequest(baseUri));
+      } else {
+        setState(() {
+          _hasLoadError = true;
+          _statusText = '远程主机地址格式无效，请检查后重试：${widget.baseAddress}';
+        });
+      }
+      return;
+    }
+    _progress.value = 0.1;
+    setState(() => _statusText = _defaultStatusText);
+    unawaited(ctrl.reload());
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
-    final botPad = MediaQuery.viewPaddingOf(context).bottom;
+    final botPad = MediaQuery.paddingOf(context).bottom;
+    final parsedCur = Uri.tryParse(_currentUrl);
+    final hostSubtitle = (parsedCur != null && parsedCur.host.isNotEmpty)
+        ? (parsedCur.hasPort ? '${parsedCur.host}:${parsedCur.port}' : parsedCur.host)
+        : widget.baseAddress;
 
     return PopScope(
       canPop: !_canGoBack,
@@ -345,6 +393,7 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
                 children: [
                   GrassBagUnifiedHeader(
                     title: '登录 ${widget.hostName}',
+                    subtitle: hostSubtitle,
                     tier: tier,
                     floating: false,
                     onBack: () => Navigator.of(context).pop<String>(null),
@@ -355,10 +404,7 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
                             tooltip: '刷新页面',
                             tier: tier,
                             useOwnLayer: false,
-                            onTap: () {
-                              setState(() => _statusText = _defaultStatusText);
-                              unawaited(_controller?.reload());
-                            },
+                            onTap: _reloadOrRetry,
                           ),
                   ),
                   // Compact status + one-tap verify/paste bar
@@ -373,9 +419,15 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
                           Row(
                             children: [
                               if (_manualVerifying)
-                                CupertinoActivityIndicator(radius: 7.5, color: t.primary)
+                                GrassBagActivityIndicator(radius: 7.5, color: t.primary)
                               else
-                                Icon(CupertinoIcons.lock_shield_fill, size: 15, color: t.primary),
+                                Icon(
+                                  _hasLoadError
+                                      ? CupertinoIcons.exclamationmark_triangle_fill
+                                      : CupertinoIcons.lock_shield_fill,
+                                  size: 15,
+                                  color: _hasLoadError ? t.warn : t.primary,
+                                ),
                               const SizedBox(width: 7),
                               Expanded(
                                 child: Text(
@@ -424,67 +476,150 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
                   Expanded(
                     child: Padding(
                       padding: EdgeInsets.fromLTRB(12, 0, 12, botPad > 0 ? botPad + 8 : 14),
-                      child: ClipRSuperellipse(
-                        borderRadius: BorderRadius.circular(24),
-                        child: DecoratedBox(
-                          decoration: ShapeDecoration(
-                            color: t.cardSolid,
-                            shape: RoundedSuperellipseBorder(
-                              borderRadius: BorderRadius.circular(24),
-                              side: BorderSide(color: t.sepStrong, width: 0.65),
+                      child: CustomPaint(
+                        foregroundPainter: tier == GrassBagGlassTier.solid
+                            ? null
+                            : GrassBagFresnelRimPainter(
+                                isDark: t.isDark,
+                                borderRadius: 24,
+                                innerWell: true,
+                                frosted: tier == GrassBagGlassTier.frosted,
+                                paintTopSheen: false,
+                                strokeWidth: 0.85,
+                              ),
+                        child: ClipRSuperellipse(
+                          borderRadius: BorderRadius.circular(24),
+                          child: DecoratedBox(
+                            decoration: ShapeDecoration(
+                              color: t.cardSolid,
+                              shape: RoundedSuperellipseBorder(
+                                borderRadius: BorderRadius.circular(24),
+                                side: tier == GrassBagGlassTier.solid
+                                    ? BorderSide(color: t.sepStrong, width: 0.65)
+                                    : BorderSide.none,
+                              ),
                             ),
-                          ),
-                          child: Stack(
-                            children: [
-                              if (_controller != null)
-                                WebViewWidget(controller: _controller!)
-                              else
-                                Center(
-                                  child: Padding(
-                                    padding: const EdgeInsets.all(24),
-                                    child: Column(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        Icon(CupertinoIcons.globe, size: 36, color: t.text3),
-                                        const SizedBox(height: 12),
-                                        Text(
-                                          '当前平台不支持内置 WebView 凭证同步',
-                                          style: TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w600,
-                                            color: t.text,
+                            child: Stack(
+                              children: [
+                                if (_controller != null)
+                                  WebViewWidget(controller: _controller!)
+                                else
+                                  Center(
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(24),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(CupertinoIcons.globe, size: 36, color: t.text3),
+                                          const SizedBox(height: 12),
+                                          Text(
+                                            '当前平台不支持内置 WebView 凭证同步',
+                                            style: TextStyle(
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.w600,
+                                              color: t.text,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            '请在浏览器打开 ${widget.baseAddress}，或直接粘贴终端打印的 dsh web 启动链接。',
+                                            textAlign: TextAlign.center,
+                                            style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text2),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                if (_controller != null && _hasLoadError)
+                                  Positioned.fill(
+                                    child: ColoredBox(
+                                      color: t.bgSolid.withValues(alpha: 0.96),
+                                      child: Center(
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(24),
+                                          child: GrassBagCard(
+                                            borderRadius: 24,
+                                            padding: const EdgeInsets.all(20),
+                                            child: Column(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                GrassBagSquircleIcon(
+                                                  icon: CupertinoIcons.wifi_exclamationmark,
+                                                  color: t.warn,
+                                                  size: 44,
+                                                  iconSize: 20,
+                                                ),
+                                                const SizedBox(height: 12),
+                                                Text(
+                                                  '登录页面加载失败',
+                                                  style: TextStyle(
+                                                    fontSize: 16,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: t.text,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 6),
+                                                Text(
+                                                  _statusText,
+                                                  textAlign: TextAlign.center,
+                                                  style: TextStyle(
+                                                    fontSize: 12.5,
+                                                    height: 1.45,
+                                                    color: t.text3,
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 16),
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: GrassBagSecondaryGlassButton(
+                                                        label: '粘贴链接',
+                                                        icon: CupertinoIcons.doc_on_clipboard,
+                                                        tier: tier,
+                                                        insideGlass: true,
+                                                        onTap: _pasteAndNavigate,
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 10),
+                                                    Expanded(
+                                                      child: GrassBagPrimaryGlassButton(
+                                                        label: '重新加载',
+                                                        icon: CupertinoIcons.refresh,
+                                                        tier: tier,
+                                                        insideGlass: true,
+                                                        onTap: _reloadOrRetry,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ],
+                                            ),
                                           ),
                                         ),
-                                        const SizedBox(height: 6),
-                                        Text(
-                                          '请在浏览器打开 ${widget.baseAddress}，或直接粘贴终端打印的 dsh web 启动链接。',
-                                          textAlign: TextAlign.center,
-                                          style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text2),
-                                        ),
-                                      ],
+                                      ),
+                                    ),
+                                  ),
+                                Positioned(
+                                  top: 0,
+                                  left: 0,
+                                  right: 0,
+                                  child: IgnorePointer(
+                                    child: ValueListenableBuilder<double>(
+                                      valueListenable: _progress,
+                                      builder: (_, v, __) {
+                                        if (v <= 0 || v >= 0.99) return const SizedBox.shrink();
+                                        return GrassBagProgressBar(
+                                          value: v,
+                                          height: 2.5,
+                                          color: t.primary,
+                                          trackColor: Colors.transparent,
+                                        );
+                                      },
                                     ),
                                   ),
                                 ),
-                              Positioned(
-                                top: 0,
-                                left: 0,
-                                right: 0,
-                                child: IgnorePointer(
-                                  child: ValueListenableBuilder<double>(
-                                    valueListenable: _progress,
-                                    builder: (_, v, __) {
-                                      if (v <= 0 || v >= 0.99) return const SizedBox.shrink();
-                                      return GrassBagProgressBar(
-                                        value: v,
-                                        height: 2.5,
-                                        color: t.primary,
-                                        trackColor: Colors.transparent,
-                                      );
-                                    },
-                                  ),
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
                       ),

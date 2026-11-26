@@ -28,13 +28,19 @@ class PermissionsCenterPage extends ConsumerWidget {
         body: Stack(
           children: [
             Positioned.fill(
-              child: SingleChildScrollView(
-                physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
-                padding: EdgeInsets.fromLTRB(16, topPad + 70, 16, 40 + botPad),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
-                    child: const PermissionsCenterView(),
+              child: RefreshIndicator.adaptive(
+                edgeOffset: topPad + 86,
+                onRefresh: () => ref
+                    .read(appProvider.notifier)
+                    .refreshNativeStatus(skipAutoConnect: true, forceFresh: true),
+                child: SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                  padding: EdgeInsets.fromLTRB(16, topPad + 86, 16, 40 + botPad),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
+                      child: const PermissionsCenterView(),
+                    ),
                   ),
                 ),
               ),
@@ -69,6 +75,118 @@ class PermissionsCenterPage extends ConsumerWidget {
   }
 }
 
+/// Shared Android 13+ Restricted Settings 3-step unlock guide invoked by both
+/// [PermissionsCenterView] and [PhoneControlView].
+void showRestrictedSettingsGuideSheet(BuildContext context, GrassBagGlassTier tier) {
+  final native = GrassBagNativeBridge.instance;
+  showGrassBagSheet<void>(
+    context,
+    title: 'Android 13+ 开启无障碍分步引导',
+    subtitle: '若系统提示「受限设置」或开启开关后服务未生效，按顺序完成以下 3 步即可解锁',
+    icon: CupertinoIcons.hand_draw_fill,
+    bodyBuilder: (ctx) => Consumer(
+      builder: (ctx, ref, _) {
+        final t = GrassBagTokens.of(ctx);
+        final perms = ref.watch(appProvider.select((s) => s.nativePermissions));
+        final steps = <(String, String, bool)>[
+          (
+            '1. 打开应用信息 → 允许受限设置',
+            '进入系统「应用信息」页，点右上角「⋮」（部分机型在页面底部），选择「允许受限设置」。',
+            perms.accessibilityEnabled,
+          ),
+          (
+            '2. 前往无障碍 → 开启 GrassBag 手机操控助手',
+            '找到「GrassBag 手机操控助手」并打开开关；若原本已开但失效，请先关闭再重新打开。',
+            perms.accessibilityEnabled,
+          ),
+          (
+            '3. 关闭电池优化（防止后台掉线）',
+            '将耗电策略设为「无限制」，避免切后台或锁屏后系统自动终止无障碍服务。',
+            perms.batteryOptIgnored,
+          ),
+        ];
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            GrassBagSheetSection(
+              dividerIndent: 14,
+              children: [
+                for (final s in steps)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                s.$1,
+                                style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: t.text),
+                              ),
+                            ),
+                            if (s.$3)
+                              _PermBadge(label: '已完成', bg: t.okSoft, fg: t.ok),
+                          ],
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          s.$2,
+                          style: TextStyle(fontSize: 12, height: 1.4, color: t.text3),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: GrassBagSecondaryGlassButton(
+                    label: '1. 应用信息',
+                    icon: CupertinoIcons.info_circle,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    height: 38,
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: () => native.openPermissionSettings('app_details'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: GrassBagPrimaryGlassButton(
+                    label: '2. 前往无障碍',
+                    icon: CupertinoIcons.hand_draw_fill,
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    height: 38,
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: () => native.openPermissionSettings('accessibility'),
+                  ),
+                ),
+              ],
+            ),
+            if (!perms.batteryOptIgnored) ...[
+              const SizedBox(height: 8),
+              GrassBagSecondaryGlassButton(
+                label: '3. 关闭电池优化（推荐）',
+                icon: CupertinoIcons.battery_100,
+                height: 38,
+                tier: tier,
+                insideGlass: true,
+                accentForeground: true,
+                onTap: () => native.openPermissionSettings('battery'),
+              ),
+            ],
+          ],
+        );
+      },
+    ),
+  );
+}
+
 /// Unified Android Permissions Center View embedded in Settings (`SettingsSection.permissions`)
 /// and wrapped by [PermissionsCenterPage].
 class PermissionsCenterView extends ConsumerStatefulWidget {
@@ -89,108 +207,8 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
     });
   }
 
-  void _showRestrictedSettingsGuide(BuildContext context, GrassBagGlassTier tier) {
-    final native = GrassBagNativeBridge.instance;
-    showGrassBagSheet<void>(
-      context,
-      title: 'Android 13+ 开启无障碍分步引导',
-      subtitle: '若系统提示「受限设置」或开启开关后服务未生效，按顺序完成以下 3 步即可解锁',
-      bodyBuilder: (ctx) => Consumer(
-        builder: (ctx, ref, _) {
-          final t = GrassBagTokens.of(ctx);
-          final perms = ref.watch(appProvider.select((s) => s.nativePermissions));
-          final steps = <(String, String, bool)>[
-            (
-              '1. 打开应用信息 → 允许受限设置',
-              '进入系统「应用信息」页，点右上角「⋮」（部分机型在页面底部），选择「允许受限设置」。',
-              perms.accessibilityEnabled,
-            ),
-            (
-              '2. 前往无障碍 → 开启 GrassBag 手机操控助手',
-              '找到「GrassBag 手机操控助手」并打开开关；若原本已开但失效，请先关闭再重新打开。',
-              perms.accessibilityEnabled,
-            ),
-            (
-              '3. 关闭电池优化（防止后台掉线）',
-              '将耗电策略设为「无限制」，避免切后台或锁屏后系统自动终止无障碍服务。',
-              perms.batteryOptIgnored,
-            ),
-          ];
-          return Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              GrassBagSheetSection(
-                dividerIndent: 14,
-                children: [
-                  for (final s in steps)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  s.$1,
-                                  style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: t.text),
-                                ),
-                              ),
-                              if (s.$3)
-                                _PermBadge(label: '已完成', bg: t.okSoft, fg: t.ok),
-                            ],
-                          ),
-                          const SizedBox(height: 3),
-                          Text(s.$2, style: TextStyle(fontSize: 12, height: 1.4, color: t.text3)),
-                        ],
-                      ),
-                    ),
-                ],
-              ),
-              const SizedBox(height: 14),
-              Row(
-                children: [
-                  Expanded(
-                    child: GrassBagSecondaryGlassButton(
-                      label: '1. 打开应用信息',
-                      icon: CupertinoIcons.info_circle,
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      tier: tier,
-                      insideGlass: true,
-                      onTap: () => native.openPermissionSettings('app_details'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: GrassBagPrimaryGlassButton(
-                      label: '2. 前往无障碍',
-                      icon: CupertinoIcons.hand_draw_fill,
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      tier: tier,
-                      insideGlass: true,
-                      onTap: () => native.openPermissionSettings('accessibility'),
-                    ),
-                  ),
-                ],
-              ),
-              if (!perms.batteryOptIgnored) ...[
-                const SizedBox(height: 8),
-                GrassBagSecondaryGlassButton(
-                  label: '3. 关闭电池优化（推荐）',
-                  icon: CupertinoIcons.battery_100,
-                  tier: tier,
-                  insideGlass: true,
-                  accentForeground: true,
-                  onTap: () => native.openPermissionSettings('battery'),
-                ),
-              ],
-            ],
-          );
-        },
-      ),
-    );
-  }
+  void _showRestrictedSettingsGuide(BuildContext context, GrassBagGlassTier tier) =>
+      showRestrictedSettingsGuideSheet(context, tier);
 
   void _showShizukuInfoSheet(BuildContext context, GrassBagGlassTier tier) {
     showGrassBagSheet<void>(
@@ -274,85 +292,126 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // 1. Summary Hero Card
+        // 1. Summary Hero Card with visual readiness progress bar
         GrassBagCard(
           borderRadius: 24,
           padding: const EdgeInsets.all(16),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              GrassBagSquircleIcon(
-                icon: needsRetoggle
-                    ? CupertinoIcons.exclamationmark_shield_fill
-                    : (coreReady
-                        ? CupertinoIcons.checkmark_shield_fill
-                        : CupertinoIcons.shield_lefthalf_fill),
-                color: needsRetoggle
-                    ? t.err
-                    : (coreReady ? t.ok : t.primary),
-                size: 44,
-                iconSize: 21,
-                filled: true,
-              ),
-              const SizedBox(width: 13),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '已开启 $grantedCount / 6 项系统权限',
-                      style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600, color: t.text),
+              Row(
+                children: [
+                  GrassBagSquircleIcon(
+                    icon: needsRetoggle
+                        ? CupertinoIcons.exclamationmark_shield_fill
+                        : (coreReady
+                            ? CupertinoIcons.checkmark_shield_fill
+                            : CupertinoIcons.shield_lefthalf_fill),
+                    color: needsRetoggle
+                        ? t.err
+                        : (coreReady ? t.ok : t.primary),
+                    size: 44,
+                    iconSize: 21,
+                    filled: true,
+                  ),
+                  const SizedBox(width: 13),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '已开启 $grantedCount / 6 项系统权限',
+                          style: TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600, color: t.text),
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          needsRetoggle
+                              ? '检测到无障碍开关已开但系统未绑定服务，请点击下方修复'
+                              : '集中管理操控手机、后台保活、文件挂载与语音所需权限',
+                          style: TextStyle(
+                            fontSize: 12,
+                            height: 1.35,
+                            color: needsRetoggle ? t.err : t.text3,
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 3),
-                    Text(
-                      needsRetoggle
-                          ? '检测到无障碍开关已开但系统未绑定服务，请点击下方修复'
-                          : '集中管理操控手机、后台保活、文件挂载与语音所需权限',
-                      style: TextStyle(
-                        fontSize: 12,
-                        height: 1.35,
-                        color: needsRetoggle ? t.err : t.text3,
+                  ),
+                  const SizedBox(width: 8),
+                  if (coreReady && !needsRetoggle && perms.batteryOptIgnored)
+                    _PermBadge(label: '核心就绪', bg: t.okSoft, fg: t.ok),
+                  const SizedBox(width: 6),
+                  Tooltip(
+                    message: '刷新系统权限状态',
+                    excludeFromSemantics: true,
+                    child: Semantics(
+                      button: true,
+                      label: '刷新系统权限状态',
+                      child: GrassBagSpringTap(
+                        enablePointerGlow: false,
+                        haptic: true,
+                        onTap: () async {
+                          await ctrl.refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
+                          ctrl.showToast('已刷新系统权限状态', tone: ToastTone.info);
+                        },
+                        child: GrassBagFresnelGlassSurface(
+                          isCircle: true,
+                          innerWell: true,
+                          interactive: true,
+                          width: 34,
+                          height: 34,
+                          alignment: Alignment.center,
+                          child: Icon(CupertinoIcons.refresh, size: 15, color: t.text2),
+                        ),
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 8),
-              if (needsRetoggle)
-                GrassBagPrimaryGlassButton(
-                  label: '去修复',
-                  height: 32,
-                  padding: const EdgeInsets.symmetric(horizontal: 11),
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () => native.openPermissionSettings('accessibility'),
-                )
-              else if (!perms.accessibilityEnabled)
-                GrassBagPrimaryGlassButton(
-                  label: '开启无障碍',
-                  height: 32,
-                  padding: const EdgeInsets.symmetric(horizontal: 11),
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () {
-                    if (perms.sdkInt >= 33) {
-                      _showRestrictedSettingsGuide(context, tier);
-                    } else {
-                      native.openPermissionSettings('accessibility');
-                    }
-                  },
-                )
-              else if (!perms.batteryOptIgnored)
-                GrassBagSecondaryGlassButton(
-                  label: '开启保活',
-                  height: 32,
-                  padding: const EdgeInsets.symmetric(horizontal: 11),
-                  tier: tier,
-                  insideGlass: true,
-                  accentForeground: true,
-                  onTap: () => native.openPermissionSettings('battery'),
-                )
-              else
-                _PermBadge(label: '核心就绪', bg: t.okSoft, fg: t.ok),
+              const SizedBox(height: 12),
+              GrassBagProgressBar(
+                value: (grantedCount / 6.0).clamp(0.0, 1.0),
+                height: 5,
+                color: needsRetoggle ? t.err : (coreReady ? t.ok : t.primary),
+                trackColor: t.fill1,
+              ),
+              if (needsRetoggle || !perms.accessibilityEnabled || !perms.batteryOptIgnored) ...[
+                const SizedBox(height: 12),
+                if (needsRetoggle)
+                  GrassBagPrimaryGlassButton(
+                    label: '前往修复无障碍服务',
+                    icon: CupertinoIcons.wrench_fill,
+                    height: 38,
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: () => native.openPermissionSettings('accessibility'),
+                  )
+                else if (!perms.accessibilityEnabled)
+                  GrassBagPrimaryGlassButton(
+                    label: perms.sdkInt >= 33 ? '开启无障碍（含解锁指南）' : '开启无障碍服务',
+                    icon: CupertinoIcons.hand_draw_fill,
+                    height: 38,
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: () {
+                      if (perms.sdkInt >= 33) {
+                        _showRestrictedSettingsGuide(context, tier);
+                      } else {
+                        native.openPermissionSettings('accessibility');
+                      }
+                    },
+                  )
+                else
+                  GrassBagSecondaryGlassButton(
+                    label: '开启后台保活（忽略电池优化）',
+                    icon: CupertinoIcons.battery_100,
+                    height: 38,
+                    tier: tier,
+                    insideGlass: true,
+                    accentForeground: true,
+                    onTap: () => native.openPermissionSettings('battery'),
+                  ),
+              ],
             ],
           ),
         ),
@@ -439,6 +498,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 fg: perms.accessibilityEnabled
                     ? t.ok
                     : (needsRetoggle ? t.err : t.warn),
+                actionable: !perms.accessibilityEnabled,
               ),
               onTap: () {
                 if (!perms.accessibilityEnabled && !needsRetoggle && perms.sdkInt >= 33) {
@@ -462,6 +522,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 label: perms.overlayGranted ? '已授权' : '去开启',
                 bg: perms.overlayGranted ? t.okSoft : t.warnSoft,
                 fg: perms.overlayGranted ? t.ok : t.warn,
+                actionable: !perms.overlayGranted,
               ),
               onTap: () => native.openPermissionSettings('overlay'),
             ),
@@ -478,26 +539,6 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 showChevron: true,
                 onTap: () => _showRestrictedSettingsGuide(context, tier),
               ),
-            GrassBagListTile(
-              leading: GrassBagSquircleIcon(
-                icon: CupertinoIcons.bolt_circle_fill,
-                color: perms.shizukuInstalled ? t.ok : t.text3,
-                size: 34,
-                iconSize: 16,
-              ),
-              title: const Text('Shizuku 增强通道（可选）'),
-              subtitle: Text(
-                perms.shizukuInstalled
-                    ? '已检测到 Shizuku（当前版本暂未集成，默认使用无障碍通道）'
-                    : '暂未集成 · 当前版本仅需开启无障碍服务即可操控手机',
-              ),
-              trailing: _PermBadge(
-                label: '暂未集成',
-                bg: t.fill1,
-                fg: t.text3,
-              ),
-              onTap: () => _showShizukuInfoSheet(context, tier),
-            ),
           ],
         ),
 
@@ -523,6 +564,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 label: perms.batteryOptIgnored ? '已允许' : '去设置',
                 bg: perms.batteryOptIgnored ? t.okSoft : t.warnSoft,
                 fg: perms.batteryOptIgnored ? t.ok : t.warn,
+                actionable: !perms.batteryOptIgnored,
               ),
               onTap: () => native.openPermissionSettings('battery'),
             ),
@@ -540,6 +582,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 label: perms.notificationsGranted ? '已授权' : '点击申请',
                 bg: perms.notificationsGranted ? t.okSoft : t.primarySoft,
                 fg: perms.notificationsGranted ? t.ok : t.primary,
+                actionable: !perms.notificationsGranted,
               ),
               onTap: () {
                 if (perms.notificationsGranted) {
@@ -577,6 +620,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 label: perms.allFilesGranted ? '已授权' : '去开启',
                 bg: perms.allFilesGranted ? t.okSoft : t.fill1,
                 fg: perms.allFilesGranted ? t.ok : t.text2,
+                actionable: !perms.allFilesGranted,
               ),
               onTap: () {
                 if (perms.sdkInt < 30 && !perms.allFilesGranted) {
@@ -600,6 +644,7 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 label: perms.microphoneGranted ? '已授权' : '点击申请',
                 bg: perms.microphoneGranted ? t.okSoft : t.fill1,
                 fg: perms.microphoneGranted ? t.ok : t.text2,
+                actionable: !perms.microphoneGranted,
               ),
               onTap: () {
                 if (perms.microphoneGranted) {
@@ -621,6 +666,26 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
               showChevron: true,
               onTap: () => native.openPermissionSettings('app_details'),
             ),
+            GrassBagListTile(
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.bolt_circle_fill,
+                color: perms.shizukuInstalled ? t.ok : t.text3,
+                size: 34,
+                iconSize: 16,
+              ),
+              title: const Text('Shizuku 增强通道（可选）'),
+              subtitle: Text(
+                perms.shizukuInstalled
+                    ? '已检测到 Shizuku（当前版本暂未集成，默认使用无障碍通道）'
+                    : '暂未集成 · 当前版本仅需开启无障碍服务即可操控手机',
+              ),
+              trailing: _PermBadge(
+                label: '暂未集成',
+                bg: t.fill1,
+                fg: t.text3,
+              ),
+              onTap: () => _showShizukuInfoSheet(context, tier),
+            ),
           ],
         ),
       ],
@@ -633,23 +698,39 @@ class _PermBadge extends StatelessWidget {
     required this.label,
     required this.bg,
     required this.fg,
+    this.actionable = false,
   });
 
   final String label;
   final Color bg;
   final Color fg;
+  final bool actionable;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(999),
+    return GrassBagFresnelGlassSurface(
+      isPill: true,
+      innerWell: true,
+      interactive: false,
+      tintColor: bg,
+      padding: EdgeInsets.only(
+        left: 9.5,
+        right: actionable ? 7.5 : 9.5,
+        top: 4,
+        bottom: 4,
       ),
-      child: Text(
-        label,
-        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: fg),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: fg),
+          ),
+          if (actionable) ...[
+            const SizedBox(width: 2),
+            Icon(CupertinoIcons.chevron_right, size: 10.5, color: fg.withValues(alpha: 0.85)),
+          ],
+        ],
       ),
     );
   }

@@ -89,11 +89,12 @@ void main() {
       );
     });
 
-    test('handles HTTP 200, 404 (no releases yet), and 403 rate limit cleanly', () async {
+    test('prefers China mirror first and falls back cleanly on mirror error, 404, or 403', () async {
+      final seenUris = <String>[];
       final okService = AppUpdateService(
         repoSlug: 'moduqishi/grassbag',
         fetcher: (uri, {timeout = const Duration(seconds: 12)}) async {
-          expect(uri.toString(), 'https://api.github.com/repos/moduqishi/grassbag/releases/latest');
+          seenUris.add(uri.toString());
           return AppUpdateHttpResponse(
             statusCode: 200,
             body: jsonEncode({
@@ -105,7 +106,8 @@ void main() {
                 {
                   'name': 'grassbag-v0.1.5+6-arm64-v8a.apk',
                   'size': 12345678,
-                  'browser_download_url': 'https://example.com/app.apk',
+                  'browser_download_url':
+                      'https://github.com/moduqishi/grassbag/releases/download/v0.1.5/grassbag-v0.1.5+6-arm64-v8a.apk',
                 },
               ],
             }),
@@ -114,8 +116,38 @@ void main() {
       );
       final okRes = await okService.fetchLatestRelease();
       expect(okRes.ok, isTrue);
+      expect(seenUris, [
+        'https://gh-proxy.com/https://api.github.com/repos/moduqishi/grassbag/releases/latest',
+      ]);
       expect(okRes.release?.versionName, '0.1.5');
       expect(okRes.release?.buildNumber, 6);
+
+      // Mirror returns HTML error page -> automatically fails over to direct api.github.com!
+      final failoverUris = <String>[];
+      final failoverService = AppUpdateService(
+        repoSlug: 'moduqishi/grassbag',
+        fetcher: (uri, {timeout = const Duration(seconds: 12)}) async {
+          failoverUris.add(uri.toString());
+          if (uri.host.contains('gh-proxy')) {
+            return const AppUpdateHttpResponse(statusCode: 200, body: '<html>502 Bad Gateway</html>');
+          }
+          return AppUpdateHttpResponse(
+            statusCode: 200,
+            body: jsonEncode({
+              'tag_name': 'v0.2.2',
+              'name': 'v0.2.2',
+              'assets': [],
+            }),
+          );
+        },
+      );
+      final failoverRes = await failoverService.fetchLatestRelease();
+      expect(failoverRes.ok, isTrue);
+      expect(failoverRes.release?.versionName, '0.2.2');
+      expect(failoverUris, [
+        'https://gh-proxy.com/https://api.github.com/repos/moduqishi/grassbag/releases/latest',
+        'https://api.github.com/repos/moduqishi/grassbag/releases/latest',
+      ]);
 
       final emptyService = AppUpdateService(
         repoSlug: 'moduqishi/grassbag',
@@ -134,6 +166,54 @@ void main() {
       final limitedRes = await rateLimited.fetchLatestRelease();
       expect(limitedRes.ok, isFalse);
       expect(limitedRes.error, contains('受限'));
+    });
+
+    test('APK download prioritizes China mirrors (gh-proxy -> ghfast -> GitHub) and fails over automatically', () async {
+      const rawApkUrl =
+          'https://github.com/moduqishi/grassbag/releases/download/v0.2.2/grassbag-v0.2.2+13-arm64-v8a.apk';
+      final candidates = buildAppUpdateDownloadCandidateUris(rawApkUrl);
+      expect(candidates.map((u) => u.toString()).toList(), [
+        'https://gh-proxy.com/$rawApkUrl',
+        'https://ghfast.top/$rawApkUrl',
+        rawApkUrl,
+      ]);
+
+      // Non-GitHub URLs stay untouched
+      final customCandidates = buildAppUpdateDownloadCandidateUris('http://192.168.1.9:8000/app.apk');
+      expect(customCandidates.map((u) => u.toString()).toList(), [
+        'http://192.168.1.9:8000/app.apk',
+      ]);
+
+      // Simulate gh-proxy.com failure -> automatic failover to ghfast.top with source label updates
+      final tried = <String>[];
+      final sources = <String>[];
+      final dlService = AppUpdateService(
+        downloader: (
+          uri,
+          dest, {
+          onProgress,
+          isCancelled,
+          expectedSizeBytes,
+          onAbortReady,
+        }) async {
+          tried.add(uri.toString());
+          if (uri.host.contains('gh-proxy')) {
+            throw Exception('timeout');
+          }
+          return dest;
+        },
+      );
+      final saved = await dlService.downloadApk(
+        downloadUrl: rawApkUrl,
+        destinationPath: '/tmp/test-update.apk',
+        onSourceChanged: sources.add,
+      );
+      expect(saved, '/tmp/test-update.apk');
+      expect(tried, [
+        'https://gh-proxy.com/$rawApkUrl',
+        'https://ghfast.top/$rawApkUrl',
+      ]);
+      expect(sources, ['国内镜像 1', '国内镜像 2']);
     });
   });
 

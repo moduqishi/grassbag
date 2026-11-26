@@ -389,6 +389,16 @@ class VanillaDshNormalizer {
       } catch (_) {}
       bytes = jsonLen * 2 < 256 ? 256 : jsonLen * 2;
     }
+    final args = normalized['args'];
+    if (args is String) {
+      bytes += args.length * 2;
+    } else if (args != null) {
+      try {
+        bytes += jsonEncode(args).length * 2;
+      } catch (_) {
+        bytes += 256;
+      }
+    }
     _toolOutputs[key] = (record: normalized, bytes: bytes);
     _toolOutputBytes += bytes;
     while ((_toolOutputs.length > maxCachedToolOutputs || _toolOutputBytes > maxCacheBytes) &&

@@ -36,7 +36,11 @@ Future<void> launchDeepSeekSignInFlow(BuildContext context, [WidgetRef? ref]) as
 
     ctrl.showToast('正在准备 DeepSeek 授权页面…', tone: ToastTone.info);
     final url = await ctrl.startDeepSeekSignIn(openExternally: false);
-    if (url == null || url.isEmpty || !context.mounted) return;
+    if (url == null || url.isEmpty) return;
+    if (!context.mounted) {
+      unawaited(ctrl.cancelDeepSeekSignIn());
+      return;
+    }
 
     await Navigator.of(context).push(
       GrassBagPageRoute<void>(
@@ -73,14 +77,28 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
   bool _callbackHit = false;
   bool _pollingAfterCallback = false;
   bool _handedOffExternally = false;
+  bool _canGoBack = false;
+
+  Future<void> _syncCanGoBack() async {
+    try {
+      final back = await _controller.canGoBack();
+      if (mounted && back != _canGoBack) {
+        setState(() => _canGoBack = back);
+      }
+    } catch (_) {}
+  }
 
   @override
   void initState() {
     super.initState();
-    if (ref.read(appProvider).isAccountSignedIn) {
+    final initialState = ref.read(appProvider);
+    if (initialState.isAccountSignedIn) {
       _completed = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) Navigator.of(context).pop();
+        if (mounted && !_popped) {
+          _popped = true;
+          Navigator.of(context).pop();
+        }
       });
     }
     final initialUri = Uri.tryParse(widget.initialUrl);
@@ -112,16 +130,18 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
                 _currentHost = isLoopback ? '正在完成本机授权校验…' : uri.host;
               }
             });
+            unawaited(_syncCanGoBack());
           },
           onPageFinished: (url) {
             if (!mounted) return;
             _progress.value = 1.0;
             final uri = Uri.tryParse(url);
             if (uri != null && _isLoopbackHost(uri.host)) {
-              _callbackHit = true;
+              if (!_callbackHit) setState(() => _callbackHit = true);
               // Loopback callback reached local DSH: refresh immediately & retry.
               unawaited(_pollFastAfterCallback());
             }
+            unawaited(_syncCanGoBack());
           },
           onWebResourceError: (err) {
             if (!mounted || err.isForMainFrame != true) return;
@@ -140,11 +160,18 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
               return;
             }
             setState(() {
-              _loadError = err.description.isNotEmpty ? err.description : '页面加载失败 (${err.errorCode})';
+              _loadError = _localizeWebError(err.description, err.errorCode);
             });
           },
         ),
       );
+    try {
+      unawaited(
+        _controller.setBackgroundColor(
+          initialState.isDark ? const Color(0xFF141B26) : const Color(0xFFF6F9FC),
+        ),
+      );
+    } catch (_) {}
     if (!_completed) {
       if (initialUri != null && (initialUri.scheme == 'http' || initialUri.scheme == 'https')) {
         unawaited(_controller.loadRequest(initialUri));
@@ -166,6 +193,26 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
     return h == '127.0.0.1' || h == 'localhost' || h == '::1';
   }
 
+  static String _localizeWebError(String description, int errorCode) {
+    final upper = description.toUpperCase();
+    if (upper.contains('ERR_CONNECTION_REFUSED')) {
+      return '目标主机拒绝连接，请确认服务可达或网络通畅后重试。';
+    }
+    if (upper.contains('ERR_NAME_NOT_RESOLVED')) {
+      return '无法解析登录域名，请检查网络连接或 DNS 设置。';
+    }
+    if (upper.contains('ERR_TIMED_OUT') || upper.contains('ERR_CONNECTION_TIMED_OUT')) {
+      return '连接超时，请检查网络或代理设置后重试。';
+    }
+    if (upper.contains('ERR_INTERNET_DISCONNECTED') || upper.contains('ERR_NETWORK_CHANGED')) {
+      return '当前网络已断开，请恢复网络后点击重新加载。';
+    }
+    if (upper.contains('SSL') || upper.contains('CERT')) {
+      return 'HTTPS 安全证书校验失败，请检查系统时间或网络代理。';
+    }
+    return description.isNotEmpty ? '授权页面加载失败：$description' : '授权页面加载失败（错误码 $errorCode）';
+  }
+
   Future<void> _pollFastAfterCallback() async {
     if (_pollingAfterCallback) return;
     _pollingAfterCallback = true;
@@ -177,6 +224,16 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
         await ctrl.refreshAccount(silent: true);
         if (!mounted || _completed) return;
         if (ref.read(appProvider).isAccountSignedIn) return;
+      }
+      if (mounted &&
+          !_completed &&
+          _callbackHit &&
+          ref.read(appProvider).activeHost.isLocal &&
+          !ref.read(appProvider).isAccountSignedIn) {
+        _progress.value = 1.0;
+        setState(() {
+          _loadError = '本机授权回调超时，请点击「重新加载」重试或改用外部浏览器完成登录。';
+        });
       }
     } finally {
       _pollingAfterCallback = false;
@@ -229,8 +286,18 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
 
     return PopScope(
       canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) unawaited(_handleCancelBack());
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        if (_canGoBack && !_callbackHit && _loadError == null) {
+          try {
+            if (await _controller.canGoBack()) {
+              await _controller.goBack();
+              unawaited(_syncCanGoBack());
+              return;
+            }
+          } catch (_) {}
+        }
+        unawaited(_handleCancelBack());
       },
       child: GrassBagGlassPage(
         child: Scaffold(
@@ -240,7 +307,7 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
               Column(
                 children: [
                   GrassBagUnifiedHeader(
-                    title: '登录 DeepSeek 账号',
+                    title: 'DeepSeek 登录',
                     subtitle: _currentHost,
                     tier: glassTier,
                     floating: false,
@@ -255,18 +322,20 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
                           useOwnLayer: false,
                           onTap: () {
                             _callbackHit = false;
-                            _progress.value = 0.12;
                             if (_loadError != null) {
                               final retryUri = Uri.tryParse(widget.initialUrl);
                               if (retryUri != null &&
                                   (retryUri.scheme == 'http' || retryUri.scheme == 'https')) {
+                                _progress.value = 0.12;
                                 setState(() => _loadError = null);
                                 unawaited(_controller.loadRequest(retryUri));
                               } else {
+                                _progress.value = 1.0;
                                 setState(() => _loadError = '授权地址格式无效：${widget.initialUrl}');
                               }
                               return;
                             }
+                            _progress.value = 0.12;
                             _controller.reload();
                           },
                         ),
@@ -304,110 +373,153 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
                     ),
                   Expanded(
                     child: Padding(
-                      padding: EdgeInsets.only(bottom: MediaQuery.viewPaddingOf(context).bottom),
-                      child: Stack(
-                        children: [
-                          Positioned.fill(
-                            child: _loadError != null
-                                ? Center(
-                                    child: Padding(
-                                      padding: const EdgeInsets.all(24),
-                                      child: GrassBagCard(
-                                        borderRadius: 24,
-                                        padding: const EdgeInsets.all(20),
-                                        child: Column(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            GrassBagSquircleIcon(
-                                              icon: CupertinoIcons.wifi_exclamationmark,
-                                              color: t.warn,
-                                              size: 44,
-                                              iconSize: 20,
-                                            ),
-                                            const SizedBox(height: 12),
-                                            Text(
-                                              '授权页面加载失败',
-                                              style: TextStyle(
-                                                fontSize: 16,
-                                                fontWeight: FontWeight.w600,
-                                                color: t.text,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 6),
-                                            Text(
-                                              _loadError!,
-                                              textAlign: TextAlign.center,
-                                              style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text3),
-                                            ),
-                                            const SizedBox(height: 16),
-                                            Row(
-                                              children: [
-                                                Expanded(
-                                                  child: GrassBagSecondaryGlassButton(
-                                                    label: isRemoteHost ? '复制授权链接' : '浏览器打开',
-                                                    icon: isRemoteHost ? CupertinoIcons.doc_on_doc : CupertinoIcons.compass,
-                                                    tier: glassTier,
-                                                    insideGlass: true,
-                                                    onTap: isRemoteHost ? _copySignInUrl : _openExternallyOrCopy,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 10),
-                                                Expanded(
-                                                  child: GrassBagPrimaryGlassButton(
-                                                    label: '重新加载',
-                                                    icon: CupertinoIcons.refresh,
-                                                    tier: glassTier,
-                                                    insideGlass: true,
-                                                    onTap: () {
-                                                      _callbackHit = false;
-                                                      _progress.value = 0.12;
-                                                      final retryUri = Uri.tryParse(widget.initialUrl);
-                                                      if (retryUri != null &&
-                                                          (retryUri.scheme == 'http' ||
-                                                              retryUri.scheme == 'https')) {
-                                                        setState(() => _loadError = null);
-                                                        unawaited(_controller.loadRequest(retryUri));
-                                                      } else {
-                                                        setState(() => _loadError = '授权地址格式无效：${widget.initialUrl}');
-                                                      }
-                                                    },
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ],
+                      padding: EdgeInsets.only(bottom: MediaQuery.paddingOf(context).bottom),
+                      child: _loadError != null
+                          ? Center(
+                              child: Padding(
+                                padding: const EdgeInsets.all(24),
+                                child: GrassBagCard(
+                                  borderRadius: 24,
+                                  padding: const EdgeInsets.all(20),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      GrassBagSquircleIcon(
+                                        icon: CupertinoIcons.wifi_exclamationmark,
+                                        color: t.warn,
+                                        size: 44,
+                                        iconSize: 20,
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Text(
+                                        '授权页面加载失败',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w600,
+                                          color: t.text,
                                         ),
                                       ),
-                                    ),
-                                  )
-                                : ClipRSuperellipse(
-                                    borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-                                    child: WebViewWidget(controller: _controller),
-                                  ),
-                          ),
-                          // ValueListenable overlay progress bar: 50x onProgress ticks NEVER rebuild the page or resize WebView!
-                          Positioned(
-                            top: 0,
-                            left: 0,
-                            right: 0,
-                            child: IgnorePointer(
-                              child: ValueListenableBuilder<double>(
-                                valueListenable: _progress,
-                                builder: (_, val, __) => AnimatedOpacity(
-                                  opacity: val < 0.99 ? 1.0 : 0.0,
-                                  duration: const Duration(milliseconds: 160),
-                                  child: GrassBagProgressBar(
-                                    value: val,
-                                    height: 2.5,
-                                    color: t.primary,
-                                    trackColor: Colors.transparent,
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        _loadError!,
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(fontSize: 12.5, height: 1.45, color: t.text3),
+                                      ),
+                                      const SizedBox(height: 16),
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: GrassBagSecondaryGlassButton(
+                                              label: isRemoteHost ? '复制授权链接' : '浏览器打开',
+                                              icon: isRemoteHost ? CupertinoIcons.doc_on_doc : CupertinoIcons.compass,
+                                              tier: glassTier,
+                                              insideGlass: true,
+                                              onTap: isRemoteHost ? _copySignInUrl : _openExternallyOrCopy,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 10),
+                                          Expanded(
+                                            child: GrassBagPrimaryGlassButton(
+                                              label: '重新加载',
+                                              icon: CupertinoIcons.refresh,
+                                              tier: glassTier,
+                                              insideGlass: true,
+                                              onTap: () {
+                                                _callbackHit = false;
+                                                final retryUri = Uri.tryParse(widget.initialUrl);
+                                                if (retryUri != null &&
+                                                    (retryUri.scheme == 'http' ||
+                                                        retryUri.scheme == 'https')) {
+                                                  _progress.value = 0.12;
+                                                  setState(() => _loadError = null);
+                                                  unawaited(_controller.loadRequest(retryUri));
+                                                } else {
+                                                  _progress.value = 1.0;
+                                                  setState(() => _loadError = '授权地址格式无效：${widget.initialUrl}');
+                                                }
+                                              },
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ),
+                            )
+                          : ClipRSuperellipse(
+                              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                              child: Stack(
+                                children: [
+                                  Positioned.fill(child: WebViewWidget(controller: _controller)),
+                                  if (_callbackHit && !isRemoteHost)
+                                    Positioned.fill(
+                                      child: ColoredBox(
+                                        color: t.bgSolid.withValues(alpha: 0.94),
+                                        child: Center(
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(24),
+                                            child: GrassBagCard(
+                                              borderRadius: 24,
+                                              padding: const EdgeInsets.symmetric(
+                                                horizontal: 24,
+                                                vertical: 22,
+                                              ),
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  GrassBagActivityIndicator(
+                                                    radius: 13,
+                                                    color: t.primary,
+                                                  ),
+                                                  const SizedBox(height: 14),
+                                                  Text(
+                                                    '正在完成本机授权校验…',
+                                                    style: TextStyle(
+                                                      fontSize: 15,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.text,
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 4),
+                                                  Text(
+                                                    '验证通过后将自动返回',
+                                                    style: TextStyle(
+                                                      fontSize: 12.5,
+                                                      color: t.text3,
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  // ValueListenable overlay progress bar clipped cleanly inside rounded corners
+                                  Positioned(
+                                    top: 0,
+                                    left: 0,
+                                    right: 0,
+                                    child: IgnorePointer(
+                                      child: ValueListenableBuilder<double>(
+                                        valueListenable: _progress,
+                                        builder: (_, val, __) => AnimatedOpacity(
+                                          opacity: val < 0.99 ? 1.0 : 0.0,
+                                          duration: const Duration(milliseconds: 160),
+                                          child: GrassBagProgressBar(
+                                            value: val,
+                                            height: 2.5,
+                                            color: t.primary,
+                                            trackColor: Colors.transparent,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
                     ),
                   ),
                 ],

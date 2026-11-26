@@ -51,11 +51,16 @@ final RegExp _ipv4HostRe = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$');
 /// Parse arbitrary user input (URL, IP, `dsh web` stdout line, or pasted block)
 /// into a normalized remote host address + optional extracted token.
 ///
+/// When [strictQr] is `true` (camera QR scanner), bare words and unrelated consumer
+/// web URLs are rejected unless they carry a `grassbag://pair` scheme, JSON pairing
+/// payload, `?token=` param, explicit port, IP/LAN host, or DSH/gbridge path/host hint.
+///
 /// Returns `null` if no valid HTTP(S) host can be parsed.
 ParsedRemoteHostInput? parseRemoteHostInput(
   String rawInput, {
   String? explicitToken,
   int defaultDshPort = 3080,
+  bool strictQr = false,
 }) {
   final trimmed = rawInput.trim();
   if (trimmed.isEmpty) return null;
@@ -213,6 +218,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     return null;
   }
 
+  final hadExplicitPort = parsed.hasPort;
   // 3) Auto-append default DSH port `:3080` when user types a bare IP / localhost without a port
   //    (e.g., `192.168.1.8` or `http://100.64.0.5`), because stock `dsh web` defaults to `:3080`.
   if (!parsed.hasPort && _isLocalOrIpHost(parsed.host) && parsed.scheme == 'http') {
@@ -228,6 +234,20 @@ ParsedRemoteHostInput? parseRemoteHostInput(
       : (queryToken != null && queryToken.isNotEmpty)
           ? queryToken
           : (extraToken != null && extraToken.isNotEmpty ? extraToken : null);
+
+  if (strictQr) {
+    final lowerHost = parsed.host.toLowerCase();
+    final lowerPath = parsed.path.toLowerCase();
+    final hasHttpScheme = urlMatches.isNotEmpty;
+    final hasDshSignal = (resolvedToken != null && resolvedToken.isNotEmpty) ||
+        _isLocalOrIpHost(parsed.host) ||
+        hadExplicitPort ||
+        lowerPath.contains('/gbridge') ||
+        lowerHost.contains('dsh');
+    if (!hasHttpScheme || !hasDshSignal) {
+      return null;
+    }
+  }
 
   final remainingQuery = Map<String, String>.from(parsed.queryParameters)
     ..remove('token')

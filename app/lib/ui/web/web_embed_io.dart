@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -22,20 +23,34 @@ void disposeWebIframe(String viewType) {}
 /// or when the URL scheme is unsupported.
 bool openUrlInNewTab(String url) {
   final uri = Uri.tryParse(url.trim());
-  if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+  if (uri == null ||
+      (uri.scheme != 'http' && uri.scheme != 'https') ||
+      uri.host.isEmpty) {
     return false;
   }
   try {
     if (Platform.isMacOS) {
-      Process.start('open', [uri.toString()], mode: ProcessStartMode.detached);
+      unawaited(
+        Process.start('open', [uri.toString()], mode: ProcessStartMode.detached)
+            .then<void>((_) {}, onError: (_) {}),
+      );
       return true;
     }
     if (Platform.isLinux) {
-      Process.start('xdg-open', [uri.toString()], mode: ProcessStartMode.detached);
+      unawaited(
+        Process.start('xdg-open', [uri.toString()], mode: ProcessStartMode.detached)
+            .then<void>((_) {}, onError: (_) {}),
+      );
       return true;
     }
     if (Platform.isWindows) {
-      Process.start('cmd', ['/c', 'start', '', uri.toString()], mode: ProcessStartMode.detached);
+      unawaited(
+        Process.start(
+          'rundll32',
+          ['url.dll,FileProtocolHandler', uri.toString()],
+          mode: ProcessStartMode.detached,
+        ).then<void>((_) {}, onError: (_) {}),
+      );
       return true;
     }
   } catch (_) {}

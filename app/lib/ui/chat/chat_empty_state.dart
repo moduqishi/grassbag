@@ -1,6 +1,6 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show ValueListenable;
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart' show Colors, Tooltip;
 import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
@@ -26,6 +26,7 @@ class ChatEmptyState extends ConsumerWidget {
     required this.onSuggestionTap,
     this.onOpenModelSettings,
     this.onOpenHostSettings,
+    this.onOpenDiagnostics,
     this.keyboardOpen = false,
     this.keyboardProgress = 0.0,
     this.keyboardProgressListenable,
@@ -36,6 +37,7 @@ class ChatEmptyState extends ConsumerWidget {
   final ValueChanged<String> onSuggestionTap;
   final VoidCallback? onOpenModelSettings;
   final VoidCallback? onOpenHostSettings;
+  final VoidCallback? onOpenDiagnostics;
   final bool keyboardOpen;
 
   /// Smooth continuous keyboard-elevation progress `0.0` (closed) → `1.0` (open).
@@ -129,7 +131,7 @@ class ChatEmptyState extends ConsumerWidget {
       (
         CupertinoIcons.folder_fill,
         '看看工作区',
-        '列出文件结构与近期改动',
+        '查看目录结构与改动',
         t.ok,
         '帮我查看当前工作区的目录结构与最近文件改动概览',
       ),
@@ -144,15 +146,15 @@ class ChatEmptyState extends ConsumerWidget {
         (
           CupertinoIcons.arrow_branch,
           '梳理 Git 改动',
-          '总结未提交变更与风险',
+          '总结未提交变更风险',
           t.warn,
           '检查当前工作区的 git 状态与最近提交，总结核心变更与潜在风险',
         )
       else
         (
-          CupertinoIcons.film_fill,
+          CupertinoIcons.tray_full_fill,
           '整理手机文件',
-          '归类或压缩下载目录文件',
+          '归类或清理下载目录',
           t.warn,
           '帮我查看手机下载目录的大文件，并按类型给出清理或压缩建议',
         ),
@@ -160,15 +162,15 @@ class ChatEmptyState extends ConsumerWidget {
         (
           CupertinoIcons.device_phone_portrait,
           '操控手机',
-          '用自然语言自动操作应用',
-          t.primary,
+          '自然语言操控应用',
+          t.isDark ? const Color(0xFF56B0EE) : const Color(0xFF1F5F87),
           '帮我打开系统设置，查看当前网络与电量状态后返回 GrassBag',
         )
       else
         (
           CupertinoIcons.doc_text_fill,
           '整理项目文档',
-          '生成清晰结构与接口说明',
+          '梳理架构与接口说明',
           t.primary,
           '阅读当前项目核心模块并整理一份清晰的架构与使用说明文档',
         ),
@@ -242,8 +244,12 @@ class ChatEmptyState extends ConsumerWidget {
       children: [
         GrassBagSpringTap(
           pressedScale: 0.96,
+          enablePointerGlow: false,
           haptic: true,
-          onTap: () => showWorkspaceSheet(context, ref),
+          onTap: () => (state.activeWorkspace.isEmpty &&
+                  (isHostTransientConnecting || state.hydratingDomains))
+              ? showHostQuickSheet(context, ref)
+              : showWorkspaceSheet(context, ref),
           child: Container(
             height: 38,
             padding: const EdgeInsets.symmetric(horizontal: 15),
@@ -257,21 +263,21 @@ class ChatEmptyState extends ConsumerWidget {
                         Colors.white.withValues(alpha: 0.06),
                       ]
                     : [
-                        Colors.white.withValues(alpha: 0.68),
-                        Colors.white.withValues(alpha: 0.48),
+                        Colors.white.withValues(alpha: 0.72),
+                        Colors.white.withValues(alpha: 0.52),
                       ],
               ),
               shape: StadiumBorder(
                 side: BorderSide(
                   color: t.isDark
-                      ? Colors.white.withValues(alpha: 0.22)
+                      ? Colors.white.withValues(alpha: 0.20)
                       : Colors.white.withValues(alpha: 0.92),
                   width: 0.8,
                 ),
               ),
               shadows: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: t.isDark ? 0.24 : 0.07),
+                  color: Colors.black.withValues(alpha: t.isDark ? 0.22 : 0.055),
                   blurRadius: 14,
                   offset: const Offset(0, 4),
                 ),
@@ -381,6 +387,7 @@ class ChatEmptyState extends ConsumerWidget {
                 onBootstrap: () => triggerLocalRuntimeBootstrapWithGuard(context, ref),
                 onCancelBootstrap: () => ctrl.cancelLocalRuntimeBootstrap(),
                 onStartEngine: () => ctrl.restartLocalEngine(),
+                onOpenDiagnostics: onOpenDiagnostics,
               ),
             ] else if (showRemoteStatusBanner) ...[
               const SizedBox(height: 14),
@@ -462,7 +469,7 @@ class ChatEmptyState extends ConsumerWidget {
             ] else if (showNoModelOnboarding) ...[
               const SizedBox(height: 14),
               GrassBagCard(
-                borderRadius: 20,
+                borderRadius: 22,
                 padding: const EdgeInsets.all(14),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -471,9 +478,10 @@ class ChatEmptyState extends ConsumerWidget {
                       children: [
                         GrassBagSquircleIcon(
                           icon: CupertinoIcons.sparkles,
-                          color: t.warn,
-                          size: 34,
-                          iconSize: 16,
+                          color: t.primary,
+                          size: 36,
+                          iconSize: 17,
+                          filled: true,
                         ),
                         const SizedBox(width: 11),
                         Expanded(
@@ -540,104 +548,51 @@ class ChatEmptyState extends ConsumerWidget {
                 ],
               ),
             ),
-            // Hoist static suggestion cards + rotating tip OUTSIDE `_KbProgressBuilder` inside
-            // RepaintBoundaries so 120Hz IME spring ticks NEVER rebuild GrassBagCard / LayoutBuilder!
+            // Build only the active suggestion layout branch inside LayoutBuilder and isolate
+            // each staggered slice in a RepaintBoundary so 120Hz IME springs composite cached layers!
             () {
-              final singleColTiles = [
-                for (var i = 0; i < suggestions.length; i++)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: _SuggestionTile(
-                      icon: suggestions[i].$1,
-                      title: suggestions[i].$2,
-                      subtitle: suggestions[i].$3,
-                      accent: suggestions[i].$4,
-                      onTap: () => onSuggestionTap(suggestions[i].$5),
-                    ),
-                  ),
-              ];
-              final twoColRow1 = Row(
-                children: [
-                  Expanded(
-                    child: _SuggestionTile(
-                      icon: suggestions[0].$1,
-                      title: suggestions[0].$2,
-                      subtitle: suggestions[0].$3,
-                      accent: suggestions[0].$4,
-                      onTap: () => onSuggestionTap(suggestions[0].$5),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: _SuggestionTile(
-                      icon: suggestions[1].$1,
-                      title: suggestions[1].$2,
-                      subtitle: suggestions[1].$3,
-                      accent: suggestions[1].$4,
-                      onTap: () => onSuggestionTap(suggestions[1].$5),
-                    ),
-                  ),
-                ],
-              );
-              final twoColRow2 = Row(
-                children: [
-                  Expanded(
-                    child: _SuggestionTile(
-                      icon: suggestions[2].$1,
-                      title: suggestions[2].$2,
-                      subtitle: suggestions[2].$3,
-                      accent: suggestions[2].$4,
-                      onTap: () => onSuggestionTap(suggestions[2].$5),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: _SuggestionTile(
-                      icon: suggestions[3].$1,
-                      title: suggestions[3].$2,
-                      subtitle: suggestions[3].$3,
-                      accent: suggestions[3].$4,
-                      onTap: () => onSuggestionTap(suggestions[3].$5),
-                    ),
-                  ),
-                ],
-              );
-              final tipRowContent = Padding(
-                padding: const EdgeInsets.only(top: 12),
-                child: GrassBagSpringTap(
-                  onTap: ctrl.nextEmptyTip,
-                  pressedScale: 0.98,
-                  haptic: true,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    child: Row(
-                      children: [
-                        Icon(CupertinoIcons.lightbulb, size: 15, color: t.warn),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: AnimatedSwitcher(
-                            duration: const Duration(milliseconds: 220),
-                            switchInCurve: Curves.linear,
-                            switchOutCurve: Curves.linear,
-                            transitionBuilder: (child, anim) => _TipSlideFadeTransition(
-                              animation: anim,
-                              child: child,
-                            ),
-                            child: Align(
-                              key: ValueKey(tip),
-                              alignment: Alignment.centerLeft,
-                              child: Text(
-                                tip,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(fontSize: 12, height: 1.38, color: t.text3),
+              final tipRowContent = RepaintBoundary(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 14),
+                  child: Tooltip(
+                    message: '轻点切换使用提示',
+                    child: GrassBagSpringTap(
+                      onTap: ctrl.nextEmptyTip,
+                      pressedScale: 0.98,
+                      enablePointerGlow: false,
+                      haptic: true,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                        child: Row(
+                          children: [
+                            Icon(CupertinoIcons.lightbulb, size: 14.5, color: t.warn),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 220),
+                                switchInCurve: Curves.linear,
+                                switchOutCurve: Curves.linear,
+                                transitionBuilder: (child, anim) => _TipSlideFadeTransition(
+                                  animation: anim,
+                                  child: child,
+                                ),
+                                child: Align(
+                                  key: ValueKey(tip),
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    tip,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(fontSize: 12, height: 1.38, color: t.text3),
+                                  ),
+                                ),
                               ),
                             ),
-                          ),
+                            const SizedBox(width: 6),
+                            Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                          ],
                         ),
-                        const SizedBox(width: 6),
-                        Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
-                      ],
+                      ),
                     ),
                   ),
                 ),
@@ -648,6 +603,77 @@ class ChatEmptyState extends ConsumerWidget {
                 child: LayoutBuilder(
                   builder: (ctx, constraints) {
                     final twoCol = constraints.maxWidth >= 300;
+                    final List<Widget>? singleColTiles = twoCol
+                        ? null
+                        : [
+                            for (var i = 0; i < suggestions.length; i++)
+                              RepaintBoundary(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 8),
+                                  child: _SuggestionTile(
+                                    icon: suggestions[i].$1,
+                                    title: suggestions[i].$2,
+                                    subtitle: suggestions[i].$3,
+                                    accent: suggestions[i].$4,
+                                    onTap: () => onSuggestionTap(suggestions[i].$5),
+                                  ),
+                                ),
+                              ),
+                          ];
+                    final Widget? twoColRow1 = twoCol
+                        ? RepaintBoundary(
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: _SuggestionTile(
+                                    icon: suggestions[0].$1,
+                                    title: suggestions[0].$2,
+                                    subtitle: suggestions[0].$3,
+                                    accent: suggestions[0].$4,
+                                    onTap: () => onSuggestionTap(suggestions[0].$5),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: _SuggestionTile(
+                                    icon: suggestions[1].$1,
+                                    title: suggestions[1].$2,
+                                    subtitle: suggestions[1].$3,
+                                    accent: suggestions[1].$4,
+                                    onTap: () => onSuggestionTap(suggestions[1].$5),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        : null;
+                    final Widget? twoColRow2 = twoCol
+                        ? RepaintBoundary(
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: _SuggestionTile(
+                                    icon: suggestions[2].$1,
+                                    title: suggestions[2].$2,
+                                    subtitle: suggestions[2].$3,
+                                    accent: suggestions[2].$4,
+                                    onTap: () => onSuggestionTap(suggestions[2].$5),
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: _SuggestionTile(
+                                    icon: suggestions[3].$1,
+                                    title: suggestions[3].$2,
+                                    subtitle: suggestions[3].$3,
+                                    accent: suggestions[3].$4,
+                                    onTap: () => onSuggestionTap(suggestions[3].$5),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        : null;
                     return _KbProgressBuilder(
                       listenable: listenable,
                       fallback: fallbackProgress,
@@ -661,7 +687,7 @@ class ChatEmptyState extends ConsumerWidget {
                               if (!twoCol)
                                 Column(
                                   children: [
-                                    for (var i = 0; i < singleColTiles.length; i++)
+                                    for (var i = 0; i < singleColTiles!.length; i++)
                                       _StaggeredDeckSlice(
                                         progress: p,
                                         start: 0.02 + 0.03 * (singleColTiles.length - 1 - i),
@@ -681,7 +707,7 @@ class ChatEmptyState extends ConsumerWidget {
                                       end: 0.72,
                                       dy: 16.0,
                                       minScale: 0.94,
-                                      child: twoColRow1,
+                                      child: twoColRow1!,
                                     ),
                                     const SizedBox(height: 10),
                                     _StaggeredDeckSlice(
@@ -690,7 +716,7 @@ class ChatEmptyState extends ConsumerWidget {
                                       end: 0.58,
                                       dy: 22.0,
                                       minScale: 0.92,
-                                      child: twoColRow2,
+                                      child: twoColRow2!,
                                     ),
                                   ],
                                 ),
@@ -1017,6 +1043,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
     required this.onBootstrap,
     this.onCancelBootstrap,
     required this.onStartEngine,
+    this.onOpenDiagnostics,
   });
 
   final NativeRuntimeStatus rt;
@@ -1028,6 +1055,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
   final VoidCallback onBootstrap;
   final VoidCallback? onCancelBootstrap;
   final VoidCallback onStartEngine;
+  final VoidCallback? onOpenDiagnostics;
 
   @override
   Widget build(BuildContext context) {
@@ -1084,27 +1112,53 @@ class _LocalRuntimeBanner extends StatelessWidget {
               ),
               const SizedBox(width: 11),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13.5,
-                        fontWeight: FontWeight.w600,
-                        color: hasErr ? t.err : t.text,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: hasErr ? onOpenDiagnostics : null,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          color: hasErr ? t.err : t.text,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      subtitle,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11.5, height: 1.35, color: t.text3),
-                    ),
-                  ],
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11.5, height: 1.35, color: t.text3),
+                      ),
+                      if (hasErr && onOpenDiagnostics != null) ...[
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '查看日志',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: t.primary,
+                              ),
+                            ),
+                            const SizedBox(width: 2),
+                            Icon(
+                              CupertinoIcons.chevron_right,
+                              size: 11,
+                              color: t.primary,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
@@ -1118,7 +1172,7 @@ class _LocalRuntimeBanner extends StatelessWidget {
                   onTap: onCancelBootstrap,
                 )
               else if (starting || deploying)
-                CupertinoActivityIndicator(radius: 9, color: t.primary)
+                GrassBagActivityIndicator(radius: 9, color: t.primary)
               else
                 GrassBagPrimaryGlassButton(
                   label: !rt.initialized
@@ -1161,37 +1215,45 @@ class _SetupItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
+    final row = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 13.5, color: warnTone ? t.warn : t.text2),
+        const SizedBox(width: 5),
+        Flexible(
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: warnTone ? FontWeight.w600 : FontWeight.w500,
+              color: warnTone ? t.warn : t.text2,
+            ),
+          ),
+        ),
+        const SizedBox(width: 3),
+        Icon(
+          CupertinoIcons.chevron_down,
+          size: 10.5,
+          color: warnTone ? t.warn : t.text3,
+        ),
+      ],
+    );
     return GrassBagSpringTap(
       onTap: onTap,
       pressedScale: 0.94,
+      enablePointerGlow: false,
       haptic: true,
-      child: Container(
-        height: 32,
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        decoration: BoxDecoration(
-          color: warnTone ? t.warnSoft : Colors.transparent,
-          borderRadius: BorderRadius.circular(999),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 13.5, color: warnTone ? t.warn : t.text2),
-            const SizedBox(width: 5),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12.5,
-                fontWeight: warnTone ? FontWeight.w600 : FontWeight.w500,
-                color: warnTone ? t.warn : t.text2,
-              ),
-            ),
-            const SizedBox(width: 3),
-            Icon(
-              CupertinoIcons.chevron_down,
-              size: 10.5,
-              color: warnTone ? t.warn : t.text3,
-            ),
-          ],
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minHeight: 34),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          decoration: BoxDecoration(
+            color: warnTone ? t.warnSoft : Colors.transparent,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: row,
         ),
       ),
     );
@@ -1234,6 +1296,7 @@ class _SuggestionTileState extends State<_SuggestionTile> {
       child: GrassBagSpringTap(
         onTap: widget.onTap,
         pressedScale: 0.96,
+        enablePointerGlow: false,
         haptic: true,
         child: AnimatedScale(
           scale: _hovered ? 1.012 : 1.0,
@@ -1241,7 +1304,8 @@ class _SuggestionTileState extends State<_SuggestionTile> {
           curve: Curves.easeOutCubic,
           child: GrassBagCard(
             borderRadius: 20,
-            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 12),
+            interactive: true,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
             child: Row(
               children: [
                 GrassBagSquircleIcon(
@@ -1250,7 +1314,7 @@ class _SuggestionTileState extends State<_SuggestionTile> {
                   size: 36,
                   iconSize: 16.5,
                 ),
-                const SizedBox(width: 9),
+                const SizedBox(width: 9.5),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -1272,7 +1336,11 @@ class _SuggestionTileState extends State<_SuggestionTile> {
                         widget.subtitle,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 11.5, color: t.text3),
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          height: 1.25,
+                          color: t.text3,
+                        ),
                       ),
                     ],
                   ),

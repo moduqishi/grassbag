@@ -318,32 +318,247 @@ class AppReleaseCheckResult {
   bool get ok => error == null;
 }
 
+/// Ordered China mirror prefixes tried BEFORE direct GitHub API calls when checking updates.
+const List<String> kAppUpdateApiMirrorPrefixes = [
+  'https://gh-proxy.com/',
+];
+
+/// Ordered China mirror prefixes tried BEFORE direct GitHub Releases when downloading APKs.
+const List<String> kAppUpdateDownloadMirrorPrefixes = [
+  'https://gh-proxy.com/',
+  'https://ghfast.top/',
+];
+
+bool _looksLikeGitHubProxyPrefix(String rawUrl) {
+  final trimmed = rawUrl.trim();
+  if (trimmed.isEmpty) return false;
+  final uri = Uri.tryParse(trimmed);
+  if (uri == null || uri.host.isEmpty) return false;
+  if (_isGitHubUrl(trimmed)) return false;
+  return uri.scheme == 'https';
+}
+
+bool _isGitHubUrl(String rawUrl) {
+  final uri = Uri.tryParse(rawUrl.trim());
+  final host = uri?.host.toLowerCase() ?? '';
+  return host == 'github.com' ||
+      host == 'api.github.com' ||
+      host.endsWith('.github.com') ||
+      host.endsWith('.githubusercontent.com');
+}
+
+String _prefixWithMirror(String mirrorPrefix, String targetUrl) {
+  final cleanPrefix = mirrorPrefix.trim().replaceAll(RegExp(r'/+$'), '');
+  return '$cleanPrefix/$targetUrl';
+}
+
+/// Builds prioritized candidate URIs for GitHub API release metadata checks:
+/// custom proxy (if configured) → China mirrors (`gh-proxy.com`) → direct `api.github.com`.
+List<Uri> buildAppUpdateApiCandidateUris(
+  String rawApiUrl, {
+  String? customMirrorUrl,
+}) {
+  final cleanTarget = rawApiUrl.trim();
+  final seen = <String>{};
+  final out = <Uri>[];
+  void addUrl(String u) {
+    final trimmed = u.trim();
+    if (trimmed.isEmpty || !seen.add(trimmed)) return;
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+      out.add(parsed);
+    }
+  }
+
+  if (_isGitHubUrl(cleanTarget)) {
+    final custom = customMirrorUrl?.trim() ?? '';
+    if (custom.isNotEmpty && _looksLikeGitHubProxyPrefix(custom)) {
+      addUrl(_prefixWithMirror(custom, cleanTarget));
+    }
+    for (final prefix in kAppUpdateApiMirrorPrefixes) {
+      addUrl(_prefixWithMirror(prefix, cleanTarget));
+    }
+  }
+  addUrl(cleanTarget);
+  return out;
+}
+
+/// Builds prioritized candidate URIs for APK downloads:
+/// custom mirror (if configured) → `gh-proxy.com` → `ghfast.top` → direct GitHub Releases.
+List<Uri> buildAppUpdateDownloadCandidateUris(
+  String rawDownloadUrl, {
+  String? customMirrorUrl,
+}) {
+  final cleanTarget = rawDownloadUrl.trim();
+  final seen = <String>{};
+  final out = <Uri>[];
+  void addUrl(String u) {
+    final trimmed = u.trim();
+    if (trimmed.isEmpty || !seen.add(trimmed)) return;
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+      out.add(parsed);
+    }
+  }
+
+  if (_isGitHubUrl(cleanTarget)) {
+    final custom = customMirrorUrl?.trim() ?? '';
+    if (custom.isNotEmpty && _looksLikeGitHubProxyPrefix(custom)) {
+      addUrl(_prefixWithMirror(custom, cleanTarget));
+    }
+    for (final prefix in kAppUpdateDownloadMirrorPrefixes) {
+      addUrl(_prefixWithMirror(prefix, cleanTarget));
+    }
+  }
+  addUrl(cleanTarget);
+  return out;
+}
+
+/// Human-readable short label describing the active update mirror/direct source.
+String formatAppUpdateSourceLabel(Uri uri) {
+  final host = uri.host.toLowerCase();
+  if (host.contains('gh-proxy')) return '国内镜像 1';
+  if (host.contains('ghfast')) return '国内镜像 2';
+  if (host == 'github.com' ||
+      host == 'api.github.com' ||
+      host.endsWith('.github.com') ||
+      host.endsWith('.githubusercontent.com')) {
+    return 'GitHub 直连';
+  }
+  return host.isNotEmpty ? host : '在线源';
+}
+
 typedef AppUpdateFetcher = Future<AppUpdateHttpResponse> Function(
   Uri uri, {
   Duration timeout,
+});
+
+typedef AppUpdateApkDownloader = Future<String> Function(
+  Uri uri,
+  String destinationPath, {
+  void Function(int receivedBytes, int totalBytes)? onProgress,
+  bool Function()? isCancelled,
+  int? expectedSizeBytes,
+  void Function(void Function() abort)? onAbortReady,
 });
 
 class AppUpdateService {
   const AppUpdateService({
     this.repoSlug = kGrassBagGitHubRepo,
     AppUpdateFetcher? fetcher,
-  }) : _fetcher = fetcher ?? fetchAppUpdateJson;
+    AppUpdateApkDownloader? downloader,
+  })  : _fetcher = fetcher ?? fetchAppUpdateJson,
+        _downloader = downloader ?? downloadAppUpdateApk;
 
   final String repoSlug;
   final AppUpdateFetcher _fetcher;
+  final AppUpdateApkDownloader _downloader;
+
+  Future<({AppUpdateHttpResponse? response, Object? error, bool sawNotFound, bool sawRateLimit})>
+      _fetchFirstValidJson(
+    String rawApiUrl, {
+    required Duration timeout,
+    String? customMirrorUrl,
+    bool expectList = false,
+  }) async {
+    final candidates = buildAppUpdateApiCandidateUris(
+      rawApiUrl,
+      customMirrorUrl: customMirrorUrl,
+    );
+    Object? lastError;
+    AppUpdateHttpResponse? lastResponse;
+    var officialNotFound = false;
+    var allNotFound = candidates.isNotEmpty;
+    var sawRateLimit = false;
+
+    for (var i = 0; i < candidates.length; i++) {
+      final candidate = candidates[i];
+      final isDirectFallback = i == candidates.length - 1;
+      try {
+        final resp = await _fetcher(candidate, timeout: timeout);
+        if (resp.statusCode == 200) {
+          allNotFound = false;
+          final bodyTrim = resp.body.trimLeft();
+          if (bodyTrim.startsWith('{') || bodyTrim.startsWith('[')) {
+            try {
+              final decoded = jsonDecode(bodyTrim);
+              final isValidRelease = expectList
+                  ? (decoded is List &&
+                      (decoded.isEmpty ||
+                          decoded.any((e) => e is Map && e.containsKey('tag_name'))))
+                  : (decoded is Map && decoded.containsKey('tag_name'));
+              if (isValidRelease) {
+                return (
+                  response: resp,
+                  error: null,
+                  sawNotFound: false,
+                  sawRateLimit: false,
+                );
+              }
+            } catch (_) {}
+          }
+          // Mirror returned HTML/text or non-release JSON error page — fail over without retaining it.
+          lastError = const FormatException('镜像返回了非法的版本 JSON 内容');
+          continue;
+        }
+        lastResponse = resp;
+        if (resp.statusCode == 404) {
+          if (isDirectFallback) {
+            officialNotFound = true;
+            return (
+              response: resp,
+              error: null,
+              sawNotFound: true,
+              sawRateLimit: false,
+            );
+          }
+          continue;
+        }
+        allNotFound = false;
+        if (resp.statusCode == 403) {
+          sawRateLimit = true;
+          if (isDirectFallback) {
+            return (
+              response: resp,
+              error: null,
+              sawNotFound: false,
+              sawRateLimit: true,
+            );
+          }
+          continue;
+        }
+      } catch (e) {
+        allNotFound = false;
+        lastError = e;
+      }
+    }
+
+    return (
+      response: lastResponse,
+      error: lastError,
+      sawNotFound: officialNotFound || allNotFound,
+      sawRateLimit: sawRateLimit,
+    );
+  }
 
   Future<AppReleaseCheckResult> fetchLatestRelease({
     Duration timeout = const Duration(seconds: 12),
+    String? customMirrorUrl,
   }) async {
     final cleanSlug = repoSlug.trim();
     if (cleanSlug.isEmpty || !cleanSlug.contains('/')) {
       return const AppReleaseCheckResult(error: '未配置有效的 GitHub 仓库地址');
     }
 
-    final latestUri = Uri.parse('https://api.github.com/repos/$cleanSlug/releases/latest');
-    try {
-      final resp = await _fetcher(latestUri, timeout: timeout);
-      if (resp.statusCode == 200) {
+    final latestUrl = 'https://api.github.com/repos/$cleanSlug/releases/latest';
+    final latestAttempt = await _fetchFirstValidJson(
+      latestUrl,
+      timeout: timeout,
+      customMirrorUrl: customMirrorUrl,
+    );
+    final resp = latestAttempt.response;
+    if (resp != null && resp.statusCode == 200) {
+      try {
         final decoded = jsonDecode(resp.body);
         if (decoded is Map<String, dynamic>) {
           final info = AppReleaseInfo.fromGitHubReleaseJson(decoded);
@@ -351,10 +566,16 @@ class AppUpdateService {
             return AppReleaseCheckResult(release: info);
           }
           // If `/releases/latest` ever points to a non-app runtime asset release, fall back
-          // to scanning recent releases so app update checks never break.
-          final listUri = Uri.parse('https://api.github.com/repos/$cleanSlug/releases?per_page=10');
-          final listResp = await _fetcher(listUri, timeout: timeout);
-          if (listResp.statusCode == 200) {
+          // to scanning recent releases (also mirror-first) so app update checks never break.
+          final listUrl = 'https://api.github.com/repos/$cleanSlug/releases?per_page=10';
+          final listAttempt = await _fetchFirstValidJson(
+            listUrl,
+            timeout: timeout,
+            customMirrorUrl: customMirrorUrl,
+            expectList: true,
+          );
+          final listResp = listAttempt.response;
+          if (listResp != null && listResp.statusCode == 200) {
             final listDecoded = jsonDecode(listResp.body);
             if (listDecoded is List) {
               for (final item in listDecoded) {
@@ -370,27 +591,32 @@ class AppUpdateService {
           }
         }
         return const AppReleaseCheckResult(error: '解析 GitHub Release 元数据失败');
-      }
-
-      if (resp.statusCode == 404) {
-        // Repo may not have a published stable release yet (or only prereleases).
-        return const AppReleaseCheckResult(noReleasePublished: true);
-      }
-
-      if (resp.statusCode == 403) {
-        return const AppReleaseCheckResult(
-          error: 'GitHub API 请求频率受限，请稍后再试或直接前往 Release 页面',
+      } catch (e) {
+        return AppReleaseCheckResult(
+          error: '解析更新元数据失败：${_friendlyNetworkError(e)}',
         );
       }
+    }
 
+    if (latestAttempt.sawNotFound && (resp == null || resp.statusCode == 404)) {
+      return const AppReleaseCheckResult(noReleasePublished: true);
+    }
+
+    if (latestAttempt.sawRateLimit && (resp == null || resp.statusCode == 403)) {
+      return const AppReleaseCheckResult(
+        error: 'GitHub API 请求频率受限，请稍后再试或直接前往 Release 页面',
+      );
+    }
+
+    if (resp != null && resp.statusCode != 200) {
       return AppReleaseCheckResult(
         error: '检查更新失败（GitHub HTTP ${resp.statusCode}）',
       );
-    } catch (e) {
-      return AppReleaseCheckResult(
-        error: '无法连接 GitHub Releases：${_friendlyNetworkError(e)}',
-      );
     }
+
+    return AppReleaseCheckResult(
+      error: '无法连接更新源：${_friendlyNetworkError(latestAttempt.error ?? '网络异常')}',
+    );
   }
 
   Future<String> downloadApk({
@@ -400,16 +626,42 @@ class AppUpdateService {
     bool Function()? isCancelled,
     int? expectedSizeBytes,
     void Function(void Function() abort)? onAbortReady,
-  }) {
-    final uri = Uri.parse(downloadUrl.trim());
-    return downloadAppUpdateApk(
-      uri,
-      destinationPath,
-      onProgress: onProgress,
-      isCancelled: isCancelled,
-      expectedSizeBytes: expectedSizeBytes,
-      onAbortReady: onAbortReady,
+    String? customMirrorUrl,
+    void Function(String sourceLabel)? onSourceChanged,
+  }) async {
+    final candidates = buildAppUpdateDownloadCandidateUris(
+      downloadUrl,
+      customMirrorUrl: customMirrorUrl,
     );
+    if (candidates.isEmpty) {
+      throw ArgumentError('无效的 APK 下载地址');
+    }
+
+    Object? lastError;
+    for (final candidate in candidates) {
+      if (isCancelled?.call() == true) {
+        throw const AppUpdateDownloadCancelledException();
+      }
+      onSourceChanged?.call(formatAppUpdateSourceLabel(candidate));
+      try {
+        return await _downloader(
+          candidate,
+          destinationPath,
+          onProgress: onProgress,
+          isCancelled: isCancelled,
+          expectedSizeBytes: expectedSizeBytes,
+          onAbortReady: onAbortReady,
+        );
+      } on AppUpdateDownloadCancelledException {
+        rethrow;
+      } catch (e) {
+        if (isCancelled?.call() == true) {
+          throw const AppUpdateDownloadCancelledException();
+        }
+        lastError = e;
+      }
+    }
+    throw lastError ?? Exception('所有更新下载源均不可用，请检查网络连接后重试');
   }
 
   static String _friendlyNetworkError(Object error) {

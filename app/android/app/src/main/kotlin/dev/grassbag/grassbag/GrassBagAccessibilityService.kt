@@ -274,6 +274,90 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }.getOrDefault(false)
     }
 
+    /**
+     * Resolves the active application/interactive window root while skipping IME (`TYPE_INPUT_METHOD`),
+     * Accessibility overlays (`TYPE_ACCESSIBILITY_OVERLAY`), and passive system bars so soft keyboards
+     * and GrassBag's own HUD never shadow target app UI trees or focused input fields.
+     */
+    private fun findActiveAppRoot(retries: Int = 2): AccessibilityNodeInfo? {
+        for (attempt in 0 until retries) {
+            val fromWindows = runCatching {
+                val allWindows = windows ?: return@runCatching null
+                var bestActiveRoot: AccessibilityNodeInfo? = null
+                var bestActiveLayer = Int.MIN_VALUE
+                var bestAppRoot: AccessibilityNodeInfo? = null
+                var bestAppLayer = Int.MIN_VALUE
+                try {
+                    for (win in allWindows) {
+                        val type = win.type
+                        if (type == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+                            type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY
+                        ) {
+                            continue
+                        }
+                        val isInteractive = win.isActive || win.isFocused
+                        if (type == AccessibilityWindowInfo.TYPE_SYSTEM && !isInteractive) {
+                            continue
+                        }
+                        val r = win.root ?: continue
+                        val p = r.packageName?.toString()?.takeIf { it.isNotBlank() }
+                        if (p == null || p.contains("inputmethod", ignoreCase = true)) {
+                            recycleCompat(r)
+                            continue
+                        }
+                        val layer = win.layer
+                        var kept = false
+                        if (isInteractive && layer >= bestActiveLayer) {
+                            if (bestActiveRoot != null && bestActiveRoot !== bestAppRoot) {
+                                recycleCompat(bestActiveRoot)
+                            }
+                            bestActiveLayer = layer
+                            bestActiveRoot = r
+                            kept = true
+                        }
+                        if (type == AccessibilityWindowInfo.TYPE_APPLICATION && layer >= bestAppLayer) {
+                            if (bestAppRoot != null && bestAppRoot !== bestActiveRoot) {
+                                recycleCompat(bestAppRoot)
+                            }
+                            bestAppLayer = layer
+                            bestAppRoot = r
+                            kept = true
+                        }
+                        if (!kept) {
+                            recycleCompat(r)
+                        }
+                    }
+                    val winner = bestActiveRoot ?: bestAppRoot
+                    if (bestActiveRoot != null && bestActiveRoot !== winner) recycleCompat(bestActiveRoot)
+                    if (bestAppRoot != null && bestAppRoot !== winner) recycleCompat(bestAppRoot)
+                    winner
+                } catch (t: Throwable) {
+                    if (bestActiveRoot != null) recycleCompat(bestActiveRoot)
+                    if (bestAppRoot != null && bestAppRoot !== bestActiveRoot) recycleCompat(bestAppRoot)
+                    null
+                }
+            }.getOrNull()
+            if (fromWindows != null) return fromWindows
+
+            val activeRoot = runCatching { rootInActiveWindow }.getOrNull()
+            if (activeRoot != null) {
+                val winType = runCatching { activeRoot.window?.type }.getOrNull()
+                val pkg = activeRoot.packageName?.toString()
+                val isFiltered = winType == AccessibilityWindowInfo.TYPE_INPUT_METHOD ||
+                    winType == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY ||
+                    (!pkg.isNullOrBlank() && pkg.contains("inputmethod", ignoreCase = true))
+                if (!isFiltered) {
+                    return activeRoot
+                }
+                recycleCompat(activeRoot)
+            }
+            if (attempt + 1 < retries) {
+                runCatching { Thread.sleep(110L) }
+            }
+        }
+        return null
+    }
+
     private fun waitForActiveRoot(retries: Int = 3): AccessibilityNodeInfo? {
         for (i in 0 until retries) {
             val r = runCatching { rootInActiveWindow }.getOrNull()
@@ -372,7 +456,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
     /** Inspects the visible leaf node at `(x, y)` to find its label & whether it is a password/OTP input. */
     fun inspectPointTarget(x: Float, y: Float): Pair<String?, Boolean> {
         val (cx, cy) = clampPoint(x, y)
-        val root = waitForActiveRoot(retries = 2) ?: return Pair(null, false)
+        val root = findActiveAppRoot(retries = 2) ?: return Pair(null, false)
         try {
             val rect = Rect()
             var bestLabel: String? = null
@@ -429,9 +513,9 @@ class GrassBagAccessibilityService : AccessibilityService() {
 
     fun captureScreenTree(maxNodes: Int = 140): JSONObject {
         val safeMax = maxNodes.coerceIn(10, 300)
-        val root = waitForActiveRoot(retries = 3)
+        val root = findActiveAppRoot(retries = 3)
         try {
-            val pkg = root?.packageName?.toString() ?: lastForegroundPackage ?: "unknown"
+            val pkg = root?.packageName?.toString() ?: currentForegroundPackage() ?: lastForegroundPackage ?: "unknown"
             if (pkg == "dev.grassbag.grassbag") {
                 return JSONObject()
                     .put("ok", true)
@@ -600,30 +684,34 @@ class GrassBagAccessibilityService : AccessibilityService() {
         }
         var captureSucceeded = false
         try {
+            if (screenshotExecutor.isShutdown) {
+                return JSONObject().put("ok", false).put("reason", "service_shutting_down")
+            }
             if (hidVisibleOverlay) {
-                runCatching { Thread.sleep(18L) }
+                runCatching { Thread.sleep(36L) }
             }
             val latch = CountDownLatch(1)
             val resultRef = AtomicReference<JSONObject?>()
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY,
-                screenshotExecutor,
-                object : TakeScreenshotCallback {
-                    override fun onSuccess(screenshot: ScreenshotResult) {
-                        // Frame buffer is already latched by SurfaceFlinger — restore overlay immediately
-                        // before CPU bitmap copy/scale/JPEG encoding to eliminate visible HUD flicker!
-                        restoreOverlayOnce()
-                        try {
-                            val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
-                            if (hw == null) {
-                                resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_wrap_failed"))
-                            } else {
-                                val soft = try {
-                                    hw.copy(Bitmap.Config.RGB_565, false)
-                                        ?: hw.copy(Bitmap.Config.ARGB_8888, false)
-                                } finally {
-                                    hw.recycle()
-                                }
+            val submitted = runCatching {
+                takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    screenshotExecutor,
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: ScreenshotResult) {
+                            // Frame buffer is already latched by SurfaceFlinger — restore overlay immediately
+                            // before CPU bitmap copy/scale/JPEG encoding to eliminate visible HUD flicker!
+                            restoreOverlayOnce()
+                            try {
+                                val hw = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                                if (hw == null) {
+                                    resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_wrap_failed"))
+                                } else {
+                                    val soft = try {
+                                        runCatching { hw.copy(Bitmap.Config.RGB_565, false) }.getOrNull()
+                                            ?: runCatching { hw.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
+                                    } finally {
+                                        hw.recycle()
+                                    }
                                 if (soft == null) {
                                     resultRef.set(JSONObject().put("ok", false).put("reason", "bitmap_copy_failed"))
                                 } else {
@@ -675,6 +763,11 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     }
                 }
             )
+            true
+            }.getOrDefault(false)
+            if (!submitted) {
+                return JSONObject().put("ok", false).put("reason", "screenshot_submit_failed")
+            }
             val done = runCatching { latch.await(4500L, TimeUnit.MILLISECONDS) }.getOrDefault(false)
             val result = resultRef.get() ?: JSONObject().put("ok", false).put("reason", if (!done) "screenshot_timeout" else "screenshot_failed")
             captureSucceeded = result.optBoolean("ok", false)
@@ -769,7 +862,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
     }
 
     fun inspectFocusedInput(): Triple<Boolean, Boolean, String?> {
-        val root = waitForActiveRoot(retries = 2) ?: return Triple(false, false, null)
+        val root = findActiveAppRoot(retries = 2) ?: return Triple(false, false, null)
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         try {
             if (focused == null) return Triple(false, false, null)
@@ -784,7 +877,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
     }
 
     fun executeType(text: String, submit: Boolean = false): JSONObject {
-        val root = waitForActiveRoot(retries = 3)
+        val root = findActiveAppRoot(retries = 3)
             ?: return JSONObject().put("ok", false).put("reason", "active_window_unavailable")
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         try {
@@ -833,6 +926,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
             var submitted = false
             if (ok && submit && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 runCatching { Thread.sleep(80L) }
+                runCatching { focused.refresh() }
                 submitted = runCatching {
                     focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
                 }.getOrDefault(false)

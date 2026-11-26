@@ -675,6 +675,7 @@ class SchemasteryForm extends StatefulWidget {
     this.availableModels = const [],
     this.showJsonToggle = true,
     this.insideGlass = true,
+    this.onDirtyChanged,
   });
 
   final Map<String, dynamic> schema;
@@ -697,6 +698,7 @@ class SchemasteryForm extends StatefulWidget {
 
   final bool showJsonToggle;
   final bool insideGlass;
+  final ValueChanged<bool>? onDirtyChanged;
 
   @override
   State<SchemasteryForm> createState() => _SchemasteryFormState();
@@ -815,6 +817,12 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
     return cur ?? fallback;
   }
 
+  void _setDirty(bool next) {
+    if (_dirty == next) return;
+    _dirty = next;
+    widget.onDirtyChanged?.call(next);
+  }
+
   void _writePath(
     List<String> path,
     dynamic value, {
@@ -823,7 +831,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
   }) {
     if (widget.readOnly || !mounted) return;
     void applyMutation() {
-      _dirty = true;
+      _setDirty(true);
       _editSeq++;
       _saveError = null;
       Map<String, dynamic> cur = _values;
@@ -860,6 +868,8 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
 
   Future<void> _handleSave() async {
     if (_saving || widget.readOnly) return;
+    FocusManager.instance.primaryFocus?.unfocus();
+    _jsonValidateTimer?.cancel();
     final isRawJson = _jsonMode || !_hasStructuredProperties();
     if (isRawJson) {
       try {
@@ -897,7 +907,7 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
           _saving = false;
           if (err == null) {
             if (_editSeq == seqAtSave) {
-              _dirty = false;
+              _setDirty(false);
               _fieldErrors.clear();
               _pendingFieldErrors.clear();
               // Keep the freshly submitted `_values` (do NOT overwrite with stale `widget.initialValues`
@@ -930,24 +940,14 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
       mainAxisSize: MainAxisSize.min,
       children: [
         if (widget.readOnly)
-          Container(
-            margin: const EdgeInsets.only(bottom: 12),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-            decoration: BoxDecoration(
-              color: t.warnSoft,
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Row(
-              children: [
-                Icon(CupertinoIcons.lock_fill, size: 14, color: t.warn),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '当前部署将此配置设为只读，仅支持查看。',
-                    style: TextStyle(fontSize: 12.5, color: t.warn),
-                  ),
-                ),
-              ],
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12),
+            child: GrassBagStatusBanner(
+              tone: GrassBagBannerTone.warn,
+              icon: CupertinoIcons.lock_fill,
+              message: '当前部署将此配置设为只读，仅支持查看。',
+              borderRadius: 14,
+              padding: EdgeInsets.symmetric(horizontal: 12, vertical: 9),
             ),
           ),
 
@@ -1007,13 +1007,11 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
 
         if (_saveError != null) ...[
           const SizedBox(height: 12),
-          Container(
+          GrassBagFresnelGlassSurface(
+            borderRadius: 14,
+            innerWell: true,
+            tintColor: t.errSoft,
             padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: t.errSoft,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: t.err.withValues(alpha: 0.35), width: 0.8),
-            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1027,18 +1025,24 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                         style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.err),
                       ),
                     ),
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
+                    const SizedBox(width: 8),
+                    GrassBagSpringTap(
+                      enablePointerGlow: false,
+                      haptic: true,
                       onTap: () {
                         Clipboard.setData(ClipboardData(text: _saveError!));
-                        HapticFeedback.selectionClick();
                         setState(() => _copiedError = true);
                         Future<void>.delayed(const Duration(milliseconds: 1400), () {
                           if (mounted) setState(() => _copiedError = false);
                         });
                       },
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                      child: GrassBagFresnelGlassSurface(
+                        isPill: true,
+                        innerWell: true,
+                        interactive: true,
+                        tintColor: (_copiedError ? t.ok : t.err)
+                            .withValues(alpha: t.isDark ? 0.22 : 0.14),
+                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
                         child: Text(
                           _copiedError ? '已复制' : '复制报错',
                           style: TextStyle(
@@ -1054,8 +1058,13 @@ class _SchemasteryFormState extends State<SchemasteryForm> {
                 const SizedBox(height: 5),
                 SelectableText(
                   _saveError!,
-contextMenuBuilder: buildGrassBagEditableContextMenu,
-                  style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, height: 1.4, color: t.err),
+                  contextMenuBuilder: buildGrassBagEditableContextMenu,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11.5,
+                    height: 1.4,
+                    color: t.isDark ? t.err : t.text,
+                  ),
                 ),
               ],
             ),
@@ -1071,7 +1080,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
             icon: _saving ? CupertinoIcons.hourglass : CupertinoIcons.checkmark_alt,
             height: 44,
             tier: widget.tier,
-            insideGlass: widget.insideGlass,
+            // Always render as lightweight frosted glass (never live premium shader inside scrollable forms).
+            insideGlass: true,
             enabled: !_saving,
             onTap: _saving ? null : _handleSave,
           ),
@@ -1089,7 +1099,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           controller: _jsonCtrl,
           focusNode: _jsonFocusNode,
           readOnly: widget.readOnly,
-          insideGlass: widget.insideGlass,
+          insideGlass: true,
           monospace: true,
           fontSize: 12,
           minLines: 6,
@@ -1100,7 +1110,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           onChanged: (v) {
             _editSeq++;
             if (!_dirty) {
-              setState(() => _dirty = true);
+              setState(() => _setDirty(true));
             }
             _jsonValidateTimer?.cancel();
             _jsonValidateTimer = Timer(const Duration(milliseconds: 220), () {
@@ -1197,6 +1207,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                         _EnumChip(
                           label: variantLabels[i],
                           selected: i == activeIdx,
+                          enabled: !widget.readOnly,
                           onTap: () {
                             if (widget.readOnly || i == activeIdx) return;
                             final target = variants[i];
@@ -1221,7 +1232,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                             setState(() {
                               _values = nextMap;
                               _fieldErrors.clear();
-                              _dirty = true;
+                              _setDirty(true);
                               _editSeq++;
                               _saveError = null;
                             });
@@ -1317,15 +1328,18 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
       return GrassBagListTile(
         title: Text(title),
         subtitle: desc != null ? Text(desc) : null,
-        trailing: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-          decoration: BoxDecoration(
-            color: t.fill1,
-            borderRadius: BorderRadius.circular(999),
-          ),
-          child: Text(
-            '${current ?? schema['constValue'] ?? ''}',
-            style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: t.text2),
+        trailing: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 168),
+          child: GrassBagFresnelGlassSurface(
+            isPill: true,
+            innerWell: true,
+            padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 3.5),
+            child: Text(
+              '${current ?? schema['constValue'] ?? ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontFamily: 'monospace', fontSize: 12, color: t.text2),
+            ),
           ),
         ),
       );
@@ -1363,20 +1377,63 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               Padding(
                 padding: const EdgeInsets.only(bottom: 7),
                 child: GrassBagSpringTap(
-                  onTap: () => _writePath(path, opt.value),
+                  enabled: !widget.readOnly,
+                  borderRadius: 14,
+                  onTap: () {
+                    if (!widget.readOnly) _writePath(path, opt.value);
+                  },
                   pressedScale: 0.98,
                   haptic: true,
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 160),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: curStr == opt.value ? t.primarySoft : t.fill1,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(
-                        color: curStr == opt.value ? t.primary : t.sep,
-                        width: curStr == opt.value ? 1.1 : 0.5,
+                  child: CustomPaint(
+                    foregroundPainter: widget.tier == GrassBagGlassTier.solid
+                        ? null
+                        : GrassBagFresnelRimPainter(
+                            isDark: t.isDark,
+                            borderRadius: 14,
+                            accent: curStr == opt.value ? t.primary : null,
+                            tinted: curStr == opt.value,
+                            innerWell: curStr != opt.value,
+                            frosted: widget.tier == GrassBagGlassTier.frosted,
+                            paintTopSheen: curStr == opt.value,
+                            strokeWidth: curStr == opt.value ? 1.0 : 0.75,
+                          ),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 160),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: ShapeDecoration(
+                        color: widget.tier == GrassBagGlassTier.solid
+                            ? (curStr == opt.value ? t.primarySoft : t.fill1)
+                            : null,
+                        gradient: widget.tier == GrassBagGlassTier.solid
+                            ? null
+                            : LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: curStr == opt.value
+                                    ? [
+                                        t.primary.withValues(alpha: t.isDark ? 0.24 : 0.14),
+                                        t.primary.withValues(alpha: t.isDark ? 0.10 : 0.05),
+                                      ]
+                                    : (t.isDark
+                                        ? [
+                                            Colors.white.withValues(alpha: 0.085),
+                                            Colors.white.withValues(alpha: 0.03),
+                                          ]
+                                        : [
+                                            Colors.white.withValues(alpha: 0.68),
+                                            Colors.white.withValues(alpha: 0.42),
+                                          ]),
+                              ),
+                        shape: RoundedSuperellipseBorder(
+                          borderRadius: BorderRadius.circular(14),
+                          side: widget.tier == GrassBagGlassTier.solid
+                              ? BorderSide(
+                                  color: curStr == opt.value ? t.primary : t.sep,
+                                  width: curStr == opt.value ? 1.1 : 0.5,
+                                )
+                              : BorderSide.none,
+                        ),
                       ),
-                    ),
                     child: Row(
                       children: [
                         Expanded(
@@ -1405,6 +1462,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           Icon(CupertinoIcons.checkmark_circle_fill, size: 18, color: t.primary),
                       ],
                     ),
+                  ),
                   ),
                 ),
               ),
@@ -1447,9 +1505,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   _EnumChip(
                     label: '未设置',
                     selected: curStr == null || curStr.isEmpty,
+                    enabled: !widget.readOnly,
                     onTap: () {
                       if (widget.readOnly) return;
                       FocusManager.instance.primaryFocus?.unfocus();
+                      final customKey = '${path.join('.')}_custom_enum';
+                      _pendingFieldErrors.remove(customKey);
+                      _fieldErrors.remove(customKey);
                       _writePath(path, null, removeIfNull: true);
                     },
                   ),
@@ -1457,9 +1519,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   _EnumChip(
                     label: _labelForOption(options[i]),
                     selected: curStr == options[i],
+                    enabled: !widget.readOnly,
                     onTap: () {
                       if (widget.readOnly) return;
                       FocusManager.instance.primaryFocus?.unfocus();
+                      final customKey = '${path.join('.')}_custom_enum';
+                      _pendingFieldErrors.remove(customKey);
+                      _fieldErrors.remove(customKey);
                       _writePath(path, enumVals[i]);
                     },
                   ),
@@ -1467,26 +1533,56 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
             ),
             if (allowCustom) ...[
               const SizedBox(height: 8),
-              _InlineTextInput(
-                key: ValueKey('${path.join('.')}_custom_enum'),
-                fieldKey: '${path.join('.')}_custom_enum',
-                initialValue: (curStr != null && !options.contains(curStr)) ? curStr : '',
-                placeholder: '或输入自定义值…',
-                numeric: isNumericEnum,
-                readOnly: widget.readOnly,
-                onChanged: (v) {
-                  if (v.trim().isEmpty) {
-                    _writePath(path, null, removeIfNull: true);
-                    return;
-                  }
-                  if (isNumericEnum) {
-                    final parsed = parseFiniteSchemaNumber(v, isInteger: type == 'integer');
-                    if (parsed != null) _writePath(path, parsed);
-                  } else {
-                    _writePath(path, v);
-                  }
-                },
-              ),
+              () {
+                final customErrKey = '${path.join('.')}_custom_enum';
+                final customErr = _fieldErrors[customErrKey];
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _InlineTextInput(
+                      key: ValueKey(customErrKey),
+                      fieldKey: customErrKey,
+                      initialValue: (curStr != null && !options.contains(curStr)) ? curStr : '',
+                      placeholder: '或输入自定义值…',
+                      numeric: isNumericEnum,
+                      readOnly: widget.readOnly,
+                      hasError: customErr != null,
+                      onChanged: (v) {
+                        final trimmed = v.trim();
+                        if (trimmed.isEmpty) {
+                          _pendingFieldErrors.remove(customErrKey);
+                          final hadErr = _fieldErrors.remove(customErrKey) != null;
+                          _writePath(path, null, removeIfNull: true, rebuild: hadErr);
+                          return;
+                        }
+                        if (isNumericEnum) {
+                          final parsed = parseFiniteSchemaNumber(trimmed, isInteger: type == 'integer');
+                          if (parsed != null) {
+                            _pendingFieldErrors.remove(customErrKey);
+                            final hadErr = _fieldErrors.remove(customErrKey) != null;
+                            _writePath(path, parsed, rebuild: hadErr);
+                          } else {
+                            final errMsg = '$title 需要有效的${type == 'integer' ? '整数' : '数字'}';
+                            _pendingFieldErrors[customErrKey] = errMsg;
+                            setState(() {
+                              _fieldErrors[customErrKey] = errMsg;
+                              _setDirty(true);
+                              _editSeq++;
+                            });
+                          }
+                        } else {
+                          _writePath(path, v);
+                        }
+                      },
+                    ),
+                    if (customErr != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4, left: 4),
+                        child: Text(customErr, style: TextStyle(fontSize: 11.5, color: t.err)),
+                      ),
+                  ],
+                );
+              }(),
             ],
           ],
         ),
@@ -1516,12 +1612,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     child: Text(title,
                         style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500, color: t.text)),
                   ),
-                  Container(
+                  GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    tintColor: t.primarySoft,
                     padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: t.primarySoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
                     child: Text(
                       isInt ? '${numCur.round()}' : numCur.toStringAsFixed(2),
                       style: TextStyle(
@@ -1572,10 +1667,23 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
             Row(
               children: [
                 Expanded(
-                  child: Text(title,
-                      style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500, color: t.text)),
+                  child: Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500, color: t.text),
+                  ),
                 ),
-                Text(key, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: t.text3)),
+                const SizedBox(width: 8),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 132),
+                  child: Text(
+                    key,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: t.text3),
+                  ),
+                ),
               ],
             ),
             if (desc != null) ...[
@@ -1591,6 +1699,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               mono: true,
               numeric: true,
               readOnly: widget.readOnly,
+              hasError: fieldErr != null,
               onChanged: (v) {
                 final trimmed = v.trim();
                 _numValidateTimers.remove(numPathKey)?.cancel();
@@ -1617,7 +1726,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   // Record synchronously so tapping Save within 450ms still catches invalid input,
                   // while debouncing the inline banner so multi-digit typing doesn't bounce layout.
                   final errMsg = pendingErr;
+                  final wasDirty = _dirty;
+                  _setDirty(true);
+                  _editSeq++;
                   _pendingFieldErrors[numPathKey] = errMsg;
+                  if (!wasDirty) setState(() {});
                   _numValidateTimers[numPathKey] = Timer(const Duration(milliseconds: 450), () {
                     _numValidateTimers.remove(numPathKey);
                     if (!mounted) return;
@@ -1658,6 +1771,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   child: Text('自定义对象 (${nestedProps.length} 项)', style: TextStyle(fontSize: 12.5, color: t.text2)),
                 ),
                 GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  haptic: true,
                   onTap: () => _openNestedObjectSheet(
                     context,
                     title: title,
@@ -1666,10 +1781,16 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     pathPrefix: path,
                     onApply: (updated) => _writePath(path, updated),
                   ),
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                    decoration: BoxDecoration(color: t.primarySoft, borderRadius: BorderRadius.circular(999)),
-                    child: Text('编辑', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary)),
+                    child: Text(
+                      widget.readOnly ? '查看' : '编辑',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
+                    ),
                   ),
                 ),
               ],
@@ -1703,6 +1824,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     _EnumChip(
                       label: '自定义配置',
                       selected: !isAltConst,
+                      enabled: !widget.readOnly,
                       onTap: () {
                         if (widget.readOnly || !isAltConst) return;
                         _writePath(path, buildDefaultValueForSchema(schema));
@@ -1712,6 +1834,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       _EnumChip(
                         label: c == false ? '禁用 (false)' : (c == true ? '启用 (true)' : _labelForOption(c)),
                         selected: rawCur == c,
+                        enabled: !widget.readOnly,
                         onTap: () {
                           if (widget.readOnly) return;
                           _writePath(path, c);
@@ -1749,6 +1872,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   ),
                 ),
                 GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  haptic: true,
                   onTap: () => _openNestedObjectSheet(
                     context,
                     title: title,
@@ -1757,14 +1882,16 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     pathPrefix: path,
                     onApply: (updated) => _writePath(path, updated),
                   ),
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: t.primarySoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
                     child: Text(
-                      '编辑 (${nestedProps.length} 项)',
+                      widget.readOnly
+                          ? '查看 (${nestedProps.length} 项)'
+                          : '编辑 (${nestedProps.length} 项)',
                       style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
                     ),
                   ),
@@ -1808,24 +1935,22 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500, color: t.text)),
               ),
               if (isRedactedSecret)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: t.okSoft,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  tintColor: t.okSoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
                   child: Text(
                     '已加密保存',
                     style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.ok),
                   ),
                 )
               else if (isCredRef)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  tintColor: t.primarySoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
                   child: Text(
                     '环境变量',
                     style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.primary),
@@ -1925,6 +2050,8 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                 ),
               ),
               GrassBagSpringTap(
+                enablePointerGlow: false,
+                haptic: true,
                 onTap: () => _openNestedObjectSheet(
                   context,
                   title: '$title (${variantLabels[activeIdx]})',
@@ -1935,14 +2062,16 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   pathPrefix: path,
                   onApply: (updated) => _writePath(path, updated),
                 ),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(999),
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  tintColor: t.primarySoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5.5),
+                  child: Text(
+                    widget.readOnly ? '查看详情' : '详细设置',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.primary),
                   ),
-                  child: Text('详细设置',
-                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.primary)),
                 ),
               ),
             ],
@@ -1956,6 +2085,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                 _EnumChip(
                   label: variantLabels[i],
                   selected: i == activeIdx,
+                  enabled: !widget.readOnly,
                   onTap: () {
                     if (widget.readOnly || i == activeIdx) return;
                     final target = variants[i];
@@ -2025,12 +2155,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
             ),
             const SizedBox(height: 10),
             if (list.isEmpty)
-              Container(
+              GrassBagFresnelGlassSurface(
+                borderRadius: 12,
+                innerWell: true,
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                decoration: BoxDecoration(
-                  color: t.fill1,
-                  borderRadius: BorderRadius.circular(12),
-                ),
                 child: Text('暂无条目，点击下方按钮添加', style: TextStyle(fontSize: 12.5, color: t.text3)),
               )
             else
@@ -2065,8 +2193,14 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   onDelete: widget.readOnly
                       ? null
                       : () {
-                          final next = List<dynamic>.from(list)..removeAt(i);
-                          _writePath(path, next);
+                          final rawCur = _readRawPath(path);
+                          final next = rawCur is List
+                              ? List<dynamic>.from(rawCur)
+                              : List<dynamic>.from(list);
+                          if (i >= 0 && i < next.length) {
+                            next.removeAt(i);
+                            _writePath(path, next);
+                          }
                         },
                 ),
             if (!widget.readOnly) ...[
@@ -2076,9 +2210,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   if (isAllowedModels) ...[
                     Expanded(
                       child: GrassBagSecondaryGlassButton(
-                        label: '从可用模型选取',
+                        label: '选取模型',
                         icon: CupertinoIcons.sparkles,
                         height: 36,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
                         tier: widget.tier,
                         insideGlass: true,
                         accentForeground: true,
@@ -2092,6 +2227,7 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       label: '新增一项',
                       icon: CupertinoIcons.add,
                       height: 36,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
                       tier: widget.tier,
                       insideGlass: true,
                       onTap: () {
@@ -2154,8 +2290,13 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   _EnumChip(
                     label: _labelForOption(itemEnums[i]),
                     selected: strItems.contains(itemEnums[i]),
+                    enabled: !widget.readOnly,
                     onTap: () {
-                      final next = List<dynamic>.from(list);
+                      if (widget.readOnly) return;
+                      final rawCur = _readRawPath(path);
+                      final next = rawCur is List
+                          ? List<dynamic>.from(rawCur)
+                          : List<dynamic>.from(list);
                       final existingIdx = next.indexWhere((e) => e.toString() == itemEnums[i]);
                       if (existingIdx >= 0) {
                         next.removeAt(existingIdx);
@@ -2176,32 +2317,66 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               children: [
                 for (var i = 0; i < strItems.length; i++)
                   if (itemEnums.isEmpty || !itemEnums.contains(strItems[i]))
-                    Container(
-                      padding: const EdgeInsets.only(left: 10, right: 6, top: 5, bottom: 5),
-                      decoration: BoxDecoration(
-                        color: t.primarySoft,
-                        borderRadius: BorderRadius.circular(999),
+                    GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      tintColor: t.primarySoft,
+                      padding: EdgeInsets.only(
+                        left: 11,
+                        right: widget.readOnly ? 11 : 4,
+                        top: 3.5,
+                        bottom: 3.5,
                       ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(
-                            strItems[i],
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                              color: t.primary,
+                          Flexible(
+                            child: Text(
+                              strItems[i],
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                                color: t.primary,
+                              ),
                             ),
                           ),
                           if (!widget.readOnly) ...[
-                            const SizedBox(width: 4),
-                            GestureDetector(
-                              onTap: () {
-                                final next = List<dynamic>.from(list)..removeAt(i);
-                                _writePath(path, next);
-                              },
-                              child: Icon(CupertinoIcons.xmark_circle_fill, size: 14, color: t.primary),
+                            const SizedBox(width: 2),
+                            Tooltip(
+                              message: '移除「${strItems[i]}」',
+                              excludeFromSemantics: true,
+                              child: Semantics(
+                                button: true,
+                                label: '移除「${strItems[i]}」',
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    HapticFeedback.selectionClick();
+                                    final rawCur = _readRawPath(path);
+                                    final next = rawCur is List
+                                        ? List<dynamic>.from(rawCur)
+                                        : List<dynamic>.from(list);
+                                    if (i >= 0 && i < next.length) {
+                                      next.removeAt(i);
+                                      _writePath(path, next);
+                                    }
+                                  },
+                                  child: SizedBox(
+                                    width: 28,
+                                    height: 28,
+                                    child: Center(
+                                      child: Icon(
+                                        CupertinoIcons.xmark_circle_fill,
+                                        size: 15,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ],
                         ],
@@ -2216,13 +2391,15 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               placeholder: isNumericItem ? '输入数值后点击添加…' : '输入后点击添加…',
               numeric: isNumericItem,
               onAdd: (val) {
+                final rawCur = _readRawPath(path);
+                final base = rawCur is List ? rawCur : list;
                 if (isNumericItem) {
                   final parsed = parseFiniteSchemaNumber(val, isInteger: itemType == 'integer');
                   if (parsed == null) return false;
-                  _writePath(path, [...list, parsed]);
+                  _writePath(path, [...base, parsed]);
                   return true;
                 } else {
-                  _writePath(path, [...list, val]);
+                  _writePath(path, [...base, val]);
                   return true;
                 }
               },
@@ -2272,12 +2449,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
             ),
             const SizedBox(height: 10),
             if (map.isEmpty)
-              Container(
+              GrassBagFresnelGlassSurface(
+                borderRadius: 12,
+                innerWell: true,
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                decoration: BoxDecoration(
-                  color: t.fill1,
-                  borderRadius: BorderRadius.circular(12),
-                ),
                 child: Text('暂未配置任何条目，点击下方新增', style: TextStyle(fontSize: 12.5, color: t.text3)),
               )
             else
@@ -2309,7 +2484,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                   onDelete: widget.readOnly
                       ? null
                       : () {
-                          final next = Map<String, dynamic>.from(map)..remove(entry.key);
+                          final rawCur = _readRawPath(path);
+                          final next = rawCur is Map
+                              ? Map<String, dynamic>.from(rawCur)
+                              : Map<String, dynamic>.from(map);
+                          next.remove(entry.key);
                           _writePath(path, next);
                         },
                 ),
@@ -2360,12 +2539,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
               for (final entry in map.entries)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 7),
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    borderRadius: 12,
+                    innerWell: true,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
                     child: Row(
                       children: [
                         Expanded(
@@ -2375,8 +2552,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                                 ? null
                                 : () {
                                     HapticFeedback.lightImpact();
-                                    final next = Map<String, dynamic>.from(map);
-                                    next[entry.key] = !(entry.value == true);
+                                    final rawCur = _readRawPath(path);
+                                    final next = rawCur is Map
+                                        ? Map<String, dynamic>.from(rawCur)
+                                        : Map<String, dynamic>.from(map);
+                                    next[entry.key] = !(next[entry.key] == true);
                                     _writePath(path, next);
                                   },
                             child: Padding(
@@ -2394,24 +2574,40 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                           onChanged: widget.readOnly
                               ? null
                               : (v) {
-                                  final next = Map<String, dynamic>.from(map);
+                                  final rawCur = _readRawPath(path);
+                                  final next = rawCur is Map
+                                      ? Map<String, dynamic>.from(rawCur)
+                                      : Map<String, dynamic>.from(map);
                                   next[entry.key] = v;
                                   _writePath(path, next);
                                 },
                         ),
                         if (!widget.readOnly) ...[
                           const SizedBox(width: 4),
-                          GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTap: () {
-                              final next = Map<String, dynamic>.from(map)..remove(entry.key);
-                              _writePath(path, next);
-                            },
-                            child: SizedBox(
-                              width: 34,
-                              height: 34,
-                              child: Center(
-                                child: Icon(CupertinoIcons.trash, size: 15, color: t.text3),
+                          Tooltip(
+                            message: '删除「${entry.key}」',
+                            excludeFromSemantics: true,
+                            child: Semantics(
+                              button: true,
+                              label: '删除「${entry.key}」',
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () {
+                                  HapticFeedback.selectionClick();
+                                  final rawCur = _readRawPath(path);
+                                  final next = rawCur is Map
+                                      ? Map<String, dynamic>.from(rawCur)
+                                      : Map<String, dynamic>.from(map);
+                                  next.remove(entry.key);
+                                  _writePath(path, next);
+                                },
+                                child: SizedBox(
+                                  width: 40,
+                                  height: 40,
+                                  child: Center(
+                                    child: Icon(CupertinoIcons.trash, size: 15.5, color: t.text3),
+                                  ),
+                                ),
                               ),
                             ),
                           ),
@@ -2463,12 +2659,10 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
           for (final entry in map.entries)
             Padding(
               padding: const EdgeInsets.only(bottom: 7),
-              child: Container(
+              child: GrassBagFresnelGlassSurface(
+                borderRadius: 12,
+                innerWell: true,
                 padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-                decoration: BoxDecoration(
-                  color: t.fill1,
-                  borderRadius: BorderRadius.circular(12),
-                ),
                 child: Row(
                   children: [
                     Flexible(
@@ -2499,17 +2693,30 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                       ),
                     ),
                     if (!widget.readOnly)
-                      GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: () {
-                          final next = Map<String, dynamic>.from(map)..remove(entry.key);
-                          _writePath(path, next);
-                        },
-                        child: SizedBox(
-                          width: 34,
-                          height: 34,
-                          child: Center(
-                            child: Icon(CupertinoIcons.xmark_circle_fill, size: 15, color: t.text3),
+                      Tooltip(
+                        message: '删除「${entry.key}」',
+                        excludeFromSemantics: true,
+                        child: Semantics(
+                          button: true,
+                          label: '删除「${entry.key}」',
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () {
+                              HapticFeedback.selectionClick();
+                              final rawCur = _readRawPath(path);
+                              final next = rawCur is Map
+                                  ? Map<String, dynamic>.from(rawCur)
+                                  : Map<String, dynamic>.from(map);
+                              next.remove(entry.key);
+                              _writePath(path, next);
+                            },
+                            child: SizedBox(
+                              width: 40,
+                              height: 40,
+                              child: Center(
+                                child: Icon(CupertinoIcons.xmark_circle_fill, size: 16, color: t.text3),
+                              ),
+                            ),
                           ),
                         ),
                       ),
@@ -2575,10 +2782,21 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
     List<String> pathPrefix = const [],
   }) {
     final nestedSecrets = _scopedSecretPaths(pathPrefix);
+    var nestedDirty = false;
     showGrassBagSheet<void>(
       context,
       title: title,
       subtitle: subtitle ?? '编辑子配置属性',
+      onWillDismiss: () async {
+        if (!nestedDirty || !context.mounted) return true;
+        return showGrassBagConfirmDialog(
+          context,
+          title: '放弃未保存的子配置改动？',
+          message: '当前子项有未应用的修改，关闭后将不会保留。',
+          confirmLabel: '放弃修改',
+          isDestructive: true,
+        );
+      },
       bodyBuilder: (ctx) => SchemasteryForm(
         namespaceId: widget.namespaceId,
         secretPaths: nestedSecrets,
@@ -2589,7 +2807,9 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
         submitLabel: '确定应用',
         dynamicOptions: widget.dynamicOptions,
         availableModels: widget.availableModels,
+        onDirtyChanged: (d) => nestedDirty = d,
         onSubmit: (updated) async {
+          nestedDirty = false;
           onApply(updated);
           if (ctx.mounted) Navigator.of(ctx).pop();
           return null;
@@ -2664,9 +2884,11 @@ contextMenuBuilder: buildGrassBagEditableContextMenu,
                     ? Icon(CupertinoIcons.checkmark_circle_fill, size: 18, color: t.primary)
                     : Icon(CupertinoIcons.plus_circle, size: 18, color: t.text3),
                 onTap: () {
-                  final exists = currentList.any((e) => e is Map && e['provider'] == m.$1 && e['model'] == m.$2);
+                  final rawCur = _readRawPath(path);
+                  final base = rawCur is List ? rawCur : currentList;
+                  final exists = base.any((e) => e is Map && e['provider'] == m.$1 && e['model'] == m.$2);
                   if (!exists) {
-                    _writePath(path, [...currentList, {'provider': m.$1, 'model': m.$2}]);
+                    _writePath(path, [...base, {'provider': m.$1, 'model': m.$2}]);
                   }
                   Navigator.of(ctx).pop();
                 },
@@ -2721,20 +2943,26 @@ class _EnumChip extends StatelessWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.enabled = true,
   });
 
   final String label;
   final bool selected;
   final VoidCallback onTap;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
-    return GrassBagFilterChip(
+    final chip = GrassBagFilterChip(
       label: label,
       selected: selected,
-      onTap: onTap,
+      onTap: enabled ? onTap : () {},
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
       fontSize: 12.5,
+    );
+    if (enabled) return chip;
+    return IgnorePointer(
+      child: Opacity(opacity: 0.6, child: chip),
     );
   }
 }
@@ -2759,15 +2987,13 @@ class _ComplexEntryTile extends StatelessWidget {
       padding: const EdgeInsets.only(bottom: 7),
       child: GrassBagSpringTap(
         onTap: onTap,
+        borderRadius: 14,
         pressedScale: 0.985,
         haptic: true,
-        child: Container(
+        child: GrassBagFresnelGlassSurface(
+          borderRadius: 14,
+          innerWell: true,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: t.fill1,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: t.sep, width: 0.5),
-          ),
           child: Row(
             children: [
               Expanded(
@@ -2797,21 +3023,33 @@ class _ComplexEntryTile extends StatelessWidget {
                 ),
               ),
               if (onDelete != null)
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () async {
-                    final ok = await showGrassBagConfirmDialog(
-                      context,
-                      title: '删除「$title」？',
-                      message: '移除该配置条目后，点击底部保存按钮将同步写入当前 DSH 主机。',
-                      confirmLabel: '删除',
-                      isDestructive: true,
-                    );
-                    if (ok) onDelete!();
-                  },
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    child: Icon(CupertinoIcons.trash, size: 15, color: t.err),
+                Tooltip(
+                  message: '删除「$title」',
+                  excludeFromSemantics: true,
+                  child: Semantics(
+                    button: true,
+                    label: '删除「$title」',
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () async {
+                        HapticFeedback.selectionClick();
+                        final ok = await showGrassBagConfirmDialog(
+                          context,
+                          title: '删除「$title」？',
+                          message: '移除该配置条目后，点击底部保存按钮将同步写入当前 DSH 主机。',
+                          confirmLabel: '删除',
+                          isDestructive: true,
+                        );
+                        if (ok) onDelete!();
+                      },
+                      child: SizedBox(
+                        width: 40,
+                        height: 40,
+                        child: Center(
+                          child: Icon(CupertinoIcons.trash, size: 15.5, color: t.err),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
               Icon(CupertinoIcons.chevron_right, size: 13.5, color: t.text3),
@@ -2914,6 +3152,7 @@ class _InlineTextInput extends StatefulWidget {
     this.numeric = false,
     this.multiline = false,
     this.readOnly = false,
+    this.hasError = false,
   });
 
   final String fieldKey;
@@ -2925,6 +3164,7 @@ class _InlineTextInput extends StatefulWidget {
   final bool numeric;
   final bool multiline;
   final bool readOnly;
+  final bool hasError;
 
   @override
   State<_InlineTextInput> createState() => _InlineTextInputState();
@@ -2989,18 +3229,30 @@ class _InlineTextInputState extends State<_InlineTextInput> {
       fontSize: 13.5,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       placeholder: widget.placeholder,
+      hasError: widget.hasError,
       suffix: widget.secret
-          ? GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _obscure = !_obscure),
-              child: SizedBox(
-                width: 36,
-                height: 36,
-                child: Center(
-                  child: Icon(
-                    _obscure ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
-                    size: 16,
-                    color: t.text3,
+          ? Tooltip(
+              message: _obscure ? '显示密钥' : '隐藏密钥',
+              excludeFromSemantics: true,
+              child: Semantics(
+                button: true,
+                label: _obscure ? '显示密钥' : '隐藏密钥',
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    setState(() => _obscure = !_obscure);
+                  },
+                  child: SizedBox(
+                    width: 40,
+                    height: 40,
+                    child: Center(
+                      child: Icon(
+                        _obscure ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                        size: 16,
+                        color: t.text3,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -3076,15 +3328,16 @@ class _QuickAddChipInputState extends State<_QuickAddChipInput> {
             ),
             const SizedBox(width: 8),
             GrassBagSpringTap(
+              enablePointerGlow: false,
               onTap: _submit,
               haptic: true,
-              child: Container(
-                height: 36,
+              child: GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                interactive: true,
+                tintColor: t.primarySoft,
+                height: 40,
                 padding: const EdgeInsets.symmetric(horizontal: 14),
-                decoration: BoxDecoration(
-                  color: t.primarySoft,
-                  borderRadius: BorderRadius.circular(999),
-                ),
                 alignment: Alignment.center,
                 child: Text('添加', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.primary)),
               ),
@@ -3195,18 +3448,27 @@ class _QuickAddKeyValueInputState extends State<_QuickAddKeyValueInput> {
               ),
             ),
             const SizedBox(width: 6),
-            GrassBagSpringTap(
-              onTap: _submit,
-              haptic: true,
-              child: Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: t.primarySoft,
-                  shape: BoxShape.circle,
+            Tooltip(
+              message: '添加键值对',
+              excludeFromSemantics: true,
+              child: Semantics(
+                button: true,
+                label: '添加键值对',
+                child: GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  onTap: _submit,
+                  haptic: true,
+                  child: GrassBagFresnelGlassSurface(
+                    isCircle: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    width: 40,
+                    height: 40,
+                    alignment: Alignment.center,
+                    child: Icon(CupertinoIcons.add, size: 16, color: t.primary),
+                  ),
                 ),
-                alignment: Alignment.center,
-                child: Icon(CupertinoIcons.add, size: 16, color: t.primary),
               ),
             ),
           ],

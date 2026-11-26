@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show Tooltip;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:gbridge_client/gbridge_client.dart';
@@ -91,14 +92,13 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
   bool _obscureToken = true;
   bool _connecting = false;
   bool _hasScannedLan = false;
+  bool _hadAddrText = false;
   String? _capturedCookie;
   String? _selectedLanAddr;
   RemoteHostDiagnosis? _diagnosis;
 
   bool get _supportsInAppWebLogin =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS);
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   bool get _supportsQrScan =>
       !kIsWeb &&
@@ -121,6 +121,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     final parsed = parseRemoteHostInput(text);
     if (parsed == null) {
       _addrCtrl.text = text;
+      _hadAddrText = text.trim().isNotEmpty;
       setState(() {
         _capturedCookie = null;
         _diagnosis = null;
@@ -130,6 +131,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     }
     final addrChanged = _addrCtrl.text.trim() != parsed.address;
     _addrCtrl.text = parsed.address;
+    _hadAddrText = parsed.address.trim().isNotEmpty;
     if (parsed.token != null && parsed.token!.isNotEmpty) {
       _tokenCtrl.text = parsed.token!;
     } else if (addrChanged) {
@@ -170,6 +172,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
         _addrCtrl.text = widget.initialInput!.trim();
       }
     }
+    _hadAddrText = _addrCtrl.text.trim().isNotEmpty;
     if (widget.initialDiagnosis != null) {
       _diagnosis = widget.initialDiagnosis;
     }
@@ -233,6 +236,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
   Future<RemoteHostDiagnosis?> _diagnoseOnly() async {
     final raw = _addrCtrl.text.trim();
     if (raw.isEmpty) {
+      _addrFocus.requestFocus();
       ref.read(appProvider.notifier).showToast('请先输入远程地址或粘贴启动链接', tone: ToastTone.warn);
       return null;
     }
@@ -298,6 +302,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     if (_connecting) return;
     final raw = _addrCtrl.text.trim();
     if (raw.isEmpty) {
+      _addrFocus.requestFocus();
       ref.read(appProvider.notifier).showToast('请先输入远程地址或粘贴启动链接', tone: ToastTone.warn);
       return;
     }
@@ -470,17 +475,29 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             const SizedBox(height: 12),
           ],
 
-          // Quick-Action Top Bar: 1-tap QR Scan (single unified Paste inside input + single Guide toggle below!)
+          // Quick-Action Top Bar: 1-tap QR Scan — single primary CTA hierarchy per viewport
           if (_supportsQrScan) ...[
-            GrassBagPrimaryGlassButton(
-              label: '扫码连接',
-              icon: CupertinoIcons.qrcode_viewfinder,
-              height: 40,
-              tier: slice.glassTier,
-              insideGlass: true,
-              enabled: !_connecting,
-              onTap: _connecting ? null : _scanQrCode,
-            ),
+            if (_addrCtrl.text.trim().isEmpty && _selectedLanAddr == null && diag == null)
+              GrassBagPrimaryGlassButton(
+                label: '扫码连接',
+                icon: CupertinoIcons.qrcode_viewfinder,
+                height: 42,
+                tier: slice.glassTier,
+                insideGlass: true,
+                enabled: !_connecting,
+                onTap: _connecting ? null : _scanQrCode,
+              )
+            else
+              GrassBagSecondaryGlassButton(
+                label: '改用扫码连接',
+                icon: CupertinoIcons.qrcode_viewfinder,
+                height: 40,
+                tier: slice.glassTier,
+                insideGlass: true,
+                accentForeground: true,
+                enabled: !_connecting,
+                onTap: _connecting ? null : _scanQrCode,
+              ),
             const SizedBox(height: 11),
           ],
 
@@ -525,6 +542,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                     onTap: () {
                       _addrCtrl.clear();
                       _tokenCtrl.clear();
+                      _hadAddrText = false;
                       if (_diagnosis != null ||
                           _capturedCookie != null ||
                           _selectedLanAddr != null) {
@@ -537,12 +555,18 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                         setState(() {});
                       }
                     },
-                    child: Padding(
-                      padding: const EdgeInsets.all(5),
-                      child: Icon(
-                        CupertinoIcons.xmark_circle_fill,
-                        size: 16,
-                        color: t.text3,
+                    child: Tooltip(
+                      message: '清空地址',
+                      child: SizedBox(
+                        width: 34,
+                        height: 34,
+                        child: Center(
+                          child: Icon(
+                            CupertinoIcons.xmark_circle_fill,
+                            size: 16,
+                            color: t.text3,
+                          ),
+                        ),
                       ),
                     ),
                   );
@@ -550,15 +574,17 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 return Padding(
                   padding: const EdgeInsets.only(right: 5),
                   child: GrassBagSpringTap(
+                    enablePointerGlow: false,
+                    haptic: true,
                     onTap: () {
                       if (!_connecting) _pasteFromClipboard();
                     },
-                    child: Container(
+                    child: GrassBagFresnelGlassSurface(
+                      borderRadius: 10,
+                      innerWell: true,
+                      interactive: true,
+                      tintColor: t.primarySoft,
                       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: t.primarySoft,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
@@ -579,13 +605,18 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 );
               },
             ),
-            onChanged: (_) {
+            onChanged: (v) {
+              final hasText = v.trim().isNotEmpty;
+              final toggledEmpty = hasText != _hadAddrText;
+              _hadAddrText = hasText;
               if (_diagnosis != null || _capturedCookie != null || _selectedLanAddr != null) {
                 setState(() {
                   _capturedCookie = null;
                   _selectedLanAddr = null;
                   _diagnosis = null;
                 });
+              } else if (_supportsQrScan && toggledEmpty) {
+                setState(() {});
               }
             },
             onSubmitted: (_) => _connectNow(),
@@ -656,89 +687,83 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             ],
           ),
 
-          AnimatedSize(
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.topCenter,
-            child: _showAdvanced
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 6, bottom: 4),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        GrassBagTextField(
-                          controller: _tokenCtrl,
-                          focusNode: _tokenFocus,
-                          placeholder: '访问令牌 Token（选填，留空或走网页登录）',
-                          insideGlass: true,
-                          monospace: true,
-                          obscureText: _obscureToken,
-                          textInputAction: TextInputAction.done,
-                          fontSize: 13,
-                          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
-                          onChanged: (_) => setState(() => _diagnosis = null),
-                          onSubmitted: (_) => _connectNow(),
-                          suffix: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTap: () => setState(() => _obscureToken = !_obscureToken),
-                            child: SizedBox(
-                              width: 34,
-                              height: 34,
-                              child: Center(
-                                child: Icon(
-                                  _obscureToken ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
-                                  size: 15,
-                                  color: t.text3,
-                                ),
-                              ),
-                            ),
+          if (_showAdvanced)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, bottom: 4),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  GrassBagTextField(
+                    controller: _tokenCtrl,
+                    focusNode: _tokenFocus,
+                    placeholder: '访问令牌 Token（选填，留空或走网页登录）',
+                    insideGlass: true,
+                    monospace: true,
+                    obscureText: _obscureToken,
+                    textInputAction: TextInputAction.done,
+                    fontSize: 13,
+                    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+                    onChanged: (_) => setState(() => _diagnosis = null),
+                    onSubmitted: (_) => _connectNow(),
+                    suffix: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(() => _obscureToken = !_obscureToken),
+                      child: SizedBox(
+                        width: 34,
+                        height: 34,
+                        child: Center(
+                          child: Icon(
+                            _obscureToken ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                            size: 15,
+                            color: t.text3,
                           ),
                         ),
-                        const SizedBox(height: 8),
-                        GrassBagTextField(
-                          controller: _nameCtrl,
-                          placeholder: '备注名称（选填，例如：办公室 Mac）',
-                          insideGlass: true,
-                          textInputAction: TextInputAction.done,
-                          onSubmitted: (_) => _connectNow(),
-                          fontSize: 13,
-                          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
-                        ),
-                        const SizedBox(height: 8),
-                        GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () => setState(() {
-                            _allowBadCerts = !_allowBadCerts;
-                            _diagnosis = null;
-                          }),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 4),
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    '信任自签名 HTTPS 证书（Tailscale / Caddy / 内网）',
-                                    style: TextStyle(fontSize: 12, color: t.text2),
-                                  ),
-                                ),
-                                const SizedBox(width: 10),
-                                GrassBagGlassSwitch(
-                                  value: _allowBadCerts,
-                                  tier: slice.glassTier,
-                                  onChanged: (v) => setState(() {
-                                    _allowBadCerts = v;
-                                    _diagnosis = null;
-                                  }),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
-                  )
-                : const SizedBox.shrink(),
-          ),
+                  ),
+                  const SizedBox(height: 8),
+                  GrassBagTextField(
+                    controller: _nameCtrl,
+                    placeholder: '备注名称（选填，例如：办公室 Mac）',
+                    insideGlass: true,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _connectNow(),
+                    fontSize: 13,
+                    padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+                  ),
+                  const SizedBox(height: 8),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => setState(() {
+                      _allowBadCerts = !_allowBadCerts;
+                      _diagnosis = null;
+                    }),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '信任自签名 HTTPS 证书（Tailscale / Caddy / 内网）',
+                              style: TextStyle(fontSize: 12, color: t.text2),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          GrassBagGlassSwitch(
+                            value: _allowBadCerts,
+                            tier: slice.glassTier,
+                            onChanged: (v) => setState(() {
+                              _allowBadCerts = v;
+                              _diagnosis = null;
+                            }),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
 
           // Live inline diagnosis result banner (only shown when actionable!)
           if (diag != null) ...[
@@ -768,160 +793,173 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
           ],
 
           // Single crystal-clear primary Connect CTA — always above the guide!
+          // When QR scan is the active hero (empty input), keep Connect as crisp accent secondary
+          // so only one Primary button leads the eye at any moment.
           const SizedBox(height: 12),
-          GrassBagPrimaryGlassButton(
-            label: _connecting
-                ? '正在检测并连接…'
-                : (diag?.canConnectNow == true
-                    ? (diag!.kind == RemoteDiagnosisKind.readyDirect ? '免插件立即接入' : '立即接入设备')
-                    : (diag?.needsWebOrTokenAuth == true && _tokenCtrl.text.trim().isNotEmpty
-                        ? '验证令牌并连接'
-                        : '连接远程设备')),
-            icon: CupertinoIcons.arrow_right_circle_fill,
-            height: 44,
-            tier: slice.glassTier,
-            insideGlass: true,
-            enabled: !_connecting,
-            onTap: _connecting ? null : _connectNow,
-          ),
+          if (_supportsQrScan &&
+              _addrCtrl.text.trim().isEmpty &&
+              _selectedLanAddr == null &&
+              diag == null)
+            GrassBagSecondaryGlassButton(
+              label: _connecting ? '正在检测并连接…' : '连接远程设备',
+              icon: CupertinoIcons.arrow_right_circle_fill,
+              height: 44,
+              tier: slice.glassTier,
+              insideGlass: true,
+              accentForeground: true,
+              enabled: !_connecting,
+              onTap: _connecting ? null : _connectNow,
+            )
+          else
+            GrassBagPrimaryGlassButton(
+              label: _connecting
+                  ? '正在检测并连接…'
+                  : (diag?.canConnectNow == true
+                      ? (diag!.kind == RemoteDiagnosisKind.readyDirect ? '免插件立即接入' : '立即接入设备')
+                      : (diag?.needsWebOrTokenAuth == true && _tokenCtrl.text.trim().isNotEmpty
+                          ? '验证令牌并连接'
+                          : '连接远程设备')),
+              icon: CupertinoIcons.arrow_right_circle_fill,
+              height: 44,
+              tier: slice.glassTier,
+              insideGlass: true,
+              enabled: !_connecting,
+              onTap: _connecting ? null : _connectNow,
+            ),
 
-          // Clean 2-tab Setup Guide positioned below the primary CTA so actions stay above the fold
-          AnimatedSize(
-            duration: const Duration(milliseconds: 220),
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.topCenter,
-            child: _showGuide
-                ? Container(
-                    margin: const EdgeInsets.only(top: 12),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: t.sep, width: 0.6),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
+          // Clean 2-tab Setup Guide positioned below the primary CTA so actions stay above the fold.
+          // Avoid AnimatedSize so toggling inside a GrassBagGlass sheet does a single layout pass
+          // instead of 22 consecutive glass backdrop rebakes.
+          if (_showGuide)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: GrassBagSheetSection(
+                borderRadius: 16,
+                padding: const EdgeInsets.all(12),
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                    Row(
                       children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: _GuideSegmentPill(
-                                label: '官方插件（扫码推荐）',
-                                selected: _guideTab == 0,
-                                onTap: () => setState(() => _guideTab = 0),
-                              ),
+                        Expanded(
+                          child: _GuideSegmentPill(
+                            label: '官方插件（扫码推荐）',
+                            selected: _guideTab == 0,
+                            onTap: () => setState(() => _guideTab = 0),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: _GuideSegmentPill(
+                            label: '免插件直连（dsh web）',
+                            selected: _guideTab == 1,
+                            onTap: () => setState(() => _guideTab = 1),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (_guideTab == 0) ...[
+                      const _CompactStepRow(
+                        step: '1',
+                        text: '在电脑端 DeepSeek Harness 安装 GrassBag 官方插件（国内镜像加速，零额外服务、零端口冲突）：',
+                      ),
+                      const SizedBox(height: 7),
+                      _CommandCopyRow(
+                        label: '终端一键安装（或在桌面端「插件 → 添加插件」直接粘贴 .tgz 地址）',
+                        command: RemoteHostConnectCard.acceleratedInstallCommand,
+                        onCopy: _copyCommand,
+                      ),
+                      const SizedBox(height: 8),
+                      const _CompactStepRow(
+                        step: '2',
+                        text: '启用后桌面端左侧栏出现「手机连接」并立即弹出配对二维码，点击上方「扫码连接」1 秒接入。',
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: GrassBagSecondaryGlassButton(
+                              label: '复制加速包地址',
+                              icon: CupertinoIcons.link,
+                              height: 36,
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              tier: slice.glassTier,
+                              insideGlass: true,
+                              accentForeground: true,
+                              onTap: () {
+                                Clipboard.setData(
+                                  const ClipboardData(text: kOfficialGbridgeAcceleratedUrl),
+                                );
+                                ctrl.showToast('已复制 .tgz 加速地址，可直接粘贴到 DSH 插件安装框',
+                                    tone: ToastTone.ok);
+                              },
                             ),
-                            const SizedBox(width: 6),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: GrassBagSecondaryGlassButton(
+                              label: '复制 AI 安装指令',
+                              icon: CupertinoIcons.sparkles,
+                              height: 36,
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              tier: slice.glassTier,
+                              insideGlass: true,
+                              accentForeground: true,
+                              onTap: () {
+                                Clipboard.setData(
+                                  const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
+                                );
+                                ctrl.showToast('已复制 AI 安装指令，发给电脑端 DSH 即可自动安装',
+                                    tone: ToastTone.ok);
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 9),
+                      Text(
+                        '官方插件直接复用运行中的 DSH 实例：dsh web 共享原端口不另开服务，桌面端自动避让冲突端口并支持实时切换。',
+                        style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
+                      ),
+                    ] else ...[
+                      // Clean 1-command OS switcher
+                      Row(
+                        children: [
+                          for (final (idx, osName) in [
+                            (0, 'macOS'),
+                            (1, 'Windows'),
+                            (2, 'Linux'),
+                          ]) ...[
+                            if (idx > 0) const SizedBox(width: 6),
                             Expanded(
-                              child: _GuideSegmentPill(
-                                label: '免插件直连（dsh web）',
-                                selected: _guideTab == 1,
-                                onTap: () => setState(() => _guideTab = 1),
+                              child: _OsChip(
+                                label: osName,
+                                selected: _cliOsTab == idx,
+                                onTap: () => setState(() => _cliOsTab = idx),
                               ),
                             ),
                           ],
-                        ),
-                        const SizedBox(height: 10),
-                        if (_guideTab == 0) ...[
-                          const _CompactStepRow(
-                            step: '1',
-                            text: '在电脑端 DeepSeek Harness 安装 GrassBag 官方插件（国内镜像加速，零额外服务、零端口冲突）：',
-                          ),
-                          const SizedBox(height: 7),
-                          _CommandCopyRow(
-                            label: '终端一键安装（或在桌面端「插件 → 添加插件」直接粘贴 .tgz 地址）',
-                            command: RemoteHostConnectCard.acceleratedInstallCommand,
-                            onCopy: _copyCommand,
-                          ),
-                          const SizedBox(height: 8),
-                          const _CompactStepRow(
-                            step: '2',
-                            text: '启用后桌面端左侧栏出现「手机连接」并立即弹出配对二维码，点击上方「扫码连接」1 秒接入。',
-                          ),
-                          const SizedBox(height: 10),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: GrassBagSecondaryGlassButton(
-                                  label: '复制加速包地址',
-                                  icon: CupertinoIcons.link,
-                                  height: 36,
-                                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                                  tier: slice.glassTier,
-                                  insideGlass: true,
-                                  accentForeground: true,
-                                  onTap: () {
-                                    Clipboard.setData(
-                                      const ClipboardData(text: kOfficialGbridgeAcceleratedUrl),
-                                    );
-                                    ctrl.showToast('已复制 .tgz 加速地址，可直接粘贴到 DSH 插件安装框',
-                                        tone: ToastTone.ok);
-                                  },
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: GrassBagSecondaryGlassButton(
-                                  label: '复制 AI 安装指令',
-                                  icon: CupertinoIcons.sparkles,
-                                  height: 36,
-                                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                                  tier: slice.glassTier,
-                                  insideGlass: true,
-                                  accentForeground: true,
-                                  onTap: () {
-                                    Clipboard.setData(
-                                      const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
-                                    );
-                                    ctrl.showToast('已复制 AI 安装指令，发给电脑端 DSH 即可自动安装',
-                                        tone: ToastTone.ok);
-                                  },
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 9),
-                          Text(
-                            '官方插件直接复用运行中的 DSH 实例：dsh web 共享原端口不另开服务，桌面端自动避让冲突端口并支持实时切换。',
-                            style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
-                          ),
-                        ] else ...[
-                          // Clean 1-command OS switcher
-                          Row(
-                            children: [
-                              for (final (idx, osName) in [
-                                (0, 'macOS'),
-                                (1, 'Windows'),
-                                (2, 'Linux'),
-                              ]) ...[
-                                if (idx > 0) const SizedBox(width: 6),
-                                Expanded(
-                                  child: _OsChip(
-                                    label: osName,
-                                    selected: _cliOsTab == idx,
-                                    onTap: () => setState(() => _cliOsTab = idx),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          _CommandCopyRow(
-                            label: _currentCliCommand.$1,
-                            command: _currentCliCommand.$2,
-                            onCopy: _copyCommand,
-                          ),
-                          const SizedBox(height: 7),
-                          Text(
-                            '无需任何插件：原版 dsh web 与桌面端共享全部会话与模型；首次粘贴启动链接后自动保持 30 天登录态。',
-                            style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
-                          ),
                         ],
-                      ],
-                    ),
-                  )
-                : const SizedBox.shrink(),
-          ),
+                      ),
+                      const SizedBox(height: 8),
+                      _CommandCopyRow(
+                        label: _currentCliCommand.$1,
+                        command: _currentCliCommand.$2,
+                        onCopy: _copyCommand,
+                      ),
+                      const SizedBox(height: 7),
+                      Text(
+                        '无需任何插件：原版 dsh web 与桌面端共享全部会话与模型；首次粘贴启动链接后自动保持 30 天登录态。',
+                        style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
+                      ),
+                    ],
+                  ],
+                ),
+                ],
+              ),
+            ),
         ],
       );
     if (widget.embeddedInSheet) return body;
@@ -958,9 +996,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
           if (isHtmlProxy && _supportsInAppWebLogin) ...[
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: 'App 内网页登录',
+                label: '网页登录',
                 icon: CupertinoIcons.globe,
-                height: 34,
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
                 tier: tier,
                 insideGlass: true,
                 enabled: !_connecting,
@@ -970,9 +1009,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             const SizedBox(width: 8),
             Expanded(
               child: GrassBagSecondaryGlassButton(
-                label: '粘贴链接 / Token',
+                label: '粘贴链接',
                 icon: CupertinoIcons.doc_on_clipboard,
-                height: 34,
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
                 tier: tier,
                 insideGlass: true,
                 enabled: !_connecting,
@@ -982,9 +1022,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
           ] else ...[
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '粘贴链接 / Token',
+                label: '粘贴链接',
                 icon: CupertinoIcons.doc_on_clipboard,
-                height: 34,
+                height: 36,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
                 tier: tier,
                 insideGlass: true,
                 enabled: !_connecting,
@@ -997,7 +1038,8 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 child: GrassBagSecondaryGlassButton(
                   label: '网页登录',
                   icon: CupertinoIcons.globe,
-                  height: 34,
+                  height: 36,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
                   tier: tier,
                   insideGlass: true,
                   enabled: !_connecting,
@@ -1060,23 +1102,20 @@ class _LanRadarStrip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return Container(
+    return GrassBagFresnelGlassSurface(
+      borderRadius: 16,
+      innerWell: true,
       padding: const EdgeInsets.all(11),
-      decoration: BoxDecoration(
-        color: t.fill1,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: t.sep, width: 0.6),
-      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             children: [
               if (scanning)
-                const SizedBox(
+                SizedBox(
                   width: 14,
                   height: 14,
-                  child: CupertinoActivityIndicator(radius: 6.5),
+                  child: GrassBagActivityIndicator(radius: 6.5, color: t.primary),
                 )
               else
                 Icon(
@@ -1100,11 +1139,12 @@ class _LanRadarStrip extends StatelessWidget {
                 ),
               ),
               GrassBagSpringTap(
-                onTap: () {
-                  if (!scanning) onRescan();
-                },
+                enablePointerGlow: false,
+                haptic: true,
+                enabled: !scanning,
+                onTap: onRescan,
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                   child: Text(
                     scanning ? '扫描中' : '重新扫描',
                     style: TextStyle(
@@ -1140,13 +1180,18 @@ class _LanRadarStrip extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  haptic: true,
                   onTap: onOpenGuide,
-                  child: Text(
-                    '开启引导',
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
-                      color: t.primary,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    child: Text(
+                      '开启引导',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: t.primary,
+                      ),
                     ),
                   ),
                 ),
@@ -1177,19 +1222,16 @@ class _LanHostTile extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final oneTapReady = !host.requiresAuth && host.isDsh;
     return GrassBagSpringTap(
-      onTap: () {
-        if (!busy) onTap();
-      },
-      child: Container(
+      enablePointerGlow: false,
+      haptic: true,
+      enabled: !busy,
+      onTap: onTap,
+      child: GrassBagFresnelGlassSurface(
+        borderRadius: 14,
+        innerWell: !selected,
+        interactive: !busy,
+        tintColor: selected ? t.primarySoft : null,
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: selected ? t.primarySoft : t.bgSolid.withValues(alpha: t.isDark ? 0.5 : 0.85),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: selected ? t.primary : t.sep,
-            width: selected ? 0.9 : 0.6,
-          ),
-        ),
         child: Row(
           children: [
             Icon(
@@ -1227,12 +1269,11 @@ class _LanHostTile extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: oneTapReady ? t.okSoft : t.primarySoft,
-                borderRadius: BorderRadius.circular(8),
-              ),
+            GrassBagFresnelGlassSurface(
+              isPill: true,
+              innerWell: true,
+              tintColor: oneTapReady ? t.okSoft : t.primarySoft,
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
               child: Text(
                 oneTapReady ? '一键直连' : '授权接入',
                 style: TextStyle(
@@ -1264,19 +1305,17 @@ class _GuideSegmentPill extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     return GrassBagSpringTap(
+      enablePointerGlow: false,
+      haptic: true,
       onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 160),
+      child: GrassBagFresnelGlassSurface(
+        borderRadius: 10,
+        innerWell: !selected,
+        elevated: selected,
+        interactive: true,
+        tintColor: selected ? t.primarySoft : null,
         padding: const EdgeInsets.symmetric(vertical: 7),
         alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? t.primarySoft : t.bgSolid.withValues(alpha: t.isDark ? 0.35 : 0.65),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color: selected ? t.primary.withValues(alpha: 0.5) : t.sep,
-            width: 0.65,
-          ),
-        ),
         child: Text(
           label,
           style: TextStyle(
@@ -1305,19 +1344,16 @@ class _OsChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     return GrassBagSpringTap(
+      enablePointerGlow: false,
+      haptic: true,
       onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 140),
-        padding: const EdgeInsets.symmetric(vertical: 5),
+      child: GrassBagFresnelGlassSurface(
+        borderRadius: 9,
+        innerWell: !selected,
+        interactive: true,
+        tintColor: selected ? t.primary : null,
+        padding: const EdgeInsets.symmetric(vertical: 7.5),
         alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? t.primary : t.bgSolid.withValues(alpha: t.isDark ? 0.35 : 0.72),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: selected ? t.primary : t.sep,
-            width: 0.6,
-          ),
-        ),
         child: Text(
           label,
           style: TextStyle(
@@ -1343,21 +1379,22 @@ class _CompactStepRow extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Container(
-          width: 18,
-          height: 18,
-          margin: const EdgeInsets.only(top: 1),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: t.primarySoft,
-            shape: BoxShape.circle,
-          ),
-          child: Text(
-            step,
-            style: TextStyle(
-              fontSize: 10.5,
-              fontWeight: FontWeight.w700,
-              color: t.primary,
+        Padding(
+          padding: const EdgeInsets.only(top: 1),
+          child: GrassBagFresnelGlassSurface(
+            isCircle: true,
+            innerWell: true,
+            tintColor: t.primarySoft,
+            width: 18,
+            height: 18,
+            alignment: Alignment.center,
+            child: Text(
+              step,
+              style: TextStyle(
+                fontSize: 10.5,
+                fontWeight: FontWeight.w700,
+                color: t.primary,
+              ),
             ),
           ),
         ),
@@ -1387,49 +1424,53 @@ class _CommandCopyRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: t.bgSolid.withValues(alpha: t.isDark ? 0.58 : 0.88),
-        borderRadius: BorderRadius.circular(11),
-        border: Border.all(color: t.sep, width: 0.6),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(label, style: TextStyle(fontSize: 10.5, color: t.text3)),
-                const SizedBox(height: 2),
-                Text(
-                  command,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 11,
-                    height: 1.35,
-                    color: t.text,
-                  ),
+    return Tooltip(
+      message: '点击复制命令',
+      child: GrassBagSpringTap(
+        enablePointerGlow: false,
+        haptic: true,
+        pressedScale: 0.985,
+        onTap: () => onCopy(command),
+        child: GrassBagFresnelGlassSurface(
+          borderRadius: 12,
+          innerWell: true,
+          interactive: true,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(label, style: TextStyle(fontSize: 10.5, color: t.text3)),
+                    const SizedBox(height: 2),
+                    Text(
+                      command,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        height: 1.35,
+                        color: t.text,
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          GrassBagSpringTap(
-            onTap: () => onCopy(command),
-            child: Container(
-              width: 32,
-              height: 32,
-              decoration: BoxDecoration(
-                color: t.primarySoft,
-                borderRadius: BorderRadius.circular(9),
               ),
-              child: Icon(CupertinoIcons.doc_on_doc, size: 14, color: t.primary),
-            ),
+              const SizedBox(width: 8),
+              GrassBagFresnelGlassSurface(
+                borderRadius: 10,
+                innerWell: true,
+                tintColor: t.primarySoft,
+                width: 32,
+                height: 32,
+                alignment: Alignment.center,
+                child: Icon(CupertinoIcons.doc_on_doc, size: 14, color: t.primary),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }

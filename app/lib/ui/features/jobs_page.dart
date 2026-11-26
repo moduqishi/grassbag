@@ -103,11 +103,24 @@ class _JobsPageState extends ConsumerState<JobsPage> {
   }
 
   void _openLaunchSheet(BuildContext context) {
+    var hasDraft = false;
     showGrassBagSheet<void>(
       context,
       title: '启动后台命令',
       subtitle: '在当前工作区常驻执行并实时收集标准输出',
-      bodyBuilder: (sheetCtx) => const _LaunchJobSheetBody(),
+      onWillDismiss: () async {
+        if (!hasDraft || !context.mounted) return true;
+        return showGrassBagConfirmDialog(
+          context,
+          title: '放弃已输入的命令？',
+          message: '关闭后当前命令行输入内容将不会保留。',
+          confirmLabel: '放弃并关闭',
+          isDestructive: true,
+        );
+      },
+      bodyBuilder: (sheetCtx) => _LaunchJobSheetBody(
+        onDraftChanged: (dirty) => hasDraft = dirty,
+      ),
     );
   }
 
@@ -172,13 +185,15 @@ class _JobsPageState extends ConsumerState<JobsPage> {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
                   child: RefreshIndicator.adaptive(
-                    edgeOffset: topPad + 64,
-                    onRefresh: () => ctrl.refreshJobs(silent: true),
+                    edgeOffset: topPad + 74,
+                    onRefresh: () => ctrl.refreshJobs(
+                      silent: state.connectionPhase == ConnectionPhase.connected,
+                    ),
                     child: CustomScrollView(
                       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                       slivers: [
                         SliverPadding(
-                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          padding: EdgeInsets.fromLTRB(16, topPad + 76, 16, 40 + botPad),
                           sliver: SliverMainAxisGroup(
                             slivers: [
                               if (state.connectionPhase != ConnectionPhase.connected)
@@ -219,37 +234,35 @@ class _JobsPageState extends ConsumerState<JobsPage> {
                                         (running.length == 1 && !_collapsedIds.contains(job.id));
                                     return Padding(
                                       padding: const EdgeInsets.only(bottom: 12),
-                                      child: RepaintBoundary(
-                                        child: _IsolatedJobCard(
-                                          key: ValueKey('job-${job.id}'),
-                                          jobId: job.id,
-                                          expanded: isExp,
-                                          onToggle: () {
-                                            final nextExp = !isExp;
-                                            setState(() {
-                                              if (nextExp) {
-                                                _expandedIds.add(job.id);
-                                                _collapsedIds.remove(job.id);
-                                              } else {
-                                                _expandedIds.remove(job.id);
-                                                _collapsedIds.add(job.id);
-                                              }
-                                            });
-                                            _syncJobSubscription(job, nextExp);
-                                          },
-                                          onKill: (liveJob) async {
-                                            final ok = await showGrassBagConfirmDialog(
-                                              context,
-                                              title: '终止后台任务',
-                                              message: '确定强制终止「${liveJob.command}」吗？',
-                                              confirmLabel: '确认终止',
-                                              isDestructive: true,
-                                            );
-                                            if (ok) {
-                                              unawaited(ctrl.killJob(liveJob.id));
+                                      child: _IsolatedJobCard(
+                                        key: ValueKey('job-${job.id}'),
+                                        jobId: job.id,
+                                        expanded: isExp,
+                                        onToggle: () {
+                                          final nextExp = !isExp;
+                                          setState(() {
+                                            if (nextExp) {
+                                              _expandedIds.add(job.id);
+                                              _collapsedIds.remove(job.id);
+                                            } else {
+                                              _expandedIds.remove(job.id);
+                                              _collapsedIds.add(job.id);
                                             }
-                                          },
-                                        ),
+                                          });
+                                          _syncJobSubscription(job, nextExp);
+                                        },
+                                        onKill: (liveJob) async {
+                                          final ok = await showGrassBagConfirmDialog(
+                                            context,
+                                            title: '终止后台任务',
+                                            message: '确定强制终止「${liveJob.command}」吗？',
+                                            confirmLabel: '确认终止',
+                                            isDestructive: true,
+                                          );
+                                          if (ok) {
+                                            unawaited(ctrl.killJob(liveJob.id));
+                                          }
+                                        },
                                       ),
                                     );
                                   },
@@ -268,16 +281,14 @@ class _JobsPageState extends ConsumerState<JobsPage> {
                                     final job = finished[idx];
                                     return Padding(
                                       padding: const EdgeInsets.only(bottom: 12),
-                                      child: RepaintBoundary(
-                                        child: _IsolatedJobCard(
-                                          key: ValueKey('job-${job.id}'),
-                                          jobId: job.id,
-                                          expanded: _expandedIds.contains(job.id),
-                                          onToggle: () => setState(() {
-                                            if (!_expandedIds.add(job.id)) _expandedIds.remove(job.id);
-                                          }),
-                                          onKill: null,
-                                        ),
+                                      child: _IsolatedJobCard(
+                                        key: ValueKey('job-${job.id}'),
+                                        jobId: job.id,
+                                        expanded: _expandedIds.contains(job.id),
+                                        onToggle: () => setState(() {
+                                          if (!_expandedIds.add(job.id)) _expandedIds.remove(job.id);
+                                        }),
+                                        onKill: null,
                                       ),
                                     );
                                   },
@@ -288,7 +299,7 @@ class _JobsPageState extends ConsumerState<JobsPage> {
                                   child: GrassBagCard(
                                     padding: const EdgeInsets.symmetric(vertical: 34),
                                     child: Center(
-                                      child: CupertinoActivityIndicator(radius: 11, color: t.primary),
+                                      child: GrassBagActivityIndicator(radius: 11, color: t.primary),
                                     ),
                                   ),
                                 )
@@ -509,12 +520,11 @@ class _JobCard extends StatelessWidget {
                   ],
                 ),
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: badgeColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
-                  borderRadius: BorderRadius.circular(999),
-                ),
+              GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                tintColor: badgeColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
+                padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3),
                 child: Text(
                   badgeLabel,
                   style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: badgeColor),
@@ -530,12 +540,13 @@ class _JobCard extends StatelessWidget {
             children: [
               GrassBagSpringTap(
                 onTap: onToggle,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(
-                    color: t.fill1,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
+                enablePointerGlow: false,
+                haptic: true,
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -546,7 +557,11 @@ class _JobCard extends StatelessWidget {
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        expanded ? '收起日志' : '实时输出 (${job.outputLines.length} 行)',
+                        expanded
+                            ? '收起日志'
+                            : (isRunning
+                                ? '实时输出 (${job.outputLines.length} 行)'
+                                : '查看日志 (${job.outputLines.length} 行)'),
                         style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text2),
                       ),
                     ],
@@ -555,18 +570,20 @@ class _JobCard extends StatelessWidget {
               ),
               if (expanded && job.outputLines.isNotEmpty)
                 GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  haptic: true,
                   onTap: () {
                     Clipboard.setData(ClipboardData(text: job.outputLines.join('\n')));
                     ProviderScope.containerOf(context, listen: false)
                         .read(appProvider.notifier)
                         .showToast('已复制任务日志到剪贴板', tone: ToastTone.ok);
                   },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: t.primarySoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -583,13 +600,14 @@ class _JobCard extends StatelessWidget {
               if (onKill != null)
                 GrassBagSpringTap(
                   onTap: onKill!,
+                  enablePointerGlow: false,
                   haptic: true,
-                  child: Container(
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.errSoft,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-                    decoration: BoxDecoration(
-                      color: t.errSoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -691,7 +709,9 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
     final visibleCount = total - tailOffset;
     final viewportHeight =
         visibleCount == 0 ? 44.0 : (visibleCount * 17.5 + 24.0 + (tailOffset > 0 ? 22.0 : 0.0)).clamp(64.0, 260.0);
-    return ClipRSuperellipse(
+    final logTier = resolveAmbientGlassTier(context);
+    final logSolid = logTier == GrassBagGlassTier.solid;
+    final logBox = ClipRSuperellipse(
       borderRadius: BorderRadius.circular(14),
       child: Container(
         width: double.infinity,
@@ -701,11 +721,16 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
           color: t.codeBg,
           shape: RoundedSuperellipseBorder(
             borderRadius: BorderRadius.circular(14),
-            side: BorderSide(color: Colors.white.withValues(alpha: 0.08), width: 0.65),
+            side: logSolid
+                ? BorderSide(
+                    color: t.isDark ? Colors.white.withValues(alpha: 0.08) : t.sep,
+                    width: 0.65,
+                  )
+                : BorderSide.none,
           ),
         ),
         child: visibleCount == 0
-            ? const Align(
+            ? Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
                   '（等待输出…）',
@@ -713,7 +738,7 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                     fontSize: 11.5,
                     height: 1.48,
                     fontFamily: 'monospace',
-                    color: Color(0xFFDDE3EA),
+                    color: t.text3,
                   ),
                 ),
               )
@@ -727,9 +752,9 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                           padding: const EdgeInsets.only(bottom: 6),
                           child: Text(
                             '… 已省略早期 $tailOffset 行，仅展示最新 $maxTailLines 行（复制可获取完整日志）',
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontSize: 10.5,
-                              color: Color(0xFF94A3B8),
+                              color: t.text3,
                             ),
                           ),
                         ),
@@ -743,11 +768,11 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                               itemCount: visibleCount,
                               itemBuilder: (_, idx) => Text(
                                 widget.lines[tailOffset + idx],
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 11.5,
                                   height: 1.48,
                                   fontFamily: 'monospace',
-                                  color: Color(0xFFDDE3EA),
+                                  color: t.codeFg,
                                 ),
                               ),
                             ),
@@ -760,41 +785,39 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                     Positioned(
                       right: 2,
                       bottom: 2,
-                      child: GrassBagSpringTap(
+                      child: GrassBagPrimaryGlassButton(
+                        label: '最新输出',
+                        icon: CupertinoIcons.arrow_down,
+                        height: 36,
+                        padding: const EdgeInsets.symmetric(horizontal: 11),
+                        tier: logTier,
+                        insideGlass: true,
                         onTap: () => _jumpToTailIfNearBottom(force: true),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: t.primary.withValues(alpha: 0.90),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.arrow_down, size: 11, color: t.onPrimary),
-                              const SizedBox(width: 3),
-                              Text(
-                                '最新输出',
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: t.onPrimary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
                       ),
                     ),
                 ],
               ),
       ),
     );
+    if (logSolid) return logBox;
+    return CustomPaint(
+      foregroundPainter: GrassBagFresnelRimPainter(
+        isDark: t.isDark,
+        borderRadius: 14,
+        accent: t.isDark ? t.primaryHi : null,
+        innerWell: true,
+        frosted: logTier == GrassBagGlassTier.frosted,
+        paintTopSheen: false,
+        strokeWidth: 0.8,
+      ),
+      child: logBox,
+    );
   }
 }
 
 class _LaunchJobSheetBody extends ConsumerStatefulWidget {
-  const _LaunchJobSheetBody();
+  const _LaunchJobSheetBody({this.onDraftChanged});
+  final ValueChanged<bool>? onDraftChanged;
 
   @override
   ConsumerState<_LaunchJobSheetBody> createState() => _LaunchJobSheetBodyState();
@@ -811,6 +834,10 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
   final _cmdCtrl = TextEditingController();
   String? _err;
   bool _submitting = false;
+
+  void _syncDraft() {
+    widget.onDraftChanged?.call(_cmdCtrl.text.trim().isNotEmpty);
+  }
 
   @override
   void dispose() {
@@ -834,12 +861,13 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
       _err = null;
     });
     try {
-      final ok = await ref.read(appProvider.notifier).launchQuickJob(text);
+      final err = await ref.read(appProvider.notifier).launchQuickJob(text);
       if (!mounted) return;
-      if (ok) {
+      if (err == null) {
+        widget.onDraftChanged?.call(false);
         Navigator.of(context).pop();
       } else {
-        setState(() => _err = '启动后台命令失败，请检查命令或主机连接状态');
+        setState(() => _err = err);
       }
     } finally {
       if (mounted) setState(() => _submitting = false);
@@ -872,12 +900,10 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Container(
+        GrassBagFresnelGlassSurface(
+          borderRadius: 12,
+          innerWell: true,
           padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7),
-          decoration: BoxDecoration(
-            color: t.fill1,
-            borderRadius: BorderRadius.circular(11),
-          ),
           child: Row(
             children: [
               Icon(CupertinoIcons.folder, size: 13, color: t.text3),
@@ -902,6 +928,7 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
           textInputAction: TextInputAction.done,
           hasError: _err != null,
           onChanged: (_) {
+            _syncDraft();
             if (_err != null) setState(() => _err = null);
           },
           onSubmitted: (_) => _submit(),
@@ -920,17 +947,18 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
           children: [
             for (final pair in _quickCmds)
               GrassBagSpringTap(
+                enablePointerGlow: false,
+                haptic: true,
                 onTap: () {
                   _cmdCtrl.text = pair.$2;
+                  _syncDraft();
                   if (_err != null) setState(() => _err = null);
                 },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: t.fill1,
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(color: t.sep, width: 0.6),
-                  ),
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 6),
                   child: Text(
                     '${pair.$1} · ${pair.$2}',
                     style: TextStyle(fontSize: 11.5, color: t.text2),
@@ -947,7 +975,8 @@ class _LaunchJobSheetBodyState extends ConsumerState<_LaunchJobSheetBody> {
                 label: '取消',
                 tier: tier,
                 insideGlass: true,
-                onTap: () => Navigator.of(context).pop(),
+                enabled: !_submitting,
+                onTap: _submitting ? null : () => Navigator.of(context).pop(),
               ),
             ),
             const SizedBox(width: 10),

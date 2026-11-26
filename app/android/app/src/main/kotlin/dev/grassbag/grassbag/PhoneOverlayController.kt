@@ -3,12 +3,13 @@ package dev.grassbag.grassbag
 import android.accessibilityservice.AccessibilityService
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
-import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.ActivityOptions
 import android.app.PendingIntent
+import android.content.ComponentCallbacks
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
@@ -18,8 +19,10 @@ import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.RuntimeShader
 import android.graphics.Shader
 import android.graphics.SweepGradient
 import android.graphics.Typeface
@@ -40,13 +43,16 @@ import android.view.MotionEvent
 import android.view.RoundedCorner
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.graphics.ColorUtils
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -141,11 +147,14 @@ class PhoneOverlayController(private val appContext: Context) {
     private var hudDockBadge: TextView? = null
 
     private var hudStartedAtMs = 0L
+    private var hudPausedAccumMs = 0L
+    private var hudPausedSinceMs = 0L
     private var hudActionText = "准备操控手机"
     private var hudCurrentApp = ""
     private var hudWaitingForUser = false
     private var hudCompletedState = false
     private var hudCompletedAlreadyInApp = false
+    private var hudCompletedSubtitle = ""
     private var hudTimerRunning = false
     private var pendingHideRunnable: Runnable? = null
     private val completionGen = AtomicInteger(0)
@@ -154,20 +163,89 @@ class PhoneOverlayController(private val appContext: Context) {
     private val previewDemoActive = AtomicBoolean(false)
     private val previewDemoGen = AtomicInteger(0)
     private val hudSessionActiveAtomic = AtomicBoolean(false)
+    private var lastUiModeNight: Int =
+        appContext.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+    private var configCallbacksRegistered = false
+    private val appConfigCallbacks = object : ComponentCallbacks {
+        override fun onConfigurationChanged(newConfig: Configuration) {
+            this@PhoneOverlayController.onConfigurationChanged()
+        }
+
+        override fun onLowMemory() {}
+    }
+
+    private data class SafeScreenMetrics(
+        val width: Int,
+        val height: Int,
+        val topInset: Int,
+        val bottomInset: Int,
+        val leftInset: Int,
+        val rightInset: Int
+    )
+
+    private fun screenMetrics(ctx: Context, wm: WindowManager?): SafeScreenMetrics {
+        val resolvedWm = wm ?: (ctx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)
+        if (resolvedWm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = runCatching { resolvedWm.currentWindowMetrics }.getOrNull()
+            if (metrics != null && metrics.bounds.width() > 0 && metrics.bounds.height() > 0) {
+                val insets = runCatching {
+                    metrics.windowInsets.getInsetsIgnoringVisibility(
+                        WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
+                    )
+                }.getOrNull()
+                return SafeScreenMetrics(
+                    width = metrics.bounds.width(),
+                    height = metrics.bounds.height(),
+                    topInset = insets?.top ?: systemBarHeightPx(ctx, "status_bar_height", 28),
+                    bottomInset = insets?.bottom ?: systemBarHeightPx(ctx, "navigation_bar_height", 24),
+                    leftInset = insets?.left ?: 0,
+                    rightInset = insets?.right ?: 0
+                )
+            }
+        }
+        val dm = ctx.resources.displayMetrics
+        return SafeScreenMetrics(
+            width = dm.widthPixels.coerceAtLeast(1),
+            height = dm.heightPixels.coerceAtLeast(1),
+            topInset = systemBarHeightPx(ctx, "status_bar_height", 28),
+            bottomInset = systemBarHeightPx(ctx, "navigation_bar_height", 24),
+            leftInset = 0,
+            rightInset = 0
+        )
+    }
+
+    private fun ensureConfigCallbacksRegistered() {
+        if (!configCallbacksRegistered) {
+            configCallbacksRegistered = true
+            runCatching { appContext.registerComponentCallbacks(appConfigCallbacks) }
+        }
+    }
+
+    private fun unregisterConfigCallbacksIfIdle() {
+        if (configCallbacksRegistered &&
+            hudContainer == null &&
+            fxCanvasView == null &&
+            activeConfirmContainer == null
+        ) {
+            configCallbacksRegistered = false
+            runCatching { appContext.unregisterComponentCallbacks(appConfigCallbacks) }
+        }
+    }
 
     // Out-of-app confirmation / handoff card
     private val promptSerializationLock = Any()
+    private val promptStateLock = Any()
     private var activeConfirmContainer: FrameLayout? = null
     private var activeConfirmWm: WindowManager? = null
     private var activeConfirmParams: WindowManager.LayoutParams? = null
     private var activeConfirmTick: Runnable? = null
-    private var activeConfirmProgressAnim: ObjectAnimator? = null
+    private var activeConfirmProgressAnim: Animator? = null
     private val activeConfirmLatch = AtomicReference<CountDownLatch?>(null)
     private val activeConfirmResult = AtomicReference<Any?>(null)
 
     private val hudClockTick = object : Runnable {
         override fun run() {
-            if (!hudTimerRunning || hudContainer == null) return
+            if (!hudTimerRunning || hudContainer == null || SafetyGate.isPaused()) return
             refreshHudTexts()
             mainHandler.postDelayed(this, 1000L)
         }
@@ -180,8 +258,8 @@ class PhoneOverlayController(private val appContext: Context) {
     fun detachService(service: AccessibilityService) {
         if (activeService === service) {
             activeService = null
+            dismissAll(immediate = true)
         }
-        dismissAll(immediate = true)
     }
 
     fun isHudVisible(): Boolean = hudContainer != null
@@ -190,18 +268,80 @@ class PhoneOverlayController(private val appContext: Context) {
 
     fun onConfigurationChanged() {
         mainHandler.post {
-            val dm = appContext.resources.displayMetrics
+            val curNight = appContext.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+            if (curNight != lastUiModeNight) {
+                lastUiModeNight = curNight
+                refreshVisualPreferences()
+            }
             val hud = hudContainer
             val hp = hudParams
             val hwm = hudAttachedWm
             if (hud != null && hp != null && hwm != null && hud.isAttachedToWindow) {
+                val m = screenMetrics(hud.context, hwm)
+                val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(appContext, 220))
+                val minTop = (m.topInset + dp(appContext, 6)).coerceAtLeast(dp(appContext, 24))
                 hudSnapAnimator?.cancel()
                 hudSnapAnimator = null
-                val halfW = (dm.widthPixels / 2 - dp(appContext, 84)).coerceAtLeast(0)
-                hp.x = hp.x.coerceIn(-halfW, halfW)
-                hp.y = hp.y.coerceIn(dp(appContext, 24), (dm.heightPixels - dp(appContext, 120)).coerceAtLeast(dp(appContext, 24)))
+                when (hudMode) {
+                    HudMode.EXPANDED -> {
+                        hp.width = min(safeW - dp(appContext, 22), dp(appContext, 368))
+                            .coerceAtLeast(dp(appContext, 220))
+                        hp.x = 0
+                        hp.y = hp.y.coerceIn(
+                            minTop,
+                            (m.height - m.bottomInset - dp(appContext, 240)).coerceAtLeast(minTop)
+                        )
+                    }
+                    HudMode.DOCKED_LEFT, HudMode.DOCKED_RIGHT -> {
+                        hp.x = if (hudMode == HudMode.DOCKED_LEFT) m.leftInset else m.rightInset
+                        hp.y = hp.y.coerceIn(
+                            minTop + dp(appContext, 12),
+                            (m.height - m.bottomInset - dp(appContext, 100)).coerceAtLeast(minTop + dp(appContext, 12))
+                        )
+                    }
+                    HudMode.COMPACT -> {
+                        val halfHud = if (hud.width > 0) hud.width / 2 else dp(appContext, 132)
+                        val maxOffsetX = (safeW / 2 - halfHud - dp(appContext, 6)).coerceAtLeast(0)
+                        hp.x = hp.x.coerceIn(-maxOffsetX, maxOffsetX)
+                        hp.y = hp.y.coerceIn(
+                            minTop,
+                            (m.height - m.bottomInset - dp(appContext, 100)).coerceAtLeast(minTop)
+                        )
+                    }
+                }
                 hudSavedY = hp.y
                 runCatching { hwm.updateViewLayout(hud, hp) }
+            }
+            val confirm = activeConfirmContainer
+            val cp = activeConfirmParams
+            val cwm = activeConfirmWm
+            if (confirm != null && cp != null && cwm != null && confirm.isAttachedToWindow) {
+                val m = screenMetrics(confirm.context, cwm)
+                val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(appContext, 240))
+                cp.width = min(safeW - dp(appContext, 24), dp(appContext, 412))
+                if ((cp.gravity and Gravity.TOP) == Gravity.TOP) {
+                    val minY = (m.topInset + dp(appContext, 6)).coerceAtLeast(dp(appContext, 24))
+                    val maxY = (m.height - m.bottomInset - dp(appContext, 200)).coerceAtLeast(minY)
+                    cp.y = cp.y.coerceIn(minY, maxY)
+                }
+                runCatching { cwm.updateViewLayout(confirm, cp) }
+            }
+            val fx = fxCanvasView
+            val fxWm = fxAttachedWm
+            if (fx != null && fxWm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                runCatching {
+                    val insets = fxWm.currentWindowMetrics.windowInsets
+                    val r = maxOf(
+                        insets.getRoundedCorner(RoundedCorner.POSITION_TOP_LEFT)?.radius ?: 0,
+                        insets.getRoundedCorner(RoundedCorner.POSITION_TOP_RIGHT)?.radius ?: 0,
+                        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius ?: 0,
+                        insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius ?: 0
+                    )
+                    if (r > 0) {
+                        fx.cornerRadiusPx = r.toFloat()
+                        fx.invalidate()
+                    }
+                }
             }
         }
     }
@@ -248,15 +388,29 @@ class PhoneOverlayController(private val appContext: Context) {
         val wereAnyVisible = AtomicBoolean(false)
         runOnMainSyncOrPost(sync = shouldHide) {
             if (shouldHide) {
+                val pendingFading = synchronized(fadingOverlayViews) {
+                    val copy = fadingOverlayViews.toList()
+                    fadingOverlayViews.clear()
+                    copy
+                }
                 val anyVis = (hudContainer?.visibility == View.VISIBLE) ||
                     (fxCanvasView?.visibility == View.VISIBLE) ||
-                    (activeConfirmContainer?.visibility == View.VISIBLE)
+                    (activeConfirmContainer?.visibility == View.VISIBLE) ||
+                    pendingFading.isNotEmpty()
                 wereAnyVisible.set(anyVis)
+                for ((wm, view) in pendingFading) {
+                    runCatching { view.animate().cancel() }
+                    runCatching { view.visibility = View.INVISIBLE }
+                    runCatching { if (view.isAttachedToWindow) wm.removeViewImmediate(view) }
+                }
             }
             val vis = if (shouldHide) View.INVISIBLE else View.VISIBLE
             hudContainer?.visibility = vis
             fxCanvasView?.visibility = vis
-            if (!shouldHide && (SafetyGate.isShowEdgeAurora() || fxCanvasView?.hasActiveFx() == true)) {
+            if (!shouldHide &&
+                ((SafetyGate.isShowEdgeAurora() && !SafetyGate.isPaused()) ||
+                    fxCanvasView?.hasActiveFx() == true)
+            ) {
                 fxCanvasView?.startLoop()
             }
             activeConfirmContainer?.visibility = vis
@@ -308,6 +462,21 @@ class PhoneOverlayController(private val appContext: Context) {
     fun syncPausedState(paused: Boolean) {
         mainHandler.post {
             if (hudContainer == null) return@post
+            if (paused) {
+                if (hudPausedSinceMs == 0L) {
+                    hudPausedSinceMs = SystemClock.elapsedRealtime()
+                }
+                mainHandler.removeCallbacks(hudClockTick)
+            } else {
+                if (hudPausedSinceMs > 0L) {
+                    hudPausedAccumMs += (SystemClock.elapsedRealtime() - hudPausedSinceMs).coerceAtLeast(0L)
+                    hudPausedSinceMs = 0L
+                }
+                if (hudTimerRunning && !hudCompletedState) {
+                    mainHandler.removeCallbacks(hudClockTick)
+                    mainHandler.postDelayed(hudClockTick, 1000L)
+                }
+            }
             hudLogo?.setMode(
                 when {
                     hudCompletedState -> GrassBagOverlayLogoView.Mode.COMPLETED
@@ -397,9 +566,14 @@ class PhoneOverlayController(private val appContext: Context) {
         if (!isPreview && previewDemoActive.getAndSet(false)) {
             previewDemoGen.incrementAndGet()
         }
-        // Only real phone-control runs claim hudSessionActiveAtomic so background text-only
-        // chat turns finishing never hijack an interactive overlay preview in Settings!
-        val startedFreshAtomic = if (isPreview) false else hudSessionActiveAtomic.compareAndSet(false, true)
+        val canAttachOverlay = resolveWindowTarget() != null
+        // Only real phone-control runs with an attachable window target claim hudSessionActiveAtomic
+        // so missing overlay permissions never leave hudSessionActiveAtomic wedged true!
+        val startedFreshAtomic = if (isPreview || !canAttachOverlay) {
+            false
+        } else {
+            hudSessionActiveAtomic.compareAndSet(false, true)
+        }
         if (startedFreshAtomic) {
             stepCountAtomic.set(0)
         }
@@ -409,17 +583,19 @@ class PhoneOverlayController(private val appContext: Context) {
         }
         mainHandler.post {
             cancelPendingHide()
-            val target = resolveWindowTarget() ?: return@post
+            val target = resolveWindowTarget()
+            if (target == null) {
+                if (startedFreshAtomic) hudSessionActiveAtomic.set(false)
+                return@post
+            }
             val freshSession = startedFreshAtomic || hudContainer == null || hudCompletedState
             if (freshSession) {
-                if (!startedFreshAtomic && (hudContainer == null || hudCompletedState)) {
-                    // HUD restarted after previous completion/hide
-                    recentSteps.clear()
-                } else {
-                    recentSteps.clear()
-                }
+                recentSteps.clear()
                 hudStartedAtMs = SystemClock.elapsedRealtime()
+                hudPausedAccumMs = 0L
+                hudPausedSinceMs = 0L
                 hudCompletedState = false
+                hudCompletedSubtitle = ""
                 hudMode = HudMode.COMPACT
                 ensureFxCanvasAttached(target)
                 if (hudContainer == null) {
@@ -512,6 +688,14 @@ class PhoneOverlayController(private val appContext: Context) {
                 hudCompletedAlreadyInApp = alreadyInGrassBag
                 hudWaitingForUser = false
                 hudActionText = if (willReturn) "操作完成 · 正在返回 GrassBag" else "手机操控已完成"
+                val subSummary = summary.trim().take(28)
+                hudCompletedSubtitle = when {
+                    subSummary.isNotEmpty() -> subSummary
+                    alreadyInGrassBag && stepCountAtomic.get() > 0 -> "共执行 ${stepCountAtomic.get()} 步 · 操控已完成"
+                    alreadyInGrassBag -> "任务已完成"
+                    stepCountAtomic.get() > 0 -> "共执行 ${stepCountAtomic.get()} 步 · 点击立即返回"
+                    else -> "轻点悬浮岛立即返回 GrassBag"
+                }
                 if (hudContainer == null) {
                     hudStartedAtMs = SystemClock.elapsedRealtime()
                     attachHudWindow(target.first, target.second, target.third, HudMode.COMPACT)
@@ -523,14 +707,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 fxCanvasView?.setVisualMode(GrassBagAmbientAndGestureCanvasView.VisualMode.COMPLETED)
                 fxCanvasView?.emitCompletionWave()
                 animateActionTitleSwap(hudActionText)
-                val subSummary = summary.trim().take(28)
-                hudSubView?.text = when {
-                    subSummary.isNotEmpty() -> subSummary
-                    alreadyInGrassBag && stepCountAtomic.get() > 0 -> "共执行 ${stepCountAtomic.get()} 步 · 操控已完成"
-                    alreadyInGrassBag -> "任务已完成"
-                    stepCountAtomic.get() > 0 -> "共执行 ${stepCountAtomic.get()} 步 · 点击立即返回"
-                    else -> "轻点悬浮岛立即返回 GrassBag"
-                }
+                hudSubView?.text = hudCompletedSubtitle
             }
 
             val finishDelayMs = if (willReturn) 680L else 1250L
@@ -720,6 +897,7 @@ class PhoneOverlayController(private val appContext: Context) {
             hudSnapAnimator = null
             hudTimerRunning = false
             hudCompletedState = false
+            hudCompletedSubtitle = ""
             hudWaitingForUser = false
             mainHandler.removeCallbacks(hudClockTick)
 
@@ -787,6 +965,7 @@ class PhoneOverlayController(private val appContext: Context) {
                     }
                 }
             }
+            unregisterConfigCallbacksIfIdle()
         }
         if (immediate && Looper.myLooper() == Looper.getMainLooper()) {
             doHide()
@@ -801,9 +980,12 @@ class PhoneOverlayController(private val appContext: Context) {
     }
 
     fun cancelActivePrompt(reason: Any = ConfirmDecision.STOP, immediate: Boolean = false) {
-        promptGen.incrementAndGet()
-        activeConfirmResult.compareAndSet(null, reason)
-        activeConfirmLatch.getAndSet(null)?.countDown()
+        val latchToRelease = synchronized(promptStateLock) {
+            promptGen.incrementAndGet()
+            activeConfirmResult.compareAndSet(null, reason)
+            activeConfirmLatch.getAndSet(null)
+        }
+        latchToRelease?.countDown()
         if (immediate && Looper.myLooper() == Looper.getMainLooper()) {
             removeActiveConfirmView(animate = false)
         } else {
@@ -865,36 +1047,46 @@ class PhoneOverlayController(private val appContext: Context) {
         )
 
         mainHandler.post {
-            if (promptGen.get() != myPromptGen || (!isPreview && SafetyGate.isEmergencyStopped())) {
-                resultBox.compareAndSet(null, ConfirmDecision.STOP)
-                shownOk.set(false)
-                shownLatch.countDown()
-                latch.countDown()
-                return@post
+            val prevLatch = synchronized(promptStateLock) {
+                if (promptGen.get() != myPromptGen || (!isPreview && SafetyGate.isEmergencyStopped())) {
+                    resultBox.compareAndSet(null, ConfirmDecision.STOP)
+                    shownOk.set(false)
+                    shownLatch.countDown()
+                    latch.countDown()
+                    return@post
+                }
+                activeConfirmResult.set(null)
+                activeConfirmLatch.getAndSet(latch)
             }
+            prevLatch?.countDown()
             val target = resolveWindowTarget()
             if (target == null) {
+                synchronized(promptStateLock) { activeConfirmLatch.compareAndSet(latch, null) }
                 shownOk.set(false)
                 shownLatch.countDown()
                 return@post
             }
             removeActiveConfirmView(animate = false)
-            activeConfirmLatch.getAndSet(latch)?.countDown()
-            activeConfirmResult.set(null)
 
             val (ctx, wm, windowType) = target
+            // Never set FLAG_BLUR_BEHIND on raw WindowManager overlay windows: Android 12+ blurs
+            // the entire underlying target app screen instead of just the card bounds!
+            val hasBlur = false
             val deadlineMs = SystemClock.elapsedRealtime() + timeoutMs
             val armedAtMs = SystemClock.elapsedRealtime() + 360L
 
             fun finish(decision: ConfirmDecision) {
                 if (resultBox.compareAndSet(null, decision)) {
-                    activeConfirmResult.compareAndSet(null, decision)
+                    synchronized(promptStateLock) {
+                        activeConfirmResult.compareAndSet(null, decision)
+                        activeConfirmLatch.compareAndSet(latch, null)
+                    }
                     removeActiveConfirmView(animate = true, expectedView = cardRef.get())
                     latch.countDown()
                 }
             }
 
-            val card = buildGlassPromptCard(
+            val (card, startCountdown) = buildGlassPromptCard(
                 ctx = ctx,
                 title = title,
                 appLabel = appLabel,
@@ -905,6 +1097,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 armedAtMs = armedAtMs,
                 isHandoff = false,
                 allowTurnOption = allowTurnOption,
+                hasBackdropBlur = hasBlur,
                 onPrimary = { finish(ConfirmDecision.ALLOW_ONCE) },
                 onSecondary = { finish(ConfirmDecision.ALLOW_TURN) },
                 onCancel = { finish(ConfirmDecision.DENY) },
@@ -921,20 +1114,27 @@ class PhoneOverlayController(private val appContext: Context) {
             )
             cardRef.set(card)
 
-            val params = buildBottomCardParams(ctx, windowType, atTop = false)
+            val params = buildBottomCardParams(ctx, windowType, atTop = false, hasBlur = hasBlur)
             val attached = runCatching {
                 wm.addView(card, params)
                 activeConfirmContainer = card
                 activeConfirmWm = wm
                 activeConfirmParams = params
+                ensureConfigCallbacksRegistered()
+                startCountdown()
                 animateCardEntrance(card)
                 true
             }.getOrDefault(false)
+            if (!attached) {
+                synchronized(promptStateLock) { activeConfirmLatch.compareAndSet(latch, null) }
+            }
             shownOk.set(attached)
             shownLatch.countDown()
         }
 
         if (!runCatching { shownLatch.await(2000L, TimeUnit.MILLISECONDS) }.getOrDefault(false) || !shownOk.get()) {
+            promptGen.compareAndSet(myPromptGen, myPromptGen + 1)
+            mainHandler.post { removeActiveConfirmView(animate = false, expectedView = cardRef.get()) }
             return resultBox.get() ?: ConfirmDecision.UNAVAILABLE
         }
 
@@ -978,36 +1178,44 @@ class PhoneOverlayController(private val appContext: Context) {
         )
 
         mainHandler.post {
-            if (promptGen.get() != myPromptGen || SafetyGate.isEmergencyStopped()) {
-                resultBox.compareAndSet(null, HandoffDecision.STOP)
-                shownOk.set(false)
-                shownLatch.countDown()
-                latch.countDown()
-                return@post
+            val prevLatch = synchronized(promptStateLock) {
+                if (promptGen.get() != myPromptGen || SafetyGate.isEmergencyStopped()) {
+                    resultBox.compareAndSet(null, HandoffDecision.STOP)
+                    shownOk.set(false)
+                    shownLatch.countDown()
+                    latch.countDown()
+                    return@post
+                }
+                activeConfirmResult.set(null)
+                activeConfirmLatch.getAndSet(latch)
             }
+            prevLatch?.countDown()
             val target = resolveWindowTarget()
             if (target == null) {
+                synchronized(promptStateLock) { activeConfirmLatch.compareAndSet(latch, null) }
                 shownOk.set(false)
                 shownLatch.countDown()
                 return@post
             }
             removeActiveConfirmView(animate = false)
-            activeConfirmLatch.getAndSet(latch)?.countDown()
-            activeConfirmResult.set(null)
 
             val (ctx, wm, windowType) = target
+            val hasBlur = false
             val deadlineMs = SystemClock.elapsedRealtime() + timeoutMs
             val armedAtMs = SystemClock.elapsedRealtime() + 360L
 
             fun finish(decision: HandoffDecision) {
                 if (resultBox.compareAndSet(null, decision)) {
-                    activeConfirmResult.compareAndSet(null, decision)
+                    synchronized(promptStateLock) {
+                        activeConfirmResult.compareAndSet(null, decision)
+                        activeConfirmLatch.compareAndSet(latch, null)
+                    }
                     removeActiveConfirmView(animate = true, expectedView = cardRef.get())
                     latch.countDown()
                 }
             }
 
-            val card = buildGlassPromptCard(
+            val (card, startCountdown) = buildGlassPromptCard(
                 ctx = ctx,
                 title = "需要你手动完成这一步",
                 appLabel = appLabel,
@@ -1018,6 +1226,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 armedAtMs = armedAtMs,
                 isHandoff = true,
                 allowTurnOption = false,
+                hasBackdropBlur = hasBlur,
                 onPrimary = { finish(HandoffDecision.CONTINUE) },
                 onSecondary = {},
                 onCancel = {
@@ -1034,21 +1243,31 @@ class PhoneOverlayController(private val appContext: Context) {
             cardRef.set(card)
 
             // Position handoff card cleanly near the top below the HUD so it NEVER covers
-            // the soft keyboard while the user types passwords / 2FA codes!
-            val params = buildBottomCardParams(ctx, windowType, atTop = true)
+            // the soft keyboard while the user types passwords / 2FA codes, and let the user
+            // vertically drag the grabber/header if it sits over a login or SMS input!
+            val params = buildBottomCardParams(ctx, windowType, atTop = true, hasBlur = hasBlur)
+            card.findViewWithTag<View>("prompt_drag_area")
+                ?.setOnTouchListener(createVerticalDragListener(ctx, wm, card, params, saveHudY = false))
             val attached = runCatching {
                 wm.addView(card, params)
                 activeConfirmContainer = card
                 activeConfirmWm = wm
                 activeConfirmParams = params
+                ensureConfigCallbacksRegistered()
+                startCountdown()
                 animateCardEntrance(card)
                 true
             }.getOrDefault(false)
+            if (!attached) {
+                synchronized(promptStateLock) { activeConfirmLatch.compareAndSet(latch, null) }
+            }
             shownOk.set(attached)
             shownLatch.countDown()
         }
 
         if (!runCatching { shownLatch.await(2000L, TimeUnit.MILLISECONDS) }.getOrDefault(false) || !shownOk.get()) {
+            promptGen.compareAndSet(myPromptGen, myPromptGen + 1)
+            mainHandler.post { removeActiveConfirmView(animate = false, expectedView = cardRef.get()) }
             return resultBox.get() ?: HandoffDecision.UNAVAILABLE
         }
         val completed = runCatching { latch.await(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
@@ -1087,12 +1306,15 @@ class PhoneOverlayController(private val appContext: Context) {
 
     private fun isDarkPalette(): Boolean {
         val sp = appContext.getSharedPreferences("gb_native_ui_v1", Context.MODE_PRIVATE)
-        return sp.getBoolean("isDark", false)
+        val systemDark = (appContext.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        val followSystem = sp.getBoolean("followSystemTheme", !sp.contains("isDark"))
+        return if (followSystem) systemDark else sp.getBoolean("isDark", systemDark)
     }
 
     private fun resolveAccentColors(): Pair<Int, Int> {
         val sp = appContext.getSharedPreferences("gb_native_ui_v1", Context.MODE_PRIVATE)
-        val dark = sp.getBoolean("isDark", false)
+        val dark = isDarkPalette()
         val defaultPrimary = if (dark) Color.parseColor("#54AAE8") else Color.parseColor("#2A78B5")
         val defaultHi = if (dark) Color.parseColor("#84C6F5") else Color.parseColor("#4D9CD6")
         val p = sp.getInt("accentPrimary", defaultPrimary)
@@ -1178,6 +1400,7 @@ class PhoneOverlayController(private val appContext: Context) {
             fxCanvasView = view
             fxParams = params
             fxAttachedWm = wm
+            ensureConfigCallbacksRegistered()
             view.startLoop()
         }
     }
@@ -1186,17 +1409,17 @@ class PhoneOverlayController(private val appContext: Context) {
     // 2. Three-Mode Morphing Liquid Glass Dynamic Island HUD
     // -------------------------------------------------------------------------
 
-    private fun supportsCrossWindowBlur(wm: WindowManager?): Boolean {
-        if (wm == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-        return runCatching { wm.isCrossWindowBlurEnabled }.getOrDefault(false)
-    }
-
     private fun attachHudWindow(ctx: Context, wm: WindowManager, windowType: Int, mode: HudMode) {
+        val m = screenMetrics(ctx, wm)
+        val safeTopY = (m.topInset + dp(ctx, 8)).coerceAtLeast(dp(ctx, 28))
+        val maxY = (m.height - m.bottomInset - dp(ctx, 120)).coerceAtLeast(safeTopY)
         val container = FrameLayout(ctx).apply {
             clipChildren = false
             clipToPadding = false
             setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 10))
         }
+        // Never set FLAG_BLUR_BEHIND on raw WindowManager overlay windows: Android 12+ blurs
+        // the entire underlying screen behind the window instead of just the HUD capsule!
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -1210,7 +1433,14 @@ class PhoneOverlayController(private val appContext: Context) {
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             x = 0
-            y = if (hudSavedY >= dp(ctx, 24)) hudSavedY else dp(ctx, 40)
+            y = (if (hudSavedY >= safeTopY) hudSavedY else safeTopY).coerceIn(safeTopY, maxY)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
         }
 
         hudContainer = container
@@ -1222,6 +1452,7 @@ class PhoneOverlayController(private val appContext: Context) {
 
         runCatching {
             wm.addView(container, params)
+            ensureConfigCallbacksRegistered()
             container.alpha = 0f
             container.scaleX = 0.84f
             container.scaleY = 0.84f
@@ -1246,44 +1477,51 @@ class PhoneOverlayController(private val appContext: Context) {
         val container = hudContainer ?: return
         val params = hudParams ?: return
         val attachedWm = hudAttachedWm ?: wm
+        hudSnapAnimator?.cancel()
+        hudSnapAnimator = null
         hudMode = nextMode
-        val dm = ctx.resources.displayMetrics
+        val m = screenMetrics(ctx, attachedWm)
+        val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(ctx, 220))
+        val safeTopY = (m.topInset + dp(ctx, 8)).coerceAtLeast(dp(ctx, 28))
         when (nextMode) {
             HudMode.COMPACT -> {
-                val minY = dp(ctx, 24)
-                val maxY = (dm.heightPixels - dp(ctx, 140)).coerceAtLeast(minY)
+                val minY = safeTopY
+                val maxY = (m.height - m.bottomInset - dp(ctx, 120)).coerceAtLeast(minY)
                 params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
                 params.width = WindowManager.LayoutParams.WRAP_CONTENT
                 params.x = 0
-                params.y = (if (hudSavedY >= minY) hudSavedY else dp(ctx, 40)).coerceIn(minY, maxY)
+                params.y = (if (hudSavedY >= minY) hudSavedY else safeTopY).coerceIn(minY, maxY)
                 container.setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 10))
             }
             HudMode.EXPANDED -> {
-                val minY = dp(ctx, 24)
-                val maxY = (dm.heightPixels * 0.45f).toInt().coerceAtLeast(minY)
+                val minY = safeTopY
+                val maxY = (m.height * 0.45f).toInt().coerceAtLeast(minY)
                 params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                params.width = min(dm.widthPixels - dp(ctx, 22), dp(ctx, 368)).coerceAtLeast(dp(ctx, 220))
+                params.width = min(safeW - dp(ctx, 22), dp(ctx, 368)).coerceAtLeast(dp(ctx, 220))
                 params.x = 0
-                params.y = (if (hudSavedY >= minY) hudSavedY else dp(ctx, 40)).coerceIn(minY, maxY)
+                params.y = (if (hudSavedY >= minY) hudSavedY else safeTopY).coerceIn(minY, maxY)
                 container.setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 10))
             }
             HudMode.DOCKED_LEFT -> {
-                val minY = dp(ctx, 48)
-                val maxY = (dm.heightPixels - dp(ctx, 140)).coerceAtLeast(minY)
-                params.gravity = Gravity.TOP or Gravity.START
+                val minY = safeTopY + dp(ctx, 12)
+                val maxY = (m.height - m.bottomInset - dp(ctx, 120)).coerceAtLeast(minY)
+                // Use physical Gravity.LEFT/RIGHT so flat bezel edge stays flush on RTL locales too.
+                @Suppress("RtlHardcoded")
+                params.gravity = Gravity.TOP or Gravity.LEFT
                 params.width = WindowManager.LayoutParams.WRAP_CONTENT
-                params.x = 0
-                params.y = (if (hudSavedY >= dp(ctx, 64)) hudSavedY else (dm.heightPixels * 0.24f).toInt())
+                params.x = m.leftInset
+                params.y = (if (hudSavedY >= minY) hudSavedY else (m.height * 0.24f).toInt())
                     .coerceIn(minY, maxY)
                 container.setPadding(0, dp(ctx, 4), dp(ctx, 6), dp(ctx, 6))
             }
             HudMode.DOCKED_RIGHT -> {
-                val minY = dp(ctx, 48)
-                val maxY = (dm.heightPixels - dp(ctx, 140)).coerceAtLeast(minY)
-                params.gravity = Gravity.TOP or Gravity.END
+                val minY = safeTopY + dp(ctx, 12)
+                val maxY = (m.height - m.bottomInset - dp(ctx, 120)).coerceAtLeast(minY)
+                @Suppress("RtlHardcoded")
+                params.gravity = Gravity.TOP or Gravity.RIGHT
                 params.width = WindowManager.LayoutParams.WRAP_CONTENT
-                params.x = 0
-                params.y = (if (hudSavedY >= dp(ctx, 64)) hudSavedY else (dm.heightPixels * 0.24f).toInt())
+                params.x = m.rightInset
+                params.y = (if (hudSavedY >= minY) hudSavedY else (m.height * 0.24f).toInt())
                     .coerceIn(minY, maxY)
                 container.setPadding(dp(ctx, 6), dp(ctx, 4), 0, dp(ctx, 6))
             }
@@ -1347,7 +1585,14 @@ class PhoneOverlayController(private val appContext: Context) {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(ctx, 9), dp(ctx, 7), dp(ctx, 9), dp(ctx, 7))
-            background = LiquidGlassDrawable(ctx, dark, radiusDp = 999f, accentTint = accentPrimary, elevated = true)
+            background = LiquidGlassDrawable(
+                ctx = ctx,
+                dark = dark,
+                radiusDp = 999f,
+                accentTint = accentPrimary,
+                elevated = true,
+                hasBackdropBlur = false
+            )
             elevation = 16f * density
         }
 
@@ -1434,9 +1679,10 @@ class PhoneOverlayController(private val appContext: Context) {
                     setColor(if (dark) Color.parseColor("#2AFFFFFF") else Color.parseColor("#1614395C"))
                     setStroke((0.8f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#38FFFFFF") else Color.parseColor("#220F3554"))
                 },
-                hPadDp = 10,
-                vPadDp = 6,
-                textSp = 11.5f
+                hPadDp = 12,
+                vPadDp = 9,
+                textSp = 11.8f,
+                minHeightDp = 40
             ) {
                 togglePauseFromOverlay()
             }
@@ -1446,7 +1692,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { marginEnd = dp(ctx, 6) }
+                ).apply { marginEnd = dp(ctx, 8) }
             )
 
             val stopBtn = makeTactilePillButton(
@@ -1460,9 +1706,10 @@ class PhoneOverlayController(private val appContext: Context) {
                     cornerRadius = 999f * density
                     setStroke((0.8f * density).toInt().coerceAtLeast(1), Color.parseColor("#55FFFFFF"))
                 },
-                hPadDp = 10,
-                vPadDp = 6,
-                textSp = 11.5f,
+                hPadDp = 12,
+                vPadDp = 9,
+                textSp = 11.8f,
+                minHeightDp = 40,
                 longPressHaptic = true
             ) {
                 triggerStopFromOverlay()
@@ -1514,7 +1761,14 @@ class PhoneOverlayController(private val appContext: Context) {
         val card = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(ctx, 15), dp(ctx, 13), dp(ctx, 15), dp(ctx, 14))
-            background = LiquidGlassDrawable(ctx, dark, radiusDp = 28f, accentTint = accentPrimary, elevated = true)
+            background = LiquidGlassDrawable(
+                ctx = ctx,
+                dark = dark,
+                radiusDp = 28f,
+                accentTint = accentPrimary,
+                elevated = true,
+                hasBackdropBlur = false
+            )
             elevation = 22f * density
         }
 
@@ -1549,10 +1803,6 @@ class PhoneOverlayController(private val appContext: Context) {
             setPadding(dp(ctx, 10), 0, dp(ctx, 8), 0)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val titleLine = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
         val titleTv = TextView(ctx).apply {
             text = hudActionText
             setTextColor(ink)
@@ -1560,30 +1810,34 @@ class PhoneOverlayController(private val appContext: Context) {
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val subLine = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(ctx, 2), 0, 0)
         }
         val statusBadge = TextView(ctx).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            setPadding(dp(ctx, 8), dp(ctx, 2), dp(ctx, 8), dp(ctx, 2))
+            setPadding(dp(ctx, 7), dp(ctx, 1), dp(ctx, 7), dp(ctx, 1))
         }
-        titleLine.addView(titleTv)
-        titleLine.addView(
-            statusBadge,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = dp(ctx, 6) }
-        )
-
         val subTv = TextView(ctx).apply {
             setTextColor(subInk)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
-        headTextCol.addView(titleLine)
-        headTextCol.addView(subTv)
+        subLine.addView(
+            statusBadge,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(ctx, 6) }
+        )
+        subLine.addView(subTv)
+        headTextCol.addView(titleTv)
+        headTextCol.addView(subLine)
         headerRow.addView(headTextCol)
 
         val dockBtn = makeTactilePillButton(
@@ -1592,11 +1846,16 @@ class PhoneOverlayController(private val appContext: Context) {
             textColor = subInk,
             bgDrawable = GradientDrawable().apply {
                 cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#20FFFFFF") else Color.parseColor("#1214395C"))
+                setColor(if (dark) Color.parseColor("#20FFFFFF") else Color.parseColor("#B5F1F6FC"))
+                setStroke(
+                    (0.75f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#32FFFFFF") else Color.parseColor("#2214395C")
+                )
             },
-            hPadDp = 9,
-            vPadDp = 5,
-            textSp = 11f
+            hPadDp = 10,
+            vPadDp = 7,
+            textSp = 11.2f,
+            minHeightDp = 36
         ) {
             rebuildHudContent(ctx, wm, HudMode.DOCKED_RIGHT, animateMorph = true)
         }
@@ -1605,7 +1864,7 @@ class PhoneOverlayController(private val appContext: Context) {
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { marginEnd = dp(ctx, 5) }
+            ).apply { marginEnd = dp(ctx, 6) }
         )
 
         val collapseBtn = makeTactilePillButton(
@@ -1614,25 +1873,33 @@ class PhoneOverlayController(private val appContext: Context) {
             textColor = subInk,
             bgDrawable = GradientDrawable().apply {
                 cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#20FFFFFF") else Color.parseColor("#1214395C"))
+                setColor(if (dark) Color.parseColor("#20FFFFFF") else Color.parseColor("#B5F1F6FC"))
+                setStroke(
+                    (0.75f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#32FFFFFF") else Color.parseColor("#2214395C")
+                )
             },
-            hPadDp = 9,
-            vPadDp = 5,
-            textSp = 11f
+            hPadDp = 10,
+            vPadDp = 7,
+            textSp = 11.2f,
+            minHeightDp = 36
         ) {
             rebuildHudContent(ctx, wm, HudMode.COMPACT, animateMorph = true)
         }
         headerRow.addView(collapseBtn)
         card.addView(headerRow)
 
-        // Live Step Timeline Glass Well
+        // Live Step Timeline Glass Well (concentric: 28dp outer - 15dp padding = 13dp)
         val timelineWell = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10))
             background = GradientDrawable().apply {
-                cornerRadius = 18f * density
-                setColor(if (dark) Color.parseColor("#2AFFFFFF") else Color.parseColor("#CCFFFFFF"))
-                setStroke((0.75f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#32FFFFFF") else Color.parseColor("#E6FFFFFF"))
+                cornerRadius = 13f * density
+                setColor(if (dark) Color.parseColor("#18FFFFFF") else Color.parseColor("#C2FFFFFF"))
+                setStroke(
+                    (0.75f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#28FFFFFF") else Color.parseColor("#2014395C")
+                )
             }
         }
         card.addView(
@@ -1654,8 +1921,11 @@ class PhoneOverlayController(private val appContext: Context) {
             textColor = ink,
             bgDrawable = GradientDrawable().apply {
                 cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#30FFFFFF") else Color.parseColor("#DCE6F0FA"))
-                setStroke((0.8f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#3CFFFFFF") else Color.parseColor("#2214395C"))
+                setColor(if (dark) Color.parseColor("#26FFFFFF") else Color.parseColor("#C8F1F6FC"))
+                setStroke(
+                    (0.8f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#38FFFFFF") else Color.parseColor("#2414395C")
+                )
             },
             hPadDp = 12,
             vPadDp = 9,
@@ -1665,16 +1935,18 @@ class PhoneOverlayController(private val appContext: Context) {
         }
         row1.addView(pauseBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
+        val returnMid = blendColor(accentHi, accentPrimary, 0.5f)
+        val returnInk = if (ColorUtils.calculateLuminance(returnMid) > 0.36) Color.parseColor("#0A1A2A") else Color.WHITE
         val returnBtn = makeTactilePillButton(
             ctx = ctx,
             label = "返回 GrassBag",
-            textColor = Color.WHITE,
+            textColor = returnInk,
             bgDrawable = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
                 intArrayOf(accentHi, accentPrimary)
             ).apply {
                 cornerRadius = 999f * density
-                setStroke((0.8f * density).toInt().coerceAtLeast(1), Color.parseColor("#55FFFFFF"))
+                setStroke((0.85f * density).toInt().coerceAtLeast(1), Color.parseColor("#55FFFFFF"))
             },
             hPadDp = 12,
             vPadDp = 9,
@@ -1795,7 +2067,8 @@ class PhoneOverlayController(private val appContext: Context) {
                 customRadiiPx = radii,
                 accentTint = accentPrimary,
                 elevated = true,
-                dockedEdge = if (dockedLeft) -1 else 1
+                dockedEdge = if (dockedLeft) -1 else 1,
+                hasBackdropBlur = false
             )
             elevation = 16f * density
         }
@@ -1813,7 +2086,7 @@ class PhoneOverlayController(private val appContext: Context) {
             setPadding(dp(ctx, 6), dp(ctx, 2), dp(ctx, 6), dp(ctx, 2))
             background = GradientDrawable().apply {
                 cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#2E529EE0") else Color.parseColor("#1A2A78B5"))
+                setColor(withAlpha(if (dark) accentHi else accentPrimary, if (dark) 54 else 30))
             }
         }
         val badgeLp = LinearLayout.LayoutParams(
@@ -1863,11 +2136,15 @@ class PhoneOverlayController(private val appContext: Context) {
                         dragged = true
                     }
                     if (dragged) {
-                        val dm = ctx.resources.displayMetrics
-                        val minY = dp(ctx, 44)
-                        val maxY = (dm.heightPixels - dp(ctx, 130)).coerceAtLeast(minY)
+                        val m = screenMetrics(ctx, wm)
+                        val minY = (m.topInset + dp(ctx, 14)).coerceAtLeast(dp(ctx, 40))
+                        val maxY = (m.height - m.bottomInset - dp(ctx, 110)).coerceAtLeast(minY)
                         params.y = (startY + dy.toInt()).coerceIn(minY, maxY)
                         hudSavedY = params.y
+                        val inwardPull = if (dockedLeft) dx.coerceAtLeast(0f) else (-dx).coerceAtLeast(0f)
+                        val maxNudge = dp(ctx, 22).toFloat()
+                        val damped = (inwardPull * 0.38f).coerceIn(0f, maxNudge)
+                        bubble.translationX = if (dockedLeft) damped else -damped
                         runCatching { wm.updateViewLayout(container, params) }
                     }
                     true
@@ -1875,9 +2152,22 @@ class PhoneOverlayController(private val appContext: Context) {
                 MotionEvent.ACTION_UP -> {
                     val pulledIn = if (dockedLeft) (ev.rawX - downX) > dp(ctx, 46) else (downX - ev.rawX) > dp(ctx, 46)
                     if (!dragged || pulledIn) {
+                        bubble.translationX = 0f
                         v.performClick()
                         v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                         rebuildHudContent(ctx, wm, HudMode.COMPACT, animateMorph = true)
+                    } else if (bubble.translationX != 0f) {
+                        bubble.animate()
+                            .translationX(0f)
+                            .setDuration(180L)
+                            .setInterpolator(OvershootInterpolator(1.08f))
+                            .start()
+                    }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    if (bubble.translationX != 0f) {
+                        bubble.animate().translationX(0f).setDuration(150L).start()
                     }
                     true
                 }
@@ -1900,6 +2190,9 @@ class PhoneOverlayController(private val appContext: Context) {
         var startY = 0
         var dragged = false
         return View.OnTouchListener { v, event ->
+            val glassBg = container.getChildAt(0)?.background as? LiquidGlassDrawable
+            val localX = event.x + v.left.toFloat()
+            val localY = event.y + v.top.toFloat()
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     hudSnapAnimator?.cancel()
@@ -1909,6 +2202,7 @@ class PhoneOverlayController(private val appContext: Context) {
                     startX = params.x
                     startY = params.y
                     dragged = false
+                    glassBg?.setTouchHighlight(localX, localY, 1f)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -1917,12 +2211,15 @@ class PhoneOverlayController(private val appContext: Context) {
                     if (!dragged && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                         dragged = true
                     }
+                    glassBg?.setTouchHighlight(localX, localY, 1f)
                     if (dragged) {
-                        val dm = ctx.resources.displayMetrics
-                        val halfW = (dm.widthPixels / 2 - dp(ctx, 84)).coerceAtLeast(0)
-                        val minY = dp(ctx, 24)
-                        val maxY = (dm.heightPixels - dp(ctx, 120)).coerceAtLeast(minY)
-                        params.x = (startX + dx.toInt()).coerceIn(-halfW, halfW)
+                        val m = screenMetrics(ctx, wm)
+                        val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(ctx, 220))
+                        val halfHud = if (container.width > 0) container.width / 2 else dp(ctx, 132)
+                        val maxOffsetX = (safeW / 2 - halfHud - dp(ctx, 6)).coerceAtLeast(0)
+                        val minY = (m.topInset + dp(ctx, 6)).coerceAtLeast(dp(ctx, 24))
+                        val maxY = (m.height - m.bottomInset - dp(ctx, 100)).coerceAtLeast(minY)
+                        params.x = (startX + dx.toInt()).coerceIn(-maxOffsetX, maxOffsetX)
                         params.y = (startY + dy.toInt()).coerceIn(minY, maxY)
                         hudSavedY = params.y
                         runCatching { wm.updateViewLayout(container, params) }
@@ -1930,17 +2227,18 @@ class PhoneOverlayController(private val appContext: Context) {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    glassBg?.fadeOutTouchHighlight()
                     if (!dragged) {
                         v.performClick()
                         v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                         onTap()
                     } else {
-                        val dm = ctx.resources.displayMetrics
+                        val m = screenMetrics(ctx, wm)
                         val edgeThreshold = dp(ctx, 42)
-                        if (event.rawX < edgeThreshold) {
+                        if (!hudCompletedState && event.rawX < m.leftInset + edgeThreshold) {
                             v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                             rebuildHudContent(ctx, wm, HudMode.DOCKED_LEFT, animateMorph = true)
-                        } else if (event.rawX > dm.widthPixels - edgeThreshold) {
+                        } else if (!hudCompletedState && event.rawX > m.width - m.rightInset - edgeThreshold) {
                             v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                             rebuildHudContent(ctx, wm, HudMode.DOCKED_RIGHT, animateMorph = true)
                         } else if (abs(params.x) < dp(ctx, 64)) {
@@ -1960,6 +2258,10 @@ class PhoneOverlayController(private val appContext: Context) {
                     }
                     true
                 }
+                MotionEvent.ACTION_CANCEL -> {
+                    glassBg?.fadeOutTouchHighlight()
+                    true
+                }
                 else -> false
             }
         }
@@ -1969,7 +2271,8 @@ class PhoneOverlayController(private val appContext: Context) {
         ctx: Context,
         wm: WindowManager,
         container: FrameLayout,
-        params: WindowManager.LayoutParams
+        params: WindowManager.LayoutParams,
+        saveHudY: Boolean = true
     ): View.OnTouchListener {
         val touchSlop = ViewConfiguration.get(ctx).scaledTouchSlop
         var downY = 0f
@@ -1987,11 +2290,11 @@ class PhoneOverlayController(private val appContext: Context) {
                     val dy = ev.rawY - downY
                     if (!dragged && abs(dy) > touchSlop) dragged = true
                     if (dragged) {
-                        val dm = ctx.resources.displayMetrics
-                        val minY = dp(ctx, 24)
-                        val maxY = (dm.heightPixels - dp(ctx, 260)).coerceAtLeast(minY)
+                        val m = screenMetrics(ctx, wm)
+                        val minY = (m.topInset + dp(ctx, 6)).coerceAtLeast(dp(ctx, 24))
+                        val maxY = (m.height - m.bottomInset - dp(ctx, 220)).coerceAtLeast(minY)
                         params.y = (startY + dy.toInt()).coerceIn(minY, maxY)
-                        hudSavedY = params.y
+                        if (saveHudY) hudSavedY = params.y
                         runCatching { wm.updateViewLayout(container, params) }
                     }
                     true
@@ -2051,23 +2354,28 @@ class PhoneOverlayController(private val appContext: Context) {
         val btn = hudAutoReturnBtn ?: return
         val on = SafetyGate.isAutoReturnEnabled()
         val dark = isDarkPalette()
-        val (accentPrimary, _) = resolveAccentColors()
+        val (accentPrimary, accentHi) = resolveAccentColors()
         btn.text = if (on) "完后返回：开" else "完后返回：关"
         btn.setTextColor(
-            if (on) (if (dark) Color.parseColor("#8CD0FF") else accentPrimary)
+            if (on) (if (dark) accentHi else accentPrimary)
             else (if (dark) Color.parseColor("#9DB3C9") else Color.parseColor("#54697F"))
         )
     }
 
     private fun refreshHudTexts() {
-        val elapsedSec = ((SystemClock.elapsedRealtime() - hudStartedAtMs) / 1000L).coerceAtLeast(0L)
+        val nowMs = if (hudPausedSinceMs > 0L) hudPausedSinceMs else SystemClock.elapsedRealtime()
+        val elapsedSec = ((nowMs - hudStartedAtMs - hudPausedAccumMs) / 1000L).coerceAtLeast(0L)
         val timeText = String.format(Locale.US, "%02d:%02d", elapsedSec / 60L, elapsedSec % 60L)
         val steps = stepCountAtomic.get()
         val appPart = if (hudCurrentApp.isNotBlank()) " · $hudCurrentApp" else ""
 
         hudDockBadge?.text = if (steps > 0) "$steps" else "●"
 
-        if (!hudCompletedState) {
+        if (hudCompletedState) {
+            if (hudCompletedSubtitle.isNotEmpty()) {
+                hudSubView?.text = hudCompletedSubtitle
+            }
+        } else {
             hudSubView?.text = when {
                 SafetyGate.isPaused() -> "已暂停 · $timeText$appPart"
                 hudWaitingForUser -> "等待确认 · $timeText$appPart"
@@ -2081,13 +2389,14 @@ class PhoneOverlayController(private val appContext: Context) {
         val badge = hudStatusBadge
         if (badge != null) {
             val dark = isDarkPalette()
+            val (accentPrimary, accentHi) = resolveAccentColors()
             val statusState = when {
                 hudCompletedState -> "done"
                 SafetyGate.isPaused() -> "paused"
                 hudWaitingForUser -> "waiting"
                 else -> "active"
             }
-            val badgeKey = "$statusState:$dark"
+            val badgeKey = "$statusState:$dark:$accentPrimary"
             if (badgeKey != lastHudBadgeKey) {
                 lastHudBadgeKey = badgeKey
                 val density = appContext.resources.displayMetrics.density
@@ -2109,8 +2418,8 @@ class PhoneOverlayController(private val appContext: Context) {
                     )
                     else -> Triple(
                         "操控中",
-                        if (dark) Color.parseColor("#7CC7FA") else Color.parseColor("#1E6DAE"),
-                        if (dark) Color.parseColor("#2638BDF8") else Color.parseColor("#1A2A78B5")
+                        if (dark) accentHi else accentPrimary,
+                        withAlpha(if (dark) accentHi else accentPrimary, if (dark) 38 else 26)
                     )
                 }
                 badge.text = label
@@ -2131,7 +2440,7 @@ class PhoneOverlayController(private val appContext: Context) {
         val well = hudTimelineContainer ?: return
         val ctx = well.context
         val dark = isDarkPalette()
-        val (accentPrimary, _) = resolveAccentColors()
+        val (accentPrimary, accentHi) = resolveAccentColors()
         val ink = if (dark) Color.parseColor("#EBF3FC") else Color.parseColor("#16283B")
         val muted = if (dark) Color.parseColor("#8FA6BE") else Color.parseColor("#5F748A")
 
@@ -2156,7 +2465,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 text = if (isLatest && !hudCompletedState) "●" else "✓"
                 setTextColor(
                     when {
-                        isLatest && !hudCompletedState -> if (dark) Color.parseColor("#6AC2FA") else accentPrimary
+                        isLatest && !hudCompletedState -> if (dark) accentHi else accentPrimary
                         else -> if (dark) Color.parseColor("#4ADE80") else Color.parseColor("#1B945B")
                     }
                 )
@@ -2195,6 +2504,7 @@ class PhoneOverlayController(private val appContext: Context) {
         hPadDp: Int,
         vPadDp: Int,
         textSp: Float,
+        minHeightDp: Int = 0,
         longPressHaptic: Boolean = false,
         onClick: () -> Unit
     ): TextView {
@@ -2205,6 +2515,10 @@ class PhoneOverlayController(private val appContext: Context) {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, textSp)
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             setPadding(dp(ctx, hPadDp), dp(ctx, vPadDp), dp(ctx, hPadDp), dp(ctx, vPadDp))
+            if (minHeightDp > 0) {
+                minHeight = dp(ctx, minHeightDp)
+                minimumHeight = dp(ctx, minHeightDp)
+            }
             background = bgDrawable
             isClickable = true
             setOnTouchListener { v, ev ->
@@ -2236,32 +2550,64 @@ class PhoneOverlayController(private val appContext: Context) {
         return if (resId > 0) ctx.resources.getDimensionPixelSize(resId) else dp(ctx, fallbackDp)
     }
 
+    private fun withAlpha(color: Int, alpha: Int): Int =
+        Color.argb(alpha.coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
+
+    private fun blendColor(from: Int, to: Int, ratio: Float): Int {
+        val t = ratio.coerceIn(0f, 1f)
+        val inv = 1f - t
+        return Color.argb(
+            (Color.alpha(from) * inv + Color.alpha(to) * t).toInt().coerceIn(0, 255),
+            (Color.red(from) * inv + Color.red(to) * t).toInt().coerceIn(0, 255),
+            (Color.green(from) * inv + Color.green(to) * t).toInt().coerceIn(0, 255),
+            (Color.blue(from) * inv + Color.blue(to) * t).toInt().coerceIn(0, 255)
+        )
+    }
+
     private fun buildBottomCardParams(
         ctx: Context,
         windowType: Int,
-        atTop: Boolean = false
+        atTop: Boolean = false,
+        hasBlur: Boolean = false
     ): WindowManager.LayoutParams {
-        val dm = ctx.resources.displayMetrics
-        val cardWidth = min(dm.widthPixels - dp(ctx, 22), dp(ctx, 424))
+        val m = screenMetrics(ctx, null)
+        val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(ctx, 240))
+        val dark = isDarkPalette()
+        val cardWidth = min(safeW - dp(ctx, 24), dp(ctx, 412))
+        // Keep the underlying target app 100% crisp & readable during confirmation so the user can
+        // verify the exact UI element before approving (NO FLAG_BLUR_BEHIND full-screen blur!).
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        if (!atTop) {
+            flags = flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND
+        }
         return WindowManager.LayoutParams(
             cardWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            flags,
             PixelFormat.TRANSLUCENT
         ).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+            if (!atTop) {
+                dimAmount = if (dark) 0.24f else 0.12f
+            }
             if (atTop) {
                 gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
                 x = 0
-                y = systemBarHeightPx(ctx, "status_bar_height", 28) + dp(ctx, 96)
+                y = m.topInset + dp(ctx, 88)
             } else {
                 gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
                 x = 0
-                val navInset = systemBarHeightPx(ctx, "navigation_bar_height", 24)
-                y = navInset + dp(ctx, 20)
+                y = m.bottomInset + dp(ctx, 20)
             }
         }
     }
@@ -2277,78 +2623,92 @@ class PhoneOverlayController(private val appContext: Context) {
         armedAtMs: Long,
         isHandoff: Boolean,
         allowTurnOption: Boolean,
+        hasBackdropBlur: Boolean = false,
         onPrimary: () -> Unit,
         onSecondary: () -> Unit,
         onCancel: () -> Unit,
         onStop: () -> Unit
-    ): FrameLayout {
+    ): Pair<FrameLayout, () -> Unit> {
         val dark = isDarkPalette()
         val (accentPrimary, accentHi) = resolveAccentColors()
         val density = ctx.resources.displayMetrics.density
-        val ink = if (dark) Color.parseColor("#F4F8FD") else Color.parseColor("#102030")
+        val ink = if (dark) Color.parseColor("#F5F9FF") else Color.parseColor("#0E1E2E")
         val subInk = if (dark) Color.parseColor("#9EB4CA") else Color.parseColor("#54697F")
+        val isHighRisk = isHandoff ||
+            (riskBadge?.contains("敏感") == true) ||
+            (riskBadge?.contains("关键") == true) ||
+            (riskBadge?.contains("接管") == true)
+        val displayTitle = title.removePrefix("GrassBag ").ifBlank { title }
 
         val wrapper = FrameLayout(ctx).apply {
             clipChildren = false
             clipToPadding = false
-            setPadding(dp(ctx, 4), dp(ctx, 4), dp(ctx, 4), dp(ctx, 8))
+            setPadding(dp(ctx, 4), dp(ctx, 4), dp(ctx, 4), dp(ctx, 10))
         }
 
         val card = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(ctx, 18), dp(ctx, 15), dp(ctx, 18), dp(ctx, 16))
-            background = LiquidGlassDrawable(ctx, dark, radiusDp = 30f, accentTint = accentPrimary, elevated = true)
+            setPadding(dp(ctx, 18), dp(ctx, 12), dp(ctx, 18), dp(ctx, 16))
+            background = LiquidGlassDrawable(
+                ctx = ctx,
+                dark = dark,
+                radiusDp = 32f,
+                accentTint = if (isHighRisk) Color.parseColor("#E69500") else accentPrimary,
+                elevated = true,
+                hasBackdropBlur = hasBackdropBlur
+            )
             elevation = 24f * density
         }
 
-        // Countdown hairline progress track
-        val progressTrack = FrameLayout(ctx).apply {
-            background = GradientDrawable().apply {
-                cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#22FFFFFF") else Color.parseColor("#14132C44"))
+        // Subtle iOS 26 floating-sheet grabber pill ONLY on draggable Handoff cards (never a dead affordance!)
+        if (isHandoff) {
+            val dragZone = FrameLayout(ctx).apply {
+                tag = "prompt_drag_area"
+                setPadding(0, dp(ctx, 2), 0, dp(ctx, 11))
             }
-        }
-        val progressFill = View(ctx).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.LEFT_RIGHT,
-                intArrayOf(accentHi, Color.parseColor("#20C997"))
-            ).apply { cornerRadius = 999f * density }
-        }
-        progressTrack.addView(
-            progressFill,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
+            val handle = View(ctx).apply {
+                background = GradientDrawable().apply {
+                    cornerRadius = 999f * density
+                    setColor(if (dark) Color.parseColor("#44FFFFFF") else Color.parseColor("#2A132C44"))
+                }
+            }
+            dragZone.addView(
+                handle,
+                FrameLayout.LayoutParams(dp(ctx, 38), (4f * density).toInt().coerceAtLeast(3), Gravity.CENTER)
             )
-        )
-        card.addView(
-            progressTrack,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 3)).apply {
-                bottomMargin = dp(ctx, 12)
-            }
-        )
+            card.addView(
+                dragZone,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        } else {
+            card.setPadding(dp(ctx, 18), dp(ctx, 16), dp(ctx, 18), dp(ctx, 16))
+        }
 
-        // Header row: Logo + Title + Risk Chip + Countdown Pill
+        // Header row: Brand Glass Medallion + Title & Scoped Meta + Precision Countdown Ring
         val headerRow = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         val logo = GrassBagOverlayLogoView(ctx, dark, accentPrimary, accentHi).apply {
             setMode(GrassBagOverlayLogoView.Mode.WAITING)
-            layoutParams = LinearLayout.LayoutParams(dp(ctx, 34), dp(ctx, 34))
+            layoutParams = LinearLayout.LayoutParams(dp(ctx, 40), dp(ctx, 40))
         }
         headerRow.addView(logo)
 
         val titleCol = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(ctx, 10), 0, dp(ctx, 8), 0)
+            setPadding(dp(ctx, 11), 0, dp(ctx, 10), 0)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         titleCol.addView(TextView(ctx).apply {
-            text = title
+            text = displayTitle
             setTextColor(ink)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            letterSpacing = -0.02f
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         })
@@ -2356,98 +2716,161 @@ class PhoneOverlayController(private val appContext: Context) {
             val metaRow = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(ctx, 2), 0, 0)
+                setPadding(0, dp(ctx, 3), 0, 0)
             }
             if (!appLabel.isNullOrBlank()) {
                 metaRow.addView(TextView(ctx).apply {
                     text = appLabel
                     setTextColor(subInk)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
                     if (!riskBadge.isNullOrBlank()) {
-                        maxWidth = dp(ctx, 132)
+                        maxWidth = dp(ctx, 128)
                     }
                 })
             }
             if (!riskBadge.isNullOrBlank()) {
-                val isHighRisk = riskBadge.contains("敏感") || riskBadge.contains("关键") || riskBadge.contains("接管")
+                val badgeFg = if (isHighRisk) {
+                    if (dark) Color.parseColor("#FCD34D") else Color.parseColor("#B45309")
+                } else {
+                    if (dark) blendColor(accentHi, Color.WHITE, 0.25f) else accentPrimary
+                }
+                val badgeBg = if (isHighRisk) {
+                    if (dark) Color.parseColor("#2AF59E0B") else Color.parseColor("#18E68A00")
+                } else {
+                    withAlpha(if (dark) accentHi else accentPrimary, if (dark) 38 else 22)
+                }
+                val badgeStroke = if (isHighRisk) {
+                    if (dark) Color.parseColor("#44F59E0B") else Color.parseColor("#33D97706")
+                } else {
+                    withAlpha(if (dark) accentHi else accentPrimary, if (dark) 62 else 42)
+                }
                 metaRow.addView(TextView(ctx).apply {
                     text = riskBadge
-                    setTextColor(
-                        if (isHighRisk) (if (dark) Color.parseColor("#FBBF24") else Color.parseColor("#B45309"))
-                        else (if (dark) Color.parseColor("#86C8FA") else accentPrimary)
-                    )
+                    setTextColor(badgeFg)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
                     typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-                    setPadding(dp(ctx, 7), dp(ctx, 1), dp(ctx, 7), dp(ctx, 1))
+                    setPadding(dp(ctx, 8), dp(ctx, 2), dp(ctx, 8), dp(ctx, 2))
                     background = GradientDrawable().apply {
                         cornerRadius = 999f * density
-                        setColor(
-                            if (isHighRisk) (if (dark) Color.parseColor("#2BF59E0B") else Color.parseColor("#1AE68A00"))
-                            else (if (dark) Color.parseColor("#2438BDF8") else Color.parseColor("#162A78B5"))
-                        )
+                        setColor(badgeBg)
+                        setStroke((0.65f * density).toInt().coerceAtLeast(1), badgeStroke)
                     }
                 }, LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { if (!appLabel.isNullOrBlank()) marginStart = dp(ctx, 6) })
+                ).apply { if (!appLabel.isNullOrBlank()) marginStart = dp(ctx, 7) })
             }
             titleCol.addView(metaRow)
         }
         headerRow.addView(titleCol)
 
-        val countdownPill = TextView(ctx).apply {
-            setTextColor(if (dark) Color.parseColor("#8AC8FF") else accentPrimary)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            setPadding(dp(ctx, 9), dp(ctx, 4), dp(ctx, 9), dp(ctx, 4))
-            background = GradientDrawable().apply {
-                cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#24499CF0") else Color.parseColor("#162A78B5"))
-            }
+        val countdownRing = CountdownRingView(
+            context = ctx,
+            dark = dark,
+            accentPrimary = accentPrimary,
+            accentHi = accentHi,
+            highRisk = isHighRisk
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(ctx, 38), dp(ctx, 38))
         }
-        headerRow.addView(countdownPill)
+        headerRow.addView(countdownRing)
         card.addView(headerRow)
 
-        // Human-readable action summary glass well
+        // Concentric recessed crystal glass well (32dp outer - 18dp horizontal padding = 14dp)
         val actionWell = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(ctx, 14), dp(ctx, 12), dp(ctx, 14), dp(ctx, 12))
+            setPadding(dp(ctx, 15), dp(ctx, 12), dp(ctx, 15), dp(ctx, 13))
             background = GradientDrawable().apply {
-                cornerRadius = 18f * density
-                setColor(if (dark) Color.parseColor("#20FFFFFF") else Color.parseColor("#AEFFFFFF"))
-                setStroke((0.75f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#2AFFFFFF") else Color.parseColor("#E0FFFFFF"))
+                cornerRadius = 14f * density
+                setColor(if (dark) Color.parseColor("#18FFFFFF") else Color.parseColor("#B8FFFFFF"))
+                setStroke(
+                    (0.8f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#26FFFFFF") else Color.parseColor("#2014395C")
+                )
             }
         }
-        actionWell.addView(TextView(ctx).apply {
-            text = actionSummary
-            setTextColor(ink)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.5f)
-            setLineSpacing(0f, 1.35f)
-            maxLines = 4
-            ellipsize = TextUtils.TruncateAt.END
+        val eyebrowRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(ctx, 5))
+        }
+        eyebrowRow.addView(
+            View(ctx).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(if (isHighRisk) Color.parseColor("#F59E0B") else (if (dark) accentHi else accentPrimary))
+                }
+            },
+            LinearLayout.LayoutParams(dp(ctx, 6), dp(ctx, 6)).apply {
+                marginEnd = dp(ctx, 6)
+            }
+        )
+        eyebrowRow.addView(TextView(ctx).apply {
+            text = when {
+                isHandoff -> "需要你手动完成"
+                isHighRisk -> "敏感操作 · 请仔细核对"
+                else -> "即将执行的操作"
+            }
+            setTextColor(
+                if (isHighRisk) (if (dark) Color.parseColor("#FCD34D") else Color.parseColor("#B45309"))
+                else subInk
+            )
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            letterSpacing = 0.02f
         })
+        actionWell.addView(eyebrowRow)
+
+        val maxSummaryPx = dp(ctx, 144)
+        val summaryScroll = object : ScrollView(ctx) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val cappedH = View.MeasureSpec.makeMeasureSpec(maxSummaryPx, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, cappedH)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            addView(
+                TextView(ctx).apply {
+                    text = actionSummary
+                    setTextColor(ink)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14.8f)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    setLineSpacing(0f, 1.38f)
+                }
+            )
+        }
+        actionWell.addView(
+            summaryScroll,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
         card.addView(
             actionWell,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(ctx, 12)
-                bottomMargin = dp(ctx, 14)
+                topMargin = dp(ctx, 14)
+                bottomMargin = dp(ctx, 15)
             }
         )
 
-        // Guarded anti-hijack button factory with tactile press spring!
-        // Only positive approval buttons (guarded = true) enforce the 360ms arming delay and
-        // full-occlusion tapjacking rejection; Cancel / Stop / Emergency Stop / Return buttons
-        // stay ALWAYS clickable even when an OEM sidebar or floating a11y button partially overlaps!
+        // Guarded anti-hijack button factory with silky tactile press spring!
+        // Positive approval buttons (guarded = true) enforce the 360ms arming delay and
+        // full-occlusion tapjacking rejection; Cancel / Stop / Return stay ALWAYS clickable.
         fun makeGuardedButton(
             label: String,
             bgDrawable: GradientDrawable,
             textColor: Int,
             guarded: Boolean,
+            minHeightDp: Int = 46,
+            textSp: Float = 14.5f,
             action: () -> Unit
         ): TextView = object : TextView(ctx) {
             private var rejected = false
@@ -2455,10 +2878,11 @@ class PhoneOverlayController(private val appContext: Context) {
                 text = label
                 gravity = Gravity.CENTER
                 setTextColor(textColor)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, textSp)
                 typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-                minimumHeight = dp(ctx, 44)
-                setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10))
+                letterSpacing = -0.01f
+                minimumHeight = dp(ctx, minHeightDp)
+                setPadding(dp(ctx, 14), dp(ctx, 10), dp(ctx, 14), dp(ctx, 10))
                 background = bgDrawable
                 filterTouchesWhenObscured = guarded
                 isClickable = true
@@ -2473,10 +2897,10 @@ class PhoneOverlayController(private val appContext: Context) {
                         gestureInjectRefCount.get() > 0
                     }
                     if (!rejected) {
-                        animate().scaleX(0.95f).scaleY(0.95f).setDuration(80L).start()
+                        animate().scaleX(0.96f).scaleY(0.96f).setDuration(80L).start()
                     }
                 } else if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
-                    animate().scaleX(1f).scaleY(1f).setDuration(140L).setInterpolator(OvershootInterpolator(1.08f)).start()
+                    animate().scaleX(1f).scaleY(1f).setDuration(150L).setInterpolator(OvershootInterpolator(1.06f)).start()
                 }
                 if (rejected) {
                     if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
@@ -2493,148 +2917,214 @@ class PhoneOverlayController(private val appContext: Context) {
             }
         }
 
-        // Primary action row
-        val primaryRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        // Tier 1: Unmistakable Full-Width Hero Primary Pill (harmonized with live accent & WCAG AAA ink)
+        val heroTop = blendColor(accentHi, Color.WHITE, if (dark) 0.06f else 0.10f)
+        val heroMid = blendColor(heroTop, accentPrimary, 0.5f)
+        val heroTextColor = if (ColorUtils.calculateLuminance(heroMid) > 0.36) Color.parseColor("#0A1A2A") else Color.WHITE
         val primaryBg = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
-            intArrayOf(accentHi, accentPrimary)
+            intArrayOf(heroTop, accentPrimary)
         ).apply {
             cornerRadius = 999f * density
-            setStroke((0.85f * density).toInt().coerceAtLeast(1), Color.parseColor("#55FFFFFF"))
+            setStroke((0.9f * density).toInt().coerceAtLeast(1), Color.parseColor("#66FFFFFF"))
         }
         val primaryBtn = makeGuardedButton(
-            label = if (isHandoff) "我已完成，继续" else "允许一次",
+            label = if (isHandoff) "我已完成，继续" else "允许本次",
             bgDrawable = primaryBg,
-            textColor = Color.WHITE,
+            textColor = heroTextColor,
             guarded = true,
+            minHeightDp = 48,
+            textSp = 15f,
             action = onPrimary
         )
-        primaryRow.addView(primaryBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-
-        if (!isHandoff && allowTurnOption) {
-            val turnBg = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                if (dark) intArrayOf(Color.parseColor("#30C98E"), Color.parseColor("#1D9B6C"))
-                else intArrayOf(Color.parseColor("#29C287"), Color.parseColor("#189666"))
-            ).apply {
-                cornerRadius = 999f * density
-                setStroke((0.85f * density).toInt().coerceAtLeast(1), Color.parseColor("#55FFFFFF"))
-            }
-            val turnBtn = makeGuardedButton(
-                label = "本轮允许",
-                bgDrawable = turnBg,
-                textColor = Color.WHITE,
-                guarded = true,
-                action = onSecondary
+        card.addView(
+            primaryBtn,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             )
-            primaryRow.addView(
-                turnBtn,
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(ctx, 8)
-                }
-            )
-        }
-        card.addView(primaryRow)
-
-        // Secondary cancel / emergency stop row
-        val secondaryRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-        val cancelBg = GradientDrawable().apply {
-            cornerRadius = 999f * density
-            setColor(if (dark) Color.parseColor("#2EFFFFFF") else Color.parseColor("#E4EBF3FB"))
-            setStroke((0.8f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#38FFFFFF") else Color.parseColor("#22132C44"))
-        }
-        val cancelBtn = makeGuardedButton(
-            label = if (isHandoff) "停止任务" else "取消此步",
-            bgDrawable = cancelBg,
-            textColor = if (isHandoff) (if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A")) else ink,
-            guarded = false,
-            action = onCancel
         )
-        secondaryRow.addView(cancelBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        // Tier 2: Harmonious Frosted Glass Secondary Row (NO clashing rainbow pills!)
+        val secondaryRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        val neutralGlassBg = GradientDrawable().apply {
+            cornerRadius = 999f * density
+            setColor(if (dark) Color.parseColor("#1EFFFFFF") else Color.parseColor("#C2F1F6FC"))
+            setStroke(
+                (0.8f * density).toInt().coerceAtLeast(1),
+                if (dark) Color.parseColor("#32FFFFFF") else Color.parseColor("#2414395C")
+            )
+        }
 
         if (isHandoff) {
-            val backAppBg = GradientDrawable().apply {
-                cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#22FFFFFF") else Color.parseColor("#14132C44"))
-                setStroke((0.8f * density).toInt().coerceAtLeast(1), if (dark) Color.parseColor("#32FFFFFF") else Color.parseColor("#20132C44"))
-            }
             val backAppBtn = makeGuardedButton(
                 label = "返回 GrassBag",
-                bgDrawable = backAppBg,
+                bgDrawable = neutralGlassBg,
                 textColor = ink,
                 guarded = false,
+                minHeightDp = 44,
+                textSp = 14f,
                 action = { bringGrassBagToFrontNow() }
             )
+            val stopHandoffBg = GradientDrawable().apply {
+                cornerRadius = 999f * density
+                setColor(if (dark) Color.parseColor("#26EF4444") else Color.parseColor("#14DC2626"))
+                setStroke(
+                    (0.8f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#44F87171") else Color.parseColor("#33DC2626")
+                )
+            }
+            val stopHandoffBtn = makeGuardedButton(
+                label = "停止任务",
+                bgDrawable = stopHandoffBg,
+                textColor = if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A"),
+                guarded = false,
+                minHeightDp = 44,
+                textSp = 14f,
+                action = onCancel
+            )
+            secondaryRow.addView(backAppBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             secondaryRow.addView(
-                backAppBtn,
+                stopHandoffBtn,
                 LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(ctx, 8)
+                    marginStart = dp(ctx, 10)
                 }
             )
         } else {
-            val stopBg = GradientDrawable().apply {
-                cornerRadius = 999f * density
-                setColor(if (dark) Color.parseColor("#2CF05252") else Color.parseColor("#1AE03131"))
-                setStroke((0.8f * density).toInt().coerceAtLeast(1), Color.parseColor("#55F05252"))
-            }
-            val stopBtn = makeGuardedButton(
-                label = "急停任务",
-                bgDrawable = stopBg,
-                textColor = if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A"),
-                guarded = false,
-                action = onStop
-            )
-            secondaryRow.addView(
-                stopBtn,
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(ctx, 8)
+            if (allowTurnOption) {
+                val turnGlassBg = GradientDrawable().apply {
+                    cornerRadius = 999f * density
+                    setColor(withAlpha(if (dark) accentHi else accentPrimary, if (dark) 44 else 24))
+                    setStroke(
+                        (0.85f * density).toInt().coerceAtLeast(1),
+                        withAlpha(if (dark) accentHi else accentPrimary, if (dark) 88 else 58)
+                    )
                 }
+                val turnBtn = makeGuardedButton(
+                    label = "本轮允许",
+                    bgDrawable = turnGlassBg,
+                    textColor = if (dark) blendColor(accentHi, Color.WHITE, 0.28f) else accentPrimary,
+                    guarded = true,
+                    minHeightDp = 44,
+                    textSp = 14f,
+                    action = onSecondary
+                )
+                secondaryRow.addView(
+                    turnBtn,
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        marginEnd = dp(ctx, 10)
+                    }
+                )
+            }
+            val cancelBtn = makeGuardedButton(
+                label = "取消此步",
+                bgDrawable = neutralGlassBg,
+                textColor = ink,
+                guarded = false,
+                minHeightDp = 44,
+                textSp = 14f,
+                action = onCancel
             )
+            secondaryRow.addView(cancelBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
         card.addView(
             secondaryRow,
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(ctx, 8) }
+            ).apply { topMargin = dp(ctx, 10) }
         )
 
+        // Tier 3 (Confirmation only): Calm, restrained low-profile Emergency Stop escape bar
+        if (!isHandoff) {
+            val stopBg = GradientDrawable().apply {
+                cornerRadius = 999f * density
+                setColor(if (dark) Color.parseColor("#18EF4444") else Color.parseColor("#0EDC2626"))
+                setStroke(
+                    (0.75f * density).toInt().coerceAtLeast(1),
+                    if (dark) Color.parseColor("#36F87171") else Color.parseColor("#28DC2626")
+                )
+            }
+            val stopBtn = makeGuardedButton(
+                label = "急停全部操控",
+                bgDrawable = stopBg,
+                textColor = if (dark) Color.parseColor("#FCA5A5") else Color.parseColor("#C92A2A"),
+                guarded = false,
+                minHeightDp = 42,
+                textSp = 13f,
+                action = onStop
+            )
+            card.addView(
+                stopBtn,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(ctx, 8) }
+            )
+        }
+
+        val cardScroll = object : ScrollView(ctx) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val m = screenMetrics(ctx, activeConfirmWm)
+                val dynamicMaxH =
+                    (m.height - m.topInset - m.bottomInset - dp(ctx, 56))
+                        .coerceAtLeast(dp(ctx, 260))
+                val cappedH = View.MeasureSpec.makeMeasureSpec(dynamicMaxH, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, cappedH)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            clipChildren = false
+            clipToPadding = false
+            addView(
+                card,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        }
         wrapper.addView(
-            card,
+            cardScroll,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT
             )
         )
 
-        progressFill.pivotX = 0f
-        activeConfirmProgressAnim?.cancel()
-        activeConfirmProgressAnim = ObjectAnimator.ofFloat(progressFill, View.SCALE_X, 1f, 0f).apply {
-            duration = totalMs.coerceAtLeast(1L)
-            interpolator = LinearInterpolator()
-            start()
-        }
-
-        val tick = object : Runnable {
-            private var lastSec = -1
-            override fun run() {
-                if (activeConfirmContainer !== wrapper) return
-                val remMs = (deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
-                val sec = ((remMs + 999L) / 1000L).toInt()
-                if (sec != lastSec) {
-                    lastSec = sec
-                    countdownPill.text = "${sec}s"
+        val startCountdown: () -> Unit = {
+            activeConfirmProgressAnim?.cancel()
+            activeConfirmProgressAnim = ValueAnimator.ofFloat(1f, 0f).apply {
+                duration = totalMs.coerceAtLeast(1L)
+                interpolator = LinearInterpolator()
+                addUpdateListener { anim ->
+                    countdownRing.setProgress(anim.animatedValue as Float)
                 }
-                if (remMs > 0L) {
-                    val nextDelay = ((remMs - 1L) % 1000L + 16L).coerceIn(100L, 1000L)
-                    mainHandler.postDelayed(this, nextDelay)
+                start()
+            }
+
+            val tick = object : Runnable {
+                private var lastSec = -1
+                override fun run() {
+                    if (activeConfirmContainer !== wrapper) return
+                    val remMs = (deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                    val sec = ((remMs + 999L) / 1000L).toInt()
+                    if (sec != lastSec) {
+                        lastSec = sec
+                        countdownRing.setSeconds(sec)
+                    }
+                    if (remMs > 0L) {
+                        val nextDelay = ((remMs - 1L) % 1000L + 16L).coerceIn(100L, 1000L)
+                        mainHandler.postDelayed(this, nextDelay)
+                    }
                 }
             }
+            activeConfirmTick = tick
+            mainHandler.post(tick)
         }
-        activeConfirmTick = tick
-        mainHandler.post(tick)
 
-        return wrapper
+        return wrapper to startCountdown
     }
 
     private fun animateCardEntrance(view: View) {
@@ -2666,6 +3156,7 @@ class PhoneOverlayController(private val appContext: Context) {
         activeConfirmParams = null
         if (!animate) {
             runCatching { wm.removeViewImmediate(view) }
+            unregisterConfigCallbacksIfIdle()
             return
         }
         // Immediately make the fading confirmation card non-touchable BEFORE starting the 175ms
@@ -2688,6 +3179,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 override fun onAnimationEnd(animation: Animator) {
                     fadingOverlayViews.remove(entry)
                     runCatching { if (view.isAttachedToWindow) wm.removeViewImmediate(view) }
+                    unregisterConfigCallbacksIfIdle()
                 }
             })
             .start()
@@ -2717,7 +3209,10 @@ class PhoneOverlayController(private val appContext: Context) {
         (ctx.resources.displayMetrics.density * value).toInt()
 
     // =========================================================================
-    // Layered Apple iOS 26/27 Liquid Glass Surface Drawable (Frosted + Specular + Rim)
+    // Kyant0-inspired Android 13+ AGSL RuntimeShader Liquid Glass Drawable
+    // (Analytic SDF + Dual-Lobe Directional/Ambient Fresnel Rim + Clipped
+    // Meniscus InnerShadow + Micro RGB Dispersion + Interactive Touch Spotlight,
+    // with automatic Canvas fallback on API < 33)
     // =========================================================================
 
     private class LiquidGlassDrawable(
@@ -2727,25 +3222,189 @@ class PhoneOverlayController(private val appContext: Context) {
         private val customRadiiPx: FloatArray? = null,
         private val accentTint: Int = Color.parseColor("#2A78B5"),
         private val elevated: Boolean = true,
-        private val dockedEdge: Int = 0 // -1 left bezel, +1 right bezel, 0 floating
+        private val dockedEdge: Int = 0, // -1 left bezel, +1 right bezel, 0 floating
+        private val hasBackdropBlur: Boolean = false
     ) : Drawable() {
+        companion object {
+            // Kyant0 AndroidLiquidGlass-inspired AGSL shader:
+            // analytic rounded-rect SDF + finite-diff normal + meniscus InnerShadow
+            // + dual-lobe directional/ambient Fresnel rim + subtle corner RGB dispersion
+            // + interactive pointer-tracking specular spotlight.
+            private const val KYANT_LIQUID_GLASS_AGSL = """
+                uniform float2 uSize;
+                uniform float4 uRadii; // (rTR, rBR, rTL, rBL)
+                uniform float uDensity;
+                uniform float uDark;
+                uniform float uElevated;
+                uniform float uHasBlur;
+                uniform float4 uAccent;
+                uniform float2 uTouchPos;
+                uniform float uTouchAlpha;
+                uniform float uDockedEdge;
+
+                float sdRoundedRect(float2 p, float2 b, float4 r4) {
+                    float2 rx = (p.x > 0.0) ? r4.xy : r4.zw;
+                    float r = (p.y > 0.0) ? rx.y : rx.x;
+                    float2 q = abs(p) - b + float2(r);
+                    return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - r;
+                }
+
+                float2 gradSdRoundedRect(float2 p, float2 b, float4 r4) {
+                    float eps = 0.75;
+                    float dx = sdRoundedRect(p + float2(eps, 0.0), b, r4) - sdRoundedRect(p - float2(eps, 0.0), b, r4);
+                    float dy = sdRoundedRect(p + float2(0.0, eps), b, r4) - sdRoundedRect(p - float2(0.0, eps), b, r4);
+                    float2 g = float2(dx, dy);
+                    float len = length(g);
+                    return (len > 0.0001) ? (g / len) : float2(0.0, -1.0);
+                }
+
+                half4 main(float2 fragCoord) {
+                    float2 halfSize = uSize * 0.5;
+                    float2 p = fragCoord - halfSize;
+                    float d = sdRoundedRect(p, halfSize, uRadii);
+                    float cov = clamp(0.5 - d, 0.0, 1.0);
+                    if (cov <= 0.001) {
+                        return half4(0.0);
+                    }
+
+                    float dens = max(uDensity, 1.0);
+                    float depthDp = max(0.0, -d) / dens;
+                    float2 n = gradSdRoundedRect(p, halfSize, uRadii);
+                    float2 uv = clamp(fragCoord / max(uSize, float2(1.0)), float2(0.0), float2(1.0));
+
+                    // Mask out the bezel-attached edge when docked left (-1) or right (+1)
+                    float edgeMask = 1.0;
+                    if (uDockedEdge < -0.5) {
+                        edgeMask = smoothstep(0.0, 4.0 * dens, fragCoord.x);
+                    } else if (uDockedEdge > 0.5) {
+                        edgeMask = smoothstep(0.0, 4.0 * dens, uSize.x - fragCoord.x);
+                    }
+
+                    // 1. Sculpted translucent glass body gradient (lighter veil when cross-window blur is live)
+                    float diag = clamp(uv.x * 0.42 + uv.y * 0.58, 0.0, 1.0);
+                    float3 topCol;
+                    float3 botCol;
+                    float baseAlpha;
+                    if (uDark > 0.5) {
+                        topCol = mix(float3(0.148, 0.165, 0.198), uAccent.rgb, 0.07);
+                        botCol = mix(float3(0.082, 0.094, 0.118), uAccent.rgb, 0.04);
+                        baseAlpha = (uHasBlur > 0.5) ? 0.72 : ((uElevated > 0.5) ? 0.84 : 0.79);
+                    } else {
+                        topCol = mix(float3(0.990, 0.992, 0.996), uAccent.rgb, 0.025);
+                        botCol = mix(float3(0.935, 0.945, 0.960), uAccent.rgb, 0.055);
+                        baseAlpha = (uHasBlur > 0.5) ? 0.78 : ((uElevated > 0.5) ? 0.87 : 0.83);
+                    }
+                    float3 rgb = mix(topCol, botCol, diag);
+
+                    // 2. Subtle top-left ambient accent wash
+                    float wash = pow(clamp(1.0 - length(uv * float2(0.85, 1.15)), 0.0, 1.0), 1.6);
+                    rgb = mix(rgb, uAccent.rgb, wash * (uDark > 0.5 ? 0.14 : 0.065));
+
+                    // 3. Kyant0 Clipped Meniscus InnerShadow (opposite 135-deg light axis, zero muddiness)
+                    float2 lightDir = normalize(float2(-0.7071, -0.7071));
+                    float shadowFace = clamp(dot(n, -lightDir), 0.0, 1.0);
+                    float innerShadow = exp(-depthDp * 0.36) * pow(max(shadowFace, 0.0001), 1.7) * (uDark > 0.5 ? 0.26 : 0.10) * edgeMask;
+                    rgb *= (1.0 - innerShadow);
+
+                    // 4. Tight top meniscus catchlight sheen (stays cleanly above body text)
+                    float topSheen = exp(-uv.y * 5.0) * clamp(1.0 - uv.x * 0.55, 0.0, 1.0);
+                    rgb += float3(1.0) * topSheen * (uDark > 0.5 ? 0.12 : 0.26);
+
+                    // Delicate 0.65dp outer contrast hairline applied BEFORE Fresnel specular so bright
+                    // top-left catchlights stay luminous while keeping a neutral crisp contour over white apps.
+                    rgb = clamp(rgb, 0.0, 1.0);
+                    float outerEdge = smoothstep(0.75, 0.0, depthDp) * edgeMask;
+                    rgb = mix(rgb, uDark > 0.5 ? float3(0.0) : float3(0.08, 0.10, 0.13), outerEdge * (uDark > 0.5 ? 0.22 : 0.13));
+
+                    // 5. Kyant0 Dual-Lobe Directional + Ambient Fresnel Rim + Accent-Harmonized Corner Shimmer
+                    float rimMask = smoothstep(1.85, 0.0, depthDp) * edgeMask;
+                    float primaryLobe = pow(max(dot(n, lightDir), 0.0001), 3.6);
+                    float counterLobe = 0.76 * pow(max(dot(n, -lightDir), 0.0001), 4.2);
+                    float ambientLobe = 0.16;
+                    float rimEnergy = rimMask * (primaryLobe + counterLobe + ambientLobe);
+
+                    float corner = 4.0 * abs(n.x * n.y);
+                    float3 accentChroma = uAccent.rgb - float3(dot(uAccent.rgb, float3(0.299, 0.587, 0.114)));
+                    float3 prismTint = accentChroma * corner * (uDark > 0.5 ? 0.26 : 0.14);
+                    float3 rimColor = mix(float3(1.0), uAccent.rgb * 0.55 + float3(0.45), 0.24) + prismTint;
+                    rgb += rimColor * rimEnergy * (uDark > 0.5 ? 0.54 : 0.62);
+                    rgb = clamp(rgb, 0.0, 1.0);
+
+                    // 6. Kyant0 InteractiveHighlight (finger-tracking radial spotlight + local curved rim glint)
+                    if (uTouchAlpha > 0.001) {
+                        float distDp = length(fragCoord - uTouchPos) / dens;
+                        float spot = exp(-(distDp * distDp) / (46.0 * 46.0));
+                        float rimSpot = exp(-(distDp * distDp) / (36.0 * 36.0)) * smoothstep(2.2, 0.0, depthDp) * edgeMask;
+                        float3 touchCol = mix(float3(1.0), uAccent.rgb * 0.4 + float3(0.6), 0.28);
+                        rgb += touchCol * (spot * (uDark > 0.5 ? 0.22 : 0.30) + rimSpot * (uDark > 0.5 ? 0.62 : 0.54)) * uTouchAlpha;
+                    }
+
+                    float outAlpha = clamp(baseAlpha + rimEnergy * 0.16 + uTouchAlpha * 0.04, 0.0, 1.0) * cov;
+                    return half4(clamp(rgb, 0.0, 1.0) * outAlpha, outAlpha);
+                }
+            """
+        }
+
         private val density = ctx.resources.displayMetrics.density
         private val clipPath = Path()
         private val boundsRect = RectF()
         private val rimRect = RectF()
         private val rimPath = Path()
+        private val outerRect = RectF()
+        private val outerPath = Path()
         private var cachedRimRadiusPx = 0f
+        private var cachedOuterRadiusPx = 0f
+        private var agslShader: Shader? = null
+        private val agslPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private var touchX = 0f
+        private var touchY = 0f
+        private var touchAlpha = 0f
+        private var touchFadeAnimator: ValueAnimator? = null
         private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val tintWashPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val specularPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = (if (dark) 0.95f else 0.9f) * density
+            strokeWidth = (if (dark) 1.05f else 1.1f) * density
         }
         private val outerHairlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 0.6f * density
-            color = if (dark) Color.parseColor("#28000000") else Color.parseColor("#1A132C44")
+            strokeWidth = 0.65f * density
+            color = if (dark) Color.parseColor("#38000000") else Color.parseColor("#1C132C44")
+        }
+
+        init {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                agslShader = runCatching { RuntimeShader(KYANT_LIQUID_GLASS_AGSL) }.getOrNull()
+                agslShader?.let { agslPaint.shader = it }
+            }
+        }
+
+        fun setTouchHighlight(xPx: Float, yPx: Float, alpha: Float) {
+            touchFadeAnimator?.cancel()
+            touchFadeAnimator = null
+            touchX = xPx
+            touchY = yPx
+            touchAlpha = alpha.coerceIn(0f, 1f)
+            invalidateSelf()
+        }
+
+        fun fadeOutTouchHighlight() {
+            if (touchAlpha <= 0.01f) {
+                touchAlpha = 0f
+                return
+            }
+            touchFadeAnimator?.cancel()
+            val start = touchAlpha
+            touchFadeAnimator = ValueAnimator.ofFloat(start, 0f).apply {
+                duration = 220L
+                interpolator = DecelerateInterpolator()
+                addUpdateListener {
+                    touchAlpha = it.animatedValue as Float
+                    invalidateSelf()
+                }
+                start()
+            }
         }
 
         override fun onBoundsChange(bounds: Rect) {
@@ -2756,54 +3415,122 @@ class PhoneOverlayController(private val appContext: Context) {
             if (w <= 0f || h <= 0f) return
 
             clipPath.reset()
-            val rPx = min(radiusDp * density, min(w, h) / 2f)
+            val maxR = min(w, h) / 2f
+            val rPx = min(radiusDp * density, maxR)
             if (customRadiiPx != null) {
                 clipPath.addRoundRect(boundsRect, customRadiiPx, Path.Direction.CW)
             } else {
                 clipPath.addRoundRect(boundsRect, rPx, rPx, Path.Direction.CW)
             }
 
-            // 1. High-clarity milky satin frosted glass body:
-            // Prevents sharp unblurred text from bleeding through on Android overlay windows
-            // while preserving soft iOS 26 luminous depth, specular sheen, and prism rim!
-            val topCol = if (dark) {
-                if (elevated) Color.parseColor("#F7222F42") else Color.parseColor("#F21D2839")
-            } else {
-                if (elevated) Color.parseColor("#FAFCFEFF") else Color.parseColor("#F5F4F9FE")
+            // Configure API 33+ AGSL RuntimeShader uniforms once per resize (zero per-frame allocs!)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                (agslShader as? RuntimeShader)?.let { shader ->
+                    val rTL = if (customRadiiPx != null) min(customRadiiPx[0], maxR) else rPx
+                    val rTR = if (customRadiiPx != null) min(customRadiiPx[2], maxR) else rPx
+                    val rBR = if (customRadiiPx != null) min(customRadiiPx[4], maxR) else rPx
+                    val rBL = if (customRadiiPx != null) min(customRadiiPx[6], maxR) else rPx
+                    shader.setFloatUniform("uSize", w, h)
+                    shader.setFloatUniform("uRadii", rTR, rBR, rTL, rBL)
+                    shader.setFloatUniform("uDensity", density)
+                    shader.setFloatUniform("uDark", if (dark) 1f else 0f)
+                    shader.setFloatUniform("uElevated", if (elevated) 1f else 0f)
+                    shader.setFloatUniform("uHasBlur", if (hasBackdropBlur) 1f else 0f)
+                    shader.setFloatUniform(
+                        "uAccent",
+                        Color.red(accentTint) / 255f,
+                        Color.green(accentTint) / 255f,
+                        Color.blue(accentTint) / 255f,
+                        1f
+                    )
+                    shader.setFloatUniform("uDockedEdge", dockedEdge.toFloat())
+                }
             }
-            val botCol = if (dark) {
-                if (elevated) Color.parseColor("#F4172130") else Color.parseColor("#EF141D2A")
-            } else {
-                if (elevated) Color.parseColor("#F6EAF3FC") else Color.parseColor("#F1E6F0FA")
-            }
-            bodyPaint.shader = LinearGradient(0f, boundsRect.top, 0f, boundsRect.bottom, topCol, botCol, Shader.TileMode.CLAMP)
 
-            // 2. Subtle ambient accent wash
-            val tintA = if (dark) 22 else 14
+            // 1. Sculpted Apple iOS 26/27 Liquid Glass body (Canvas fallback for API < 33):
+            // Harmonized subtly with active accentTint so non-blue themes stay cohesive.
+            val baseTop = if (dark) {
+                when {
+                    hasBackdropBlur -> Color.parseColor("#C81F2530")
+                    elevated -> Color.parseColor("#D61E242E")
+                    else -> Color.parseColor("#CE191F29")
+                }
+            } else {
+                when {
+                    hasBackdropBlur -> Color.parseColor("#D4FCFEFF")
+                    elevated -> Color.parseColor("#E0FCFEFF")
+                    else -> Color.parseColor("#D8F7FAFD")
+                }
+            }
+            val baseBot = if (dark) {
+                when {
+                    hasBackdropBlur -> Color.parseColor("#BE131820")
+                    elevated -> Color.parseColor("#CC141A24")
+                    else -> Color.parseColor("#C411161F")
+                }
+            } else {
+                when {
+                    hasBackdropBlur -> Color.parseColor("#C6EEF3F8")
+                    elevated -> Color.parseColor("#D2EEF3F8")
+                    else -> Color.parseColor("#CAEAF0F6")
+                }
+            }
+            val topCol = ColorUtils.setAlphaComponent(
+                ColorUtils.blendARGB(baseTop, accentTint, if (dark) 0.14f else 0.05f),
+                Color.alpha(baseTop)
+            )
+            val botCol = ColorUtils.setAlphaComponent(
+                ColorUtils.blendARGB(baseBot, accentTint, if (dark) 0.10f else 0.07f),
+                Color.alpha(baseBot)
+            )
+            bodyPaint.shader = LinearGradient(
+                boundsRect.left, boundsRect.top, boundsRect.right, boundsRect.bottom,
+                topCol, botCol, Shader.TileMode.CLAMP
+            )
+
+            // 2. Subtle ambient accent wash radiating from top-left
+            val tintA = if (dark) 26 else 16
             val washCol = Color.argb(tintA, Color.red(accentTint), Color.green(accentTint), Color.blue(accentTint))
             tintWashPaint.shader = LinearGradient(
                 boundsRect.left, boundsRect.top, boundsRect.right, boundsRect.bottom,
                 washCol, Color.TRANSPARENT, Shader.TileMode.CLAMP
             )
 
-            // 3. Top directional iOS 26 liquid specular sheen
+            // 3. Directional 135-degree iOS 26/27 liquid specular sheen + subtle top meniscus glow
             specularPaint.shader = LinearGradient(
-                0f, boundsRect.top, 0f, boundsRect.top + h * 0.44f,
-                if (dark) Color.parseColor("#24FFFFFF") else Color.parseColor("#88FFFFFF"),
-                Color.TRANSPARENT,
+                boundsRect.left, boundsRect.top, boundsRect.left + w * 0.42f, boundsRect.top + h * 0.52f,
+                intArrayOf(
+                    if (dark) Color.parseColor("#36FFFFFF") else Color.parseColor("#C2FFFFFF"),
+                    if (dark) Color.parseColor("#12CFE8FF") else Color.parseColor("#44FFFFFF"),
+                    Color.TRANSPARENT
+                ),
+                floatArrayOf(0f, 0.40f, 1f),
                 Shader.TileMode.CLAMP
             )
 
-            // 4. Dual-tone prism rim highlight (luminous top -> delicate bottom)
+            // 4. 4-stop 135-degree Fresnel prism rim highlight (luminous top-left catchlight ->
+            //    cool accent shimmer -> delicate shadow waist -> opposite-edge counter-glint)
+            val accentRim = Color.argb(
+                if (dark) 62 else 148,
+                (Color.red(accentTint) + 255) / 2,
+                (Color.green(accentTint) + 255) / 2,
+                (Color.blue(accentTint) + 255) / 2
+            )
             rimPaint.shader = LinearGradient(
-                0f, boundsRect.top, 0f, boundsRect.bottom,
-                if (dark) Color.parseColor("#54C4E2FF") else Color.parseColor("#F2FFFFFF"),
-                if (dark) Color.parseColor("#1E9FC8F0") else Color.parseColor("#70FFFFFF"),
+                boundsRect.left, boundsRect.top, boundsRect.right, boundsRect.bottom,
+                intArrayOf(
+                    if (dark) Color.parseColor("#7CE4F3FF") else Color.parseColor("#FEFFFFFF"),
+                    accentRim,
+                    if (dark) Color.parseColor("#1695C2EC") else Color.parseColor("#24162E42"),
+                    if (dark) Color.parseColor("#3C9CC8F0") else Color.parseColor("#A4FFFFFF")
+                ),
+                floatArrayOf(0f, 0.30f, 0.70f, 1f),
                 Shader.TileMode.CLAMP
             )
 
-            // Precompute rim geometry once per size change (zero allocations in draw())
-            val inset = 0.7f * density
+            // Precompute rim & outer hairline geometry once per size change (zero allocations in draw())
+            val inset = 0.75f * density
+            val outerInset = 0.35f * density
             val bezelBleed = 2.0f * density
             rimRect.set(
                 boundsRect.left + if (dockedEdge < 0) -bezelBleed else inset,
@@ -2811,30 +3538,77 @@ class PhoneOverlayController(private val appContext: Context) {
                 boundsRect.right + if (dockedEdge > 0) bezelBleed else -inset,
                 boundsRect.bottom - inset
             )
-            cachedRimRadiusPx = min(radiusDp * density, min(rimRect.width(), rimRect.height()) / 2f)
+            outerRect.set(
+                boundsRect.left + if (dockedEdge < 0) -bezelBleed else outerInset,
+                boundsRect.top + outerInset,
+                boundsRect.right + if (dockedEdge > 0) bezelBleed else -outerInset,
+                boundsRect.bottom - outerInset
+            )
+            cachedRimRadiusPx = min((radiusDp * density - inset).coerceAtLeast(0f), min(rimRect.width(), rimRect.height()) / 2f)
+            cachedOuterRadiusPx = min((radiusDp * density - outerInset).coerceAtLeast(0f), min(outerRect.width(), outerRect.height()) / 2f)
             rimPath.reset()
+            outerPath.reset()
             if (customRadiiPx != null) {
-                rimPath.addRoundRect(rimRect, customRadiiPx, Path.Direction.CW)
+                val rimRadii = FloatArray(8) { i -> (customRadiiPx[i] - inset).coerceAtLeast(0f) }
+                val outerRadii = FloatArray(8) { i -> (customRadiiPx[i] - outerInset).coerceAtLeast(0f) }
+                rimPath.addRoundRect(rimRect, rimRadii, Path.Direction.CW)
+                outerPath.addRoundRect(outerRect, outerRadii, Path.Direction.CW)
             }
         }
 
         override fun draw(canvas: Canvas) {
             if (boundsRect.width() <= 0f || boundsRect.height() <= 0f) return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val shader = agslShader as? RuntimeShader
+                if (shader != null) {
+                    shader.setFloatUniform("uTouchPos", touchX, touchY)
+                    shader.setFloatUniform("uTouchAlpha", touchAlpha)
+                    // Draw unclipped rect: SDF `cov` in KYANT_LIQUID_GLASS_AGSL handles exact
+                    // single-pass edge anti-aliasing without double-clip fraying!
+                    canvas.drawRect(boundsRect, agslPaint)
+                    return
+                }
+            }
+
             canvas.save()
             canvas.clipPath(clipPath)
             canvas.drawRect(boundsRect, bodyPaint)
             canvas.drawRect(boundsRect, tintWashPaint)
             canvas.drawRect(boundsRect, specularPaint)
+            if (touchAlpha > 0.01f) {
+                val glowRadius = (min(boundsRect.width(), boundsRect.height()) * 0.72f).coerceAtLeast(36f * density)
+                val peakAlpha = ((if (dark) 78f else 110f) * touchAlpha).toInt().coerceIn(0, 255)
+                val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    shader = RadialGradient(
+                        touchX,
+                        touchY,
+                        glowRadius,
+                        intArrayOf(
+                            ColorUtils.setAlphaComponent(
+                                if (dark) Color.WHITE else ColorUtils.blendARGB(Color.WHITE, accentTint, 0.18f),
+                                peakAlpha
+                            ),
+                            Color.TRANSPARENT
+                        ),
+                        floatArrayOf(0f, 1f),
+                        Shader.TileMode.CLAMP
+                    )
+                }
+                canvas.drawCircle(touchX, touchY, glowRadius, glowPaint)
+            }
             canvas.restore()
 
+            // Draw outer contrast hairline first, then 4-stop 135-degree Fresnel catchlight on top
+            // so the dark outer hairline never dulls the luminous specular top-left rim.
             if (customRadiiPx != null) {
                 canvas.save()
                 canvas.clipRect(boundsRect)
+                canvas.drawPath(outerPath, outerHairlinePaint)
                 canvas.drawPath(rimPath, rimPaint)
                 canvas.restore()
             } else {
+                canvas.drawRoundRect(outerRect, cachedOuterRadiusPx, cachedOuterRadiusPx, outerHairlinePaint)
                 canvas.drawRoundRect(rimRect, cachedRimRadiusPx, cachedRimRadiusPx, rimPaint)
-                canvas.drawRoundRect(boundsRect, cachedRimRadiusPx, cachedRimRadiusPx, outerHairlinePaint)
             }
         }
 
@@ -2842,26 +3616,139 @@ class PhoneOverlayController(private val appContext: Context) {
             if (bounds.isEmpty) return
             val w = bounds.width().toFloat()
             val h = bounds.height().toFloat()
-            val rPx = if (customRadiiPx != null) {
-                min(h / 2f, customRadiiPx.maxOrNull() ?: (radiusDp * density))
-            } else {
-                min(radiusDp * density, min(w, h) / 2f)
+            val rPx = min(radiusDp * density, min(w, h) / 2f)
+            if (customRadiiPx != null && !clipPath.isEmpty) {
+                val pathOk = runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        outline.setPath(clipPath)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        outline.setConvexPath(clipPath)
+                    }
+                    true
+                }.getOrDefault(false)
+                if (pathOk) return
             }
             outline.setRoundRect(bounds, rPx)
         }
 
+        override fun setVisible(visible: Boolean, restart: Boolean): Boolean {
+            if (!visible) {
+                touchFadeAnimator?.cancel()
+                touchFadeAnimator = null
+                touchAlpha = 0f
+            }
+            return super.setVisible(visible, restart)
+        }
+
         override fun setAlpha(alpha: Int) {
+            agslPaint.alpha = alpha
             bodyPaint.alpha = alpha
+            tintWashPaint.alpha = alpha
+            specularPaint.alpha = alpha
+            rimPaint.alpha = alpha
+            outerHairlinePaint.alpha = alpha
             invalidateSelf()
         }
 
         override fun setColorFilter(colorFilter: ColorFilter?) {
+            agslPaint.colorFilter = colorFilter
             bodyPaint.colorFilter = colorFilter
+            tintWashPaint.colorFilter = colorFilter
+            specularPaint.colorFilter = colorFilter
+            rimPaint.colorFilter = colorFilter
+            outerHairlinePaint.colorFilter = colorFilter
             invalidateSelf()
         }
 
         @Deprecated("Deprecated in Java")
         override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    /**
+     * Precision circular Liquid Glass countdown complication for authorization cards.
+     * Replaces noisy full-width gradient progress bars with a calm Apple-style sweeping ring.
+     */
+    private class CountdownRingView(
+        context: Context,
+        private val dark: Boolean,
+        private val accentPrimary: Int,
+        private val accentHi: Int,
+        private val highRisk: Boolean
+    ) : View(context) {
+        private val density = context.resources.displayMetrics.density
+        private var progress = 1f
+        private var seconds = 35
+        private val arcRect = RectF()
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = if (dark) Color.parseColor("#18FFFFFF") else Color.parseColor("#88FFFFFF")
+        }
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.4f * density
+            color = if (dark) Color.parseColor("#24FFFFFF") else Color.parseColor("#18132C44")
+        }
+        private val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2.4f * density
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = Paint.Align.CENTER
+            textSize = 10.5f * context.resources.displayMetrics.scaledDensity
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            fontFeatureSettings = "tnum"
+        }
+
+        fun setProgress(value: Float) {
+            val clamped = value.coerceIn(0f, 1f)
+            if (abs(clamped - progress) >= 0.002f) {
+                progress = clamped
+                invalidate()
+            }
+        }
+
+        fun setSeconds(sec: Int) {
+            val clamped = sec.coerceAtLeast(0)
+            if (clamped != seconds) {
+                seconds = clamped
+                invalidate()
+            }
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+            val cx = w / 2f
+            val cy = h / 2f
+            val stroke = trackPaint.strokeWidth
+            val r = min(w, h) / 2f - stroke
+            if (r <= 0f) return
+
+            val urgent = seconds in 1..8
+            val activeColor = when {
+                urgent -> if (dark) Color.parseColor("#FBBF24") else Color.parseColor("#B45309")
+                highRisk -> if (dark) Color.parseColor("#FBBF24") else Color.parseColor("#D97706")
+                else -> if (dark) accentHi else accentPrimary
+            }
+
+            canvas.drawCircle(cx, cy, r, fillPaint)
+            canvas.drawCircle(cx, cy, r, trackPaint)
+            arcRect.set(cx - r, cy - r, cx + r, cy + r)
+            arcPaint.color = activeColor
+            canvas.drawArc(arcRect, -90f, 360f * progress, false, arcPaint)
+
+            textPaint.color = if (urgent) {
+                if (dark) Color.parseColor("#FDE68A") else Color.parseColor("#9A4D00")
+            } else {
+                if (dark) Color.parseColor("#E6F1FC") else Color.parseColor("#183149")
+            }
+            val fm = textPaint.fontMetrics
+            val baseline = cy - (fm.ascent + fm.descent) / 2f
+            canvas.drawText("${seconds}s", cx, baseline, textPaint)
+        }
     }
 
     // =========================================================================
@@ -2890,7 +3777,18 @@ class PhoneOverlayController(private val appContext: Context) {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
         }
-        private val eyePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        private val eyePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            val pouchMid = Color.rgb(
+                (Color.red(accentPrimary) + Color.red(accentHi)) / 2,
+                (Color.green(accentPrimary) + Color.green(accentHi)) / 2,
+                (Color.blue(accentPrimary) + Color.blue(accentHi)) / 2
+            )
+            color = if (ColorUtils.calculateLuminance(pouchMid) > 0.42) {
+                Color.parseColor("#18191D")
+            } else {
+                Color.WHITE
+            }
+        }
         private val checkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
@@ -3123,19 +4021,27 @@ class PhoneOverlayController(private val appContext: Context) {
         private var activeTypeBadge: TypeBadgeEffect? = null
 
         private val density = context.resources.displayMetrics.density
-        // Multi-layer concentric halo strokes replace BlurMaskFilter so Skia/HWUI never runs a
-        // full-screen Gaussian blur pass at 60/120Hz while preserving the luminous edge aurora!
+        // 5-layer tapered concentric vector strokes replace BlurMaskFilter so Skia/HWUI never
+        // runs a full-screen Gaussian blur pass at 60/120Hz while eliminating stepped halo banding!
+        private val outerHaloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 24f * density
+        }
         private val outerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 20f * density
+            strokeWidth = 15f * density
         }
         private val midGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 9.5f * density
+            strokeWidth = 8.5f * density
+        }
+        private val innerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 4.2f * density
         }
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
-            strokeWidth = 2.4f * density
+            strokeWidth = 1.9f * density
         }
         private val fxRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -3404,8 +4310,10 @@ class PhoneOverlayController(private val appContext: Context) {
                 )
             }
             sweepShader = SweepGradient(width / 2f, height / 2f, palette, null)
+            outerHaloPaint.shader = sweepShader
             outerGlowPaint.shader = sweepShader
             midGlowPaint.shader = sweepShader
+            innerGlowPaint.shader = sweepShader
             rimPaint.shader = sweepShader
         }
 
@@ -3427,7 +4335,7 @@ class PhoneOverlayController(private val appContext: Context) {
             if (width == 0 || height == 0) return
             val nowMs = SystemClock.elapsedRealtime()
 
-            // 1. Ambient Apple Intelligence Style Edge Aurora (3-layer soft halo, zero BlurMaskFilter)
+            // 1. Ambient Apple Intelligence Style Edge Aurora (5-layer tapered halo, zero BlurMaskFilter)
             if (showAurora && fade > 0.01f) {
                 sweepShader?.let { s ->
                     sweepMatrix.setRotate(phaseDeg, width / 2f, height / 2f)
@@ -3440,13 +4348,19 @@ class PhoneOverlayController(private val appContext: Context) {
                 }
                 val boost = 1f + reactivePulse * 0.28f
                 val intensity = (fade * baseBreathe * boost).coerceIn(0f, 1.25f)
-                outerGlowPaint.strokeWidth = (18f + reactivePulse * 7f) * density
-                outerGlowPaint.alpha = (intensity * (if (dark) 44f else 32f)).toInt().coerceIn(0, 255)
-                midGlowPaint.strokeWidth = (8.5f + reactivePulse * 3.5f) * density
-                midGlowPaint.alpha = (intensity * (if (dark) 92f else 72f)).toInt().coerceIn(0, 255)
-                rimPaint.alpha = (intensity * (if (dark) 225f else 185f)).toInt().coerceIn(0, 255)
+                outerHaloPaint.strokeWidth = (24f + reactivePulse * 8f) * density
+                outerHaloPaint.alpha = (intensity * (if (dark) 22f else 16f)).toInt().coerceIn(0, 255)
+                outerGlowPaint.strokeWidth = (15f + reactivePulse * 5.5f) * density
+                outerGlowPaint.alpha = (intensity * (if (dark) 40f else 30f)).toInt().coerceIn(0, 255)
+                midGlowPaint.strokeWidth = (8.5f + reactivePulse * 3.2f) * density
+                midGlowPaint.alpha = (intensity * (if (dark) 78f else 62f)).toInt().coerceIn(0, 255)
+                innerGlowPaint.strokeWidth = (4.2f + reactivePulse * 1.5f) * density
+                innerGlowPaint.alpha = (intensity * (if (dark) 142f else 115f)).toInt().coerceIn(0, 255)
+                rimPaint.alpha = (intensity * (if (dark) 235f else 195f)).toInt().coerceIn(0, 255)
+                canvas.drawPath(borderPath, outerHaloPaint)
                 canvas.drawPath(borderPath, outerGlowPaint)
                 canvas.drawPath(borderPath, midGlowPaint)
+                canvas.drawPath(borderPath, innerGlowPaint)
                 canvas.drawPath(borderPath, rimPaint)
             }
 

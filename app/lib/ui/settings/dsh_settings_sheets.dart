@@ -50,10 +50,22 @@ void showDshNamespaceEditorSheet(
   WidgetRef ref,
   DshSettingsNamespace ns,
 ) {
+  var isDirty = false;
   showGrassBagSheet<void>(
     context,
     title: ns.title,
     subtitle: '${ns.ns} · ${ns.subtitle}',
+    expandable: true,
+    onWillDismiss: () async {
+      if (!isDirty || !context.mounted) return true;
+      return showGrassBagConfirmDialog(
+        context,
+        title: '放弃未保存的配置修改？',
+        message: '「${ns.title}」中存在尚未写入 DSH 的改动，关闭后将丢失。',
+        confirmLabel: '放弃修改',
+        isDestructive: true,
+      );
+    },
     bodyBuilder: (ctx) => Consumer(
       builder: (cCtx, cRef, _) {
         cRef.watch(
@@ -82,6 +94,7 @@ void showDshNamespaceEditorSheet(
           dynamicOptions: buildDynamicSchemaOptions(state),
           availableModels: buildAvailableModelTuples(state),
           submitLabel: '保存配置',
+          onDirtyChanged: (d) => isDirty = d,
           onSubmit: (vals) async {
             final ops = computeSchemasteryMutationOps(
               liveNs.value,
@@ -89,13 +102,15 @@ void showDshNamespaceEditorSheet(
               secretPaths: liveNs.secrets.toSet(),
             );
             if (ops.isEmpty) {
+              isDirty = false;
               ctrl.showToast('配置未发生变化', tone: ToastTone.info);
               if (cCtx.mounted) Navigator.of(cCtx).pop();
               return null;
             }
             final err = await ctrl.mutateDshNamespace(liveNs.ns, ops);
-            if (err == null && cCtx.mounted) {
-              Navigator.of(cCtx).pop();
+            if (err == null) {
+              isDirty = false;
+              if (cCtx.mounted) Navigator.of(cCtx).pop();
             }
             return err;
           },
@@ -126,7 +141,14 @@ class _SearchableProviderCredentialsBody extends ConsumerStatefulWidget {
 
 class _SearchableProviderCredentialsBodyState
     extends ConsumerState<_SearchableProviderCredentialsBody> {
+  final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -158,6 +180,7 @@ class _SearchableProviderCredentialsBodyState
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         GrassBagGlassSearchBar(
+          controller: _searchCtrl,
           placeholder: '搜索 ${st.providerCredentials.length} 个模型渠道或密钥变量…',
           tier: st.glassTier,
           insideGlass: true,
@@ -190,11 +213,36 @@ class _SearchableProviderCredentialsBodyState
         ),
         const SizedBox(height: 10),
         if (visible.isEmpty)
-          GrassBagCard(
-            padding: const EdgeInsets.all(16),
-            child: Center(
-              child: Text('未找到匹配「$_query」的渠道', style: TextStyle(fontSize: 13, color: t.text3)),
-            ),
+          GrassBagSheetSection(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+            children: [
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    st.providerCredentials.isEmpty
+                        ? '暂未获取到渠道列表，请确认 DSH 主机已连接'
+                        : '未找到匹配「$_query」的渠道',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 13, color: t.text3),
+                  ),
+                  if (q.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    GrassBagSecondaryGlassButton(
+                      label: '清除搜索',
+                      height: 32,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: st.glassTier,
+                      insideGlass: true,
+                      onTap: () {
+                        _searchCtrl.clear();
+                        setState(() => _query = '');
+                      },
+                    ),
+                  ],
+                ],
+              ),
+            ],
           )
         else
           GrassBagSheetSection(
@@ -219,12 +267,11 @@ class _SearchableProviderCredentialsBodyState
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  trailing: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: p.configured ? t.okSoft : t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
+                  trailing: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    tintColor: p.configured ? t.okSoft : t.fill1,
+                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
                     child: Text(
                       p.configured ? '编辑' : '配置',
                       style: TextStyle(

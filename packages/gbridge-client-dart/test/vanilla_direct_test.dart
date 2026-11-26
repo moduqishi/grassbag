@@ -1433,6 +1433,124 @@ void main() {
         isTrue,
       );
     });
+
+    test('v52 regression: onAutoApprove error falls back to interaction.requested & reconnectNow skips in-flight connect', () async {
+      final serverCtrl = StreamController<String>.broadcast();
+      final sent = <Map<String, dynamic>>[];
+      final done = Completer<void>();
+      var openCount = 0;
+      final firstSocketReady = Completer<GbridgeRawWebSocket>();
+      final mux = VanillaDshMuxEngine(
+        normalizer: VanillaDshNormalizer(),
+        autoReconnect: false,
+        openSocket: (_) {
+          openCount++;
+          return firstSocketReady.future;
+        },
+        onAutoApprove: (_, __) async => throw StateError('rpc_failed'),
+      );
+      addTearDown(() async {
+        mux.dispose();
+        await serverCtrl.close();
+      });
+      final frames = <StreamFrame>[];
+      final sub = mux.frames.listen(frames.add);
+      addTearDown(sub.cancel);
+
+      // Start connect() while socket handshake is pending; calling reconnectNow() must NOT supersede it!
+      final connectFut = mux.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      mux.reconnectNow();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(openCount, 1);
+
+      firstSocketReady.complete(_FakeRawWs(serverCtrl.stream, sent, done));
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final evOpen = sent.firstWhere((m) => m['endpoint'] == r'$events');
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {'type': 'ready', 'clientId': 'c-v52'},
+      }));
+      await connectFut;
+
+      // Remember session always-allow; when onAutoApprove throws, mux must fall back to interaction.requested!
+      mux.rememberSessionAlwaysAllowed('s-v52', {'tool': 'bash'});
+      serverCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': evOpen['streamId'],
+        'value': {
+          'type': 'waterfall',
+          'event': 'approval/request',
+          'eventId': 'ev-v52-fallback',
+          'agentId': 's-v52',
+          'request': {'tool': 'bash', 'command': 'ls'},
+        },
+      }));
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+      expect(
+        frames.any((f) => f.type == 'interaction.requested' && f.dataMap?['id'] == 'ev-v52-fallback'),
+        isTrue,
+      );
+    });
+
+    test('v53 regression: evictDshAuthCookies preserves proxy SSO cookies, expired Set-Cookie fails exchange, and HTML proxy 403 maps to HostProbeNeedsAuth', () async {
+      // 1. evictDshAuthCookies removes dsh-auth-* / gbridge-lan-auth* while preserving proxy SSO cookies
+      final updatedCookies = <String>[];
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+
+      server.listen((req) async {
+        if (req.uri.path == '/' && req.uri.queryParameters['token'] == 'tok-expired') {
+          req.response
+            ..statusCode = 200
+            ..headers.add('set-cookie', 'dsh-auth-3080=; Max-Age=0; Path=/')
+            ..write('ok');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/api/events') {
+          req.response
+            ..statusCode = 403
+            ..headers.contentType = ContentType.html
+            ..write('<html><body>Cloudflare Access Forbidden</body></html>');
+          await req.response.close();
+          return;
+        }
+        req.response
+          ..statusCode = 403
+          ..headers.contentType = ContentType.html
+          ..write('<html><body>SSO Login Required</body></html>');
+        await req.response.close();
+      });
+
+      final baseUri = Uri.parse('http://127.0.0.1:${server.port}');
+      final transport = GbridgeHttpTransport(
+        HostEndpoint.http(
+          baseUri: baseUri,
+          cookie: 'CF_Authorization=proxy-jwt-123; dsh-auth-3080=stale-val; gbridge-lan-auth=old',
+        ),
+        onCookieUpdated: updatedCookies.add,
+      );
+      addTearDown(transport.close);
+
+      transport.evictDshAuthCookies();
+      expect(transport.cookieHeader, 'CF_Authorization=proxy-jwt-123');
+      expect(updatedCookies.last, 'CF_Authorization=proxy-jwt-123');
+
+      // 2. Expired Set-Cookie (Max-Age=0) must NOT mark exchangeAuthToken as succeeded
+      final exchanged = await transport.exchangeAuthToken('tok-expired');
+      expect(exchanged, isFalse);
+
+      // 3. HTML reverse-proxy/SSO 403 without DSH header/host error classifies as HostProbeNeedsAuth
+      final client = GbridgeClient(
+        HostEndpoint.http(baseUri: baseUri),
+        autoReconnect: false,
+      );
+      addTearDown(client.dispose);
+      final probe = await client.bootstrap.probeHost();
+      expect(probe, isA<HostProbeNeedsAuth>());
+    });
   });
 }
 

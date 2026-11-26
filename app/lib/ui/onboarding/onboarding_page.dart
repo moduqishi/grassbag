@@ -43,39 +43,21 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     with TickerProviderStateMixin, WidgetsBindingObserver {
   final PageController _pageCtrl = PageController();
   final ValueNotifier<double> _pageOffsetNotifier = ValueNotifier<double>(0.0);
-  late final AnimationController _ambientCtrl;
   late final AnimationController _welcomeEntranceCtrl;
 
   int _currentPage = 0;
   int _selectedMode = 0; // 0: Local container, 1: Remote PC/Server
   bool _bootstrapping = false;
   bool _finishing = false;
-  bool _lifecycleResumed = true;
-  bool _routeCurrent = true;
-  bool _animationsEnabled = true;
+  bool _expandRemoteCardWhenConnected = false;
 
   bool get _isAndroidDevice =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
-
-  void _syncAmbientTicker() {
-    final shouldRun = _lifecycleResumed && _routeCurrent && _animationsEnabled;
-    if (shouldRun) {
-      if (!_ambientCtrl.isAnimating) {
-        _ambientCtrl.repeat();
-      }
-    } else if (_ambientCtrl.isAnimating) {
-      _ambientCtrl.stop();
-    }
-  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _ambientCtrl = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 12),
-    );
     _welcomeEntranceCtrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 920),
@@ -84,6 +66,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     if (!_isAndroidDevice) {
       _selectedMode = 1;
     } else {
+      _selectedMode = ref.read(appProvider).activeHost.isLocal ? 0 : 1;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
           unawaited(ref.read(appProvider.notifier).refreshPermissionsOnly());
@@ -93,17 +76,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
   }
 
   @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    _routeCurrent = ModalRoute.of(context)?.isCurrent ?? true;
-    _animationsEnabled = !MediaQuery.disableAnimationsOf(context);
-    _syncAmbientTicker();
-  }
-
-  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _lifecycleResumed = state == AppLifecycleState.resumed;
-    _syncAmbientTicker();
     if (state == AppLifecycleState.resumed && _isAndroidDevice && mounted) {
       unawaited(ref.read(appProvider.notifier).refreshPermissionsOnly());
     }
@@ -123,7 +96,6 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     _pageCtrl.removeListener(_onPageScroll);
     _pageCtrl.dispose();
     _pageOffsetNotifier.dispose();
-    _ambientCtrl.dispose();
     _welcomeEntranceCtrl.dispose();
     super.dispose();
   }
@@ -223,12 +195,17 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
 
     final rt = slice.nativeRuntimeStatus;
     final localReady = _isAndroidDevice
-        ? (rt.initialized && rt.engineState != 'error')
+        ? (rt.initialized &&
+            rt.engineState != 'error' &&
+            (rt.engineRunning || slice.connectionPhase == ConnectionPhase.connected))
         : (slice.activeHost.isLocal && slice.activeHost.isConnectedUsable);
     final remoteConnected = !slice.activeHost.isLocal && slice.activeHost.isConnectedUsable;
     final envReady =
         localReady || remoteConnected || slice.connectionPhase == ConnectionPhase.connected;
     final modelReady = slice.routableCount > 0;
+    final isBootstrappingNow = _isAndroidDevice &&
+        (slice.connectionPhase == ConnectionPhase.bootstrapping ||
+            (slice.runtimeProgressPct > 0 && slice.runtimeProgressPct < 100));
 
     return PopScope(
       canPop: _currentPage == 0,
@@ -249,7 +226,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               child: CustomPaint(
                 painter: _OnboardingAmbientPainter(
                   pageOffset: _pageOffsetNotifier,
-                  ambient: _ambientCtrl,
+                  ambient: _welcomeEntranceCtrl,
                   isDark: t.isDark,
                   primary: t.primary,
                   primaryHi: t.primaryHi,
@@ -271,87 +248,78 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       constraints: BoxConstraints(maxWidth: isWide ? 620 : double.infinity),
                       child: SizedBox(
                         height: 40,
-                        child: Stack(
-                          alignment: Alignment.center,
-                          children: [
-                            // Left: Back button on steps 1 & 2
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: AnimatedOpacity(
-                                opacity: _currentPage > 0 ? 1.0 : 0.0,
-                                duration: const Duration(milliseconds: 200),
-                                child: IgnorePointer(
-                                  ignoring: _currentPage == 0,
-                                  child: GrassBagSpringTap(
+                        child: GrassBagGlassBarLayer(
+                          tier: slice.glassTier,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              // Left: Back button ONLY mounted on steps 1 & 2 (never leaves a ghost
+                              // refractive SDF pill inside GrassBagGlassBarLayer on step 0!)
+                              if (_currentPage > 0)
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: GrassBagGlassPillButton(
+                                    tier: slice.glassTier,
+                                    height: 34,
+                                    useOwnLayer: false,
+                                    padding: const EdgeInsets.symmetric(horizontal: 11),
                                     onTap: () => _goToPage(_currentPage - 1),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 11, vertical: 7),
-                                      decoration: BoxDecoration(
-                                        color: t.isDark
-                                            ? const Color(0x28FFFFFF)
-                                            : const Color(0x99FFFFFF),
-                                        borderRadius: BorderRadius.circular(18),
-                                        border: Border.all(
-                                          color: t.isDark
-                                              ? const Color(0x26FFFFFF)
-                                              : const Color(0xCCFFFFFF),
-                                          width: 0.7,
-                                        ),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(CupertinoIcons.chevron_back,
-                                              size: 14, color: t.text),
-                                          const SizedBox(width: 2),
-                                          Text(
-                                            '上一步',
-                                            style: TextStyle(
-                                              fontSize: 12.5,
-                                              fontWeight: FontWeight.w500,
-                                              color: t.text,
-                                            ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(CupertinoIcons.chevron_back,
+                                            size: 14, color: t.text),
+                                        const SizedBox(width: 2),
+                                        Text(
+                                          '上一步',
+                                          style: TextStyle(
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w500,
+                                            color: t.text,
                                           ),
-                                        ],
-                                      ),
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ),
-                              ),
-                            ),
 
-                            // Center: Morphing 3-pill step indicator
-                            ValueListenableBuilder<double>(
-                              valueListenable: _pageOffsetNotifier,
-                              builder: (_, offset, __) => _MorphingStepIndicator(
-                                pageOffset: offset,
-                                onTapStep: _goToPage,
+                              // Center: Morphing 3-pill step indicator
+                              ValueListenableBuilder<double>(
+                                valueListenable: _pageOffsetNotifier,
+                                builder: (_, offset, __) => _MorphingStepIndicator(
+                                  pageOffset: offset,
+                                  onTapStep: _goToPage,
+                                ),
                               ),
-                            ),
 
-                            // Right: Skip (first launch) or Close (replay)
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: GrassBagSpringTap(
-                                onTap: _finishOnboarding,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 7),
-                                  decoration: BoxDecoration(
-                                    color: t.isDark
-                                        ? const Color(0x20FFFFFF)
-                                        : const Color(0x88FFFFFF),
-                                    borderRadius: BorderRadius.circular(18),
-                                    border: Border.all(
-                                      color: t.isDark
-                                          ? const Color(0x22FFFFFF)
-                                          : const Color(0xCCFFFFFF),
-                                      width: 0.7,
-                                    ),
-                                  ),
+                                // Right: Skip (first launch) or Close (replay)
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: GrassBagGlassPillButton(
+                                  tier: slice.glassTier,
+                                  height: 34,
+                                  useOwnLayer: false,
+                                  padding: const EdgeInsets.symmetric(horizontal: 13),
+                                  onTap: () async {
+                                    if (widget.isFirstLaunch &&
+                                        _currentPage < 2 &&
+                                        isBootstrappingNow) {
+                                      final ok = await showGrassBagConfirmDialog(
+                                        context,
+                                        title: '本机容器仍在下载部署中',
+                                        message: '现在跳过引导后，容器部署将继续在后台运行，你随时可在主界面顶部查看进度。确认现在进入主界面吗？',
+                                        confirmLabel: '后台继续并进入',
+                                      );
+                                      if (!ok || !mounted) return;
+                                    }
+                                    _finishOnboarding();
+                                  },
                                   child: Text(
-                                    widget.isFirstLaunch ? '跳过' : '完成',
+                                    _currentPage < 2
+                                        ? (widget.isFirstLaunch ? '跳过' : '关闭')
+                                        : '完成',
+                                    textScaler: MediaQuery.textScalerOf(context)
+                                        .clamp(maxScaleFactor: 1.2),
                                     style: TextStyle(
                                       fontSize: 12.5,
                                       fontWeight: FontWeight.w500,
@@ -360,8 +328,8 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   ),
                                 ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -390,6 +358,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                         localReady,
                         remoteConnected,
                         slice.activeHost,
+                        slice.connectionPhase,
                       ),
                       _buildReadyStep(
                         t,
@@ -427,8 +396,12 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
             ),
           ),
 
-          // 3. Toast Feedback Overlay so all onboarding & remote-connect toasts are visible
-          const GrassBagToastOverlay(bottomOffset: 88),
+          // 3. Toast Feedback Overlay (drops near IME top when keyboard hides bottom footer)
+          Builder(
+            builder: (toastCtx) => GrassBagToastOverlay(
+              bottomOffset: MediaQuery.viewInsetsOf(toastCtx).bottom > 80 ? 16.0 : 88.0,
+            ),
+          ),
         ],
       ),
       ),
@@ -474,48 +447,23 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const SizedBox(height: 10),
-              // Hero Kinetic Mascot inside a delicate translucent radial halo
+              // Hero Kinetic Mascot (GrassBagAnimatedLogo paints its own radial bloom — no double halo!)
               Center(
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    Container(
-                      width: 148,
-                      height: 148,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        gradient: RadialGradient(
-                          colors: [
-                            t.primary.withValues(alpha: t.isDark ? 0.24 : 0.16),
-                            t.primaryHi.withValues(alpha: t.isDark ? 0.08 : 0.05),
-                            Colors.transparent,
-                          ],
-                          stops: const [0.0, 0.56, 1.0],
-                        ),
-                      ),
-                    ),
-                    GrassBagAnimatedLogo(
-                      size: 108,
-                      duration: const Duration(milliseconds: 1120),
-                      autoPlay: !widget.isFirstLaunch,
-                      ambientFloat: false,
-                    ),
-                  ],
+                child: GrassBagAnimatedLogo(
+                  size: 114,
+                  duration: const Duration(milliseconds: 1120),
+                  autoPlay: !widget.isFirstLaunch,
+                  ambientFloat: false,
                 ),
               ),
               const SizedBox(height: 14),
               // Eyebrow glass capsule
               Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                      color: t.primary.withValues(alpha: 0.28),
-                      width: 0.65,
-                    ),
-                  ),
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  tintColor: t.primarySoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4.5),
                   child: Text(
                     'DEEPSEEK HARNESS · LIQUID GLASS',
                     style: TextStyle(
@@ -621,6 +569,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     bool localReady,
     bool remoteConnected,
     ManagedHost activeHost,
+    ConnectionPhase connectionPhase,
   ) {
     final progress = (runtimeProgressPct / 100.0).clamp(0.0, 1.0);
     final isBootstrappingNow =
@@ -630,11 +579,13 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     final localHasError = rt.engineState == 'error' && (rt.engineError?.isNotEmpty == true);
     final launcherDisplay =
         rt.executorMode.startsWith('proot') ? '标准兼容内核' : '高速原生内核';
-    final localStopped = _isAndroidDevice &&
-        localReady &&
+    final localInstalled = _isAndroidDevice && rt.initialized;
+    final localStopped = localInstalled &&
         !rt.engineRunning &&
         rt.engineState != 'starting' &&
+        !localHasError &&
         !isBootstrappingNow;
+    final localStarting = localInstalled && rt.engineState == 'starting' && !isBootstrappingNow;
     final desktopLocalConnected = !_isAndroidDevice &&
         activeHost.isLocal &&
         activeHost.isConnectedUsable;
@@ -767,7 +718,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                             ? '检测到上次未完成的下载断点（剩余约 $downloadSizeLabel），点击下方按钮即可断点续传并完成 Ubuntu + DeepSeek Harness 部署。'
                                             : '安装包已瘦身，首次部署将按需在线下载 ARM64 Ubuntu 与官方 DeepSeek Harness（约 $downloadSizeLabel），内置多国内镜像容灾、断点续传与 SHA-256 校验，部署完成后即可离线使用。')
                                         : '首次部署会自动释放 ARM64 Linux 根文件系统与官方 DeepSeek Harness，并支持后续一键安装 Python、Git、Ripgrep 等工具链。')
-                                    : '当前非 Android 设备，可直接连接本机运行的 `dsh web`，或切换至右侧接入局域网/服务器上的远程主机。',
+                                    : '当前非 Android 设备，可直接连接本机运行的 dsh web，或切换至右侧接入局域网/服务器上的远程主机。',
                                 style: TextStyle(fontSize: 12.5, height: 1.5, color: t.text2),
                               ),
                               if (isBootstrappingNow) ...[
@@ -781,7 +732,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                 const SizedBox(height: 7),
                                 Row(
                                   children: [
-                                    const CupertinoActivityIndicator(radius: 7),
+                                    GrassBagActivityIndicator(radius: 7, color: t.primary),
                                     const SizedBox(width: 8),
                                     Expanded(
                                       child: Text(
@@ -805,7 +756,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   borderRadius: 14,
                                 ),
                               ],
-                              if (localReady) ...[
+                              if (localReady || localInstalled) ...[
                                 const SizedBox(height: 12),
                                 GrassBagStatusBanner(
                                   tone: localStopped
@@ -814,10 +765,12 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   icon: localStopped
                                       ? CupertinoIcons.pause_circle_fill
                                       : CupertinoIcons.checkmark_circle_fill,
-                                  title: rt.engineRunning
+                                  title: rt.engineRunning || localReady
                                       ? '本机引擎运行正常'
-                                      : (localStopped ? '本机容器已就绪（引擎未运行）' : '本机容器已部署完成'),
-                                  message: rt.engineRunning
+                                      : (localStopped
+                                          ? '本机容器已就绪（引擎未运行）'
+                                          : (localStarting ? '正在启动本机引擎…' : '本机容器已部署完成')),
+                                  message: rt.engineRunning || localReady
                                       ? 'DeepSeek Harness 已就绪，可以继续下一步配置模型或直接进入对话。'
                                       : (localStopped
                                           ? '容器环境已就绪，点按下方按钮即可立即拉起本机 DSH 引擎。'
@@ -826,7 +779,19 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   borderRadius: 14,
                                 ),
                               ],
-                              if (_isAndroidDevice && !localReady) ...[
+                              if (localStopped) ...[
+                                const SizedBox(height: 14),
+                                GrassBagPrimaryGlassButton(
+                                  label: '启动本机引擎',
+                                  icon: CupertinoIcons.play_fill,
+                                  height: 44,
+                                  tier: tier,
+                                  insideGlass: true,
+                                  onTap: () => unawaited(
+                                    ref.read(appProvider.notifier).restartLocalEngine(),
+                                  ),
+                                ),
+                              ] else if (_isAndroidDevice && !localInstalled && !localReady) ...[
                                 const SizedBox(height: 14),
                                 if (isBootstrappingNow && runtimeProgressCanCancel)
                                   Row(
@@ -898,18 +863,6 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                     ),
                                   ),
                                 ],
-                              ] else if (localStopped) ...[
-                                const SizedBox(height: 14),
-                                GrassBagPrimaryGlassButton(
-                                  label: '启动本机引擎',
-                                  icon: CupertinoIcons.play_fill,
-                                  height: 44,
-                                  tier: tier,
-                                  insideGlass: true,
-                                  onTap: () => unawaited(
-                                    ref.read(appProvider.notifier).restartLocalEngine(),
-                                  ),
-                                ),
                               ] else if (!_isAndroidDevice) ...[
                                 const SizedBox(height: 14),
                                 if (desktopLocalConnected)
@@ -923,14 +876,22 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                   )
                                 else
                                   GrassBagPrimaryGlassButton(
-                                    label: '连接本机 127.0.0.1:3080',
+                                    label: connectionPhase == ConnectionPhase.connecting &&
+                                            activeHost.isLocal
+                                        ? '正在连接本机服务…'
+                                        : '连接本机 127.0.0.1:3080',
                                     icon: CupertinoIcons.link,
                                     height: 44,
                                     tier: tier,
                                     insideGlass: true,
-                                    onTap: () => unawaited(
-                                      ref.read(appProvider.notifier).switchHost('local'),
-                                    ),
+                                    enabled: !(connectionPhase == ConnectionPhase.connecting &&
+                                        activeHost.isLocal),
+                                    onTap: (connectionPhase == ConnectionPhase.connecting &&
+                                            activeHost.isLocal)
+                                        ? null
+                                        : () => unawaited(
+                                              ref.read(appProvider.notifier).switchHost('local'),
+                                            ),
                                   ),
                               ],
                             ],
@@ -950,16 +911,30 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                 message: '${activeHost.address} · ${activeHost.latency}',
                                 padding: const EdgeInsets.all(12),
                                 borderRadius: 16,
+                                action: GrassBagSecondaryGlassButton(
+                                  label: _expandRemoteCardWhenConnected ? '收起主机列表' : '更换远程主机',
+                                  icon: _expandRemoteCardWhenConnected
+                                      ? CupertinoIcons.chevron_up
+                                      : CupertinoIcons.arrow_2_squarepath,
+                                  height: 32,
+                                  tier: tier,
+                                  insideGlass: true,
+                                  onTap: () => setState(
+                                    () => _expandRemoteCardWhenConnected =
+                                        !_expandRemoteCardWhenConnected,
+                                  ),
+                                ),
                               ),
-                              const SizedBox(height: 10),
+                              if (_expandRemoteCardWhenConnected) const SizedBox(height: 10),
                             ],
-                            RemoteHostConnectCard(
-                              showHeader: false,
-                              connectImmediately: true,
-                              initiallyShowGuide: false,
-                              autoScanLan: true,
-                              onConnectedHost: (_) => _goToPage(2),
-                            ),
+                            if (!remoteConnected || _expandRemoteCardWhenConnected)
+                              RemoteHostConnectCard(
+                                showHeader: false,
+                                connectImmediately: true,
+                                initiallyShowGuide: false,
+                                autoScanLan: !remoteConnected,
+                                onConnectedHost: (_) => _goToPage(2),
+                              ),
                           ],
                         ),
                       ),
@@ -998,31 +973,43 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               const SizedBox(height: 6),
               // Celebration Emblem
               Center(
-                child: Container(
-                  width: 78,
-                  height: 78,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: allReady
-                          ? [t.ok, t.primary]
-                          : [t.primaryHi, t.primary],
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: (allReady ? t.ok : t.primary)
-                            .withValues(alpha: t.isDark ? 0.34 : 0.24),
-                        blurRadius: 24,
-                        offset: const Offset(0, 8),
+                child: CustomPaint(
+                  foregroundPainter: tier == GrassBagGlassTier.solid
+                      ? null
+                      : GrassBagFresnelRimPainter(
+                          isDark: t.isDark,
+                          isCircle: true,
+                          tinted: true,
+                          accent: allReady ? t.ok : t.primaryHi,
+                          frosted: tier == GrassBagGlassTier.frosted,
+                          strokeWidth: 1.0,
+                        ),
+                  child: Container(
+                    width: 78,
+                    height: 78,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: allReady
+                            ? [t.ok, t.primary]
+                            : [t.primaryHi, t.primary],
                       ),
-                    ],
-                  ),
-                  child: Icon(
-                    allReady ? CupertinoIcons.checkmark_alt : CupertinoIcons.sparkles,
-                    size: 36,
-                    color: t.onPrimary,
+                      boxShadow: [
+                        BoxShadow(
+                          color: (allReady ? t.ok : t.primary)
+                              .withValues(alpha: t.isDark ? 0.34 : 0.24),
+                          blurRadius: 24,
+                          offset: const Offset(0, 8),
+                        ),
+                      ],
+                    ),
+                    child: Icon(
+                      allReady ? CupertinoIcons.checkmark_alt : CupertinoIcons.sparkles,
+                      size: 36,
+                      color: t.onPrimary,
+                    ),
                   ),
                 ),
               ),
@@ -1050,7 +1037,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               // Checklist Status Card
               GrassBagCard(
                 borderRadius: 24,
-                padding: const EdgeInsets.all(15),
+                padding: const EdgeInsets.all(12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1075,16 +1062,34 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       trailing: envReady
                           ? null
                           : GrassBagSpringTap(
-                              onTap: () => _goToPage(1),
-                              child: Container(
+                              onTap: () {
+                                final rtNow = ref.read(appProvider).nativeRuntimeStatus;
+                                if (_isAndroidDevice &&
+                                    rtNow.initialized &&
+                                    !rtNow.engineRunning &&
+                                    rtNow.engineState != 'error') {
+                                  unawaited(ref.read(appProvider.notifier).restartLocalEngine());
+                                } else {
+                                  _goToPage(1);
+                                }
+                              },
+                              enablePointerGlow: false,
+                              haptic: true,
+                              child: GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                interactive: true,
+                                tintColor: t.primarySoft,
                                 padding: const EdgeInsets.symmetric(
-                                    horizontal: 10, vertical: 5),
-                                decoration: BoxDecoration(
-                                  color: t.primarySoft,
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
+                                    horizontal: 11, vertical: 5.5),
                                 child: Text(
-                                  '去配置',
+                                  (_isAndroidDevice &&
+                                          ref.read(appProvider).nativeRuntimeStatus.initialized &&
+                                          !ref.read(appProvider).nativeRuntimeStatus.engineRunning &&
+                                          ref.read(appProvider).nativeRuntimeStatus.engineState !=
+                                              'error')
+                                      ? '启动引擎'
+                                      : '去配置',
                                   style: TextStyle(
                                     fontSize: 12,
                                     fontWeight: FontWeight.w600,
@@ -1141,7 +1146,15 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                             tier: tier,
                             insideGlass: true,
                             accentForeground: true,
-                            onTap: _openModelSettings,
+                            onTap: envReady
+                                ? _openModelSettings
+                                : () {
+                                    ref.read(appProvider.notifier).showToast(
+                                          '请先完成运行环境部署或连接远程主机',
+                                          tone: ToastTone.info,
+                                        );
+                                    _goToPage(1);
+                                  },
                           );
                           if (constraints.maxWidth < 316) {
                             return Column(
@@ -1199,66 +1212,68 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                         ],
                       ),
                       const SizedBox(height: 10),
-                      _OnboardingPermissionTile(
-                        done: perms.accessibilityEnabled,
-                        warn: perms.accessibilityNeedsRetoggle,
-                        icon: CupertinoIcons.hand_draw_fill,
-                        title: perms.accessibilityEnabled
-                            ? '无障碍屏幕操控（已就绪）'
-                            : (perms.accessibilityNeedsRetoggle ? '无障碍服务需重开' : '无障碍屏幕操控'),
-                        subtitle: perms.accessibilityEnabled
-                            ? '支持跨应用悬浮确认卡、读屏与原生自动操控'
-                            : (perms.sdkInt >= 33
-                                ? 'Android 13+ 若灰显，先点右侧「应用详情」右上角允许受限设置'
-                                : '开启后 AI 可在安全护栏下跨应用操作手机'),
-                        actionLabel: perms.accessibilityEnabled ? '已开启' : '去开启',
-                        secondaryLabel: (!perms.accessibilityEnabled && perms.sdkInt >= 33) ? '应用详情' : null,
-                        onSecondaryTap: () => GrassBagNativeBridge.instance.openPermissionSettings('app_details'),
-                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('accessibility'),
-                      ),
-                      const SizedBox(height: 8),
-                      _OnboardingPermissionTile(
-                        done: perms.overlayGranted,
-                        icon: CupertinoIcons.layers_alt_fill,
-                        title: '悬浮窗权限',
-                        subtitle: '辅助显示液态玻璃悬浮岛与外部确认弹窗',
-                        actionLabel: perms.overlayGranted ? '已授权' : '去授权',
-                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('overlay'),
-                      ),
-                      const SizedBox(height: 8),
-                      _OnboardingPermissionTile(
-                        done: perms.batteryOptIgnored,
-                        icon: CupertinoIcons.battery_100,
-                        title: '忽略电池优化（后台保活）',
-                        subtitle: '防止切到其他 App 时系统杀死容器或无障碍服务',
-                        actionLabel: perms.batteryOptIgnored ? '已豁免' : '去设置',
-                        onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('battery'),
-                      ),
-                      const SizedBox(height: 8),
-                      _OnboardingPermissionTile(
-                        done: perms.notificationsGranted,
-                        icon: CupertinoIcons.bell_fill,
-                        title: '通知提醒权限',
-                        subtitle: '任务完成提醒与前台服务常驻保活',
-                        actionLabel: perms.notificationsGranted ? '已允许' : '一键授权',
-                        onTap: () => unawaited(
-                          ref.read(appProvider.notifier).requestRuntimePermission('notifications'),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      _OnboardingPermissionTile(
-                        done: perms.allFilesGranted,
-                        icon: CupertinoIcons.folder_fill,
-                        title: '手机公共存储访问',
-                        subtitle: '让容器与 AI 直接整理下载目录与手机文档',
-                        actionLabel: perms.allFilesGranted ? '已允许' : '去开启',
-                        onTap: () {
-                          if (perms.sdkInt < 30) {
-                            unawaited(ref.read(appProvider.notifier).requestRuntimePermission('storage'));
-                          } else {
-                            unawaited(GrassBagNativeBridge.instance.openPermissionSettings('storage'));
-                          }
-                        },
+                      GrassBagSheetSection(
+                        borderRadius: 12,
+                        dividerIndent: 54,
+                        children: [
+                          _OnboardingPermissionTile(
+                            done: perms.accessibilityEnabled,
+                            warn: perms.accessibilityNeedsRetoggle,
+                            icon: CupertinoIcons.hand_draw_fill,
+                            title: perms.accessibilityEnabled
+                                ? '无障碍屏幕操控（已就绪）'
+                                : (perms.accessibilityNeedsRetoggle ? '无障碍服务需重开' : '无障碍屏幕操控'),
+                            subtitle: perms.accessibilityEnabled
+                                ? '支持跨应用悬浮确认卡、读屏与原生自动操控'
+                                : (perms.sdkInt >= 33
+                                    ? 'Android 13+ 若灰显，先点下方「应用详情」允许受限设置'
+                                    : '开启后 AI 可在安全护栏下跨应用操作手机'),
+                            actionLabel: perms.accessibilityEnabled ? '已开启' : '去开启',
+                            secondaryLabel: (!perms.accessibilityEnabled && perms.sdkInt >= 33) ? '应用详情' : null,
+                            onSecondaryTap: () => GrassBagNativeBridge.instance.openPermissionSettings('app_details'),
+                            onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('accessibility'),
+                          ),
+                          _OnboardingPermissionTile(
+                            done: perms.overlayGranted,
+                            icon: CupertinoIcons.layers_alt_fill,
+                            title: '悬浮窗权限',
+                            subtitle: '辅助显示液态玻璃悬浮岛与外部确认弹窗',
+                            actionLabel: perms.overlayGranted ? '已授权' : '去授权',
+                            onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('overlay'),
+                          ),
+                          _OnboardingPermissionTile(
+                            done: perms.batteryOptIgnored,
+                            icon: CupertinoIcons.battery_100,
+                            title: '忽略电池优化（后台保活）',
+                            subtitle: '防止切到其他 App 时系统杀死容器或无障碍服务',
+                            actionLabel: perms.batteryOptIgnored ? '已豁免' : '去设置',
+                            onTap: () => GrassBagNativeBridge.instance.openPermissionSettings('battery'),
+                          ),
+                          _OnboardingPermissionTile(
+                            done: perms.notificationsGranted,
+                            icon: CupertinoIcons.bell_fill,
+                            title: '通知提醒权限',
+                            subtitle: '任务完成提醒与前台服务常驻保活',
+                            actionLabel: perms.notificationsGranted ? '已允许' : '一键授权',
+                            onTap: () => unawaited(
+                              ref.read(appProvider.notifier).requestRuntimePermission('notifications'),
+                            ),
+                          ),
+                          _OnboardingPermissionTile(
+                            done: perms.allFilesGranted,
+                            icon: CupertinoIcons.folder_fill,
+                            title: '手机公共存储访问',
+                            subtitle: '让容器与 AI 直接整理下载目录与手机文档',
+                            actionLabel: perms.allFilesGranted ? '已允许' : '去开启',
+                            onTap: () {
+                              if (perms.sdkInt < 30) {
+                                unawaited(ref.read(appProvider.notifier).requestRuntimePermission('storage'));
+                              } else {
+                                unawaited(GrassBagNativeBridge.instance.openPermissionSettings('storage'));
+                              }
+                            },
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 6),
                       Align(
@@ -1313,23 +1328,40 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                   tier: tier,
                   onTap: () => _goToPage(1),
                 ),
-              1 => GrassBagPrimaryGlassButton(
-                  label: envReady ? '继续下一步' : '稍后配置，继续下一步',
-                  icon: CupertinoIcons.arrow_right_circle_fill,
-                  height: 48,
-                  tier: tier,
-                  onTap: () => _goToPage(2),
-                ),
-              _ => GrassBagPrimaryGlassButton(
-                  label: _finishing
-                      ? '正在进入…'
-                      : (modelReady ? '开始使用 GrassBag' : '进入 GrassBag'),
-                  icon: CupertinoIcons.sparkles,
-                  height: 48,
-                  tier: tier,
-                  enabled: !_finishing,
-                  onTap: _finishing ? null : _finishOnboarding,
-                ),
+              1 => envReady
+                  ? GrassBagPrimaryGlassButton(
+                      label: '继续下一步',
+                      icon: CupertinoIcons.arrow_right_circle_fill,
+                      height: 48,
+                      tier: tier,
+                      onTap: () => _goToPage(2),
+                    )
+                  : GrassBagSecondaryGlassButton(
+                      label: '稍后配置，继续下一步',
+                      icon: CupertinoIcons.arrow_right_circle,
+                      height: 48,
+                      tier: tier,
+                      accentForeground: true,
+                      onTap: () => _goToPage(2),
+                    ),
+              _ => modelReady
+                  ? GrassBagPrimaryGlassButton(
+                      label: _finishing ? '正在进入…' : '开始使用 GrassBag',
+                      icon: CupertinoIcons.sparkles,
+                      height: 48,
+                      tier: tier,
+                      enabled: !_finishing,
+                      onTap: _finishing ? null : _finishOnboarding,
+                    )
+                  : GrassBagSecondaryGlassButton(
+                      label: _finishing ? '正在进入…' : '稍后配置模型，直接进入',
+                      icon: CupertinoIcons.arrow_right_circle,
+                      height: 48,
+                      tier: tier,
+                      accentForeground: true,
+                      enabled: !_finishing,
+                      onTap: _finishing ? null : _finishOnboarding,
+                    ),
             },
           ),
         ),
@@ -1351,33 +1383,46 @@ class _MorphingStepIndicator extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: List.generate(3, (i) {
-        final dist = (pageOffset - i).abs().clamp(0.0, 1.0);
-        final active = 1.0 - dist;
-        final width = 7.0 + 21.0 * active;
-        final color = Color.lerp(
-          t.isDark ? const Color(0x38FFFFFF) : const Color(0x2E0F172A),
-          t.primary,
-          active,
-        )!;
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => onTapStep(i),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
-            child: Container(
-              width: width,
-              height: 6.5,
-              decoration: BoxDecoration(
-                color: color,
-                borderRadius: BorderRadius.circular(4),
+    return GrassBagFresnelGlassSurface(
+      isPill: true,
+      innerWell: true,
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 1),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: List.generate(3, (i) {
+          final dist = (pageOffset - i).abs().clamp(0.0, 1.0);
+          final active = 1.0 - dist;
+          final width = 7.0 + 21.0 * active;
+          final color = Color.lerp(
+            t.sepStrong,
+            t.primary,
+            active,
+          )!;
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => onTapStep(i),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
+              child: Container(
+                width: width,
+                height: 6.5,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(4),
+                  boxShadow: active > 0.5
+                      ? [
+                          BoxShadow(
+                            color: t.primary.withValues(alpha: 0.36 * active),
+                            blurRadius: 6,
+                          ),
+                        ]
+                      : null,
+                ),
               ),
             ),
-          ),
-        );
-      }),
+          );
+        }),
+      ),
     );
   }
 }
@@ -1404,90 +1449,128 @@ class _ModeChoiceCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return GrassBagSpringTap(
-      onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeOutCubic,
-        padding: const EdgeInsets.all(13),
-        decoration: BoxDecoration(
-          color: selected
-              ? (t.isDark
-                  ? t.primary.withValues(alpha: 0.22)
-                  : t.primary.withValues(alpha: 0.11))
-              : (t.isDark
-                  ? const Color(0xB818222C)
-                  : const Color(0xCCFFFFFF)),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: selected
-                ? t.primary.withValues(alpha: 0.72)
-                : (t.isDark ? const Color(0x24FFFFFF) : const Color(0xD8FFFFFF)),
-            width: selected ? 1.35 : 0.8,
-          ),
-          boxShadow: selected
-              ? [
-                  BoxShadow(
-                    color: t.primary.withValues(alpha: t.isDark ? 0.20 : 0.12),
-                    blurRadius: 16,
-                    offset: const Offset(0, 6),
-                  ),
-                ]
-              : null,
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                GrassBagSquircleIcon(
-                  icon: icon,
-                  color: selected ? t.primary : t.text2,
-                  size: 32,
-                  iconSize: 16,
-                ),
-                const Spacer(),
-                if (badge != null)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
-                    decoration: BoxDecoration(
-                      color: badgeOk
-                          ? t.okSoft
-                          : (selected ? t.primarySoft : t.fill1),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      badge!,
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600,
-                        color: badgeOk ? t.ok : (selected ? t.primary : t.text3),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            Text(
-              title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: t.text,
+    final ambientTier = resolveAmbientGlassTier(context);
+    final isSolid = ambientTier == GrassBagGlassTier.solid;
+    final card = AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOutCubic,
+      padding: const EdgeInsets.all(13),
+      decoration: ShapeDecoration(
+        color: isSolid
+            ? (selected ? t.primarySoft : t.cardSolid)
+            : null,
+        gradient: isSolid
+            ? null
+            : LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: selected
+                    ? (t.isDark
+                        ? [
+                            t.primaryHi.withValues(alpha: 0.26),
+                            t.primary.withValues(alpha: 0.13),
+                          ]
+                        : [
+                            Color.lerp(Colors.white, t.primaryHi, 0.22)!.withValues(alpha: 0.90),
+                            Color.lerp(Colors.white, t.primaryHi, 0.10)!.withValues(alpha: 0.76),
+                          ])
+                    : (t.isDark
+                        ? [
+                            Color.lerp(t.cardSolid, Colors.white, 0.09)!.withValues(alpha: 0.78),
+                            t.cardSolid.withValues(alpha: 0.64),
+                          ]
+                        : [
+                            Colors.white.withValues(alpha: 0.80),
+                            Colors.white.withValues(alpha: 0.56),
+                          ]),
               ),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              subtitle,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11.5, color: t.text3),
-            ),
-          ],
+        shape: RoundedSuperellipseBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: isSolid
+              ? BorderSide(
+                  color: selected ? t.primary : t.sep,
+                  width: selected ? 1.3 : 0.7,
+                )
+              : (selected && !t.isDark
+                  ? BorderSide(color: t.primaryHi.withValues(alpha: 0.38), width: 0.85)
+                  : BorderSide.none),
         ),
       ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              GrassBagSquircleIcon(
+                icon: icon,
+                color: selected ? t.primary : t.text2,
+                size: 32,
+                iconSize: 16,
+                filled: selected,
+              ),
+              const Spacer(),
+              if (badge != null)
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  tintColor: badgeOk
+                      ? t.okSoft
+                      : (selected ? t.primarySoft : null),
+                  padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2.5),
+                  child: Text(
+                    badge!,
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      color: badgeOk ? t.ok : (selected ? t.primary : t.text3),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: t.text,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 11.5, color: t.text3),
+          ),
+        ],
+      ),
+    );
+    return GrassBagSpringTap(
+      onTap: onTap,
+      borderRadius: 20,
+      enablePointerGlow: isSolid,
+      haptic: true,
+      child: isSolid
+          ? card
+          : GrassBagInteractiveHighlight(
+              borderRadius: 20,
+              accent: selected ? t.primary : t.primaryHi,
+              child: CustomPaint(
+                foregroundPainter: GrassBagFresnelRimPainter(
+                  isDark: t.isDark,
+                  borderRadius: 20,
+                  accent: selected ? t.primary : t.primaryHi,
+                  tinted: selected,
+                  frosted: ambientTier == GrassBagGlassTier.frosted,
+                  strokeWidth: selected ? 1.1 : 0.85,
+                ),
+                child: card,
+              ),
+            ),
     );
   }
 }
@@ -1610,8 +1693,8 @@ class _OnboardingAmbientPainter extends CustomPainter {
       begin: Alignment.topLeft,
       end: Alignment.bottomRight,
       colors: isDark
-          ? [bg, Color.lerp(bg, const Color(0xFF0A141D), 0.7)!]
-          : [bg, const Color(0xFFE5EFF7)],
+          ? [bg, Color.lerp(bg, primary, 0.08)!]
+          : [bg, Color.lerp(bg, primary, 0.09)!],
     );
     canvas.drawRect(rect, Paint()..shader = bgGrad.createShader(rect));
 
@@ -1620,7 +1703,7 @@ class _OnboardingAmbientPainter extends CustomPainter {
     final driftX = math.sin(ambientPhase) * 18.0;
     final driftY = math.cos(ambientPhase * 0.8) * 14.0;
 
-    // Orb 1: Primary cyan-teal halo shifting smoothly across pages
+    // Orb 1: Primary halo shifting smoothly across pages
     _drawOrb(
       canvas,
       Offset(
@@ -1628,10 +1711,10 @@ class _OnboardingAmbientPainter extends CustomPainter {
         size.height * (0.18 + math.sin(p * math.pi) * 0.12) + driftY,
       ),
       size.shortestSide * 0.68,
-      primary.withValues(alpha: isDark ? 0.22 : 0.17),
+      primary.withValues(alpha: isDark ? 0.22 : 0.16),
     );
 
-    // Orb 2: Mint-emerald accent counter-drifting on bottom edge
+    // Orb 2: Secondary accent counter-drifting on bottom edge
     _drawOrb(
       canvas,
       Offset(
@@ -1639,10 +1722,10 @@ class _OnboardingAmbientPainter extends CustomPainter {
         size.height * (0.76 - p * 0.14) - driftY,
       ),
       size.shortestSide * 0.62,
-      primaryHi.withValues(alpha: isDark ? 0.16 : 0.14),
+      primaryHi.withValues(alpha: isDark ? 0.16 : 0.13),
     );
 
-    // Orb 3: Soft sapphire-frost bloom for depth
+    // Orb 3: Soft theme-harmonized frost bloom for depth
     _drawOrb(
       canvas,
       Offset(
@@ -1650,8 +1733,7 @@ class _OnboardingAmbientPainter extends CustomPainter {
         size.height * (0.48 + p * 0.12) + driftY * 0.5,
       ),
       size.shortestSide * 0.55,
-      (isDark ? const Color(0xFF38BDF8) : const Color(0xFF7DD3FC))
-          .withValues(alpha: isDark ? 0.10 : 0.13),
+      Color.lerp(primary, primaryHi, 0.55)!.withValues(alpha: isDark ? 0.10 : 0.11),
     );
   }
 
@@ -1700,27 +1782,16 @@ class _OnboardingPermissionTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final accent = done ? t.ok : (warn ? t.err : t.primary);
-    return GrassBagSpringTap(
-      onTap: onTap,
-      pressedScale: 0.985,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
-        decoration: BoxDecoration(
-          color: t.isDark
-              ? Colors.white.withValues(alpha: done ? 0.06 : 0.04)
-              : Colors.white.withValues(alpha: done ? 0.64 : 0.48),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: done
-                ? t.ok.withValues(alpha: 0.28)
-                : (warn ? t.err.withValues(alpha: 0.35) : t.sep),
-            width: 0.7,
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10.5),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          GrassBagSpringTap(
+            onTap: onTap,
+            pressedScale: 0.98,
+            haptic: true,
+            child: Row(
               children: [
                 GrassBagSquircleIcon(
                   icon: done ? CupertinoIcons.checkmark_alt : icon,
@@ -1755,16 +1826,12 @@ class _OnboardingPermissionTile extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                Container(
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: !done,
+                  tintColor: done ? t.okSoft : (warn ? t.errSoft : t.primarySoft),
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                  decoration: BoxDecoration(
-                    color: done ? t.okSoft : (warn ? t.errSoft : t.primarySoft),
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(
-                      color: accent.withValues(alpha: 0.26),
-                      width: 0.6,
-                    ),
-                  ),
                   child: Text(
                     actionLabel,
                     style: TextStyle(
@@ -1776,40 +1843,40 @@ class _OnboardingPermissionTile extends StatelessWidget {
                 ),
               ],
             ),
-            if (secondaryLabel != null && onSecondaryTap != null) ...[
-              const SizedBox(height: 8),
-              Align(
-                alignment: Alignment.centerRight,
-                child: GrassBagSpringTap(
-                  onTap: onSecondaryTap!,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4.5),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: t.sep, width: 0.6),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(CupertinoIcons.info_circle, size: 12, color: t.text2),
-                        const SizedBox(width: 4),
-                        Text(
-                          '打开$secondaryLabel以解除受限设置',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w500,
-                            color: t.text2,
-                          ),
+          ),
+          if (secondaryLabel != null && onSecondaryTap != null) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: GrassBagSpringTap(
+                onTap: onSecondaryTap!,
+                enablePointerGlow: false,
+                haptic: true,
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4.5),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(CupertinoIcons.info_circle, size: 12, color: t.text2),
+                      const SizedBox(width: 4),
+                      Text(
+                        '打开$secondaryLabel以解除受限设置',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                          color: t.text2,
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ],
+            ),
           ],
-        ),
+        ],
       ),
     );
   }

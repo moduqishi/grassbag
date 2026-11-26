@@ -119,8 +119,13 @@ class SduiNodeRenderer extends StatelessWidget {
   Widget _buildRow(BuildContext context) {
     final gap = _parseFiniteDouble(node['gap'], fallback: 10.0).clamp(0.0, 64.0).toDouble();
     final items = _children();
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    final equalHeightCards = items.length >= 2 &&
+        items.every((c) {
+          final type = c['type']?.toString();
+          return type == 'metric' || type == 'card' || type == 'section';
+        });
+    final row = Row(
+      crossAxisAlignment: equalHeightCards ? CrossAxisAlignment.stretch : CrossAxisAlignment.start,
       children: [
         for (var i = 0; i < items.length; i++) ...[
           if (i > 0) SizedBox(width: gap),
@@ -136,6 +141,7 @@ class SduiNodeRenderer extends StatelessWidget {
         ],
       ],
     );
+    return equalHeightCards ? IntrinsicHeight(child: row) : row;
   }
 
   Color _toneColor(GrassBagTokens t, String? tone) => switch (tone) {
@@ -341,19 +347,23 @@ class SduiNodeRenderer extends StatelessWidget {
                     ),
                     if (raw[i]['copyable'] == true) ...[
                       const SizedBox(width: 4),
-                      GrassBagSpringTap(
-                        onTap: () {
-                          final val = raw[i]['value']?.toString() ?? '';
-                          Clipboard.setData(ClipboardData(text: val));
-                          onCopied?.call(val);
-                        },
-                        haptic: true,
-                        pressedScale: 0.88,
-                        child: SizedBox(
-                          width: 34,
-                          height: 34,
-                          child: Center(
-                            child: Icon(CupertinoIcons.doc_on_doc, size: 13.5, color: t.primary),
+                      Tooltip(
+                        message: '复制',
+                        child: GrassBagSpringTap(
+                          onTap: () {
+                            final val = raw[i]['value']?.toString() ?? '';
+                            Clipboard.setData(ClipboardData(text: val));
+                            onCopied?.call(val);
+                          },
+                          haptic: true,
+                          borderRadius: 999,
+                          pressedScale: 0.88,
+                          child: SizedBox(
+                            width: 34,
+                            height: 34,
+                            child: Center(
+                              child: Icon(CupertinoIcons.doc_on_doc, size: 13.5, color: t.primary),
+                            ),
                           ),
                         ),
                       ),
@@ -398,12 +408,11 @@ class SduiNodeRenderer extends StatelessWidget {
     final tone = _toneColor(t, node['tone']?.toString());
     return Align(
       alignment: Alignment.centerLeft,
-      child: Container(
+      child: GrassBagFresnelGlassSurface(
+        isPill: true,
+        innerWell: true,
+        tintColor: tone.withValues(alpha: t.isDark ? 0.22 : 0.12),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-          color: tone.withValues(alpha: t.isDark ? 0.22 : 0.12),
-          borderRadius: BorderRadius.circular(999),
-        ),
         child: Text(
           node['label']?.toString() ?? '',
           style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: tone),
@@ -484,9 +493,20 @@ class SduiNodeRenderer extends StatelessWidget {
     return LayoutBuilder(
       builder: (_, box) {
         final minW = math.max(box.maxWidth.isFinite ? box.maxWidth : 320.0, colCount * 110.0);
-        return SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: SizedBox(width: minW, child: tableBody),
+        return ShaderMask(
+          blendMode: BlendMode.dstIn,
+          shaderCallback: (bounds) => const LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            colors: [Colors.white, Colors.white, Colors.transparent],
+            stops: [0.0, 0.93, 1.0],
+          ).createShader(bounds),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            padding: const EdgeInsets.only(right: 16),
+            child: SizedBox(width: minW, child: tableBody),
+          ),
         );
       },
     );
@@ -552,53 +572,28 @@ class SduiNodeRenderer extends StatelessWidget {
   }
 
   Widget _buildAlert(BuildContext context) {
-    final t = GrassBagTokens.of(context);
     final toneName = node['tone']?.toString() ?? 'warn';
-    final tone = _toneColor(t, toneName);
     final title = node['title']?.toString() ?? '';
     final message = node['message']?.toString() ?? node['value']?.toString() ?? '';
+    final bannerTone = switch (toneName) {
+      'good' || 'ok' => GrassBagBannerTone.ok,
+      'bad' || 'danger' || 'error' => GrassBagBannerTone.error,
+      'accent' || 'info' => GrassBagBannerTone.info,
+      _ => GrassBagBannerTone.warn,
+    };
     final icon = switch (toneName) {
       'good' || 'ok' => CupertinoIcons.checkmark_circle_fill,
       'bad' || 'danger' || 'error' => CupertinoIcons.exclamationmark_triangle_fill,
       'accent' || 'info' => CupertinoIcons.info_circle_fill,
       _ => CupertinoIcons.exclamationmark_circle_fill,
     };
-    return Container(
+    return GrassBagStatusBanner(
+      tone: bannerTone,
+      icon: icon,
+      title: title.isNotEmpty && message.isNotEmpty ? title : null,
+      message: message.isNotEmpty ? message : title,
+      borderRadius: 16,
       padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-      decoration: BoxDecoration(
-        color: tone.withValues(alpha: t.isDark ? 0.18 : 0.10),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: tone.withValues(alpha: 0.35), width: 0.7),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.only(top: 1),
-            child: Icon(icon, size: 16, color: tone),
-          ),
-          const SizedBox(width: 9),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (title.isNotEmpty)
-                  Text(
-                    title,
-                    style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: tone),
-                  ),
-                if (message.isNotEmpty) ...[
-                  if (title.isNotEmpty) const SizedBox(height: 3),
-                  Text(
-                    message,
-                    style: TextStyle(fontSize: 12.5, height: 1.4, color: t.text2),
-                  ),
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
     );
   }
 
@@ -617,71 +612,140 @@ class SduiNodeRenderer extends StatelessWidget {
     }
     final contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
 
-    return RepaintBoundary(
-      child: ClipRSuperellipse(
-        borderRadius: BorderRadius.circular(16),
-        child: Container(
-          decoration: ShapeDecoration(
-            color: t.codeBg,
-            shape: RoundedSuperellipseBorder(
-              borderRadius: BorderRadius.circular(16),
-              side: BorderSide(color: Colors.white.withValues(alpha: 0.08), width: 0.6),
-            ),
+    final diffCard = ClipRSuperellipse(
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        decoration: ShapeDecoration(
+          color: t.codeBg,
+          shape: RoundedSuperellipseBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: tier == GrassBagGlassTier.solid
+                ? BorderSide(
+                    color: t.isDark ? Colors.white.withValues(alpha: 0.08) : t.sep,
+                    width: 0.65,
+                  )
+                : BorderSide.none,
           ),
-          child: Column(
+        ),
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
               color: t.codeBar,
-              child: Text(
-                path,
-                style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      path,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
+                    ),
+                  ),
+                  Tooltip(
+                    message: '复制 Diff',
+                    child: GrassBagSpringTap(
+                      enablePointerGlow: false,
+                      haptic: true,
+                      onTap: () {
+                        Clipboard.setData(ClipboardData(text: diff));
+                        onCopied?.call(diff);
+                      },
+                      child: GrassBagFresnelGlassSurface(
+                        isPill: true,
+                        innerWell: true,
+                        interactive: true,
+                        padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(CupertinoIcons.doc_on_doc, size: 11, color: t.codeFg),
+                            const SizedBox(width: 4),
+                            Text(
+                              '复制',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: t.codeFg,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             Padding(
               padding: const EdgeInsets.all(10),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SizedBox(
-                  width: contentWidth,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      for (final line in lines)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                          color: line.startsWith('+') && !line.startsWith('+++')
-                              ? t.ok.withValues(alpha: 0.16)
-                              : (line.startsWith('-') && !line.startsWith('---')
-                                  ? t.err.withValues(alpha: 0.16)
-                                  : null),
-                          child: Text(
-                            line,
-                            softWrap: false,
-                            overflow: TextOverflow.visible,
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 11.5,
-                              color: line.startsWith('+') && !line.startsWith('+++')
-                                  ? const Color(0xFF6EE7B7)
-                                  : (line.startsWith('-') && !line.startsWith('---')
-                                      ? const Color(0xFFFCA5A5)
-                                      : (line.startsWith('@@')
-                                          ? const Color(0xFF93C5FD)
-                                          : t.codeFg)),
+              child: ShaderMask(
+                blendMode: BlendMode.dstIn,
+                shaderCallback: (bounds) => const LinearGradient(
+                  begin: Alignment.centerLeft,
+                  end: Alignment.centerRight,
+                  colors: [Colors.white, Colors.white, Colors.transparent],
+                  stops: [0.0, 0.94, 1.0],
+                ).createShader(bounds),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  padding: const EdgeInsets.only(right: 16),
+                  child: SizedBox(
+                    width: contentWidth,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (final line in lines)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                            color: line.startsWith('+') && !line.startsWith('+++')
+                                ? t.ok.withValues(alpha: t.isDark ? 0.16 : 0.13)
+                                : (line.startsWith('-') && !line.startsWith('---')
+                                    ? t.err.withValues(alpha: t.isDark ? 0.16 : 0.12)
+                                    : null),
+                            child: Text(
+                              line,
+                              softWrap: false,
+                              overflow: TextOverflow.visible,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11.5,
+                                color: line.startsWith('+') && !line.startsWith('+++')
+                                    ? (t.isDark ? const Color(0xFF6EE7B7) : const Color(0xFF0D7A4F))
+                                    : (line.startsWith('-') && !line.startsWith('---')
+                                        ? (t.isDark ? const Color(0xFFFCA5A5) : const Color(0xFFC42B2B))
+                                        : (line.startsWith('@@')
+                                            ? (t.isDark ? const Color(0xFF93C5FD) : const Color(0xFF2563EB))
+                                            : t.codeFg)),
+                              ),
                             ),
                           ),
-                        ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
           ],
         ),
-        ),
       ),
+    );
+    return RepaintBoundary(
+      child: tier == GrassBagGlassTier.solid
+          ? diffCard
+          : CustomPaint(
+              foregroundPainter: GrassBagFresnelRimPainter(
+                isDark: t.isDark,
+                borderRadius: 16,
+                innerWell: true,
+                frosted: tier == GrassBagGlassTier.frosted,
+                paintTopSheen: false,
+                strokeWidth: 0.78,
+              ),
+              child: diffCard,
+            ),
     );
   }
 
@@ -693,6 +757,7 @@ class SduiNodeRenderer extends StatelessWidget {
       schema: schema,
       initialValues: values,
       tier: tier,
+      insideGlass: true,
       onSubmit: (v) async => await onAction(submitId, v),
     );
   }
@@ -880,29 +945,42 @@ class _SduiCardSectionState extends State<_SduiCardSection> {
           if (title != null)
             GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: collapsible ? () => setState(() => _collapsed = !_collapsed) : null,
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          title,
-                          style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+              onTap: collapsible
+                  ? () {
+                      HapticFeedback.selectionClick();
+                      setState(() => _collapsed = !_collapsed);
+                    }
+                  : null,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: collapsible ? 34 : 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+                          ),
+                          if (subtitle != null)
+                            Text(subtitle, style: TextStyle(fontSize: 12, color: t.text3)),
+                        ],
+                      ),
+                    ),
+                    if (collapsible)
+                      AnimatedRotation(
+                        turns: _collapsed ? 0.0 : 0.5,
+                        duration: const Duration(milliseconds: 180),
+                        curve: Curves.easeOutCubic,
+                        child: Icon(
+                          CupertinoIcons.chevron_down,
+                          size: 14,
+                          color: t.text3,
                         ),
-                        if (subtitle != null)
-                          Text(subtitle, style: TextStyle(fontSize: 12, color: t.text3)),
-                      ],
-                    ),
-                  ),
-                  if (collapsible)
-                    Icon(
-                      _collapsed ? CupertinoIcons.chevron_down : CupertinoIcons.chevron_up,
-                      size: 14,
-                      color: t.text3,
-                    ),
-                ],
+                      ),
+                  ],
+                ),
               ),
             ),
           AnimatedSize(
@@ -1020,12 +1098,31 @@ class _SduiChartPainter extends CustomPainter {
     final plotTop = 8.0;
     final plotH = math.max(20.0, plotBottom - plotTop);
 
-    // Subtle baseline grid
+    // Subtle baseline grid + compact Y-axis reference labels (max & mid) for scale readability
     final gridPaint = Paint()
       ..color = gridColor
       ..strokeWidth = 0.6;
     canvas.drawLine(Offset(0, plotBottom), Offset(size.width, plotBottom), gridPaint);
     canvas.drawLine(Offset(0, plotTop + plotH * 0.5), Offset(size.width, plotTop + plotH * 0.5), gridPaint);
+    String fmtTick(double v) {
+      if (v >= 1000000) return '${(v / 1000000).toStringAsFixed(1)}M';
+      if (v >= 1000) return '${(v / 1000).toStringAsFixed(1)}k';
+      return v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
+    }
+    for (final (tickVal, tickY) in [(maxY, plotTop), (maxY * 0.5, plotTop + plotH * 0.5)]) {
+      final tp = TextPainter(
+        text: TextSpan(
+          text: fmtTick(tickVal),
+          style: TextStyle(
+            fontSize: 9.5,
+            fontFeatures: const [FontFeature.tabularFigures()],
+            color: labelColor.withValues(alpha: 0.78),
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(2, tickY - tp.height * 0.5));
+    }
 
     final slotW = size.width / count;
 

@@ -186,7 +186,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
         const _ProviderPresetSpec(
           id: 'google',
           name: 'Google Gemini',
-          subtitle: 'Gemini 2.5 Pro / Flash (OpenAI 兼容)',
+          subtitle: 'Gemini 2.5 Pro / Flash',
           settingsNs: 'llm-pi-ai',
           apiProtocol: 'openai-completions',
           defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
@@ -379,20 +379,25 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                         Row(
                           children: [
                             if (activeEntry != null && activeEntry.providerName.isNotEmpty) ...[
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 1.5),
-                                decoration: BoxDecoration(
-                                  color: t.primarySoft,
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  activeEntry.providerName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w600,
-                                    color: t.primary,
+                              Flexible(
+                                flex: 0,
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(maxWidth: 112),
+                                  child: GrassBagFresnelGlassSurface(
+                                    isPill: true,
+                                    innerWell: true,
+                                    tintColor: t.primarySoft,
+                                    padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
+                                    child: Text(
+                                      activeEntry.providerName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -402,8 +407,8 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                               child: Text(
                                 hasUsableModel
                                     ? '$effectiveProviderId / $effectiveModelId'
-                                    : '登录 DeepSeek 账号或添加自定义渠道即可开始对话',
-                                maxLines: 1,
+                                    : '登录 DeepSeek 或添加自定义渠道即可开始',
+                                maxLines: hasUsableModel ? 1 : 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
                                   fontFamily: hasUsableModel ? 'monospace' : null,
@@ -434,15 +439,17 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                     child: GrassBagSpringTap(
                       onTap: _refreshCatalog,
                       pressedScale: 0.88,
-                      child: Container(
-                        width: 32,
-                        height: 32,
-                        decoration: BoxDecoration(
-                          color: t.fill1,
-                          shape: BoxShape.circle,
-                        ),
+                      enablePointerGlow: false,
+                      haptic: true,
+                      child: GrassBagFresnelGlassSurface(
+                        isCircle: true,
+                        innerWell: true,
+                        interactive: true,
+                        width: 34,
+                        height: 34,
+                        alignment: Alignment.center,
                         child: _refreshing
-                            ? Center(child: CupertinoActivityIndicator(radius: 7, color: t.primary))
+                            ? Center(child: GrassBagActivityIndicator(radius: 7, color: t.primary))
                             : Icon(CupertinoIcons.refresh, size: 15, color: t.text2),
                       ),
                     ),
@@ -516,12 +523,10 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                 ),
               ] else if (hasUsableModel) ...[
                 const SizedBox(height: 11),
-                Container(
+                GrassBagFresnelGlassSurface(
+                  borderRadius: 12,
+                  innerWell: true,
                   padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: t.fill1,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
                   child: Row(
                     children: [
                       Icon(CupertinoIcons.info_circle, size: 14, color: t.text3),
@@ -641,12 +646,11 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                       ),
                       const SizedBox(width: 6),
                       if (p.modelsCount > 0)
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                          decoration: BoxDecoration(
-                            color: t.okSoft,
-                            borderRadius: BorderRadius.circular(999),
-                          ),
+                        GrassBagFresnelGlassSurface(
+                          isPill: true,
+                          innerWell: true,
+                          tintColor: t.okSoft,
+                          padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 1.5),
                           child: Text(
                             '${p.modelsCount} 模型',
                             style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.ok),
@@ -703,6 +707,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
               final isConfigured = !spec.isCustomTemplate && (existing?.configured ?? false);
               return GrassBagSpringTap(
                 pressedScale: 0.97,
+                enablePointerGlow: false,
                 haptic: true,
                 onTap: () {
                   if (spec.isCustomTemplate) {
@@ -731,22 +736,30 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                       initialEnvRef: (existing?.envRef.isNotEmpty == true)
                           ? existing!.envRef
                           : spec.envRef,
-                      initialProtocol: piCfg?['api']?.toString() ?? spec.apiProtocol,
+                      initialProtocol: resolveProviderApiProtocol(
+                        explicit: piCfg?['api']?.toString() ?? spec.apiProtocol,
+                        providerId: spec.id,
+                        baseUrl: (existing?.baseUrl.isNotEmpty == true)
+                            ? existing!.baseUrl
+                            : spec.defaultBaseUrl,
+                      ),
                       isCustomNew: false,
                     );
                   }
                 },
                 child: GrassBagCard(
                   borderRadius: 18,
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+                  interactive: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 11),
                   child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
                       GrassBagSquircleIcon(
                         icon: spec.icon,
                         color: spec.color,
                         size: 32,
                         iconSize: 15,
-                        filled: spec.isCustomTemplate || isConfigured,
+                        filled: false,
                       ),
                       const SizedBox(width: 9),
                       Expanded(
@@ -774,12 +787,12 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                                 ],
                               ],
                             ),
-                            const SizedBox(height: 1),
+                            const SizedBox(height: 1.5),
                             Text(
                               spec.subtitle,
-                              maxLines: 1,
+                              maxLines: 2,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11, color: t.text3),
+                              style: TextStyle(fontSize: 11, height: 1.28, color: t.text3),
                             ),
                           ],
                         ),
@@ -801,16 +814,19 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
             return Column(
               children: [
                 for (int i = 0; i < presets.length; i += 2) ...[
-                  Row(
-                    children: [
-                      Expanded(child: buildCard(presets[i])),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: i + 1 < presets.length
-                            ? buildCard(presets[i + 1])
-                            : const SizedBox.shrink(),
-                      ),
-                    ],
+                  IntrinsicHeight(
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(child: buildCard(presets[i])),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: i + 1 < presets.length
+                              ? buildCard(presets[i + 1])
+                              : const SizedBox.shrink(),
+                        ),
+                      ],
+                    ),
                   ),
                   if (i + 2 < presets.length) const SizedBox(height: 8),
                 ],
@@ -932,6 +948,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                                 tier: state.glassTier,
                                 insideGlass: true,
                                 onTap: () {
+                                  _providerSearchTimer?.cancel();
                                   _providerSearchCtrl.clear();
                                   setState(() => _providerSearch = '');
                                 },
@@ -954,23 +971,21 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
-                            trailing: Container(
+                            trailing: GrassBagFresnelGlassSurface(
+                              isPill: true,
+                              innerWell: true,
+                              tintColor: t.primarySoft,
                               padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: t.primarySoft,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
                               child: Text(
                                 '配置',
                                 style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
                               ),
                             ),
                             onTap: () {
-                              final lowerId = p.id.toLowerCase();
-                              final lowerUrl = p.baseUrl.toLowerCase();
-                              final inferredProto = (lowerId.contains('anthropic') || lowerUrl.contains('anthropic'))
-                                  ? 'anthropic-messages'
-                                  : (lowerId == 'openai' ? 'openai-responses' : 'openai-completions');
+                              final inferredProto = resolveProviderApiProtocol(
+                                providerId: p.id,
+                                baseUrl: p.baseUrl,
+                              );
                               showVisualProviderEditorSheet(
                                 context,
                                 providerId: p.id,
@@ -1103,7 +1118,10 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
         tier: state.glassTier,
         onAction: () {
           if (state.connectionPhase == ConnectionPhase.connected) {
-            setState(() => _tabIndex = 0);
+            setState(() {
+              _prevTabIndex = _tabIndex;
+              _tabIndex = 0;
+            });
           } else {
             ctrl.probeAndRefreshHost(state.activeHostId);
           }
@@ -1114,6 +1132,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
     final credById = <String, ProviderCredentialItem>{
       for (final p in state.providerCredentials) p.id: p,
     };
+    final routableIds = state.routableProviders.toSet();
     final activeGroupFilter = (_modelGroupFilter != null && groups.any((g) => g.id == _modelGroupFilter))
         ? _modelGroupFilter
         : null;
@@ -1169,32 +1188,47 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
         ),
         if (groups.length > 1) ...[
           const SizedBox(height: 10),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                _FilterPill(
-                  label: '全部 ($totalModels)',
-                  active: activeGroupFilter == null,
-                  onTap: () => setState(() {
-                    _modelGroupFilter = null;
-                    _allModelsLimit = 60;
-                  }),
-                ),
-                for (final g in groups) ...[
-                  const SizedBox(width: 6),
+          () {
+            final chipsRow = SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              padding: EdgeInsets.only(right: groups.length >= 3 ? 18 : 0),
+              child: Row(
+                children: [
                   _FilterPill(
-                    label: '${g.name} (${g.models.length})',
-                    active: activeGroupFilter == g.id,
+                    label: '全部 ($totalModels)',
+                    active: activeGroupFilter == null,
                     onTap: () => setState(() {
-                      _modelGroupFilter = g.id;
+                      _modelGroupFilter = null;
                       _allModelsLimit = 60;
                     }),
                   ),
+                  for (final g in groups) ...[
+                    const SizedBox(width: 6),
+                    _FilterPill(
+                      label: '${g.name} (${g.models.length})',
+                      active: activeGroupFilter == g.id,
+                      onTap: () => setState(() {
+                        _modelGroupFilter = g.id;
+                        _allModelsLimit = 60;
+                      }),
+                    ),
+                  ],
                 ],
-              ],
-            ),
-          ),
+              ),
+            );
+            if (groups.length < 3) return chipsRow;
+            return ShaderMask(
+              blendMode: BlendMode.dstIn,
+              shaderCallback: (bounds) => const LinearGradient(
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+                colors: [Colors.white, Colors.white, Colors.transparent],
+                stops: [0.0, 0.91, 1.0],
+              ).createShader(bounds),
+              child: chipsRow,
+            );
+          }(),
         ],
         const SizedBox(height: 12),
         if (visibleEntries.isEmpty)
@@ -1217,6 +1251,7 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                   insideGlass: true,
                   accentForeground: true,
                   onTap: () {
+                    _modelSearchTimer?.cancel();
                     _modelSearchCtrl.clear();
                     setState(() {
                       _modelSearch = '';
@@ -1243,6 +1278,8 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                       final selected = effId == m.id &&
                           (effProv.isEmpty || effProv == g.id);
                       final cred = credById[g.id];
+                      final isRoutable =
+                          routableIds.contains(g.id) || (cred?.configured ?? false);
                       final canEditParams = cred != null
                           ? cred.settingsNs == 'llm-pi-ai'
                           : (g.id != 'deepseek-official' &&
@@ -1266,22 +1303,42 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                               ),
                             ),
                             const SizedBox(width: 6),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                              decoration: BoxDecoration(
-                                color: selected ? t.primarySoft : t.fill1,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Text(
-                                g.name,
-                                style: TextStyle(
-                                  fontSize: 10.5,
-                                  fontWeight: FontWeight.w500,
-                                  color: selected ? t.primary : t.text3,
+                            ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 96),
+                              child: GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                tintColor: selected ? t.primarySoft : null,
+                                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 1.5),
+                                child: Text(
+                                  g.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w500,
+                                    color: selected ? t.primary : t.text3,
+                                  ),
                                 ),
                               ),
                             ),
-                            if (ctxTag.isNotEmpty) ...[
+                            if (!isRoutable) ...[
+                              const SizedBox(width: 5),
+                              GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                tintColor: t.warnSoft,
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                                child: Text(
+                                  '需配置密钥',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.warn,
+                                  ),
+                                ),
+                              ),
+                            ] else if (ctxTag.isNotEmpty) ...[
                               const SizedBox(width: 5),
                               Text(ctxTag, style: TextStyle(fontSize: 10.5, color: t.text3)),
                             ],
@@ -1324,15 +1381,38 @@ class _DshModelConfigViewState extends ConsumerState<DshModelConfigView> {
                               Icon(CupertinoIcons.checkmark_circle_fill, size: 19, color: t.primary),
                           ],
                         ),
-                        onTap: () => ctrl.setModel(
-                          m.name,
-                          m.shortLabel,
-                          provider: g.id,
-                          modelId: m.id,
-                          effortId: m.efforts.any((e) => e.id == state.modelEffortId)
-                              ? state.modelEffortId
-                              : m.defaultEffort,
-                        ),
+                        onTap: () {
+                          if (!isRoutable) {
+                            if (g.id == 'deepseek-account' || g.id == 'deepseek-official') {
+                              unawaited(launchDeepSeekSignInFlow(context, ref));
+                            } else {
+                              final targetCred = cred;
+                              showVisualProviderEditorSheet(
+                                context,
+                                providerId: g.id,
+                                settingsNs: targetCred?.settingsNs ?? 'llm-pi-ai',
+                                initialDisplayName: targetCred?.name ?? g.name,
+                                initialBaseUrl: targetCred?.baseUrl ?? '',
+                                initialEnvRef: targetCred?.envRef ?? '',
+                                initialProtocol: resolveProviderApiProtocol(
+                                  providerId: g.id,
+                                  baseUrl: targetCred?.baseUrl ?? '',
+                                ),
+                                isCustomNew: false,
+                              );
+                            }
+                            return;
+                          }
+                          ctrl.setModel(
+                            m.name,
+                            m.shortLabel,
+                            provider: g.id,
+                            modelId: m.id,
+                            effortId: m.efforts.any((e) => e.id == state.modelEffortId)
+                                ? state.modelEffortId
+                                : m.defaultEffort,
+                          );
+                        },
                       );
                     },
                   ),
@@ -1385,6 +1465,36 @@ class _FilterPill extends StatelessWidget {
   }
 }
 
+String _normalizeRelayBaseUrl(String raw) {
+  var s = raw.trim();
+  if (s.isEmpty) return '';
+  if (!RegExp(r'^https?://', caseSensitive: false).hasMatch(s)) {
+    final lower = s.toLowerCase();
+    final isLocalOrLan = lower.startsWith('localhost') ||
+        lower.startsWith('127.') ||
+        lower.startsWith('10.') ||
+        lower.startsWith('192.168.') ||
+        RegExp(r'^172\.(1[6-9]|2\d|3[0-1])\.').hasMatch(lower);
+    s = '${isLocalOrLan ? 'http' : 'https'}://$s';
+  }
+  s = s.replaceAll(RegExp(r'/+$'), '');
+  // Strip accidentally pasted full API endpoint suffixes from provider docs.
+  const endpointSuffixes = [
+    '/chat/completions',
+    '/responses',
+    '/messages',
+    '/models',
+  ];
+  final lower = s.toLowerCase();
+  for (final suffix in endpointSuffixes) {
+    if (lower.endsWith(suffix)) {
+      s = s.substring(0, s.length - suffix.length).replaceAll(RegExp(r'/+$'), '');
+      break;
+    }
+  }
+  return s;
+}
+
 /// All-in-One Visual Provider & Custom Model Workbench Sheet.
 /// Owns its own [ConsumerState] `ref` and controllers (zero disposed-ref risk!).
 void showVisualProviderEditorSheet(
@@ -1397,24 +1507,40 @@ void showVisualProviderEditorSheet(
   String? initialProtocol,
   bool isCustomNew = false,
 }) {
-  showGrassBagSheet<void>(
-    context,
-    title: isCustomNew
-        ? '添加自定义渠道 / 中转站'
-        : '配置 ${initialDisplayName.isNotEmpty ? initialDisplayName : providerId}',
-    subtitle: isCustomNew
-        ? '填写 API 地址、密钥与模型即可接入任意 OpenAI / Anthropic / Gemini 兼容服务'
-        : '密钥加密写入宿主机凭据库，修改保存后自动刷新模型目录',
-    bodyBuilder: (_) => _VisualProviderEditorBody(
-      outerContext: context,
-      providerId: providerId,
-      settingsNs: settingsNs,
-      initialDisplayName: initialDisplayName,
-      initialBaseUrl: initialBaseUrl,
-      initialEnvRef: initialEnvRef,
-      initialProtocol: initialProtocol,
-      isCustomNew: isCustomNew,
-    ),
+  final dirtyNotifier = ValueNotifier<bool>(false);
+  unawaited(
+    showGrassBagSheet<void>(
+      context,
+      title: isCustomNew
+          ? '添加自定义渠道 / 中转站'
+          : '配置 ${initialDisplayName.isNotEmpty ? initialDisplayName : providerId}',
+      subtitle: isCustomNew
+          ? '填写 API 地址、密钥与模型即可接入任意 OpenAI / Anthropic / Gemini 兼容服务'
+          : '密钥加密写入宿主机凭据库，修改保存后自动刷新模型目录',
+      expandable: true,
+      onWillDismiss: () async {
+        if (!dirtyNotifier.value) return true;
+        if (!context.mounted) return true;
+        return showGrassBagConfirmDialog(
+          context,
+          title: '放弃未保存的渠道配置？',
+          message: '你已修改该渠道的地址、密钥或模型列表，离开后未保存的内容将会丢失。',
+          confirmLabel: '放弃更改',
+          isDestructive: true,
+        );
+      },
+      bodyBuilder: (_) => _VisualProviderEditorBody(
+        outerContext: context,
+        providerId: providerId,
+        settingsNs: settingsNs,
+        initialDisplayName: initialDisplayName,
+        initialBaseUrl: initialBaseUrl,
+        initialEnvRef: initialEnvRef,
+        initialProtocol: initialProtocol,
+        isCustomNew: isCustomNew,
+        dirtyNotifier: dirtyNotifier,
+      ),
+    ).whenComplete(dirtyNotifier.dispose),
   );
 }
 
@@ -1428,6 +1554,7 @@ class _VisualProviderEditorBody extends ConsumerStatefulWidget {
     required this.initialEnvRef,
     required this.initialProtocol,
     required this.isCustomNew,
+    this.dirtyNotifier,
   });
 
   final BuildContext outerContext;
@@ -1438,6 +1565,7 @@ class _VisualProviderEditorBody extends ConsumerStatefulWidget {
   final String initialEnvRef;
   final String? initialProtocol;
   final bool isCustomNew;
+  final ValueNotifier<bool>? dirtyNotifier;
 
   @override
   ConsumerState<_VisualProviderEditorBody> createState() => _VisualProviderEditorBodyState();
@@ -1572,9 +1700,18 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _lastTplName = tpl.name;
       _lastTplModel = tpl.sampleModel;
     });
+    _markDirty();
+  }
+
+  void _markDirty() {
+    final dn = widget.dirtyNotifier;
+    if (dn != null && !dn.value) {
+      dn.value = true;
+    }
   }
 
   void _maybeInferProtocolFromUrl(String url) {
+    _markDirty();
     if (_protocolManuallyPicked || widget.settingsNs != 'llm-pi-ai') return;
     final lower = url.trim().toLowerCase();
     String? inferred;
@@ -1582,6 +1719,8 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       inferred = 'anthropic-messages';
     } else if (lower.contains('openai.com') && widget.providerId == 'openai') {
       inferred = 'openai-responses';
+    } else if (_protocol == 'anthropic-messages' && lower.isNotEmpty) {
+      inferred = 'openai-completions';
     }
     if (inferred != null && inferred != _protocol) {
       setState(() => _protocol = inferred!);
@@ -1590,10 +1729,21 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
 
   Future<void> _discoverModels({bool testOnly = false}) async {
     if (_discovering || _testingConnection || _saving) return;
-    final baseUrl = _baseUrlCtrl.text.trim();
-    if (baseUrl.isEmpty) {
+    final rawBaseUrl = _baseUrlCtrl.text.trim();
+    if (rawBaseUrl.isEmpty) {
       setState(() => _errorMsg = '请先填写 API 地址 (Base URL) 后再测试或拉取模型列表');
       return;
+    }
+    final baseUrl = _normalizeRelayBaseUrl(rawBaseUrl);
+    final parsed = Uri.tryParse(baseUrl);
+    if (parsed == null ||
+        (parsed.scheme != 'http' && parsed.scheme != 'https') ||
+        parsed.host.isEmpty) {
+      setState(() => _errorMsg = 'API 地址格式无效，请检查域名或端口（例如 https://api.example.com/v1）');
+      return;
+    }
+    if (baseUrl != rawBaseUrl) {
+      _baseUrlCtrl.text = baseUrl;
     }
     setState(() {
       if (testOnly) {
@@ -1606,8 +1756,10 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     });
     final pid = _derivedProviderId();
     List<Map<String, dynamic>> discovered = const [];
+    String? discoverError;
+    var discoverReachable = false;
     try {
-      discovered = await ref.read(appProvider.notifier).discoverProviderModels(
+      final res = await ref.read(appProvider.notifier).discoverProviderModels(
             providerId: pid,
             apiProtocol: _protocol,
             baseUrl: baseUrl,
@@ -1615,6 +1767,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             envRef: _derivedEnvRef(pid),
             testOnly: testOnly,
           );
+      discovered = res.models;
+      discoverError = res.error;
+      discoverReachable = res.reachable;
       // Best-effort enrich discovered `/v1/models` items with accurate models.dev parameters
       // while keeping the busy indicator active and capped to a short timeout.
       if (!testOnly && discovered.isNotEmpty) {
@@ -1665,36 +1820,52 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     }
     if (!mounted) return;
     setState(() {
-      if (discovered.isEmpty) {
-        _errorMsg = '未能从该接口获取到可用模型，请检查 Base URL、协议类型或 API 密钥是否正确；也可在下方手动填写模型 ID。';
+      if (!discoverReachable) {
+        _errorMsg = discoverError?.isNotEmpty == true
+            ? discoverError
+            : '未能连接到该接口，请检查 Base URL、协议类型或 API 密钥是否正确；也可在下方手动填写模型 ID。';
+        if (_models.isEmpty) {
+          _showAddModel = true;
+        }
+      } else if (discovered.isEmpty) {
+        _probeSuccessMsg = '接口连通正常，但未返回可用模型列表，可在下方手动填写模型 ID。';
         if (_models.isEmpty) {
           _showAddModel = true;
         }
       } else {
         _probeSuccessMsg = '连通正常，发现 ${discovered.length} 个模型';
+        final existingIds = _models.map((m) => m['id']?.toString()).toSet();
+        final fresh = discovered
+            .where((m) {
+              final id = m['id']?.toString() ?? '';
+              return id.isNotEmpty && !existingIds.contains(id);
+            })
+            .toList(growable: false);
         if (!testOnly) {
-          final existingIds = _models.map((m) => m['id']?.toString()).toSet();
-          final fresh = discovered
-              .where((m) {
-                final id = m['id']?.toString() ?? '';
-                return id.isNotEmpty && !existingIds.contains(id);
-              })
-              .toList(growable: false);
           if (fresh.length <= 6) {
-            _models.addAll(fresh);
+            if (fresh.isNotEmpty) {
+              _models.addAll(fresh);
+              _markDirty();
+              if (_editingModelIndex == null) {
+                _newModelIdCtrl.clear();
+                _newModelNameCtrl.clear();
+                _showAddModel = false;
+              }
+            }
             _discoveredPool = const [];
             _selectedDiscoveredIds.clear();
-            if (_editingModelIndex == null) {
-              _newModelIdCtrl.clear();
-              _newModelNameCtrl.clear();
-              _showAddModel = false;
-            }
           } else {
             _discoveredPool = fresh;
             _selectedDiscoveredIds
               ..clear()
               ..addAll(fresh.take(5).map((m) => m['id'].toString()));
           }
+        } else if (fresh.isNotEmpty) {
+          // Retain discovered models from test-only probe so user can import them in 1 tap!
+          _discoveredPool = fresh;
+          _selectedDiscoveredIds
+            ..clear()
+            ..addAll(fresh.take(5).map((m) => m['id'].toString()));
         }
       }
     });
@@ -1723,6 +1894,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         _showAddModel = false;
       }
     });
+    _markDirty();
   }
 
   @override
@@ -2052,6 +2224,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _newModelIdCtrl.clear();
       _newModelNameCtrl.clear();
     });
+    _markDirty();
     return true;
   }
 
@@ -2059,7 +2232,11 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     if (_saving || _discovering) return;
     final pid = _derivedProviderId();
     final name = _nameCtrl.text.trim().isEmpty ? pid : _nameCtrl.text.trim();
-    final baseUrl = _baseUrlCtrl.text.trim();
+    final rawBaseUrl = _baseUrlCtrl.text.trim();
+    final baseUrl = _normalizeRelayBaseUrl(rawBaseUrl);
+    if (baseUrl != rawBaseUrl && baseUrl.isNotEmpty) {
+      _baseUrlCtrl.text = baseUrl;
+    }
     final envRef = _derivedEnvRef(pid);
     final secret = _apiKeyCtrl.text.trim();
 
@@ -2130,6 +2307,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     }
 
     if (!mounted || err != null) return;
+    widget.dirtyNotifier?.value = false;
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -2172,13 +2350,12 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (_probeSuccessMsg != null) ...[
-          Container(
+        if (!isPiAi && _probeSuccessMsg != null) ...[
+          GrassBagFresnelGlassSurface(
+            borderRadius: 13,
+            innerWell: true,
+            tintColor: t.okSoft,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: t.okSoft,
-              borderRadius: BorderRadius.circular(12),
-            ),
             child: Row(
               children: [
                 Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: t.ok),
@@ -2188,18 +2365,6 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                 ),
               ],
             ),
-          ),
-          const SizedBox(height: 10),
-        ],
-        if (_errorMsg != null) ...[
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-            decoration: BoxDecoration(
-              color: t.errSoft,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: t.err.withValues(alpha: 0.35), width: 0.6),
-            ),
-            child: Text(_errorMsg!, style: TextStyle(fontSize: 12.5, color: t.err)),
           ),
           const SizedBox(height: 10),
         ],
@@ -2235,19 +2400,30 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         if (widget.isCustomNew && isPiAi) ...[
           Text('快捷填充常见中转模板', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
           const SizedBox(height: 6),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: [
-                for (int i = 0; i < _kCustomQuickTemplates.length; i++) ...[
-                  if (i > 0) const SizedBox(width: 6),
-                  _FilterPill(
-                    label: _kCustomQuickTemplates[i].label,
-                    active: _baseUrlCtrl.text.trim() == _kCustomQuickTemplates[i].baseUrl,
-                    onTap: () => _applyCustomTemplate(_kCustomQuickTemplates[i]),
-                  ),
+          ShaderMask(
+            blendMode: BlendMode.dstIn,
+            shaderCallback: (bounds) => const LinearGradient(
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+              colors: [Colors.white, Colors.white, Colors.transparent],
+              stops: [0.0, 0.90, 1.0],
+            ).createShader(bounds),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              padding: const EdgeInsets.only(right: 18),
+              child: Row(
+                children: [
+                  for (int i = 0; i < _kCustomQuickTemplates.length; i++) ...[
+                    if (i > 0) const SizedBox(width: 6),
+                    _FilterPill(
+                      label: _kCustomQuickTemplates[i].label,
+                      active: _baseUrlCtrl.text.trim() == _kCustomQuickTemplates[i].baseUrl,
+                      onTap: () => _applyCustomTemplate(_kCustomQuickTemplates[i]),
+                    ),
+                  ],
                 ],
-              ],
+              ),
             ),
           ),
           const SizedBox(height: 12),
@@ -2260,6 +2436,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           GrassBagTextField(
             controller: _nameCtrl,
             insideGlass: true,
+            onChanged: (_) => _markDirty(),
             placeholder: '例如：我的中转站 / OpenAI / DeepSeek',
             fontSize: 13.5,
             padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
@@ -2279,10 +2456,13 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                 _FilterPill(
                   label: proto.$2,
                   active: _protocol == proto.$1,
-                  onTap: () => setState(() {
-                    _protocol = proto.$1;
-                    _protocolManuallyPicked = true;
-                  }),
+                  onTap: () {
+                    setState(() {
+                      _protocol = proto.$1;
+                      _protocolManuallyPicked = true;
+                    });
+                    _markDirty();
+                  },
                 ),
             ],
           ),
@@ -2323,17 +2503,26 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             Text('API 密钥 (Key)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
             const SizedBox(width: 8),
             if (alreadyHasKey)
-              Container(
+              GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                tintColor: t.okSoft,
                 padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
-                decoration: BoxDecoration(color: t.okSoft, borderRadius: BorderRadius.circular(999)),
                 child: Text('已配置', style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.ok)),
               ),
             const Spacer(),
             GestureDetector(
-              onTap: () => setState(() => _showAdvancedEnv = !_showAdvancedEnv),
-              child: Text(
-                _showAdvancedEnv ? '隐藏密钥标识' : '密钥标识设置',
-                style: TextStyle(fontSize: 11.5, color: t.primary),
+              behavior: HitTestBehavior.opaque,
+              onTap: () {
+                HapticFeedback.selectionClick();
+                setState(() => _showAdvancedEnv = !_showAdvancedEnv);
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                child: Text(
+                  _showAdvancedEnv ? '隐藏密钥标识' : '密钥标识设置',
+                  style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.primary),
+                ),
               ),
             ),
           ],
@@ -2344,6 +2533,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           insideGlass: true,
           monospace: true,
           obscureText: _obscureKey,
+          onChanged: (_) => _markDirty(),
           placeholder: alreadyHasKey ? '留空保持当前密钥，或粘贴新密钥覆盖…' : 'sk-…',
           fontSize: 13,
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
@@ -2361,30 +2551,44 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     return;
                   }
                   _apiKeyCtrl.text = pasted;
+                  _markDirty();
                   setState(() => _errorMsg = null);
+                  HapticFeedback.selectionClick();
+                  ctrl.showToast('已从剪贴板填入密钥', tone: ToastTone.ok);
                 },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                  margin: const EdgeInsets.only(right: 4),
-                  decoration: BoxDecoration(
-                    color: t.primarySoft,
-                    borderRadius: BorderRadius.circular(7),
-                  ),
-                  child: Text(
-                    '粘贴',
-                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 4),
+                  child: GrassBagFresnelGlassSurface(
+                    borderRadius: 8,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3.5),
+                    child: Text(
+                      '粘贴',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                    ),
                   ),
                 ),
               ),
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => setState(() => _obscureKey = !_obscureKey),
-                child: Padding(
-                  padding: const EdgeInsets.only(right: 10, left: 4),
-                  child: Icon(
-                    _obscureKey ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
-                    size: 16,
-                    color: t.text3,
+              Tooltip(
+                message: _obscureKey ? '显示密钥' : '隐藏密钥',
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    setState(() => _obscureKey = !_obscureKey);
+                  },
+                  child: SizedBox(
+                    width: 36,
+                    height: 36,
+                    child: Center(
+                      child: Icon(
+                        _obscureKey ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                        size: 16,
+                        color: t.text3,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -2407,6 +2611,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     fontSize: 12,
                     borderRadius: 12,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                    onChanged: (_) => _markDirty(),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -2420,6 +2625,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   fontSize: 12,
                   borderRadius: 12,
                   padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                  onChanged: (_) => _markDirty(),
                 ),
               ),
             ],
@@ -2437,12 +2643,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
           ),
           const SizedBox(height: 6),
-          Container(
-            decoration: BoxDecoration(
-              color: t.fill1,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: t.sep, width: 0.5),
-            ),
+          GrassBagFresnelGlassSurface(
+            borderRadius: 15,
+            innerWell: true,
             child: Column(
               children: [
                 for (int i = 0; i < liveGroup.models.length && i < 6; i++) ...[
@@ -2464,7 +2667,16 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                         subtitle: Text(m.id, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: t.text3)),
                         trailing: isDefault
                             ? Icon(CupertinoIcons.checkmark_circle_fill, size: 17, color: t.primary)
-                            : Text('设为默认', style: TextStyle(fontSize: 11.5, color: t.primary)),
+                            : GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                tintColor: t.primarySoft,
+                                padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3),
+                                child: Text(
+                                  '设为默认',
+                                  style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                                ),
+                              ),
                         onTap: () => ctrl.setModel(
                           m.name,
                           m.shortLabel,
@@ -2525,18 +2737,18 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   enabled: !_testingConnection && !_discovering && !_saving,
                   onTap: () => _discoverModels(testOnly: true),
                   pressedScale: 0.94,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5.5),
-                    decoration: BoxDecoration(
-                      color: t.fill1,
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: t.sep, width: 0.65),
-                    ),
+                  enablePointerGlow: false,
+                  haptic: true,
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5.5),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         if (_testingConnection)
-                          CupertinoActivityIndicator(radius: 6, color: t.text2)
+                          GrassBagActivityIndicator(radius: 6, color: t.text2)
                         else
                           Icon(CupertinoIcons.checkmark_shield, size: 13, color: t.text2),
                         const SizedBox(width: 4),
@@ -2552,18 +2764,19 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   enabled: !_discovering && !_testingConnection && !_saving,
                   onTap: () => _discoverModels(testOnly: false),
                   pressedScale: 0.94,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5.5),
-                    decoration: BoxDecoration(
-                      color: t.primarySoft,
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: t.primary.withValues(alpha: 0.25), width: 0.65),
-                    ),
+                  enablePointerGlow: false,
+                  haptic: true,
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5.5),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         if (_discovering)
-                          CupertinoActivityIndicator(radius: 6, color: t.primary)
+                          GrassBagActivityIndicator(radius: 6, color: t.primary)
                         else
                           Icon(CupertinoIcons.cloud_download, size: 13, color: t.primary),
                         const SizedBox(width: 4),
@@ -2585,16 +2798,14 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   }
                 },
                 pressedScale: 0.94,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5.5),
-                  decoration: BoxDecoration(
-                    color: _showAddModel ? t.fill2 : t.primarySoft,
-                    borderRadius: BorderRadius.circular(999),
-                    border: Border.all(
-                      color: _showAddModel ? t.sep : t.primary.withValues(alpha: 0.25),
-                      width: 0.65,
-                    ),
-                  ),
+                enablePointerGlow: false,
+                haptic: true,
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  interactive: true,
+                  tintColor: _showAddModel ? null : t.primarySoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5.5),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -2619,13 +2830,28 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             ],
           ),
           const SizedBox(height: 6),
-          if (_models.isNotEmpty)
-            Container(
-              decoration: BoxDecoration(
-                color: t.fill1,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: t.sep, width: 0.5),
+          if (_probeSuccessMsg != null) ...[
+            GrassBagFresnelGlassSurface(
+              borderRadius: 13,
+              innerWell: true,
+              tintColor: t.okSoft,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                children: [
+                  Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: t.ok),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(_probeSuccessMsg!, style: TextStyle(fontSize: 12, color: t.ok)),
+                  ),
+                ],
               ),
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (_models.isNotEmpty)
+            GrassBagFresnelGlassSurface(
+              borderRadius: 15,
+              innerWell: true,
               child: Column(
                 children: [
                   for (int i = 0; i < _models.length; i++) ...[
@@ -2698,7 +2924,9 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                               if (!widget.isCustomNew &&
                                   mid.isNotEmpty &&
                                   _savedModelIds.contains(mid))
-                                GestureDetector(
+                                GrassBagSpringTap(
+                                  enablePointerGlow: false,
+                                  haptic: true,
                                   onTap: () {
                                     final short = mname.contains('/')
                                         ? mname.split('/').last
@@ -2706,21 +2934,33 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                                     final catalogEntry = liveGroup?.models
                                         .where((entry) => entry.id == mid)
                                         .firstOrNull;
+                                    String? fallbackEffort;
+                                    if (m['reasoningEfforts'] is Map &&
+                                        (m['reasoningEfforts'] as Map).isNotEmpty) {
+                                      final keys = (m['reasoningEfforts'] as Map)
+                                          .keys
+                                          .map((k) => k.toString())
+                                          .toList();
+                                      fallbackEffort = keys.contains('medium')
+                                          ? 'medium'
+                                          : keys.first;
+                                    } else if (hasReasoning) {
+                                      fallbackEffort = 'medium';
+                                    }
                                     ctrl.setModel(
                                       mname,
                                       short.length > 18 ? '${short.substring(0, 17)}…' : short,
                                       provider: widget.providerId,
                                       modelId: mid,
-                                      effortId: catalogEntry?.defaultEffort ??
-                                          (m['reasoning'] == true ? 'medium' : null),
+                                      effortId: catalogEntry?.defaultEffort ?? fallbackEffort,
                                     );
                                   },
-                                  child: Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                    decoration: BoxDecoration(
-                                      color: isDefault ? t.primarySoft : t.fill2,
-                                      borderRadius: BorderRadius.circular(999),
-                                    ),
+                                  child: GrassBagFresnelGlassSurface(
+                                    isPill: true,
+                                    innerWell: true,
+                                    interactive: true,
+                                    tintColor: isDefault ? t.primarySoft : null,
+                                    padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 4.5),
                                     child: Text(
                                       isDefault ? '当前默认' : '设为默认',
                                       style: TextStyle(
@@ -2731,54 +2971,63 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                                     ),
                                   ),
                                 ),
-                              const SizedBox(width: 4),
-                              GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onTap: () => _startEditingModel(i),
-                                child: SizedBox(
-                                  width: 34,
-                                  height: 34,
-                                  child: Center(
-                                    child: Icon(
-                                      CupertinoIcons.pencil_circle,
-                                      size: 17,
-                                      color: isEditingThis ? t.primary : t.text2,
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: '编辑模型参数',
+                                child: GrassBagSpringTap(
+                                  pressedScale: 0.88,
+                                  haptic: true,
+                                  onTap: () => _startEditingModel(i),
+                                  child: SizedBox(
+                                    width: 34,
+                                    height: 34,
+                                    child: Center(
+                                      child: Icon(
+                                        CupertinoIcons.pencil_circle,
+                                        size: 17.5,
+                                        color: isEditingThis ? t.primary : t.text2,
+                                      ),
                                     ),
                                   ),
                                 ),
                               ),
-                              const SizedBox(width: 2),
-                              GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onTap: () async {
-                                  final modelLabel =
-                                      (_models[i]['name'] ?? _models[i]['id'] ?? '该模型').toString();
-                                  final ok = await showGrassBagConfirmDialog(
-                                    context,
-                                    title: '移除模型「$modelLabel」？',
-                                    message: '移除后点击底部「保存并刷新模型」即生效。',
-                                    confirmLabel: '移除',
-                                    isDestructive: true,
-                                  );
-                                  if (!ok || !mounted) return;
-                                  if (i >= _models.length) return;
-                                  if (_editingModelIndex == i) {
-                                    _models.removeAt(i);
-                                    _cancelEditingModel();
-                                  } else {
-                                    setState(() {
-                                      if (_editingModelIndex != null && i < _editingModelIndex!) {
-                                        _editingModelIndex = _editingModelIndex! - 1;
-                                      }
+                              const SizedBox(width: 6),
+                              Tooltip(
+                                message: '移除此模型',
+                                child: GrassBagSpringTap(
+                                  pressedScale: 0.88,
+                                  haptic: true,
+                                  onTap: () async {
+                                    final modelLabel =
+                                        (_models[i]['name'] ?? _models[i]['id'] ?? '该模型').toString();
+                                    final ok = await showGrassBagConfirmDialog(
+                                      context,
+                                      title: '移除模型「$modelLabel」？',
+                                      message: '移除后点击底部「保存并刷新模型」即生效。',
+                                      confirmLabel: '移除',
+                                      isDestructive: true,
+                                    );
+                                    if (!ok || !mounted) return;
+                                    if (i >= _models.length) return;
+                                    if (_editingModelIndex == i) {
                                       _models.removeAt(i);
-                                    });
-                                  }
-                                },
-                                child: SizedBox(
-                                  width: 34,
-                                  height: 34,
-                                  child: Center(
-                                    child: Icon(CupertinoIcons.trash, size: 15, color: t.err),
+                                      _cancelEditingModel();
+                                    } else {
+                                      setState(() {
+                                        if (_editingModelIndex != null && i < _editingModelIndex!) {
+                                          _editingModelIndex = _editingModelIndex! - 1;
+                                        }
+                                        _models.removeAt(i);
+                                      });
+                                    }
+                                    _markDirty();
+                                  },
+                                  child: SizedBox(
+                                    width: 34,
+                                    height: 34,
+                                    child: Center(
+                                      child: Icon(CupertinoIcons.trash, size: 15.5, color: t.err),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -2794,13 +3043,11 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
             ),
           if (_discoveredPool.isNotEmpty) ...[
             const SizedBox(height: 8),
-            Container(
+            GrassBagFresnelGlassSurface(
+              borderRadius: 15,
+              innerWell: true,
+              tintColor: t.okSoft.withValues(alpha: t.isDark ? 0.42 : 0.45),
               padding: const EdgeInsets.all(11),
-              decoration: BoxDecoration(
-                color: t.fill1,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: t.ok.withValues(alpha: 0.35), width: 0.7),
-              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -2894,54 +3141,59 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           ],
           if (_showAddModel) ...[
             const SizedBox(height: 8),
-            Container(
+            GrassBagFresnelGlassSurface(
+              borderRadius: 15,
+              innerWell: true,
               padding: const EdgeInsets.all(11),
-              decoration: BoxDecoration(
-                color: t.fill1,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: t.primary.withValues(alpha: 0.30), width: 0.7),
-              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Row(
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 6,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    alignment: WrapAlignment.spaceBetween,
                     children: [
                       Text(
                         _editingModelIndex != null ? '编辑模型参数' : '新增自定义模型',
                         style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
                       ),
-                      const Spacer(),
-                      GrassBagSpringTap(
-                        onTap: _modelsDevLoading
-                            ? () {}
-                            : () => _scheduleNewModelLookup(_newModelIdCtrl.text, forceFill: true),
-                        pressedScale: 0.94,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (_modelsDevLoading)
-                              CupertinoActivityIndicator(radius: 6, color: t.primary)
-                            else
-                              Icon(CupertinoIcons.sparkles, size: 12, color: t.primary),
-                            const SizedBox(width: 4),
-                            Text(
-                              _modelsDevLoading ? '查询中…' : 'models.dev 智能填充',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: t.primary,
-                              ),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          GrassBagSpringTap(
+                            onTap: _modelsDevLoading
+                                ? () {}
+                                : () => _scheduleNewModelLookup(_newModelIdCtrl.text, forceFill: true),
+                            pressedScale: 0.94,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (_modelsDevLoading)
+                                  GrassBagActivityIndicator(radius: 6, color: t.primary)
+                                else
+                                  Icon(CupertinoIcons.sparkles, size: 12, color: t.primary),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _modelsDevLoading ? '查询中…' : 'models.dev 智能填充',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.primary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (_editingModelIndex != null) ...[
+                            const SizedBox(width: 10),
+                            GestureDetector(
+                              onTap: _cancelEditingModel,
+                              child: Text('取消编辑', style: TextStyle(fontSize: 11.5, color: t.text3)),
                             ),
                           ],
-                        ),
+                        ],
                       ),
-                      if (_editingModelIndex != null) ...[
-                        const SizedBox(width: 10),
-                        GestureDetector(
-                          onTap: _cancelEditingModel,
-                          child: Text('取消编辑', style: TextStyle(fontSize: 11.5, color: t.text3)),
-                        ),
-                      ],
                     ],
                   ),
                   const SizedBox(height: 7),
@@ -2953,7 +3205,10 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     fontSize: 12.5,
                     borderRadius: 12,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8.5),
-                    onChanged: (v) => _scheduleNewModelLookup(v),
+                    onChanged: (v) {
+                      _markDirty();
+                      _scheduleNewModelLookup(v);
+                    },
                   ),
                   if (_modelsDevMatched != null) ...[
                     const SizedBox(height: 6),
@@ -2992,6 +3247,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                     fontSize: 12.5,
                     borderRadius: 12,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8.5),
+                    onChanged: (_) => _markDirty(),
                   ),
                   const SizedBox(height: 8),
                   Row(
@@ -3113,13 +3369,11 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
 
         // 6. Inline error near bottom Save CTA + Primary Save / Clear Key / Delete Custom Provider
         if (_errorMsg != null) ...[
-          Container(
+          GrassBagFresnelGlassSurface(
+            borderRadius: 13,
+            innerWell: true,
+            tintColor: t.errSoft,
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-            decoration: BoxDecoration(
-              color: t.errSoft,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: t.err.withValues(alpha: 0.35), width: 0.6),
-            ),
             child: Text(_errorMsg!, style: TextStyle(fontSize: 12.5, color: t.err)),
           ),
           const SizedBox(height: 10),
@@ -3221,22 +3475,40 @@ void showModelParamsEditorSheet(
   required String providerId,
   required ModelCatalogEntry entry,
 }) {
+  final dirty = ValueNotifier<bool>(false);
   showGrassBagSheet<void>(
     context,
     title: '编辑模型参数',
     subtitle: '$providerId / ${entry.id}',
-    bodyBuilder: (_) => _ModelParamsEditorBody(providerId: providerId, entry: entry),
-  );
+    expandable: true,
+    onWillDismiss: () async {
+      if (!dirty.value) return true;
+      return showGrassBagConfirmDialog(
+        context,
+        title: '放弃未保存的模型参数？',
+        message: '你修改的模型参数尚未写入 DSH，现在关闭将会丢失。',
+        confirmLabel: '放弃修改',
+        isDestructive: true,
+      );
+    },
+    bodyBuilder: (_) => _ModelParamsEditorBody(
+      providerId: providerId,
+      entry: entry,
+      dirtyNotifier: dirty,
+    ),
+  ).whenComplete(dirty.dispose);
 }
 
 class _ModelParamsEditorBody extends ConsumerStatefulWidget {
   const _ModelParamsEditorBody({
     required this.providerId,
     required this.entry,
+    this.dirtyNotifier,
   });
 
   final String providerId;
   final ModelCatalogEntry entry;
+  final ValueNotifier<bool>? dirtyNotifier;
 
   @override
   ConsumerState<_ModelParamsEditorBody> createState() => _ModelParamsEditorBodyState();
@@ -3349,6 +3621,13 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
     });
   }
 
+  void _markDirty() {
+    final dn = widget.dirtyNotifier;
+    if (dn != null && !dn.value) {
+      dn.value = true;
+    }
+  }
+
   void _applySpec(ModelsDevSpec spec, {required bool overwriteId}) {
     if (overwriteId) _idCtrl.text = spec.id;
     if (spec.name.isNotEmpty) _nameCtrl.text = spec.name;
@@ -3365,6 +3644,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
     }
     _modelsDevMatched = spec;
     _err = null;
+    _markDirty();
   }
 
   Future<void> _save() async {
@@ -3449,6 +3729,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
       }
     }
     if (!mounted || err != null) return;
+    widget.dirtyNotifier?.value = false;
     Navigator.of(context).pop();
   }
 
@@ -3484,7 +3765,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   if (_modelsDevLoading)
-                    CupertinoActivityIndicator(radius: 6, color: t.primary)
+                    GrassBagActivityIndicator(radius: 6, color: t.primary)
                   else
                     Icon(CupertinoIcons.sparkles, size: 12.5, color: t.primary),
                   const SizedBox(width: 4),
@@ -3504,7 +3785,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           monospace: true,
           fontSize: 13,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          onChanged: (v) => _scheduleLookup(v),
+          onChanged: (v) {
+            _markDirty();
+            _scheduleLookup(v);
+          },
         ),
         if (_modelsDevMatched != null) ...[
           const SizedBox(height: 7),
@@ -3539,6 +3823,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
           insideGlass: true,
           fontSize: 13.5,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          onChanged: (_) => _markDirty(),
         ),
         const SizedBox(height: 10),
         Row(
@@ -3556,7 +3841,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                     keyboardType: TextInputType.number,
                     fontSize: 13,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
-                    onChanged: (_) => setState(() {}),
+                    onChanged: (_) {
+                      _markDirty();
+                      setState(() {});
+                    },
                   ),
                 ],
               ),
@@ -3575,6 +3863,7 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                     keyboardType: TextInputType.number,
                     fontSize: 13,
                     padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
+                    onChanged: (_) => _markDirty(),
                   ),
                 ],
               ),
@@ -3590,7 +3879,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
               _FilterPill(
                 label: opt.$2,
                 active: curCtx == opt.$1,
-                onTap: () => setState(() => _ctxCtrl.text = '${opt.$1}'),
+                onTap: () {
+                  _markDirty();
+                  setState(() => _ctxCtrl.text = '${opt.$1}');
+                },
               ),
           ],
         ),
@@ -3603,7 +3895,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                 value: _reasoning,
                 tier: tier,
                 activeColor: t.ok,
-                onChanged: (v) => setState(() => _reasoning = v),
+                onChanged: (v) {
+                  _markDirty();
+                  setState(() => _reasoning = v);
+                },
               ),
             ),
             if (_reasoning)
@@ -3611,7 +3906,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                 padding: const EdgeInsets.fromLTRB(14, 2, 14, 12),
                 child: _ReasoningEffortsEditor(
                   efforts: _effortMap,
-                  onChanged: (next) => setState(() => _effortMap = next),
+                  onChanged: (next) {
+                    _markDirty();
+                    setState(() => _effortMap = next);
+                  },
                 ),
               ),
             GrassBagListTile(
@@ -3620,7 +3918,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
                 value: _vision,
                 tier: tier,
                 activeColor: t.ok,
-                onChanged: (v) => setState(() => _vision = v),
+                onChanged: (v) {
+                  _markDirty();
+                  setState(() => _vision = v);
+                },
               ),
             ),
             GrassBagListTile(
@@ -3628,7 +3929,10 @@ class _ModelParamsEditorBodyState extends ConsumerState<_ModelParamsEditorBody> 
               trailing: GrassBagGlassSwitch(
                 value: _setDefault,
                 tier: tier,
-                onChanged: (v) => setState(() => _setDefault = v),
+                onChanged: (v) {
+                  _markDirty();
+                  setState(() => _setDefault = v);
+                },
               ),
             ),
           ],
@@ -3764,13 +4068,11 @@ class _ModelsDevMatchedChip extends StatelessWidget {
       if (spec.reasoning) '深度思考',
       if (spec.supportsImage) '识图',
     ];
-    return Container(
+    return GrassBagFresnelGlassSurface(
+      borderRadius: 12,
+      innerWell: true,
+      tintColor: t.okSoft,
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-      decoration: BoxDecoration(
-        color: t.okSoft,
-        borderRadius: BorderRadius.circular(11),
-        border: Border.all(color: t.ok.withValues(alpha: 0.28), width: 0.65),
-      ),
       child: Row(
         children: [
           Icon(CupertinoIcons.checkmark_seal_fill, size: 13.5, color: t.ok),
@@ -3830,32 +4132,39 @@ class _ReasoningEffortsEditorState extends State<_ReasoningEffortsEditor> {
       children: [
         Row(
           children: [
-            Text(
-              '思考深度档位（点选启用/停用）',
-              style: TextStyle(fontSize: 11.5, color: t.text3),
+            Expanded(
+              child: Text(
+                '思考深度档位（点选启用/停用）',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11.5, color: t.text3),
+              ),
             ),
-            const Spacer(),
+            const SizedBox(width: 8),
             GrassBagSpringTap(
               onTap: () => setState(() => _showWireCustom = !_showWireCustom),
               pressedScale: 0.94,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    _showWireCustom ? CupertinoIcons.chevron_up : CupertinoIcons.slider_horizontal_3,
-                    size: 11.5,
-                    color: hasCustomWire ? t.primary : t.text3,
-                  ),
-                  const SizedBox(width: 3),
-                  Text(
-                    _showWireCustom ? '收起参数映射' : (hasCustomWire ? '已自定义参数' : '自定义发送值'),
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _showWireCustom ? CupertinoIcons.chevron_up : CupertinoIcons.slider_horizontal_3,
+                      size: 11.5,
                       color: hasCustomWire ? t.primary : t.text3,
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 3),
+                    Text(
+                      _showWireCustom ? '收起参数映射' : (hasCustomWire ? '已自定义参数' : '自定义发送值'),
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: hasCustomWire ? t.primary : t.text3,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
@@ -3873,7 +4182,12 @@ class _ReasoningEffortsEditorState extends State<_ReasoningEffortsEditor> {
                   final next = Map<String, String?>.from(ordered);
                   if (next.containsKey(lvl.$1)) {
                     final nonOffCount = next.keys.where((k) => k != 'off').length;
-                    if (lvl.$1 != 'off' && nonOffCount <= 1) return;
+                    if (lvl.$1 != 'off' && nonOffCount <= 1) {
+                      ProviderScope.containerOf(context, listen: false)
+                          .read(appProvider.notifier)
+                          .showToast('至少保留一个推理档位', tone: ToastTone.info);
+                      return;
+                    }
                     next.remove(lvl.$1);
                   } else {
                     next[lvl.$1] = lvl.$1 == 'off' ? null : lvl.$1;
@@ -3885,13 +4199,10 @@ class _ReasoningEffortsEditorState extends State<_ReasoningEffortsEditor> {
         ),
         if (_showWireCustom) ...[
           const SizedBox(height: 8),
-          Container(
+          GrassBagFresnelGlassSurface(
+            borderRadius: 12,
+            innerWell: true,
             padding: const EdgeInsets.all(9),
-            decoration: BoxDecoration(
-              color: t.fill1,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: t.sep, width: 0.5),
-            ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [

@@ -463,10 +463,15 @@ if (isDshBoot && process.env.GBRIDGE_BOOT_CACHE !== '0') {
     fs.lstatSync = cachedLstatSync;
     fs.readFileSync = cachedReadFileSync;
     process.stdout.write = watchStdout;
+    const rawCacheTtl = Number(process.env.GBRIDGE_BOOT_CACHE_TIMEOUT_MS);
+    const bootCacheTtlMs =
+      Number.isFinite(rawCacheTtl) && rawCacheTtl >= 15_000
+        ? Math.min(rawCacheTtl, 180_000)
+        : 90_000;
     timer = setTimeout(() => {
       uninstallBootCache();
       scheduleCompileCacheFlush([1000]);
-    }, 60_000);
+    }, bootCacheTtlMs);
     timer.unref?.();
   } catch {
     // Boot cache is purely opportunistic; never impede launch.

@@ -35,6 +35,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   static int _tabSeq = 0;
 
   final List<_LocalTermTab> _tabs = [];
+  final ScrollController _tabScrollCtrl = ScrollController();
   late final AnimationController _tabPulseCtrl;
   late final Animation<double> _tabPulseOpacity;
   int _activeIndex = 0;
@@ -42,6 +43,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   _ModLatch _ctrl = _ModLatch.off;
   _ModLatch _alt = _ModLatch.off;
   double _fontSize = 12.5;
+  final ScrollController _extraKeysScrollCtrl = ScrollController();
   GbridgeClient? _attachedClient;
   String _boundHostId = '';
   StreamSubscription<NativeEvent>? _nativeSub;
@@ -116,6 +118,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       if (currentIdx < 0 || _tabs.length <= 1) return;
       idx = currentIdx;
     }
+    final hadFocus = _tabs.any((t) => t.focusNode.hasFocus);
     setState(() {
       _tabs.removeAt(idx);
       if (_activeIndex >= _tabs.length) {
@@ -127,7 +130,9 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       _alt = _ModLatch.off;
     });
     _teardownTabs([closing], deferResourceDispose: true);
-    _focusTab(_activeIndex);
+    if (hadFocus) {
+      _focusTab(_activeIndex);
+    }
   }
 
   void _enqueuePtyChunk(_LocalTermTab tab, String chunk) {
@@ -167,6 +172,24 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     if (wsPath.startsWith('/')) return wsPath;
     if (appState.activeWorkspace.startsWith('/')) return appState.activeWorkspace;
     return '/root/workspace';
+  }
+
+  String _resolveRemoteCwd(GrassBagAppState appState) {
+    final ws = appState.activeWorkspaceDisplayName.trim();
+    if (ws.isEmpty) return '~';
+    return (ws.startsWith('/') || ws.startsWith('~')) ? ws : '~/$ws';
+  }
+
+  /// Keeps the leaf directory visible for deep paths (e.g. `…/toys/grassbag`) instead of
+  /// truncating the right-most folder name off with `TextOverflow.ellipsis`.
+  String _formatTerminalCwd(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.length <= 24) return trimmed;
+    final parts = trimmed.split('/').where((p) => p.isNotEmpty).toList(growable: false);
+    if (parts.length >= 2) {
+      return '…/${parts[parts.length - 2]}/${parts.last}';
+    }
+    return trimmed;
   }
 
   void _teardownTabs(
@@ -218,7 +241,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     final native = GrassBagNativeBridge.instance;
     final appState = ref.read(appProvider);
     final host = appState.activeHost;
-    final ws = appState.activeWorkspaceDisplayName;
+    final remoteCwd = _resolveRemoteCwd(appState);
     _boundHostId = host.id;
 
     // Strictly isolate host backends: Android local shell is ONLY allowed for `host.isLocal`!
@@ -230,7 +253,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
         id: _nextTabId(host.id),
         hostId: host.id,
         title: 'shell',
-        cwd: ws.isEmpty ? '~' : ws,
+        cwd: remoteCwd,
         backend: _TermBackend.remoteWs,
         ownerClient: live,
       );
@@ -238,14 +261,17 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       unawaited(_attachRemotePty(tab, live));
     } else if (canUseAndroidLocal) {
       final localCwd = _resolveLocalCwd(appState);
+      final extracted = appState.nativeRuntimeStatus.containerExtracted;
       final tab = _createTab(
         id: _nextTabId(host.id),
         hostId: host.id,
         title: 'bash',
         cwd: localCwd,
         backend: _TermBackend.androidLocal,
-        bootLines: const [
-          '\x1b[90m正在启动本机 Ubuntu 24.04.5 容器 Shell…\x1b[0m',
+        bootLines: [
+          extracted
+              ? '\x1b[90m正在启动本机 Ubuntu 24.04.5 容器 Shell…\x1b[0m'
+              : '\x1b[90m正在检查本机 Linux 容器环境…\x1b[0m',
         ],
       );
       _tabs.add(tab);
@@ -260,11 +286,11 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
           id: _nextTabId(host.id),
           hostId: host.id,
           title: 'shell',
-          cwd: ws.isEmpty ? '~' : ws,
+          cwd: remoteCwd,
           backend: _TermBackend.simulated,
           bootLines: [
             '\x1b[33m$notice\x1b[0m',
-            '\x1b[90m连接就绪后可点击右上角重启或自动接入 PTY。\x1b[0m',
+            '\x1b[90m连接就绪后可点击右上角重连或自动接入 PTY。\x1b[0m',
           ],
         ),
       );
@@ -305,7 +331,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
         : (canUseAndroidLocal ? _TermBackend.androidLocal : _TermBackend.simulated);
     final cwd = backend == _TermBackend.androidLocal
         ? _resolveLocalCwd(appState)
-        : (appState.activeWorkspaceDisplayName.isEmpty ? '~' : appState.activeWorkspaceDisplayName);
+        : _resolveRemoteCwd(appState);
     final replacement = _createTab(
       id: _nextTabId(host.id),
       hostId: host.id,
@@ -314,19 +340,24 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       backend: backend,
       ownerClient: backend == _TermBackend.remoteWs ? live : null,
       bootLines: backend == _TermBackend.simulated
-          ? ['\x1b[33m主机「${host.name}」尚未连接，暂无法打开远程 PTY。\x1b[0m']
+          ? ['\x1b[33m正在尝试重新连接主机「${host.name}」…\x1b[0m']
           : const [],
     );
+    final hadFocus = _tabs.any((t) => t.focusNode.hasFocus);
     setState(() {
       _tabs[_activeIndex] = replacement;
     });
     _teardownTabs([old], deferResourceDispose: true);
-    _focusTab(_activeIndex);
+    if (hadFocus) {
+      _focusTab(_activeIndex);
+    }
     if (backend == _TermBackend.remoteWs && live != null) {
       unawaited(_attachRemotePty(replacement, live));
     } else if (backend == _TermBackend.androidLocal) {
       _nativeSub ??= native.events.listen(_onNativeEvent);
       unawaited(_tryUpgradeToAndroidLocalShell(replacement));
+    } else {
+      unawaited(ctrl.probeAndRefreshHost(host.id));
     }
   }
 
@@ -346,6 +377,8 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
 
   @override
   void dispose() {
+    _tabScrollCtrl.dispose();
+    _extraKeysScrollCtrl.dispose();
     _tabPulseCtrl.dispose();
     _ptyFlushTimer?.cancel();
     _ptyFlushTimer = null;
@@ -475,8 +508,13 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   }
 
   Future<void> _attachRemotePty(_LocalTermTab tab, GbridgeClient client) async {
+    tab.backend = _TermBackend.remoteWs;
     tab.ownerClient = client;
-    tab.attaching = true;
+    if (mounted) {
+      setState(() => tab.attaching = true);
+    } else {
+      tab.attaching = true;
+    }
     _ensureWsSubscription(client);
     final appState = ref.read(appProvider);
     tab.terminal.write('\x1b[90m正在连接「${appState.activeHost.name}」实时 PTY…\x1b[0m\r\n');
@@ -558,15 +596,25 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
           _closeIfLeakedRemotePty(client, res, resolvedSid);
           return;
         }
+        final prevChannel = tab.wsChannel;
+        final prevOwner = tab.ownerClient;
+        if (prevChannel != null && prevOwner != null) {
+          prevOwner.stream.unsubscribe(prevChannel);
+        }
+        tab.backend = _TermBackend.remoteWs;
+        tab.ownerClient = client;
         tab.remoteTermId = remoteId;
         tab.remoteSessionId = resolvedSid;
         tab.wsChannel = (resolvedSid != null && resolvedSid.isNotEmpty)
             ? 'terminal:$resolvedSid:$remoteId'
             : 'terminal:$remoteId';
-        tab.attaching = false;
-        if (tab.exited && mounted) {
-          setState(() => tab.exited = false);
+        if (mounted) {
+          setState(() {
+            tab.attaching = false;
+            tab.exited = false;
+          });
         } else {
+          tab.attaching = false;
           tab.exited = false;
         }
         client.stream.subscribe(tab.wsChannel!);
@@ -581,7 +629,13 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
         tab.terminal.write('\x1b[31m创建远端 PTY 失败：$e\x1b[0m\r\n');
       }
     } finally {
-      tab.attaching = false;
+      if (tab.attaching) {
+        if (mounted) {
+          setState(() => tab.attaching = false);
+        } else {
+          tab.attaching = false;
+        }
+      }
     }
     if (!mounted || tab.closed) return;
     // NEVER fall back to Android local shell when connected to a REMOTE host!
@@ -644,29 +698,42 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   String _applyLatchesToInput(String data) {
     if (_bypassLatchTransform || (_ctrl == _ModLatch.off && _alt == _ModLatch.off)) return data;
     var out = data;
+    var ctrlTransformed = false;
+    var altTransformed = false;
     if (_ctrl != _ModLatch.off && out.length == 1) {
       final code = out.toLowerCase().codeUnitAt(0);
       if (code >= 97 && code <= 122) {
         out = String.fromCharCode(code - 96);
-      } else if (out == '[') {
+        ctrlTransformed = true;
+      } else if (out == '[' || out == '3') {
         out = '\x1b';
-      } else if (out == '\\') {
+        ctrlTransformed = true;
+      } else if (out == '\\' || out == '4') {
         out = '\x1c';
-      } else if (out == ']') {
+        ctrlTransformed = true;
+      } else if (out == ']' || out == '5') {
         out = '\x1d';
-      } else if (out == '@' || out == ' ') {
+        ctrlTransformed = true;
+      } else if (out == '@' || out == ' ' || out == '2') {
         out = '\x00';
-      } else if (out == '^') {
+        ctrlTransformed = true;
+      } else if (out == '^' || out == '6') {
         out = '\x1e';
-      } else if (out == '_') {
+        ctrlTransformed = true;
+      } else if (out == '_' || out == '7' || out == '/') {
         out = '\x1f';
+        ctrlTransformed = true;
+      } else if (out == '?' || out == '8') {
+        out = '\x7f';
+        ctrlTransformed = true;
       }
     }
     if (_alt != _ModLatch.off && out.isNotEmpty) {
       out = '\x1b$out';
+      altTransformed = true;
     }
-    final clearCtrl = _ctrl == _ModLatch.once;
-    final clearAlt = _alt == _ModLatch.once;
+    final clearCtrl = _ctrl == _ModLatch.once && ctrlTransformed;
+    final clearAlt = _alt == _ModLatch.once && altTransformed;
     if ((clearCtrl || clearAlt) && mounted) {
       setState(() {
         if (clearCtrl) _ctrl = _ModLatch.off;
@@ -729,7 +796,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
               identical(live, tab.ownerClient)) {
             live.stream.sendTerminalInput(tab.remoteTermId!, data);
           } else if (!tab.exited) {
-            tab.terminal.write('\r\n\x1b[33m[远程 PTY 连接已断开，点击右上角「重连终端」恢复]\x1b[0m\r\n');
+            tab.terminal.write('\r\n\x1b[33m[远程 PTY 连接已断开，点击右上角「重连」恢复]\x1b[0m\r\n');
             if (mounted) setState(() => tab.exited = true);
           }
           return;
@@ -830,7 +897,6 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     final native = GrassBagNativeBridge.instance;
     final appState = ref.read(appProvider);
     final host = appState.activeHost;
-    final ws = appState.activeWorkspaceDisplayName;
     final canUseAndroidLocal = native.isAndroidNative && host.isLocal;
 
     final backend = (live != null && !canUseAndroidLocal)
@@ -843,7 +909,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       title: backend == _TermBackend.androidLocal ? 'bash #$n' : 'shell #$n',
       cwd: backend == _TermBackend.androidLocal
           ? _resolveLocalCwd(appState)
-          : (ws.isEmpty ? '~' : ((ws.startsWith('/') || ws.startsWith('~')) ? ws : '~/$ws')),
+          : _resolveRemoteCwd(appState),
       backend: backend,
       ownerClient: backend == _TermBackend.remoteWs ? live : null,
       bootLines: backend == _TermBackend.simulated
@@ -856,6 +922,17 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       _activeIndex = _tabs.length - 1;
     });
     _focusTab(_activeIndex);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_tabScrollCtrl.hasClients) return;
+      final maxExt = _tabScrollCtrl.position.maxScrollExtent;
+      if (maxExt > 0) {
+        _tabScrollCtrl.animateTo(
+          maxExt,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+        );
+      }
+    });
 
     if (backend == _TermBackend.remoteWs && live != null) {
       unawaited(_attachRemotePty(newTab, live));
@@ -882,25 +959,27 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   void _sendExtraKey(String key) {
     final tab = _tabs[_activeIndex];
     if (key == 'ctrl') {
-      setState(() {
-        _ctrl = switch (_ctrl) {
-          _ModLatch.off => _ModLatch.once,
-          _ModLatch.once => _ModLatch.locked,
-          _ModLatch.locked => _ModLatch.off,
-        };
-      });
-      _scrollTabToBottomAndFocus(tab);
+      final next = switch (_ctrl) {
+        _ModLatch.off => _ModLatch.once,
+        _ModLatch.once => _ModLatch.locked,
+        _ModLatch.locked => _ModLatch.off,
+      };
+      setState(() => _ctrl = next);
+      if (!tab.focusNode.hasFocus) {
+        tab.focusNode.requestFocus();
+      }
       return;
     }
     if (key == 'alt') {
-      setState(() {
-        _alt = switch (_alt) {
-          _ModLatch.off => _ModLatch.once,
-          _ModLatch.once => _ModLatch.locked,
-          _ModLatch.locked => _ModLatch.off,
-        };
-      });
-      _scrollTabToBottomAndFocus(tab);
+      final next = switch (_alt) {
+        _ModLatch.off => _ModLatch.once,
+        _ModLatch.once => _ModLatch.locked,
+        _ModLatch.locked => _ModLatch.off,
+      };
+      setState(() => _alt = next);
+      if (!tab.focusNode.hasFocus) {
+        tab.focusNode.requestFocus();
+      }
       return;
     }
 
@@ -957,11 +1036,9 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     };
     if (ctrlChar != null) {
       final clearCtrl = _ctrl == _ModLatch.once;
-      final clearAlt = _alt == _ModLatch.once;
-      if (clearCtrl || clearAlt) {
+      if (clearCtrl) {
         setState(() {
-          if (clearCtrl) _ctrl = _ModLatch.off;
-          if (clearAlt) _alt = _ModLatch.off;
+          _ctrl = _ModLatch.off;
         });
       }
       _bypassLatchTransform = true;
@@ -1011,9 +1088,12 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
             subtitle: '点击循环切换 11 / 12.5 / 14 pt',
             icon: CupertinoIcons.textformat_size,
             onTap: () {
-              setState(() {
-                _fontSize = _fontSize == 12.5 ? 14.0 : (_fontSize == 14.0 ? 11.0 : 12.5);
-              });
+              final next = _fontSize == 12.5 ? 14.0 : (_fontSize == 14.0 ? 11.0 : 12.5);
+              setState(() => _fontSize = next);
+              ref.read(appProvider.notifier).showToast(
+                '终端字号已切换为 ${next.toStringAsFixed(1)} pt',
+                tone: ToastTone.info,
+              );
             },
           ),
           GrassBagContextMenuItem(
@@ -1068,16 +1148,19 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
   (GrassBagAccent, Color, Color)? _cachedTerminalThemeKey;
 
   TerminalTheme _resolveTerminalTheme(GrassBagTokens t) {
-    final key = (t.accent, t.codeBg, t.codeFg);
+    final darkTokens = GrassBagTokens.resolve(t.accent, Brightness.dark);
+    final key = (t.accent, darkTokens.codeBg, darkTokens.codeFg);
     if (_cachedTerminalTheme != null && _cachedTerminalThemeKey == key) {
       return _cachedTerminalTheme!;
     }
-    final darkAccent = GrassBagTokens.resolve(t.accent, Brightness.dark).primaryHi;
+    final darkAccent = darkTokens.primaryHi;
+    // Translucent block cursor (`alpha: 0.45`) so glyphs beneath the cursor remain 100% legible
+    // across all 6 accent palettes including pure-white Graphite!
     final built = TerminalTheme(
-      cursor: darkAccent,
+      cursor: darkAccent.withValues(alpha: 0.45),
       selection: darkAccent.withValues(alpha: 0.35),
-      foreground: t.codeFg,
-      background: t.codeBg,
+      foreground: darkTokens.codeFg,
+      background: darkTokens.codeBg,
       black: const Color(0xFF1A2026),
       red: const Color(0xFFE69089),
       green: const Color(0xFF5DD199),
@@ -1113,7 +1196,6 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     ref.listen<ConnectionPhase>(appProvider.select((s) => s.connectionPhase), (prev, next) {
       if (_tabs.isEmpty) return;
       if (next == ConnectionPhase.connected) {
-        final active = _tabs[_activeIndex];
         final appState = ref.read(appProvider);
         final live = ref.read(appProvider.notifier).liveClient;
         final isAndroidLocal =
@@ -1122,12 +1204,25 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
           _ensureWsSubscription(live);
         }
         if (!isAndroidLocal && live != null) {
-          if (active.backend == _TermBackend.simulated) {
-            _restartActiveTab();
-          } else if (active.backend == _TermBackend.remoteWs &&
-              !active.attaching &&
-              !identical(active.ownerClient, live)) {
-            _restartActiveTab();
+          for (var ti = 0; ti < _tabs.length; ti++) {
+            final item = _tabs[ti];
+            final needsReattach = item.backend == _TermBackend.simulated ||
+                (item.backend == _TermBackend.remoteWs &&
+                    !item.attaching &&
+                    !identical(item.ownerClient, live));
+            if (needsReattach) {
+              if (ti == _activeIndex) {
+                _restartActiveTab();
+              } else if (!item.closed) {
+                if (item.wsChannel != null && item.ownerClient != null) {
+                  item.ownerClient!.stream.unsubscribe(item.wsChannel!);
+                  item.wsChannel = null;
+                }
+                item.ownerClient = live;
+                item.exited = false;
+                unawaited(_attachRemotePty(item, live));
+              }
+            }
           }
         }
       } else if (next == ConnectionPhase.disconnected ||
@@ -1137,7 +1232,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
         for (final t in _tabs) {
           if (t.backend == _TermBackend.remoteWs && !t.exited) {
             t.exited = true;
-            t.terminal.write('\r\n\x1b[33m[主机连接已断开，重连后点击右上角「重连终端」]\x1b[0m\r\n');
+            t.terminal.write('\r\n\x1b[33m[主机连接已断开，重连后点击右上角「重连」恢复]\x1b[0m\r\n');
             changed = true;
           }
         }
@@ -1205,32 +1300,36 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
               children: [
                 GrassBagUnifiedHeader(
                   title: '终端',
-                  subtitle: '${slice.activeHostName} · ${tab.cwd}',
+                  subtitle: '${slice.activeHostName} · ${_formatTerminalCwd(tab.cwd)}',
                   tier: glassTier,
                   floating: false,
                   onBack: () => Navigator.of(context).pop(),
-                  trailing: tab.exited
+                  trailing: (tab.exited || tab.backend == _TermBackend.simulated)
                       ? Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            GrassBagSpringTap(
+                            GrassBagGlassPillButton(
                               onTap: _restartActiveTab,
-                              pressedScale: 0.94,
-                              haptic: true,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                decoration: BoxDecoration(
-                                  color: t.primarySoft,
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  tab.backend == _TermBackend.remoteWs ? '重连' : '重启',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                    color: t.primary,
+                              tier: glassTier,
+                              height: 36,
+                              useOwnLayer: false,
+                              padding: const EdgeInsets.symmetric(horizontal: 12),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(CupertinoIcons.refresh, size: 12.5, color: t.primary),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    tab.backend == _TermBackend.simulated
+                                        ? '重连主机'
+                                        : (tab.backend == _TermBackend.remoteWs ? '重连' : '重启'),
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: t.primary,
+                                    ),
                                   ),
-                                ),
+                                ],
                               ),
                             ),
                             const SizedBox(width: 6),
@@ -1254,6 +1353,7 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                 SizedBox(
                   height: 42,
                   child: ListView.separated(
+                    controller: _tabScrollCtrl,
                     scrollDirection: Axis.horizontal,
                     padding: const EdgeInsets.symmetric(horizontal: 14),
                     itemCount: _tabs.length + 1,
@@ -1261,98 +1361,179 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                     itemBuilder: (_, idx) {
                       if (idx == _tabs.length) {
                         return Center(
-                          child: GrassBagSpringTap(
-                            onTap: _addTab,
-                            pressedScale: 0.90,
-                            haptic: true,
-                            child: Container(
-                              width: 36,
-                              height: 36,
-                              decoration: BoxDecoration(
-                                color: t.fill1,
-                                shape: BoxShape.circle,
-                                border: Border.all(color: t.sep, width: 0.65),
+                          child: Tooltip(
+                            message: '新建终端标签',
+                            child: GrassBagSpringTap(
+                              onTap: _addTab,
+                              pressedScale: 0.90,
+                              enablePointerGlow: false,
+                              haptic: true,
+                              child: GrassBagFresnelGlassSurface(
+                                isCircle: true,
+                                interactive: true,
+                                width: 36,
+                                height: 36,
+                                alignment: Alignment.center,
+                                child: Icon(CupertinoIcons.add, size: 17, color: t.text2),
                               ),
-                              child: Icon(CupertinoIcons.add, size: 17, color: t.text2),
                             ),
                           ),
                         );
                       }
                       final item = _tabs[idx];
                       final active = idx == _activeIndex;
-                      final canCloseInline = active && _tabs.length > 1;
+                      final canCloseInline = _tabs.length > 1;
+                      final isSolid = glassTier == GrassBagGlassTier.solid;
                       return Center(
                         child: GrassBagSpringTap(
                           onTap: () {
                             if (_activeIndex == idx) return;
+                            final hadFocus = _tabs.any((tabItem) => tabItem.focusNode.hasFocus);
                             setState(() {
                               _activeIndex = idx;
                               _ctrl = _ModLatch.off;
                               _alt = _ModLatch.off;
                             });
                             _tabPulseCtrl.forward(from: 0.0);
-                            _focusTab(idx);
+                            if (hadFocus) {
+                              _focusTab(idx);
+                            }
                           },
                           pressedScale: 0.94,
+                          borderRadius: 999,
                           haptic: true,
-                          child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 180),
-                            curve: Curves.easeOutCubic,
-                            height: 36,
-                            padding: EdgeInsets.fromLTRB(
-                              13,
-                              0,
-                              canCloseInline ? 4 : 13,
-                              0,
-                            ),
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: active ? t.primarySoft : t.fill1,
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: active ? t.primary.withValues(alpha: 0.45) : t.sep,
-                                width: 0.7,
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  item.title,
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: active ? FontWeight.w600 : FontWeight.w500,
-                                    color: active ? t.primary : t.text2,
+                          child: CustomPaint(
+                            foregroundPainter: isSolid
+                                ? null
+                                : GrassBagFresnelRimPainter(
+                                    isDark: t.isDark,
+                                    isPill: true,
+                                    accent: active ? t.primary : t.primaryHi,
+                                    innerWell: !active,
+                                    frosted: glassTier == GrassBagGlassTier.frosted,
+                                    paintTopSheen: active,
+                                    strokeWidth: 0.85,
                                   ),
-                                ),
-                                AnimatedSize(
-                                  duration: const Duration(milliseconds: 170),
-                                  curve: Curves.easeOutCubic,
-                                  child: canCloseInline
-                                      ? Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            const SizedBox(width: 4),
-                                            GestureDetector(
-                                              behavior: HitTestBehavior.opaque,
-                                              onTap: () => _closeTabAt(idx),
-                                              child: SizedBox(
-                                                width: 28,
-                                                height: 28,
-                                                child: Center(
-                                                  child: Icon(
-                                                    CupertinoIcons.xmark,
-                                                    size: 12.5,
-                                                    color: t.primary,
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 180),
+                              curve: Curves.easeOutCubic,
+                              height: 36,
+                              padding: EdgeInsets.fromLTRB(
+                                13,
+                                0,
+                                canCloseInline ? 4 : 13,
+                                0,
+                              ),
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: isSolid
+                                    ? (active ? t.primarySoft : t.fill1)
+                                    : null,
+                                gradient: isSolid
+                                    ? null
+                                    : LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: active
+                                            ? (t.isDark
+                                                ? [
+                                                    t.primary.withValues(alpha: 0.32),
+                                                    t.primary.withValues(alpha: 0.15),
+                                                  ]
+                                                : [
+                                                    Colors.white.withValues(alpha: 0.88),
+                                                    Color.lerp(Colors.white, t.primary, 0.14)!
+                                                        .withValues(alpha: 0.74),
+                                                  ])
+                                            : (t.isDark
+                                                ? [
+                                                    Colors.white.withValues(alpha: 0.12),
+                                                    Colors.white.withValues(alpha: 0.05),
+                                                  ]
+                                                : [
+                                                    Colors.white.withValues(alpha: 0.72),
+                                                    Colors.white.withValues(alpha: 0.44),
+                                                  ]),
+                                      ),
+                                borderRadius: BorderRadius.circular(999),
+                                border: isSolid
+                                    ? Border.all(
+                                        color: active
+                                            ? t.primary.withValues(alpha: t.isDark ? 0.50 : 0.34)
+                                            : t.sep,
+                                        width: 0.7,
+                                      )
+                                    : null,
+                                boxShadow: active && !isSolid
+                                    ? [
+                                        BoxShadow(
+                                          color: t.primary.withValues(alpha: t.isDark ? 0.24 : 0.14),
+                                          blurRadius: 10,
+                                          offset: const Offset(0, 2.5),
+                                        ),
+                                      ]
+                                    : null,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  GrassBagStatusDot(
+                                    size: 6.5,
+                                    pulsing: item.attaching,
+                                    color: (item.exited || item.closed)
+                                        ? t.text3.withValues(alpha: 0.45)
+                                        : (item.attaching
+                                            ? t.primary
+                                            : (item.backend == _TermBackend.simulated
+                                                ? t.warn
+                                                : (active
+                                                    ? t.ok
+                                                    : t.ok.withValues(alpha: 0.65)))),
+                                  ),
+                                  const SizedBox(width: 6.5),
+                                  Text(
+                                    item.title,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: active ? FontWeight.w600 : FontWeight.w500,
+                                      color: active ? t.primary : t.text2,
+                                    ),
+                                  ),
+                                  AnimatedSize(
+                                    duration: const Duration(milliseconds: 170),
+                                    curve: Curves.easeOutCubic,
+                                    child: canCloseInline
+                                        ? Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const SizedBox(width: 4),
+                                              Tooltip(
+                                                message: '关闭此终端',
+                                                child: GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onTap: () {
+                                                    HapticFeedback.selectionClick();
+                                                    _closeTabAt(idx);
+                                                  },
+                                                  child: SizedBox(
+                                                    width: 32,
+                                                    height: 32,
+                                                    child: Center(
+                                                      child: Icon(
+                                                        CupertinoIcons.xmark,
+                                                        size: 12.5,
+                                                        color: active ? t.primary : t.text3,
+                                                      ),
+                                                    ),
                                                   ),
                                                 ),
                                               ),
-                                            ),
-                                          ],
-                                        )
-                                      : const SizedBox.shrink(),
-                                ),
-                              ],
+                                            ],
+                                          )
+                                        : const SizedBox.shrink(),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
@@ -1364,214 +1545,510 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
                 Expanded(
                   child: _TerminalKeyboardMargin(
                     restingBottomMargin: restingBottomMargin,
-                    child: ClipRSuperellipse(
-                      borderRadius: BorderRadius.circular(24),
-                      child: Container(
+                    child: () {
+                      final darkTerm = GrassBagTokens.resolve(t.accent, Brightness.dark);
+                      final consoleTier = resolveAmbientGlassTier(context);
+                      final consoleSolid = consoleTier == GrassBagGlassTier.solid;
+                      final consoleCard = DecoratedBox(
                         decoration: ShapeDecoration(
-                          color: t.codeBg,
+                          color: darkTerm.codeBg,
                           shape: RoundedSuperellipseBorder(
                             borderRadius: BorderRadius.circular(24),
-                            side: BorderSide(
-                              color: Colors.white.withValues(alpha: 0.09),
-                              width: 0.65,
-                            ),
+                            side: consoleSolid
+                                ? BorderSide(
+                                    color: t.isDark
+                                        ? Colors.white.withValues(alpha: 0.11)
+                                        : const Color(0xFF2B3746),
+                                    width: t.isDark ? 0.7 : 1.1,
+                                  )
+                                : (!t.isDark
+                                    ? const BorderSide(
+                                        color: Color(0x360B1726),
+                                        width: 0.85,
+                                      )
+                                    : BorderSide.none),
                           ),
+                          shadows: t.isDark
+                              ? [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.28),
+                                    blurRadius: 20,
+                                    offset: const Offset(0, 8),
+                                  ),
+                                ]
+                              : const [
+                                  BoxShadow(
+                                    color: Color(0x220B1726),
+                                    blurRadius: 22,
+                                    offset: Offset(0, 8),
+                                  ),
+                                ],
                         ),
-                        child: Column(
-                          children: [
-                            Expanded(
-                              child: Padding(
-                                padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
-                                // Keep all open tabs mounted via IndexedStack so switching tabs
-                                // preserves scrollback offset, text selection & soft-keyboard focus!
-                                // GrassBagControlledOpacity elides OpacityLayer completely at 1.0.
-                                child: AnimatedBuilder(
-                                  animation: _tabPulseOpacity,
-                                  builder: (_, child) => GrassBagControlledOpacity(
-                                    opacity: _tabPulseOpacity.value,
-                                    child: child,
-                                  ),
-                                  child: IndexedStack(
-                                    index: _activeIndex,
-                                    children: [
-                                      for (var idx = 0; idx < _tabs.length; idx++)
-                                        () {
-                                          final item = _tabs[idx];
-                                          return TickerMode(
-                                            key: ValueKey(item.id),
-                                            enabled: idx == _activeIndex,
-                                            child: RepaintBoundary(
-                                              child: TerminalView(
-                                                item.terminal,
-                                                controller: item.terminalController,
-                                                scrollController: item.scrollController,
-                                                focusNode: item.focusNode,
-                                                onSecondaryTapDown: (details, _) {
-                                                  _openMoreSheet(anchor: details.globalPosition);
-                                                },
-                                                deleteDetection: !kIsWeb &&
-                                                    (defaultTargetPlatform == TargetPlatform.android ||
-                                                        defaultTargetPlatform == TargetPlatform.iOS),
-                                                keyboardType: TextInputType.text,
-                                                textStyle: TerminalStyle(
-                                                  fontSize: _fontSize,
-                                                  fontFamily: kIsWeb ? 'Menlo' : 'monospace',
-                                                  fontFamilyFallback: const [
-                                                    'SF Mono',
-                                                    'Monaco',
-                                                    'Consolas',
-                                                    'Liberation Mono',
-                                                    'Courier New',
-                                                    'monospace',
-                                                  ],
-                                                ),
-                                                theme: _resolveTerminalTheme(t),
-                                                autofocus: false,
-                                              ),
-                                            ),
-                                          );
-                                        }(),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                            if (!kIsWeb || MediaQuery.sizeOf(context).width < 840)
-                              ListenableBuilder(
-                                listenable: tab.terminalController,
-                                builder: (_, __) {
-                                  final extraKeys =
-                                      buildExtraKeys(tab.terminalController.selection != null);
-                                  return Container(
-                                    height: 52,
-                                    decoration: BoxDecoration(
-                                      color: t.codeBar,
-                                      border: Border(
-                                        top: BorderSide(
-                                          color: Colors.white.withValues(alpha: 0.08),
-                                          width: 0.5,
-                                        ),
-                                      ),
+                        child: ClipRSuperellipse(
+                          borderRadius: BorderRadius.circular(24),
+                          child: Column(
+                            children: [
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.fromLTRB(10, 10, 10, 4),
+                                  // Keep all open tabs mounted via IndexedStack so switching tabs
+                                  // preserves scrollback offset, text selection & soft-keyboard focus!
+                                  // GrassBagControlledOpacity elides OpacityLayer completely at 1.0.
+                                  child: AnimatedBuilder(
+                                    animation: _tabPulseOpacity,
+                                    builder: (_, child) => GrassBagControlledOpacity(
+                                      opacity: _tabPulseOpacity.value,
+                                      child: child,
                                     ),
-                                    child: Row(
+                                    child: Stack(
                                       children: [
-                                        Expanded(
-                                          child: ListView.separated(
-                                            scrollDirection: Axis.horizontal,
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 10,
-                                              vertical: 7,
-                                            ),
-                                            itemCount: extraKeys.length,
-                                            separatorBuilder: (_, __) => const SizedBox(width: 6),
-                                            itemBuilder: (_, i) {
-                                              final k = extraKeys[i];
-                                              final latch = k.$2 == 'ctrl'
-                                                  ? _ctrl
-                                                  : (k.$2 == 'alt' ? _alt : _ModLatch.off);
-                                              final isActive = latch != _ModLatch.off ||
-                                                  k.$2 == 'copy';
-                                              final darkAccent = GrassBagTokens.resolve(
-                                                t.accent,
-                                                Brightness.dark,
-                                              ).primaryHi;
-                                              final repeatable = k.$2 == 'left' ||
-                                                  k.$2 == 'up' ||
-                                                  k.$2 == 'down' ||
-                                                  k.$2 == 'right' ||
-                                                  k.$2 == 'tab';
-                                              final pill = Container(
-                                                constraints: const BoxConstraints(minWidth: 42),
-                                                padding: const EdgeInsets.symmetric(horizontal: 11),
-                                                alignment: Alignment.center,
-                                                decoration: ShapeDecoration(
-                                                  color: latch == _ModLatch.locked
-                                                      ? darkAccent.withValues(alpha: 0.36)
-                                                      : (isActive
-                                                          ? darkAccent.withValues(alpha: 0.22)
-                                                          : Colors.white.withValues(alpha: 0.085)),
-                                                  shape: RoundedSuperellipseBorder(
-                                                    borderRadius: BorderRadius.circular(10),
-                                                    side: latch == _ModLatch.locked
-                                                        ? BorderSide(color: darkAccent, width: 1.2)
-                                                        : (latch == _ModLatch.once
-                                                            ? BorderSide(
-                                                                color: darkAccent.withValues(alpha: 0.55),
-                                                                width: 0.8,
-                                                              )
-                                                            : BorderSide(
-                                                                color: Colors.white.withValues(alpha: 0.07),
-                                                                width: 0.5,
-                                                              )),
+                                        IndexedStack(
+                                          index: _activeIndex,
+                                          children: [
+                                            for (var idx = 0; idx < _tabs.length; idx++)
+                                              () {
+                                                final item = _tabs[idx];
+                                                return TickerMode(
+                                                  key: ValueKey(item.id),
+                                                  enabled: idx == _activeIndex,
+                                                  child: RepaintBoundary(
+                                                    child: TerminalView(
+                                                      item.terminal,
+                                                      key: item.viewKey,
+                                                      controller: item.terminalController,
+                                                      scrollController: item.scrollController,
+                                                      focusNode: item.focusNode,
+                                                      onSecondaryTapDown: (details, _) {
+                                                        _openMoreSheet(anchor: details.globalPosition);
+                                                      },
+                                                      deleteDetection: !kIsWeb &&
+                                                          (defaultTargetPlatform == TargetPlatform.android ||
+                                                              defaultTargetPlatform == TargetPlatform.iOS),
+                                                      keyboardType: TextInputType.visiblePassword,
+                                                      alwaysShowCursor: true,
+                                                      textStyle: TerminalStyle(
+                                                        fontSize: _fontSize,
+                                                        fontFamily: kIsWeb ? 'Menlo' : 'monospace',
+                                                        fontFamilyFallback: const [
+                                                          'SF Mono',
+                                                          'Monaco',
+                                                          'Consolas',
+                                                          'Liberation Mono',
+                                                          'Courier New',
+                                                          'monospace',
+                                                        ],
+                                                      ),
+                                                      theme: _resolveTerminalTheme(t),
+                                                      autofocus: false,
+                                                    ),
                                                   ),
-                                                ),
-                                                child: Text(
-                                                  k.$1,
-                                                  style: TextStyle(
-                                                    fontFamily: 'monospace',
-                                                    fontSize: 12,
-                                                    fontWeight: FontWeight.w600,
-                                                    color: isActive ? darkAccent : t.codeFg,
-                                                  ),
-                                                ),
-                                              );
-                                              if (repeatable) {
-                                                return _RepeatableTerminalKey(
-                                                  onFire: () => _sendExtraKey(k.$2),
-                                                  child: pill,
                                                 );
-                                              }
+                                              }(),
+                                          ],
+                                        ),
+                                        Positioned(
+                                          right: 6,
+                                          bottom: 6,
+                                          child: ListenableBuilder(
+                                            listenable: tab.scrollController,
+                                            builder: (_, __) {
+                                              final sc = tab.scrollController;
+                                              final scrolledUp = sc.hasClients &&
+                                                  sc.positions.length == 1 &&
+                                                  sc.position.hasContentDimensions &&
+                                                  sc.position.hasPixels &&
+                                                  (sc.position.maxScrollExtent - sc.offset) > 80.0;
+                                              if (!scrolledUp) return const SizedBox.shrink();
                                               return GrassBagSpringTap(
-                                                onTap: () => _sendExtraKey(k.$2),
+                                                onTap: () => _scrollTabToBottomAndFocus(tab),
                                                 pressedScale: 0.90,
+                                                borderRadius: 999,
                                                 haptic: true,
-                                                child: pill,
+                                                child: Container(
+                                                  padding: const EdgeInsets.symmetric(
+                                                    horizontal: 10,
+                                                    vertical: 6,
+                                                  ),
+                                                  decoration: ShapeDecoration(
+                                                    color: darkTerm.codeBar.withValues(alpha: 0.92),
+                                                    shape: StadiumBorder(
+                                                      side: BorderSide(
+                                                        color: Colors.white.withValues(alpha: 0.16),
+                                                        width: 0.7,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  child: Row(
+                                                    mainAxisSize: MainAxisSize.min,
+                                                    children: [
+                                                      Icon(
+                                                        CupertinoIcons.arrow_down,
+                                                        size: 12,
+                                                        color: darkTerm.primaryHi,
+                                                      ),
+                                                      const SizedBox(width: 4),
+                                                      Text(
+                                                        '回到底部',
+                                                        style: TextStyle(
+                                                          fontSize: 11,
+                                                          fontWeight: FontWeight.w600,
+                                                          color: darkTerm.codeFg,
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
                                               );
                                             },
                                           ),
                                         ),
-                                        if (!kIsWeb &&
-                                            (defaultTargetPlatform == TargetPlatform.android ||
-                                                defaultTargetPlatform == TargetPlatform.iOS))
-                                          Padding(
-                                            padding: const EdgeInsets.fromLTRB(4, 7, 8, 7),
-                                            child: Tooltip(
-                                              message: '收起键盘',
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              if ((!kIsWeb &&
+                                      (defaultTargetPlatform == TargetPlatform.android ||
+                                          defaultTargetPlatform == TargetPlatform.iOS)) ||
+                                  MediaQuery.sizeOf(context).width < 840)
+                                ListenableBuilder(
+                                  listenable: tab.terminalController,
+                                  builder: (_, __) {
+                                    final extraKeys =
+                                        buildExtraKeys(tab.terminalController.selection != null);
+                                    return Container(
+                                      height: 52,
+                                      decoration: BoxDecoration(
+                                        color: darkTerm.codeBar,
+                                        border: Border(
+                                          top: BorderSide(
+                                            color: Colors.white.withValues(alpha: 0.08),
+                                            width: 0.5,
+                                          ),
+                                        ),
+                                      ),
+                                      child: Row(
+                                        children: [
+                                          Expanded(
+                                            child: Stack(
+                                              children: [
+                                                ListView.separated(
+                                                  controller: _extraKeysScrollCtrl,
+                                                  scrollDirection: Axis.horizontal,
+                                                  physics: const BouncingScrollPhysics(),
+                                                  padding: const EdgeInsets.fromLTRB(10, 7, 28, 7),
+                                                  itemCount: extraKeys.length,
+                                                  separatorBuilder: (_, __) => const SizedBox(width: 6),
+                                                  itemBuilder: (_, i) {
+                                                    final k = extraKeys[i];
+                                                    final latch = k.$2 == 'ctrl'
+                                                        ? _ctrl
+                                                        : (k.$2 == 'alt' ? _alt : _ModLatch.off);
+                                                    final isActive = latch != _ModLatch.off ||
+                                                        k.$2 == 'copy';
+                                                    final darkAccent = darkTerm.primaryHi;
+                                                    final repeatable = k.$2 == 'left' ||
+                                                        k.$2 == 'up' ||
+                                                        k.$2 == 'down' ||
+                                                        k.$2 == 'right' ||
+                                                        k.$2 == 'tab';
+                                                    final keyCore = Container(
+                                                      constraints: const BoxConstraints(minWidth: 42),
+                                                      padding: const EdgeInsets.symmetric(horizontal: 11),
+                                                      alignment: Alignment.center,
+                                                      decoration: ShapeDecoration(
+                                                        color: consoleSolid
+                                                            ? (latch == _ModLatch.locked
+                                                                ? darkAccent.withValues(alpha: 0.36)
+                                                                : (isActive
+                                                                    ? darkAccent.withValues(alpha: 0.22)
+                                                                    : Colors.white.withValues(alpha: 0.085)))
+                                                            : null,
+                                                        gradient: consoleSolid
+                                                            ? null
+                                                            : LinearGradient(
+                                                                begin: Alignment.topLeft,
+                                                                end: Alignment.bottomRight,
+                                                                colors: latch == _ModLatch.locked
+                                                                    ? [
+                                                                        darkAccent.withValues(alpha: 0.44),
+                                                                        darkAccent.withValues(alpha: 0.24),
+                                                                      ]
+                                                                    : (isActive
+                                                                        ? [
+                                                                            darkAccent.withValues(alpha: 0.30),
+                                                                            darkAccent.withValues(alpha: 0.15),
+                                                                          ]
+                                                                        : [
+                                                                            Colors.white.withValues(alpha: 0.135),
+                                                                            Colors.white.withValues(alpha: 0.055),
+                                                                          ]),
+                                                              ),
+                                                        shape: RoundedSuperellipseBorder(
+                                                          borderRadius: BorderRadius.circular(10),
+                                                          side: latch == _ModLatch.locked
+                                                              ? BorderSide(color: darkAccent, width: 1.2)
+                                                              : (latch == _ModLatch.once
+                                                                  ? BorderSide(
+                                                                      color: darkAccent.withValues(alpha: 0.55),
+                                                                      width: 0.8,
+                                                                    )
+                                                                  : (consoleSolid
+                                                                      ? BorderSide(
+                                                                          color: Colors.white.withValues(alpha: 0.07),
+                                                                          width: 0.5,
+                                                                        )
+                                                                      : BorderSide.none)),
+                                                        ),
+                                                      ),
+                                                      child: Text(
+                                                        k.$1,
+                                                        style: TextStyle(
+                                                          fontFamily: 'monospace',
+                                                          fontSize: 12,
+                                                          fontWeight: FontWeight.w600,
+                                                          color: isActive ? darkAccent : darkTerm.codeFg,
+                                                        ),
+                                                      ),
+                                                    );
+                                                    final pill = (consoleSolid || latch == _ModLatch.locked)
+                                                        ? keyCore
+                                                        : CustomPaint(
+                                                            foregroundPainter: GrassBagFresnelRimPainter(
+                                                              isDark: true,
+                                                              borderRadius: 10,
+                                                              accent: isActive ? darkAccent : null,
+                                                              innerWell: !isActive,
+                                                              frosted: consoleTier == GrassBagGlassTier.frosted,
+                                                              paintTopSheen: false,
+                                                              strokeWidth: 0.72,
+                                                            ),
+                                                            child: keyCore,
+                                                          );
+                                                    if (repeatable) {
+                                                      return _RepeatableTerminalKey(
+                                                        onFire: () => _sendExtraKey(k.$2),
+                                                        child: pill,
+                                                      );
+                                                    }
+                                                    return GrassBagSpringTap(
+                                                      onTap: () => _sendExtraKey(k.$2),
+                                                      pressedScale: 0.90,
+                                                      borderRadius: 10,
+                                                      haptic: true,
+                                                      child: pill,
+                                                    );
+                                                  },
+                                                ),
+                                                Positioned(
+                                                  left: 0,
+                                                  top: 0,
+                                                  bottom: 0,
+                                                  width: 20,
+                                                  child: IgnorePointer(
+                                                    child: ListenableBuilder(
+                                                      listenable: _extraKeysScrollCtrl,
+                                                      builder: (_, __) {
+                                                        final scrolled = _extraKeysScrollCtrl.hasClients &&
+                                                            _extraKeysScrollCtrl.positions.length == 1 &&
+                                                            _extraKeysScrollCtrl.position.hasPixels &&
+                                                            _extraKeysScrollCtrl.offset > 2.0;
+                                                        if (!scrolled) return const SizedBox.shrink();
+                                                        return DecoratedBox(
+                                                          decoration: BoxDecoration(
+                                                            gradient: LinearGradient(
+                                                              begin: Alignment.centerLeft,
+                                                              end: Alignment.centerRight,
+                                                              colors: [
+                                                                darkTerm.codeBar,
+                                                                darkTerm.codeBar.withValues(alpha: 0.0),
+                                                              ],
+                                                            ),
+                                                          ),
+                                                        );
+                                                      },
+                                                    ),
+                                                  ),
+                                                ),
+                                                Positioned(
+                                                  right: 0,
+                                                  top: 0,
+                                                  bottom: 0,
+                                                  width: 32,
+                                                  child: IgnorePointer(
+                                                    child: ListenableBuilder(
+                                                      listenable: _extraKeysScrollCtrl,
+                                                      builder: (_, __) {
+                                                        final hasMoreRight = !_extraKeysScrollCtrl.hasClients ||
+                                                            _extraKeysScrollCtrl.positions.length != 1 ||
+                                                            !_extraKeysScrollCtrl.position.hasContentDimensions ||
+                                                            (_extraKeysScrollCtrl.position.maxScrollExtent > 2.0 &&
+                                                                _extraKeysScrollCtrl.position.pixels <
+                                                                    _extraKeysScrollCtrl.position.maxScrollExtent - 2.0);
+                                                        if (!hasMoreRight) return const SizedBox.shrink();
+                                                        return DecoratedBox(
+                                                          decoration: BoxDecoration(
+                                                            gradient: LinearGradient(
+                                                              begin: Alignment.centerLeft,
+                                                              end: Alignment.centerRight,
+                                                              colors: [
+                                                                darkTerm.codeBar.withValues(alpha: 0.0),
+                                                                darkTerm.codeBar.withValues(alpha: 0.82),
+                                                                darkTerm.codeBar,
+                                                              ],
+                                                              stops: const [0.0, 0.62, 0.88],
+                                                            ),
+                                                          ),
+                                                        );
+                                                      },
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          if (tab.terminalController.selection != null)
+                                            Padding(
+                                              padding: const EdgeInsets.fromLTRB(4, 7, 4, 7),
                                               child: GrassBagSpringTap(
-                                                onTap: () => _sendExtraKey('hide_kb'),
+                                                onTap: () => _sendExtraKey('copy'),
                                                 pressedScale: 0.90,
+                                                borderRadius: 10,
                                                 haptic: true,
                                                 child: Container(
-                                                  width: 40,
+                                                  padding: const EdgeInsets.symmetric(horizontal: 10),
                                                   alignment: Alignment.center,
                                                   decoration: ShapeDecoration(
-                                                    color: Colors.white.withValues(alpha: 0.085),
+                                                    color: darkTerm.primaryHi.withValues(alpha: 0.24),
                                                     shape: RoundedSuperellipseBorder(
                                                       borderRadius: BorderRadius.circular(10),
                                                       side: BorderSide(
-                                                        color: Colors.white.withValues(alpha: 0.07),
-                                                        width: 0.5,
+                                                        color: darkTerm.primaryHi.withValues(alpha: 0.48),
+                                                        width: 0.7,
                                                       ),
                                                     ),
                                                   ),
-                                                  child: Icon(
-                                                    CupertinoIcons.keyboard_chevron_compact_down,
-                                                    size: 17,
-                                                    color: t.codeFg,
+                                                  child: Text(
+                                                    '复制',
+                                                    style: TextStyle(
+                                                      fontSize: 12,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: darkTerm.primaryHi,
+                                                    ),
                                                   ),
                                                 ),
                                               ),
                                             ),
-                                          ),
-                                      ],
-                                    ),
-                                  );
-                                },
-                              ),
+                                          if (!kIsWeb &&
+                                              (defaultTargetPlatform == TargetPlatform.android ||
+                                                  defaultTargetPlatform == TargetPlatform.iOS)) ...[
+                                            Container(
+                                              width: 0.9,
+                                              height: 24,
+                                              color: Colors.white.withValues(alpha: 0.22),
+                                            ),
+                                            Padding(
+                                              padding: const EdgeInsets.fromLTRB(6, 7, 8, 7),
+                                              child: Builder(
+                                                builder: (kbCtx) {
+                                                  final kbOpen = _TerminalKeyboardScope.isOpenOf(kbCtx);
+                                                  return Tooltip(
+                                                    message: kbOpen ? '收起键盘' : '唤起键盘',
+                                                    child: GrassBagSpringTap(
+                                                      onTap: () {
+                                                        if (kbOpen) {
+                                                          _sendExtraKey('hide_kb');
+                                                        } else {
+                                                          _scrollTabToBottomAndFocus(tab);
+                                                          final viewState = tab.viewKey.currentState;
+                                                          if (viewState != null) {
+                                                            viewState.requestKeyboard();
+                                                          } else {
+                                                            unawaited(
+                                                              SystemChannels.textInput
+                                                                  .invokeMethod<void>('TextInput.show'),
+                                                            );
+                                                          }
+                                                        }
+                                                      },
+                                                      pressedScale: 0.90,
+                                                      borderRadius: 10,
+                                                      haptic: true,
+                                                      child: CustomPaint(
+                                                        foregroundPainter: consoleSolid
+                                                            ? null
+                                                            : GrassBagFresnelRimPainter(
+                                                                isDark: true,
+                                                                borderRadius: 10,
+                                                                innerWell: true,
+                                                                frosted: consoleTier == GrassBagGlassTier.frosted,
+                                                                paintTopSheen: false,
+                                                                strokeWidth: 0.72,
+                                                              ),
+                                                        child: Container(
+                                                          width: 40,
+                                                          alignment: Alignment.center,
+                                                          decoration: ShapeDecoration(
+                                                            color: consoleSolid
+                                                                ? Colors.white.withValues(alpha: 0.085)
+                                                                : null,
+                                                            gradient: consoleSolid
+                                                                ? null
+                                                                : LinearGradient(
+                                                                    begin: Alignment.topLeft,
+                                                                    end: Alignment.bottomRight,
+                                                                    colors: [
+                                                                      Colors.white.withValues(alpha: 0.135),
+                                                                      Colors.white.withValues(alpha: 0.055),
+                                                                    ],
+                                                                  ),
+                                                            shape: RoundedSuperellipseBorder(
+                                                              borderRadius: BorderRadius.circular(10),
+                                                              side: consoleSolid
+                                                                  ? BorderSide(
+                                                                      color: Colors.white.withValues(alpha: 0.07),
+                                                                      width: 0.5,
+                                                                    )
+                                                                  : BorderSide.none,
+                                                            ),
+                                                          ),
+                                                          child: Icon(
+                                                            kbOpen
+                                                                ? CupertinoIcons.keyboard_chevron_compact_down
+                                                                : CupertinoIcons.keyboard,
+                                                            size: 17,
+                                                            color: darkTerm.codeFg,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  );
+                                                },
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                );
+                              },
+                            ),
                           ],
                         ),
                       ),
-                    ),
+                    );
+                      if (consoleSolid) return consoleCard;
+                      return CustomPaint(
+                        foregroundPainter: GrassBagFresnelRimPainter(
+                          isDark: true,
+                          borderRadius: 24,
+                          accent: darkTerm.primaryHi,
+                          frosted: consoleTier == GrassBagGlassTier.frosted,
+                          paintTopSheen: false,
+                          strokeWidth: 0.95,
+                        ),
+                        child: consoleCard,
+                      );
+                    }(),
                   ),
                 ),
               ],
@@ -1603,6 +2080,7 @@ class _LocalTermTab {
   final String title;
   final String cwd;
   final Terminal terminal;
+  final GlobalKey<TerminalViewState> viewKey = GlobalKey<TerminalViewState>();
   final TerminalController terminalController = TerminalController();
   final ScrollController scrollController = ScrollController();
   final FocusNode focusNode = FocusNode();
@@ -1716,7 +2194,27 @@ class _RepeatableTerminalKeyState extends State<_RepeatableTerminalKey> {
 /// Isolates `MediaQuery.viewInsetsOf` and settles the bottom padding 70ms after IME flight
 /// so `xterm`'s `TerminalView` runs `terminal.resize()` ONCE instead of 30x per keyboard open,
 /// while preserving all ambient MediaQuery accessibility & gesture settings!
-class _TerminalKeyboardMargin extends StatefulWidget {
+class _TerminalKeyboardScope extends InheritedWidget {
+  const _TerminalKeyboardScope({
+    required this.kbOpen,
+    required super.child,
+  });
+
+  final bool kbOpen;
+
+  static bool isOpenOf(BuildContext context) {
+    return context
+            .dependOnInheritedWidgetOfExactType<_TerminalKeyboardScope>()
+            ?.kbOpen ??
+        false;
+  }
+
+  @override
+  bool updateShouldNotify(_TerminalKeyboardScope oldWidget) =>
+      oldWidget.kbOpen != kbOpen;
+}
+
+class _TerminalKeyboardMargin extends StatelessWidget {
   const _TerminalKeyboardMargin({
     required this.restingBottomMargin,
     required this.child,
@@ -1726,44 +2224,21 @@ class _TerminalKeyboardMargin extends StatefulWidget {
   final Widget child;
 
   @override
-  State<_TerminalKeyboardMargin> createState() => _TerminalKeyboardMarginState();
-}
-
-class _TerminalKeyboardMarginState extends State<_TerminalKeyboardMargin> {
-  Timer? _settleTimer;
-  double? _settledBottom;
-  double _lastKbInset = -1.0;
-
-  @override
-  void dispose() {
-    _settleTimer?.cancel();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
+    // Track live IME inset smoothly without freezing 320ms behind the keyboard;
+    // propagate `kbOpen` BEFORE `removeViewInsets(removeBottom: true)` so the pinned
+    // keyboard toggle button always knows when the IME is open!
     final kbInset = MediaQuery.viewInsetsOf(context).bottom;
-    final targetBottom = math.max(widget.restingBottomMargin, kbInset + 6.0);
-    if (_settledBottom == null || kbInset <= 0.5) {
-      _settleTimer?.cancel();
-      _settledBottom = targetBottom;
-    } else if ((kbInset - _lastKbInset).abs() > 0.5) {
-      _settleTimer?.cancel();
-      final nextBottom = targetBottom;
-      _settleTimer = Timer(const Duration(milliseconds: 70), () {
-        if (mounted && _settledBottom != nextBottom) {
-          setState(() => _settledBottom = nextBottom);
-        }
-      });
-    }
-    _lastKbInset = kbInset;
-    final bottom = _settledBottom ?? targetBottom;
-    return MediaQuery.removeViewInsets(
-      context: context,
-      removeBottom: true,
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(12, 0, 12, bottom),
-        child: widget.child,
+    final bottom = math.max(restingBottomMargin, kbInset + 6.0);
+    return _TerminalKeyboardScope(
+      kbOpen: kbInset > 40.0,
+      child: MediaQuery.removeViewInsets(
+        context: context,
+        removeBottom: true,
+        child: Padding(
+          padding: EdgeInsets.fromLTRB(12, 0, 12, bottom),
+          child: child,
+        ),
       ),
     );
   }

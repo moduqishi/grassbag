@@ -311,6 +311,13 @@ void main() {
 
     await tester.tap(find.text('改动'));
     await tester.pumpAndSettle();
+    // Offline host truthfully surfaces disconnected empty state rather than claiming zero Git diffs
+    expect(find.text('尚未连接到 DSH 主机'), findsOneWidget);
+    final wbContainer = ProviderScope.containerOf(tester.element(find.byType(GrassBagApp)));
+    wbContainer.read(appProvider.notifier).state = wbContainer.read(appProvider).copyWith(
+      connectionPhase: ConnectionPhase.connected,
+    );
+    await tester.pumpAndSettle();
     expect(find.textContaining('没有未提交的文件改动'), findsOneWidget);
 
     await tester.tap(find.text('进度'));
@@ -737,8 +744,11 @@ void main() {
     expect(find.text('添加自定义渠道 / 中转站'), findsOneWidget);
     expect(find.textContaining('当前未连接到 DSH 核心'), findsWidgets);
 
-    // Dismiss sheet cleanly and switch to All Models tab
+    // Dismissing a dirty sheet triggers the unsaved-changes confirmation guard!
     await tester.tap(find.byIcon(CupertinoIcons.xmark).first);
+    await tester.pumpAndSettle();
+    expect(find.text('放弃未保存的渠道配置？'), findsOneWidget);
+    await tester.tap(find.text('放弃更改'));
     await tester.pumpAndSettle();
     expect(find.text('添加自定义渠道 / 中转站'), findsNothing);
 
@@ -2048,8 +2058,8 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Crystal-clear translucent Liquid Glass optics: ultra-low veil spherical lens
-      //    with prismatic chromatic rim on floating chrome & silky crystal bokeh on modal sheets!
+      // 3) Crystal-clear translucent Liquid Glass optics: ultra-low veil thin-lens spherical
+      //    optics (avoiding isClearIndicator charcoal rings) & silky crystal bokeh on modal sheets!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
@@ -2062,17 +2072,17 @@ void main() {
         expect(surf.ambientRim, 0.0);
         expect(surf.rimShade, 0.0);
         expect(surf.rimLight, greaterThan(0.8));
-        expect(surf.chromaticAberration, greaterThan(0.0));
+        expect(surf.chromaticAberration, greaterThan(0.10));
         expect(surf.blur, inInclusiveRange(1.0, 2.5));
-        expect(surf.lightIntensity, greaterThanOrEqualTo(0.8));
+        expect(surf.lightIntensity, inInclusiveRange(0.70, 1.25));
         expect(surf.glassColor.a, lessThanOrEqualTo(0.10));
         expect(sheet.lensModel, GlassLensModel.spherical);
-        expect(sheet.blur, inInclusiveRange(3.5, 5.5));
+        expect(sheet.blur, inInclusiveRange(6.5, 10.0));
         expect(sheet.frost, 0.0);
         expect(sheet.frostOpacity, 0.0);
         expect(sheet.rimLight, greaterThan(0.8));
-        expect(sheet.chromaticAberration, greaterThan(0.0));
-        expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
+        expect(sheet.chromaticAberration, greaterThan(0.10));
+        expect(sheet.glassColor.a, lessThanOrEqualTo(0.30));
       }
 
       // 4) RemoteHostConnectCard shows Desktop GUI (免命令) 1-click prompt + concrete-IP CLI tab (zero 0.0.0.0)
@@ -2267,8 +2277,9 @@ void main() {
       await tester.tap(find.byIcon(CupertinoIcons.add));
       await tester.pumpAndSettle();
       expect(find.textContaining('#2'), findsOneWidget);
-      expect(find.byIcon(CupertinoIcons.xmark), findsOneWidget);
-      await tester.tap(find.byIcon(CupertinoIcons.xmark));
+      // Both tabs expose direct close buttons when >1 tab is open; tapping the 2nd closes tab #2
+      expect(find.byIcon(CupertinoIcons.xmark), findsNWidgets(2));
+      await tester.tap(find.byIcon(CupertinoIcons.xmark).last);
       await tester.pumpAndSettle();
       // Active PTY tab asks for confirmation before terminating the shell process.
       expect(find.text('关闭终端'), findsOneWidget);
@@ -2323,16 +2334,19 @@ void main() {
     'v12 regression: Liquid Glass optics calibration, nested italic+bold, streaming code stability, fractional slider & Cron weekdays',
     (tester) async {
       // 1) Crystal-clear Kyant0-grade translucent Liquid Glass calibration:
-      //    ultra-low white veil + razor-crisp blur (`1.5dp`) + vivid refraction (`n>=1.30`, CA>0)
-      //    on chrome, and crystal bokeh (`blur: 4.6`, `frost: 0.0`) on sheets/dialogs (NEVER milky!).
+      //    thin-lens spherical optics (avoids isClearIndicator charcoal ring while keeping 44pt pills
+      //    unclamped), low specular glare, zero frosted lightIntensity/rimShade, and crystal bokeh on sheets.
       for (final brightness in Brightness.values) {
         final t = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
         final norm = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: false);
         final elev = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: true);
         final sheet = GrassBagGlassConfig.sheetSettings(t, GrassBagGlassTier.liquid);
+        final frosted = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.frosted);
         expect(norm.lensModel, GlassLensModel.spherical);
         expect(elev.lensModel, GlassLensModel.spherical);
         expect(sheet.lensModel, GlassLensModel.spherical);
+        expect(frosted.lightIntensity, 0.0);
+        expect(frosted.rimShade, 0.0);
         expect(norm.chromaticAberration, greaterThan(0.0));
         expect(elev.chromaticAberration, greaterThan(0.0));
         expect(sheet.chromaticAberration, greaterThan(0.0));
@@ -2344,12 +2358,12 @@ void main() {
         expect(sheet.rimLight, greaterThan(0.8));
         expect(sheet.frost, 0.0);
         expect(sheet.frostOpacity, 0.0);
-        expect(sheet.blur, inInclusiveRange(3.5, 5.5));
+        expect(sheet.blur, inInclusiveRange(7.0, 10.0));
         expect(norm.blur, inInclusiveRange(1.0, 2.5));
         expect(elev.blur, inInclusiveRange(1.0, 2.5));
         expect(norm.glassColor.a, lessThanOrEqualTo(0.10));
         expect(elev.glassColor.a, lessThanOrEqualTo(0.16));
-        expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
+        expect(sheet.glassColor.a, lessThanOrEqualTo(0.40));
         expect(norm.glassColor.r, closeTo(1.0, 0.02));
         expect(norm.glassColor.g, closeTo(1.0, 0.02));
         expect(norm.glassColor.b, closeTo(1.0, 0.02));
@@ -2878,6 +2892,46 @@ void main() {
       expect(container.read(appProvider).pendingAttachments.length, 1);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 6));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'v51 regression: High Contrast forces solid glass tier & inline code inside Markdown links stays styled',
+    (tester) async {
+      GrassBagGlassTier? resolvedNormal;
+      GrassBagGlassTier? resolvedHighContrast;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.dark).toMaterialTheme(),
+          home: GrassBagGlassTierScope(
+            tier: GrassBagGlassTier.liquid,
+            child: Column(
+              children: [
+                Builder(
+                  builder: (ctx) {
+                    resolvedNormal = resolveEffectiveGlassTier(ctx, GrassBagGlassTier.liquid);
+                    return const SizedBox.shrink();
+                  },
+                ),
+                MediaQuery(
+                  data: const MediaQueryData(highContrast: true),
+                  child: Builder(
+                    builder: (ctx) {
+                      resolvedHighContrast = resolveAmbientGlassTier(ctx);
+                      return const SizedBox.shrink();
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+      expect(resolvedNormal, GrassBagGlassTier.liquid);
+      expect(resolvedHighContrast, GrassBagGlassTier.solid);
       expect(tester.takeException(), isNull);
     },
   );

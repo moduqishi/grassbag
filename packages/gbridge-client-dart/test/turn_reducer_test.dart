@@ -863,5 +863,179 @@ void main() {
       expect(interruptReducer.turns.last.status, 'error');
       expect(interruptReducer.turns.last.errorMessage, '本轮回复已被中断');
     });
+
+    test('v51 replaceAll preserves running reasoning & tool start timestamps across bundle resyncs', () {
+      final reducer = TurnStreamReducer();
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.start',
+        data: {'turnId': 't-v51'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 2,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v51', 'id': 'r-live', 'delta': '思考中…'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 3,
+        type: 'tool.call',
+        data: {'turnId': 't-v51', 'callId': 'call-live', 'name': 'bash', 'title': 'ls'},
+      ));
+
+      // Simulate a periodic bundle snapshot resync while `call-live` is still running!
+      reducer.replaceAll(reducer.turns);
+
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 4,
+        type: 'tool.result',
+        data: {'turnId': 't-v51', 'callId': 'call-live', 'name': 'bash', 'status': 'ok', 'summary': 'done'},
+      ));
+      final completedTool = reducer.turns.single.steps.whereType<ToolStep>().single;
+      expect(completedTool.durationMs, isNotNull);
+      expect(completedTool.durationMs!, greaterThanOrEqualTo(1));
+    });
+
+    test('v52 regression: settles running ToolStep on turn completion/next turn & routes type:chunk via kind', () {
+      final reducer = TurnStreamReducer();
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.start',
+        data: {'turnId': 't-v52-a'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 2,
+        type: 'tool.call',
+        data: {'turnId': 't-v52-a', 'callId': 'c-hang', 'name': 'bash', 'title': 'sleep 1'},
+      ));
+      // `type: 'chunk'` with `kind: 'text'` must route to assistantText cleanly.
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 3,
+        type: 'turn.delta',
+        data: {
+          'turnId': 't-v52-a',
+          'chunks': [
+            {'type': 'chunk', 'kind': 'text', 'delta': 'Hello chunk!'},
+          ],
+        },
+      ));
+      expect(reducer.turns.single.assistantText, 'Hello chunk!');
+      expect(reducer.turns.single.steps.whereType<ToolStep>().single.status, 'running');
+
+      // Completing turn without a tool.result must settle still-running ToolStep!
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 4,
+        type: 'turn.completed',
+        data: {'turnId': 't-v52-a', 'reason': 'done'},
+      ));
+      expect(reducer.turns.single.steps.whereType<ToolStep>().single.status, 'ok');
+
+      // Also verify an error/cancelled turn settles a running ToolStep as error,
+      // and a new turn arriving while previous turn's ToolStep is still running settles it too.
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 5,
+        type: 'turn.start',
+        data: {'turnId': 't-v52-b'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 6,
+        type: 'tool.call',
+        data: {'turnId': 't-v52-b', 'callId': 'c-next', 'name': 'read', 'title': 'read file'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 7,
+        type: 'turn.start',
+        data: {'turnId': 't-v52-c'},
+      ));
+      expect(reducer.turns[1].steps.whereType<ToolStep>().single.status, isNot('running'));
+    });
+
+    test('v53 regression: preserves client-measured ReasoningStep & ToolStep durationMs across turn.snapshot & updates collapsedPreview past 4096 chars', () {
+      final reducer = TurnStreamReducer();
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.start',
+        data: {'turnId': 't-v53'},
+      ));
+      // Push > 4500 chars of reasoning, then append new line -> collapsedPreview must stay fresh!
+      final pad = 'X' * 4300;
+      reducer.apply(StreamFrame(
+        op: 'delta',
+        seq: 2,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v53', 'id': 'r-v53', 'delta': '$pad\nLine A\n'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 3,
+        type: 'reasoning.delta',
+        data: {'turnId': 't-v53', 'id': 'r-v53', 'delta': 'Final reasoning tail'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 4,
+        type: 'tool.call',
+        data: {'turnId': 't-v53', 'callId': 'c-v53', 'name': 'read', 'title': 'read · pubspec.yaml'},
+      ));
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 5,
+        type: 'tool.result',
+        data: {'turnId': 't-v53', 'callId': 'c-v53', 'status': 'ok', 'summary': 'read ok'},
+      ));
+
+      final beforeSnap = reducer.turns.single;
+      final beforeReason = beforeSnap.steps.whereType<ReasoningStep>().single;
+      final beforeTool = beforeSnap.steps.whereType<ToolStep>().single;
+      expect(beforeReason.collapsedPreview, 'Final reasoning tail');
+      expect(beforeReason.durationMs, isNotNull);
+      expect(beforeTool.durationMs, isNotNull);
+
+      // Server snapshot arrives omitting durationMs on reasoning & tool steps -> client timings must survive!
+      reducer.apply(StreamFrame(
+        op: 'event',
+        seq: 6,
+        type: 'turn.snapshot',
+        data: {
+          'turn': {
+            'turnId': 't-v53',
+            'status': 'completed',
+            'steps': [
+              {
+                'kind': 'reasoning',
+                'id': 'r-v53',
+                'text': '$pad\nLine A\nFinal reasoning tail',
+                'collapsedPreview': 'Final reasoning tail',
+              },
+              {
+                'kind': 'tool',
+                'callId': 'c-v53',
+                'name': 'read',
+                'title': 'read · pubspec.yaml',
+                'status': 'ok',
+                'summary': 'read ok',
+              },
+            ],
+            'assistantText': 'Done.',
+          },
+        },
+      ));
+      final afterSnap = reducer.turns.single;
+      final afterReason = afterSnap.steps.whereType<ReasoningStep>().single;
+      final afterTool = afterSnap.steps.whereType<ToolStep>().single;
+      expect(afterReason.durationMs, beforeReason.durationMs);
+      expect(afterTool.durationMs, beforeTool.durationMs);
+    });
   });
 }

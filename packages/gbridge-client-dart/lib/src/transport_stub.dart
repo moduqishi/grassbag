@@ -19,6 +19,7 @@ class GbridgeHttpTransport {
 
   String? get cookieHeader => null;
   void setCookieHeader(String? cookie) {}
+  void evictDshAuthCookies() {}
   void resetConnectionPool() {}
 
   Future<bool> exchangeAuthToken([String? tokenOverride]) async => false;

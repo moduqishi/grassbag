@@ -4,10 +4,12 @@ import 'dart:ui' show PathMetric;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
+import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../shell/grassbag_shell.dart';
 import 'onboarding_page.dart';
@@ -50,8 +52,13 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
   bool _notifiedAssembled = false;
 
   void _syncAmbient() {
+    if (!mounted) return;
+    final motionAllowed = !MediaQuery.disableAnimationsOf(context) &&
+        TickerMode.valuesOf(context).enabled &&
+        (ModalRoute.of(context)?.isCurrent ?? true) &&
+        WidgetsBinding.instance is WidgetsFlutterBinding;
     final shouldRepeat =
-        widget.ambientFloat && !widget.paused && _assembleCtrl.isCompleted;
+        widget.ambientFloat && !widget.paused && _assembleCtrl.isCompleted && motionAllowed;
     if (shouldRepeat) {
       if (!_ambientCtrl.isAnimating) {
         _ambientCtrl.repeat();
@@ -82,15 +89,27 @@ class _GrassBagAnimatedLogoState extends State<GrassBagAnimatedLogo>
     });
     if (widget.autoPlay) {
       // Begin kinetic assembly right after Frame 0 paints so GPU first-frame upload never
-      // eats the opening dew-particle burst!
+      // eats the opening dew-particle burst! Honor OS Reduce Motion by snapping immediately.
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _assembleCtrl.status == AnimationStatus.dismissed) {
+        if (!mounted || _assembleCtrl.status != AnimationStatus.dismissed) return;
+        if (MediaQuery.disableAnimationsOf(context)) {
+          _assembleCtrl.value = 1.0;
+          if (!_notifiedAssembled) {
+            _notifiedAssembled = true;
+            widget.onAssembled?.call();
+          }
+          _syncAmbient();
+        } else {
           _assembleCtrl.forward();
         }
       });
-    } else {
-      _syncAmbient();
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _syncAmbient();
   }
 
   @override
@@ -161,6 +180,7 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
   static final Path _collarPath = _buildCollarPath();
   static final Path _sheenPath = _buildSheenPath();
   static final Path _fullAssembledSilhouette = _buildFullAssembledSilhouette();
+  static final Rect _assembledBounds = _fullAssembledSilhouette.getBounds();
   static final PathMetric _bodyMetric = _bodyPath.computeMetrics().first;
 
   static Path _buildLeftLeafPath() => Path()
@@ -318,20 +338,35 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
     }
 
     // If fully assembled, draw the locked true-cutout silhouette cleanly + ambient sheen!
+    final brightBody = lo.computeLuminance() > 0.62;
     if (p >= 0.995) {
       canvas.drawPath(_fullAssembledSilhouette, Paint()..shader = gradientShader);
       canvas.drawPath(
         _sheenPath,
-        Paint()..color = Colors.white.withValues(alpha: isDark ? 0.30 : 0.24),
+        Paint()
+          ..color = brightBody
+              ? const Color(0xFF0F172A).withValues(alpha: 0.12)
+              : Colors.white.withValues(alpha: isDark ? 0.30 : 0.24),
       );
-      // Subtle ambient shimmer pulse along the rim
-      final pulseAlpha = (0.14 + 0.08 * math.sin(ambientPhase)) * (isDark ? 1.0 : 0.75);
+      // Subtle 135° Fresnel ambient shimmer along the full assembled silhouette (never cutting
+      // across the transparent drawstring collar cutout).
+      final pulseAlpha = (0.14 + 0.08 * math.sin(ambientPhase)) * (isDark ? 1.0 : 0.78);
+      final rimHi = brightBody ? const Color(0xFF0F172A) : Colors.white;
       canvas.drawPath(
-        _bodyPath,
+        _fullAssembledSilhouette,
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 0.65
-          ..color = Colors.white.withValues(alpha: pulseAlpha),
+          ..shader = LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              rimHi.withValues(alpha: (pulseAlpha * (brightBody ? 0.95 : 1.45)).clamp(0.0, 0.55)),
+              hi.withValues(alpha: (pulseAlpha * 0.55).clamp(0.0, 0.35)),
+              rimHi.withValues(alpha: (pulseAlpha * (brightBody ? 0.65 : 0.85)).clamp(0.0, 0.40)),
+            ],
+            stops: const [0.0, 0.52, 1.0],
+          ).createShader(_assembledBounds),
       );
       canvas.restore();
       return;
@@ -507,7 +542,10 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
     if (sheenFade > 0.0) {
       canvas.drawPath(
         _sheenPath,
-        Paint()..color = Colors.white.withValues(alpha: (isDark ? 0.30 : 0.24) * sheenFade),
+        Paint()
+          ..color = brightBody
+              ? const Color(0xFF0F172A).withValues(alpha: 0.12 * sheenFade)
+              : Colors.white.withValues(alpha: (isDark ? 0.30 : 0.24) * sheenFade),
       );
     }
 
@@ -520,14 +558,15 @@ class _GrassBagKineticLogoPainter extends CustomPainter {
       canvas.translate(32, 32);
       canvas.rotate(-0.42);
       canvas.translate(-32, -32);
+      final sweepColor = brightBody ? const Color(0xFF0F172A) : Colors.white;
       canvas.drawRect(
         beamRect,
         Paint()
           ..shader = LinearGradient(
             colors: [
-              Colors.white.withValues(alpha: 0.0),
-              Colors.white.withValues(alpha: isDark ? 0.42 : 0.52),
-              Colors.white.withValues(alpha: 0.0),
+              sweepColor.withValues(alpha: 0.0),
+              sweepColor.withValues(alpha: brightBody ? 0.18 : (isDark ? 0.42 : 0.52)),
+              sweepColor.withValues(alpha: 0.0),
             ],
           ).createShader(beamRect),
       );
@@ -802,11 +841,12 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
             child: GrassBagShell(isSplashCovered: showSplash),
           ),
 
-        // Full-screen First-Launch Onboarding Experience (mounted BEFORE splash fades out -> zero flash!)
+        // Full-screen First-Launch Onboarding Experience (mounted BEFORE splash fades out -> zero flash!
+        // Unmute TickerMode as soon as `_exitingSplash` begins so welcome cards animate into view cleanly.)
         if (showOnboarding)
           Positioned.fill(
             child: TickerMode(
-              enabled: !showSplash,
+              enabled: !showSplash || _exitingSplash,
               child: OnboardingPage(
                 isFirstLaunch: true,
                 onFinished: () {
@@ -881,7 +921,9 @@ class _GrassBagSplashLayer extends ConsumerWidget {
 
     final String statusText;
     final bool statusReady;
-    if (!slice.onboardingDone && !slice.initialized && !slice.hasRemoteHosts) {
+    final bool isStaticTagline =
+        !slice.onboardingDone && !slice.initialized && !slice.hasRemoteHosts;
+    if (isStaticTagline) {
       statusText = '把 DeepSeek Harness 装进口袋';
       statusReady = false;
     } else if (slice.phase == ConnectionPhase.connected && slice.hydrated) {
@@ -920,58 +962,25 @@ class _GrassBagSplashLayer extends ConsumerWidget {
       type: MaterialType.transparency,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: allowTapSkip ? onTapSkip : null,
+        onTap: allowTapSkip
+            ? () {
+                HapticFeedback.selectionClick();
+                onTapSkip();
+              }
+            : null,
         child: FadeTransition(
           opacity: fadeOutAnim,
-          child: ScaleTransition(
-            scale: scaleOutAnim,
-            child: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [t.bgTop, t.bgSolid, t.bgBottom],
+          child: Stack(
+            children: [
+              // Reuse the exact zero-shader atmospheric silk canvas used by Home & Onboarding
+              // unscaled at 1.0x so cross-dissolving out of the splash produces zero background jump!
+              const Positioned.fill(
+                child: GrassBagCanvasBackground(),
               ),
-            ),
-            child: Stack(
-              children: [
-                // Soft ambient aurora orbs
-                Positioned(
-                  top: -90,
-                  right: -60,
-                  child: Container(
-                    width: 280,
-                    height: 280,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: [
-                          t.primaryHi.withValues(alpha: t.isDark ? 0.22 : 0.16),
-                          t.primary.withValues(alpha: 0.0),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  bottom: -110,
-                  left: -70,
-                  child: Container(
-                    width: 300,
-                    height: 300,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: [
-                          t.primary.withValues(alpha: t.isDark ? 0.18 : 0.13),
-                          t.primary.withValues(alpha: 0.0),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                // Centerpiece Kinetic Logo Assembly + Wordmark
-                Center(
+              // Centerpiece Kinetic Logo Assembly + Wordmark (only foreground scales softly on exit)
+              ScaleTransition(
+                scale: scaleOutAnim,
+                child: Center(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -986,7 +995,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                         tween: Tween(begin: 0.0, end: 1.0),
                         duration: const Duration(milliseconds: 760),
                         curve: const Interval(0.35, 1.0, curve: Curves.easeOutCubic),
-                        builder: (context, v, child) => Opacity(
+                        builder: (context, v, child) => GrassBagControlledOpacity(
                           opacity: v,
                           child: Transform.translate(
                             offset: Offset(0, (1.0 - v) * 14.0),
@@ -1008,7 +1017,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                         tween: Tween(begin: 0.0, end: 1.0),
                         duration: const Duration(milliseconds: 980),
                         curve: const Interval(0.50, 1.0, curve: Curves.easeOutCubic),
-                        builder: (context, v, child) => Opacity(
+                        builder: (context, v, child) => GrassBagControlledOpacity(
                           opacity: v,
                           child: Transform.translate(
                             offset: Offset(0, (1.0 - v) * 10.0),
@@ -1017,53 +1026,50 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                         ),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 24),
-                          child: Container(
+                          child: GrassBagFresnelGlassSurface(
+                            isPill: true,
+                            elevated: true,
                             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: t.isDark ? 0.07 : 0.72),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: t.isDark ? 0.14 : 0.92),
-                                width: 0.7,
-                              ),
-                              boxShadow: t.isDark
-                                  ? null
-                                  : const [
-                                      BoxShadow(
-                                        color: Color(0x0A000000),
-                                        blurRadius: 12,
-                                        offset: Offset(0, 3),
+                            tintColor: statusReady ? t.okSoft : null,
+                            child: AnimatedSize(
+                              duration: const Duration(milliseconds: 200),
+                              curve: Curves.easeOutCubic,
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 180),
+                                child: Row(
+                                  key: ValueKey('$statusReady:$isStaticTagline:$statusText'),
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (statusReady)
+                                      Icon(CupertinoIcons.checkmark_circle_fill, size: 13, color: t.ok)
+                                    else if (isStaticTagline)
+                                      Icon(CupertinoIcons.sparkles, size: 13, color: t.primary)
+                                    else
+                                      SizedBox(
+                                        width: 12,
+                                        height: 12,
+                                        child: GrassBagActivityIndicator(
+                                          radius: 5.5,
+                                          animating: !exiting,
+                                          color: t.primary,
+                                        ),
                                       ),
-                                    ],
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (statusReady)
-                                  Icon(CupertinoIcons.checkmark_circle_fill, size: 13, color: t.ok)
-                                else
-                                  SizedBox(
-                                    width: 12,
-                                    height: 12,
-                                    child: CupertinoActivityIndicator(
-                                      radius: 5.5,
-                                      color: t.primary,
+                                    const SizedBox(width: 7),
+                                    Flexible(
+                                      child: Text(
+                                        statusText,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w500,
+                                          color: statusReady ? t.ok : t.text2,
+                                        ),
+                                      ),
                                     ),
-                                  ),
-                                const SizedBox(width: 7),
-                                Flexible(
-                                  child: Text(
-                                    statusText,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 12.5,
-                                      fontWeight: FontWeight.w500,
-                                      color: statusReady ? t.ok : t.text2,
-                                    ),
-                                  ),
+                                  ],
                                 ),
-                              ],
+                              ),
                             ),
                           ),
                         ),
@@ -1071,23 +1077,40 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                     ],
                   ),
                 ),
-                // Subtle bottom brand watermark
+              ),
+                // Subtle bottom brand watermark / skip crystal cue
                 Positioned(
                   left: 0,
                   right: 0,
                   bottom: MediaQuery.viewPaddingOf(context).bottom + 24,
                   child: Center(
-                    child: AnimatedOpacity(
-                      opacity: allowTapSkip ? 0.65 : 0.35,
-                      duration: const Duration(milliseconds: 300),
-                      child: Text(
-                        allowTapSkip ? '轻点屏幕立即进入' : 'DeepSeek Harness Mobile',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          letterSpacing: 0.4,
-                          color: t.text3,
-                        ),
-                      ),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 260),
+                      child: allowTapSkip
+                          ? GrassBagFresnelGlassSurface(
+                              key: const ValueKey('splash_skip_cue'),
+                              isPill: true,
+                              innerWell: true,
+                              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 5),
+                              child: Text(
+                                '轻点屏幕立即进入',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w500,
+                                  letterSpacing: 0.3,
+                                  color: t.text2,
+                                ),
+                              ),
+                            )
+                          : Text(
+                              'DeepSeek Harness Mobile',
+                              key: const ValueKey('splash_brand_mark'),
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                letterSpacing: 0.4,
+                                color: t.text3.withValues(alpha: 0.62),
+                              ),
+                            ),
                     ),
                   ),
                 ),
@@ -1095,8 +1118,6 @@ class _GrassBagSplashLayer extends ConsumerWidget {
             ),
           ),
         ),
-      ),
-    ),
-    );
+      );
   }
 }

@@ -211,6 +211,7 @@ class ModelsDevCatalogService {
         final resp = await fetchAppUpdateJson(
           uri,
           timeout: const Duration(seconds: 9),
+          maxBytes: 12 * 1024 * 1024,
         );
         body = resp.statusCode == 200 ? resp.body : null;
       }

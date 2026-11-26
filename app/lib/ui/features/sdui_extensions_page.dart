@@ -21,6 +21,7 @@ class SduiExtensionsPage extends ConsumerStatefulWidget {
 
 class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
   String _activeViewId = 'host-diagnostics';
+  int _tabDirection = 0;
   bool _loading = false;
   int _loadSeq = 0;
 
@@ -38,13 +39,13 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
     );
   }
 
-  Future<void> _loadCurrent({bool refreshSurfaces = false}) async {
+  Future<void> _loadCurrent({bool refreshSurfaces = false, bool silent = true}) async {
     if (!mounted) return;
     final seq = ++_loadSeq;
     setState(() => _loading = true);
     try {
       if (refreshSurfaces) {
-        await ref.read(appProvider.notifier).refreshSduiSurfaces(silent: true);
+        await ref.read(appProvider.notifier).refreshSduiSurfaces(silent: silent);
       }
       if (!mounted || seq != _loadSeq) return;
       final surfaces = ref.read(appProvider).sduiSurfaces;
@@ -68,10 +69,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
     });
     ref.listen<ConnectionPhase>(appProvider.select((s) => s.connectionPhase), (prev, next) {
       if (next == ConnectionPhase.connected && prev != ConnectionPhase.connected && mounted) {
-        final s = ref.read(appProvider);
-        if (s.sduiSurfaces.isEmpty || s.sduiViews[_activeViewId] == null) {
-          unawaited(_loadCurrent(refreshSurfaces: true));
-        }
+        unawaited(_loadCurrent(refreshSurfaces: true));
       }
     });
     ref.watch(
@@ -79,6 +77,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
         (s) => (
           sduiSurfaces: s.sduiSurfaces,
           activeView: s.sduiViews[_activeViewId],
+          activeHostName: s.activeHost.name,
           glassTier: s.glassTier,
           connectionPhase: s.connectionPhase,
         ),
@@ -139,35 +138,55 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                           ),
                           const SizedBox(height: 10),
                         ],
-                      if (surfaces.isNotEmpty)
+                      if (surfaces.isNotEmpty) ...[
                         SizedBox(
-                          height: 40,
-                          child: ListView.separated(
-                            scrollDirection: Axis.horizontal,
-                            itemCount: surfaces.length,
-                            separatorBuilder: (_, __) => const SizedBox(width: 8),
-                            itemBuilder: (_, i) {
-                              final meta = surfaces[i];
-                              final selected = meta.id == _activeViewId;
-                              return Center(
-                                child: GrassBagFilterChip(
-                                  label: meta.title,
-                                  selected: selected,
-                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7.5),
-                                  fontSize: 13,
-                                  onTap: () {
-                                    if (_activeViewId == meta.id) return;
-                                    setState(() => _activeViewId = meta.id);
-                                    _loadCurrent();
-                                  },
-                                ),
-                              );
-                            },
-                          ),
+                          height: 46,
+                          child: () {
+                            final strip = ListView.separated(
+                              scrollDirection: Axis.horizontal,
+                              physics: const BouncingScrollPhysics(),
+                              padding: EdgeInsets.only(right: surfaces.length > 1 ? 18 : 0),
+                              itemCount: surfaces.length,
+                              separatorBuilder: (_, __) => const SizedBox(width: 8),
+                              itemBuilder: (_, i) {
+                                final meta = surfaces[i];
+                                final selected = meta.id == _activeViewId;
+                                return Center(
+                                  child: GrassBagFilterChip(
+                                    label: meta.title,
+                                    selected: selected,
+                                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7.5),
+                                    fontSize: 13,
+                                    onTap: () {
+                                      if (_activeViewId == meta.id) return;
+                                      final prevIdx = surfaces.indexWhere((s) => s.id == _activeViewId);
+                                      setState(() {
+                                        _tabDirection = prevIdx < 0 ? 0 : i.compareTo(prevIdx);
+                                        _activeViewId = meta.id;
+                                      });
+                                      _loadCurrent();
+                                    },
+                                  ),
+                                );
+                              },
+                            );
+                            if (surfaces.length <= 1) return strip;
+                            return ShaderMask(
+                              blendMode: BlendMode.dstIn,
+                              shaderCallback: (bounds) => const LinearGradient(
+                                begin: Alignment.centerLeft,
+                                end: Alignment.centerRight,
+                                colors: [Colors.white, Colors.white, Colors.transparent],
+                                stops: [0.0, 0.92, 1.0],
+                              ).createShader(bounds),
+                              child: strip,
+                            );
+                          }(),
                         ),
-                      const SizedBox(height: 14),
+                        const SizedBox(height: 14),
+                      ],
                       GrassBagDirectionalTabSwitcher(
-                        direction: 0,
+                        direction: _tabDirection,
                         duration: const Duration(milliseconds: 170),
                         child: KeyedSubtree(
                           key: ValueKey('sdui-$_activeViewId-${activeView != null}-${_loading && activeView == null}'),
@@ -175,7 +194,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                               ? GrassBagCard(
                                   padding: const EdgeInsets.symmetric(vertical: 36),
                                   child: Center(
-                                    child: CupertinoActivityIndicator(color: t.primary),
+                                    child: GrassBagActivityIndicator(color: t.primary),
                                   ),
                                 )
                               : (activeView != null
@@ -201,12 +220,14 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                                           Icon(CupertinoIcons.square_grid_2x2, size: 30, color: t.text3),
                                           const SizedBox(height: 10),
                                           Text(
-                                            '暂无可用扩展面板',
+                                            surfaces.isNotEmpty ? '加载该面板失败' : '暂无可用扩展面板',
                                             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text2),
                                           ),
                                           const SizedBox(height: 4),
                                           Text(
-                                            '当已连接的 DSH 主机注册扩展面板时会在此自动渲染',
+                                            surfaces.isNotEmpty
+                                                ? '未能拉取当前扩展面板视图，请点击下方重新加载'
+                                                : '当已连接的 DSH 主机注册扩展面板时会在此自动渲染',
                                             textAlign: TextAlign.center,
                                             style: TextStyle(fontSize: 12, color: t.text3),
                                           ),
@@ -217,7 +238,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                                             tier: state.glassTier,
                                             insideGlass: true,
                                             accentForeground: true,
-                                            onTap: () => _loadCurrent(refreshSurfaces: true),
+                                            onTap: () => _loadCurrent(refreshSurfaces: true, silent: false),
                                           ),
                                         ],
                                       ),
@@ -244,7 +265,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                   tooltip: '刷新数据',
                   tier: state.glassTier,
                   useOwnLayer: false,
-                  onTap: () => _loadCurrent(refreshSurfaces: true),
+                  onTap: () => _loadCurrent(refreshSurfaces: true, silent: false),
                 ),
               ),
             ),

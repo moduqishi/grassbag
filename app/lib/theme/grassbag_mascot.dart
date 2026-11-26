@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
 import 'grassbag_theme.dart';
@@ -9,10 +11,12 @@ class GrassBagMascot extends StatelessWidget {
     super.key,
     this.size = 28,
     this.withShadow = false,
+    this.repaintBoundary = false,
   });
 
   final double size;
   final bool withShadow;
+  final bool repaintBoundary;
 
   @override
   Widget build(BuildContext context) {
@@ -21,46 +25,46 @@ class GrassBagMascot extends StatelessWidget {
       hi: t.primaryHi,
       lo: t.primary,
       isDark: t.isDark,
+      withShadow: withShadow,
     );
-    Widget widget = SizedBox.square(
+    final Widget widget = SizedBox.square(
       dimension: size,
       child: CustomPaint(painter: painter),
     );
-    if (withShadow) {
-      widget = DecoratedBox(
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          boxShadow: [
-            BoxShadow(
-              color: t.primary.withValues(alpha: t.isDark ? 0.24 : 0.16),
-              blurRadius: 16,
-              offset: const Offset(0, 6),
-              spreadRadius: -4,
-            ),
-          ],
-        ),
-        child: widget,
-      );
-    }
-    return RepaintBoundary(child: widget);
+    return repaintBoundary ? RepaintBoundary(child: widget) : widget;
   }
 }
 
 class _GrassBagMascotPainter extends CustomPainter {
-  const _GrassBagMascotPainter({
+  _GrassBagMascotPainter({
     required this.hi,
     required this.lo,
     required this.isDark,
+    this.withShadow = false,
   });
 
   final Color hi;
   final Color lo;
   final bool isDark;
+  final bool withShadow;
 
   /// Precomputed once in 64×64 vector coordinates using Path boolean difference
   /// so drawing GrassBagMascot NEVER allocates a GPU offscreen `canvas.saveLayer`!
   static final Path _silhouettePath = _buildSilhouettePath();
   static final Path _sheenPath = _buildSheenPath();
+  static final Map<(int, int), ui.Shader> _shaderCache = <(int, int), ui.Shader>{};
+
+  static ui.Shader _cachedBodyShader(Color hi, Color lo) {
+    final key = (hi.toARGB32(), lo.toARGB32());
+    return _shaderCache.putIfAbsent(
+      key,
+      () => LinearGradient(
+        begin: const Alignment(-0.72, -0.88),
+        end: const Alignment(0.72, 0.88),
+        colors: [hi, lo],
+      ).createShader(const Rect.fromLTWH(0, 0, 64, 64)),
+    );
+  }
 
   static Path _buildSilhouettePath() {
     final leftEar = Path()
@@ -135,22 +139,44 @@ class _GrassBagMascotPainter extends CustomPainter {
     canvas.save();
     canvas.scale(size.width / 64.0, size.height / 64.0);
 
-    final bodyPaint = Paint()
-      ..shader = LinearGradient(
-        begin: const Alignment(-0.72, -0.88),
-        end: const Alignment(0.72, 0.88),
-        colors: [hi, lo],
-      ).createShader(const Rect.fromLTWH(0, 0, 64, 64));
+    // Draw soft grounded ambient shadow strictly beneath the pouch base so the
+    // negative-space transparent collar & pill eyes stay 100% crisp and unclouded!
+    if (withShadow) {
+      final groundRect = const Rect.fromLTRB(14.0, 53.5, 50.0, 62.5);
+      final groundColor = (isDark && lo.computeLuminance() > 0.55)
+          ? Colors.black
+          : lo;
+      canvas.drawOval(
+        groundRect,
+        Paint()
+          ..shader = RadialGradient(
+            colors: [
+              groundColor.withValues(alpha: isDark ? 0.34 : 0.22),
+              groundColor.withValues(alpha: 0.0),
+            ],
+            stops: const [0.0, 1.0],
+          ).createShader(groundRect),
+      );
+    }
 
+    final bodyPaint = Paint()..shader = _cachedBodyShader(hi, lo);
     canvas.drawPath(_silhouettePath, bodyPaint);
+
+    final brightBody = lo.computeLuminance() > 0.62;
     canvas.drawPath(
       _sheenPath,
-      Paint()..color = Colors.white.withValues(alpha: isDark ? 0.28 : 0.22),
+      Paint()
+        ..color = brightBody
+            ? Colors.black.withValues(alpha: 0.07)
+            : Colors.white.withValues(alpha: isDark ? 0.28 : 0.22),
     );
     canvas.restore();
   }
 
   @override
   bool shouldRepaint(covariant _GrassBagMascotPainter oldDelegate) =>
-      oldDelegate.hi != hi || oldDelegate.lo != lo || oldDelegate.isDark != isDark;
+      oldDelegate.hi != hi ||
+      oldDelegate.lo != lo ||
+      oldDelegate.isDark != isDark ||
+      oldDelegate.withShadow != withShadow;
 }

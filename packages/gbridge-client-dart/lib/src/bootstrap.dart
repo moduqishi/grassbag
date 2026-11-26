@@ -115,6 +115,25 @@ class RemoteBootstrapClient {
 
   final GbridgeHttpTransport _transport;
 
+  static bool _isLikelyUntrustedHost403(GbridgeException err, String? dshVer) {
+    final msgLower = err.message.toLowerCase();
+    if (msgLower.contains('<!doctype') ||
+        msgLower.contains('<html') ||
+        msgLower.contains('cloudflare') ||
+        msgLower.contains('sign in') ||
+        msgLower.contains('login') ||
+        msgLower.contains('authenticate') ||
+        msgLower.contains('unauthorized') ||
+        msgLower.contains('invalid token') ||
+        msgLower.contains('access denied')) {
+      return false;
+    }
+    if (msgLower.contains('host') || msgLower.contains('origin') || msgLower.contains('trusted')) {
+      return true;
+    }
+    return dshVer != null;
+  }
+
   /// Probe host protocol capabilities, auth state, and DSH version.
   Future<HostProbeResult> probeHost() async {
     try {
@@ -134,6 +153,15 @@ class RemoteBootstrapClient {
       }
       if (err.status == 403) {
         final dshVer = await _transport.probeDshSseVersion();
+        if (!_isLikelyUntrustedHost403(err, dshVer)) {
+          final msgLower = err.message.toLowerCase();
+          return HostProbeNeedsAuth(
+            dshVersion: dshVer,
+            hasGbridge: err.code.startsWith('gbridge/') && err.code != 'gbridge/http_403',
+            isHtmlLoginPage: msgLower.contains('<html') || msgLower.contains('<!doctype'),
+            message: err.message,
+          );
+        }
         final uri = _transport.endpoint.baseUri;
         final authority = uri == null
             ? 'unknown'
@@ -202,6 +230,15 @@ class RemoteBootstrapClient {
         );
       }
       if (err.status == 403) {
+        if (!_isLikelyUntrustedHost403(err, dshVer)) {
+          final msgLower = err.message.toLowerCase();
+          return HostProbeNeedsAuth(
+            dshVersion: dshVer,
+            hasGbridge: false,
+            isHtmlLoginPage: msgLower.contains('<html') || msgLower.contains('<!doctype'),
+            message: err.message,
+          );
+        }
         final uri = _transport.endpoint.baseUri;
         final authority = uri == null
             ? 'unknown'
@@ -305,9 +342,18 @@ class RemoteBootstrapClient {
     final trimmedSpec = packageSpec.trim();
     final useOfficialMirrors = trimmedSpec.isEmpty ||
         trimmedSpec == 'dsh-gbridge' ||
-        trimmedSpec == '@grassbag/dsh-gbridge';
+        trimmedSpec == '@grassbag/dsh-gbridge' ||
+        trimmedSpec == kOfficialGbridgeAcceleratedUrl ||
+        trimmedSpec == kOfficialGbridgeDirectUrl ||
+        kOfficialGbridgeInstallSpecs.contains(trimmedSpec);
     final candidateSpecs = useOfficialMirrors
-        ? kOfficialGbridgeInstallSpecs
+        ? (trimmedSpec == kOfficialGbridgeDirectUrl
+            ? <String>[
+                kOfficialGbridgeDirectUrl,
+                for (final s in kOfficialGbridgeInstallSpecs)
+                  if (s != kOfficialGbridgeDirectUrl) s,
+              ]
+            : kOfficialGbridgeInstallSpecs)
         : <String>[trimmedSpec];
 
     Map<String, dynamic>? installValue;

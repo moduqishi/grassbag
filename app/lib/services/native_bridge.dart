@@ -511,7 +511,8 @@ class GrassBagNativeBridge {
       }
       return const NativeEvent('unknown', {});
     }).handleError((Object _) {
-      _eventStream = null;
+      // Keep the shared broadcast stream attached across transient EventChannel errors;
+      // explicit teardown uses `resetEventStream()`.
     });
   }
 
@@ -705,6 +706,10 @@ class GrassBagNativeBridge {
     return (await _safeInvoke<bool>('safety.setPolicy', {'policy': policy})) == true;
   }
 
+  Future<bool> setSafetyChatPermissionPreset(String preset) async {
+    return (await _safeInvoke<bool>('safety.setChatPermissionPreset', {'preset': preset})) == true;
+  }
+
   Future<bool> setSafetyConfirmHighRisk(bool enabled) async {
     return (await _safeInvoke<bool>('safety.setConfirmHighRisk', {'enabled': enabled})) == true;
   }
@@ -754,20 +759,38 @@ class GrassBagNativeBridge {
     return (await _safeInvoke<bool>('safety.previewOverlay', {'mode': mode})) == true;
   }
 
-  Future<void> syncThemeMode(bool isDark, {int? accentPrimary, int? accentHi}) async {
+  Future<void> syncThemeMode(
+    bool isDark, {
+    int? accentPrimary,
+    int? accentHi,
+    int? bgSolid,
+    bool followSystemTheme = false,
+  }) async {
     await _safeInvoke<bool>('app.syncThemeMode', {
       'isDark': isDark,
+      'followSystemTheme': followSystemTheme,
       if (accentPrimary != null) 'accentPrimary': accentPrimary,
       if (accentHi != null) 'accentHi': accentHi,
+      if (bgSolid != null) 'bgSolid': bgSolid,
     });
   }
 
   // Background Keepalive Service & Alert Notifications
-  Future<void> startKeepaliveService({
+  Future<bool> startKeepaliveService({
     String title = 'GrassBag 本机环境运行中',
     String text = '对话与终端后台保活通道已就绪',
+    int wakeLockMs = 0,
+    bool? holdWifiLock,
+    bool releaseWakeLock = false,
   }) async {
-    await _safeInvoke<bool>('service.start', {'title': title, 'text': text});
+    return (await _safeInvoke<bool>('service.start', {
+          'title': title,
+          'text': text,
+          if (wakeLockMs > 0) 'wakeLockMs': wakeLockMs,
+          if (holdWifiLock != null) 'holdWifiLock': holdWifiLock,
+          if (releaseWakeLock) 'releaseWakeLock': true,
+        })) ==
+        true;
   }
 
   Future<void> stopKeepaliveService() async {

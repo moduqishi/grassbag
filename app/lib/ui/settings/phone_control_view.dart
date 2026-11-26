@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart' show SelectableText;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../services/native_bridge.dart';
@@ -8,7 +9,9 @@ import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../web/official_web_page.dart';
 import 'permissions_center_page.dart';
+import 'settings_page.dart';
 
 /// Flagship Apple iOS 26/27 Liquid Glass Phone Control Center:
 /// - Live status & readiness hero card with 1-tap safe demo & interactive overlay previews
@@ -16,7 +19,12 @@ import 'permissions_center_page.dart';
 /// - SafetyGate policy control, hard-protected app rules sheet, and 1-tap Emergency Stop
 /// - Human-readable Chinese audit timeline
 class PhoneControlView extends ConsumerStatefulWidget {
-  const PhoneControlView({super.key});
+  const PhoneControlView({
+    super.key,
+    this.onOpenModelSettings,
+  });
+
+  final VoidCallback? onOpenModelSettings;
 
   @override
   ConsumerState<PhoneControlView> createState() => _PhoneControlViewState();
@@ -275,7 +283,9 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                                   ? '已锁定'
                                   : (slice.phoneLiveActive
                                       ? (slice.phoneLivePaused ? '暂停中' : '运行中')
-                                      : (perms.accessibilityEnabled ? '就绪' : '待开启')),
+                                      : (perms.accessibilityEnabled
+                                          ? '就绪'
+                                          : (needsRetoggle ? '需重开' : '待开启'))),
                               fg: heroColor,
                               bg: heroColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
                             ),
@@ -350,9 +360,15 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                       padding: const EdgeInsets.symmetric(horizontal: 14),
                       tier: slice.glassTier,
                       insideGlass: true,
-                      onTap: () => Navigator.of(context).push(
-                        GrassBagPageRoute<void>(builder: (_) => const PermissionsCenterPage()),
-                      ),
+                      onTap: () {
+                        if (perms.sdkInt >= 33) {
+                          showRestrictedSettingsGuideSheet(context, slice.glassTier);
+                        } else {
+                          Navigator.of(context).push(
+                            GrassBagPageRoute<void>(builder: (_) => const PermissionsCenterPage()),
+                          );
+                        }
+                      },
                     ),
                   ],
                 )
@@ -364,28 +380,51 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                       children: [
                         Expanded(
                           child: GrassBagPrimaryGlassButton(
-                            label: '实操试一试',
-                            icon: CupertinoIcons.play_fill,
+                            label: canRunDemo
+                                ? '实操试一试'
+                                : (!slice.isLocalHost
+                                    ? '切回本机'
+                                    : (!slice.isDshConnected ? '本机连接中…' : '去配置模型')),
+                            icon: canRunDemo
+                                ? CupertinoIcons.play_fill
+                                : (!slice.isLocalHost
+                                    ? CupertinoIcons.arrow_2_circlepath
+                                    : CupertinoIcons.slider_horizontal_3),
                             height: 38,
                             tier: slice.glassTier,
                             insideGlass: true,
-                            onTap: () {
-                              if (!canRunDemo) {
-                                final hint = !slice.isLocalHost
-                                    ? '当前正在使用远程主机，切回「本机引擎」后即可一键实操'
-                                    : (!slice.isDshConnected
-                                        ? '本机 DSH 引擎连接中，请稍候引擎就绪后再试'
-                                        : '请先在「模型」设置页配置可用模型后再实操');
-                                ctrl.showToast(hint, tone: ToastTone.info);
-                                return;
-                              }
-                              Navigator.of(context).popUntil((route) => route.isFirst);
-                              unawaited(
-                                ctrl.sendPrompt(
-                                  '请用手机操控打开计算器或时钟确认屏幕画面，操作完成后告诉我结果',
-                                ),
-                              );
-                            },
+                            enabled: canRunDemo || !slice.isLocalHost || slice.isDshConnected,
+                            onTap: canRunDemo
+                                ? () {
+                                    Navigator.of(context).popUntil((route) => route.isFirst);
+                                    unawaited(
+                                      ctrl.sendPrompt(
+                                        '请用手机操控打开计算器或时钟确认屏幕画面，操作完成后告诉我结果',
+                                      ),
+                                    );
+                                  }
+                                : (!slice.isLocalHost
+                                    ? () => unawaited(ctrl.switchHost('local'))
+                                    : (slice.isDshConnected
+                                        ? () {
+                                            if (widget.onOpenModelSettings != null) {
+                                              widget.onOpenModelSettings!();
+                                              return;
+                                            }
+                                            Navigator.of(context).push(
+                                              GrassBagPageRoute<void>(
+                                                builder: (routeCtx) => SettingsPage(
+                                                  initialSection: SettingsSection.model,
+                                                  onOpenWebUi: () => Navigator.of(routeCtx).push(
+                                                    GrassBagPageRoute<void>(
+                                                      builder: (_) => const OfficialWebPage(),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            );
+                                          }
+                                        : null)),
                           ),
                         ),
                         const SizedBox(width: 9),
@@ -529,11 +568,16 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                       ],
                     ),
                   ),
-                  GestureDetector(
-                    behavior: HitTestBehavior.opaque,
+                  GrassBagSpringTap(
+                    enablePointerGlow: false,
+                    haptic: true,
                     onTap: () => _showProtectedRulesSheet(context, slice.glassTier),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    child: GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      interactive: true,
+                      tintColor: t.primarySoft,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                       child: Text(
                         '规则详情',
                         style: TextStyle(
@@ -551,16 +595,28 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                 labels: const ['每次询问', '本轮允许', '免确认'],
                 selectedIndex: polIdx,
                 tier: slice.glassTier,
-                onSelected: (i) => ctrl.setSafetyPolicy(policies[i]),
+                onSelected: (i) async {
+                  final next = policies[i];
+                  if (next == 'always' && slice.safetyPolicy != 'always') {
+                    final ok = await showGrassBagConfirmDialog(
+                      context,
+                      title: '切换为「免确认」模式？',
+                      message: '开启后日常应用内的点击、滑动与输入将不再逐次弹出确认卡（银行、支付、系统设置与密码框仍受底层硬安全隔离）。',
+                      confirmLabel: '确认开启',
+                      isDestructive: true,
+                    );
+                    if (!ok || !context.mounted) return;
+                  }
+                  ctrl.setSafetyPolicy(next);
+                },
               ),
               const SizedBox(height: 8),
               if (polIdx == 2) ...[
-                Container(
+                GrassBagFresnelGlassSurface(
+                  borderRadius: 12,
+                  innerWell: true,
+                  tintColor: t.warnSoft,
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                  decoration: BoxDecoration(
-                    color: t.warnSoft,
-                    borderRadius: BorderRadius.circular(11),
-                  ),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -603,7 +659,19 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                 trailing: GrassBagGlassSwitch(
                   value: slice.phoneConfirmHighRisk,
                   tier: slice.glassTier,
-                  onChanged: (v) => ctrl.setPhoneSetting(confirmHighRisk: v),
+                  onChanged: (v) async {
+                    if (!v && slice.phoneConfirmHighRisk) {
+                      final ok = await showGrassBagConfirmDialog(
+                        context,
+                        title: '关闭跨应用高风险确认卡？',
+                        message: '关闭后发送消息、删除内容或卸载应用等跨应用高风险操作将不再二次弹窗确认，仅保留银行/支付/系统设置/密码框底层拦截。',
+                        confirmLabel: '确认关闭',
+                        isDestructive: true,
+                      );
+                      if (!ok || !context.mounted) return;
+                    }
+                    ctrl.setPhoneSetting(confirmHighRisk: v);
+                  },
                 ),
               ),
               if (!slice.emergencyStopped && !slice.phoneLiveActive) ...[
@@ -637,22 +705,17 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
         // 4. Readiness & System Permissions Checklist
         GrassBagGroupedSection(
           header: '系统权限与保活检查',
-          dividerIndent: 57,
+          dividerIndent: 58,
           children: [
             GrassBagListTile(
-              leading: SizedBox(
-                width: 30,
-                child: Center(
-                  child: Icon(
-                    perms.accessibilityEnabled
-                        ? CupertinoIcons.checkmark_circle_fill
-                        : CupertinoIcons.circle,
-                    size: 19,
-                    color: perms.accessibilityEnabled
-                        ? t.ok
-                        : (needsRetoggle ? t.err : t.warn),
-                  ),
-                ),
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.hand_draw_fill,
+                color: perms.accessibilityEnabled
+                    ? t.ok
+                    : (needsRetoggle ? t.err : t.warn),
+                size: 30,
+                iconSize: 15,
+                filled: perms.accessibilityEnabled,
               ),
               title: const Text('必需：无障碍屏幕操控'),
               subtitle: Text(
@@ -667,20 +730,21 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
                 fg: perms.accessibilityEnabled ? t.ok : (needsRetoggle ? t.err : t.warn),
                 bg: perms.accessibilityEnabled ? t.okSoft : (needsRetoggle ? t.errSoft : t.warnSoft),
               ),
-              onTap: () => native.openPermissionSettings('accessibility'),
+              onTap: () {
+                if (!perms.accessibilityEnabled && !needsRetoggle && perms.sdkInt >= 33) {
+                  showRestrictedSettingsGuideSheet(context, slice.glassTier);
+                } else {
+                  native.openPermissionSettings('accessibility');
+                }
+              },
             ),
             GrassBagListTile(
-              leading: SizedBox(
-                width: 30,
-                child: Center(
-                  child: Icon(
-                    perms.overlayGranted
-                        ? CupertinoIcons.checkmark_circle_fill
-                        : CupertinoIcons.circle,
-                    size: 19,
-                    color: perms.overlayGranted ? t.ok : t.text3,
-                  ),
-                ),
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.layers_alt_fill,
+                color: perms.overlayGranted ? t.ok : t.primary,
+                size: 30,
+                iconSize: 15,
+                filled: perms.overlayGranted,
               ),
               title: const Text('推荐：悬浮窗权限'),
               subtitle: Text(
@@ -694,17 +758,12 @@ class _PhoneControlViewState extends ConsumerState<PhoneControlView> {
               onTap: () => native.openPermissionSettings('overlay'),
             ),
             GrassBagListTile(
-              leading: SizedBox(
-                width: 30,
-                child: Center(
-                  child: Icon(
-                    perms.batteryOptIgnored
-                        ? CupertinoIcons.checkmark_circle_fill
-                        : CupertinoIcons.circle,
-                    size: 19,
-                    color: perms.batteryOptIgnored ? t.ok : t.text3,
-                  ),
-                ),
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.battery_100,
+                color: perms.batteryOptIgnored ? t.ok : t.warn,
+                size: 30,
+                iconSize: 15,
+                filled: perms.batteryOptIgnored,
               ),
               title: const Text('稳定：忽略电池优化'),
               subtitle: Text(
@@ -863,6 +922,34 @@ class _AuditRowTile extends StatelessWidget {
         fg: allowed ? t.ok : t.err,
         bg: allowed ? t.okSoft : t.errSoft,
       ),
+      showChevron: true,
+      onTap: () {
+        showGrassBagSheet<void>(
+          context,
+          title: label,
+          subtitle: [allowed ? '已放行' : '已拦截', if (timeStr.isNotEmpty) timeStr].join(' · '),
+          icon: icon,
+          iconColor: allowed ? t.primary : t.err,
+          bodyBuilder: (sheetCtx) {
+            final st = GrassBagTokens.of(sheetCtx);
+            return GrassBagFresnelGlassSurface(
+              borderRadius: 16,
+              innerWell: true,
+              padding: const EdgeInsets.all(14),
+              child: SelectableText(
+                [
+                  '工具：$tool',
+                  '决策：${_formatReason(reason)}',
+                  if (target.isNotEmpty && target != '-') '目标：$target',
+                  if (reason.isNotEmpty) '原始标记：$reason',
+                ].join('\n'),
+                contextMenuBuilder: buildGrassBagEditableContextMenu,
+                style: TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.55, color: st.text),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }
@@ -880,12 +967,11 @@ class _StatusChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return GrassBagFresnelGlassSurface(
+      isPill: true,
+      innerWell: true,
+      tintColor: bg,
       padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(999),
-      ),
       child: Text(
         label,
         style: TextStyle(

@@ -35,6 +35,7 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -85,9 +86,20 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         sendEvent("accessibility_state", mapOf("connected" to connected))
     }
 
+    private fun replySafe(result: MethodChannel.Result?, block: (MethodChannel.Result) -> Unit) {
+        if (result == null || detached) return
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            if (!detached) runCatching { block(result) }
+        } else {
+            mainHandler.post {
+                if (!detached) runCatching { block(result) }
+            }
+        }
+    }
+
     private fun runBg(result: MethodChannel.Result? = null, block: () -> Unit) {
         if (detached || bgPool.isShutdown) {
-            result?.let { r -> runCatching { mainHandler.post { r.error("detached", "Bridge plugin detached", null) } } }
+            replySafe(result) { it.error("detached", "Bridge plugin detached", null) }
             return
         }
         try {
@@ -96,29 +108,32 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     block()
                 } catch (t: Throwable) {
                     Log.e("GrassBagBridgePlugin", "Unhandled error in bgPool task: ${t.message}", t)
-                    result?.let { r ->
-                        runCatching {
-                            mainHandler.post {
-                                r.error("native_worker_error", t.message ?: t.javaClass.simpleName, null)
-                            }
-                        }
+                    replySafe(result) {
+                        it.error("native_worker_error", t.message ?: t.javaClass.simpleName, null)
                     }
                 }
             }
         } catch (t: Throwable) {
-            result?.let { r -> runCatching { mainHandler.post { r.error("executor_rejected", t.message ?: "Executor rejected task", null) } } }
+            replySafe(result) {
+                it.error("executor_rejected", t.message ?: "Executor rejected task", null)
+            }
         }
     }
 
     private fun runTermIo(result: MethodChannel.Result, block: () -> Unit) {
         if (detached || termIoExecutor.isShutdown) {
-            runCatching { mainHandler.post { result.success(false) } }
+            replySafe(result) { it.success(false) }
             return
         }
         try {
-            termIoExecutor.execute(block)
+            termIoExecutor.execute {
+                runCatching { block() }.onFailure { t ->
+                    Log.e("GrassBagBridgePlugin", "Unhandled error in termIoExecutor: ${t.message}", t)
+                    replySafe(result) { it.success(false) }
+                }
+            }
         } catch (_: Throwable) {
-            runCatching { mainHandler.post { result.success(false) } }
+            replySafe(result) { it.success(false) }
         }
     }
 
@@ -131,7 +146,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             val rt = runtime
             if (rt == null) {
                 val err = runtimeInitError ?: "本机运行时控制器初始化失败"
-                mainHandler.post { result.error("runtime_init_failed", err, null) }
+                replySafe(result) { it.error("runtime_init_failed", err, null) }
                 return@runBg
             }
             block(rt)
@@ -266,84 +281,84 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         when (call.method) {
             "runtime.status" -> withRuntime(result) { rt ->
                 val res = rt.getStatus()
-                mainHandler.post { result.success(res) }
+                replySafe(result) { it.success(res) }
             }
             "runtime.bootstrap" -> withRuntime(result) { rt ->
                 rt.bootstrapRuntime { res ->
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.cancelBootstrap" -> withRuntime(result) { rt ->
                 val res = rt.cancelBootstrap()
-                mainHandler.post { result.success(res) }
+                replySafe(result) { it.success(res) }
             }
             "runtime.setRuntimeMirror" -> {
                 val url = call.argument<String>("url") ?: ""
                 withRuntime(result) { rt ->
                     val res = rt.setRuntimeMirrorUrl(url)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.startEngine" -> withRuntime(result) { rt ->
                 rt.startEngine { res ->
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.stopEngine" -> withRuntime(result) { rt ->
                 val res = rt.stopEngine()
-                mainHandler.post { result.success(res) }
+                replySafe(result) { it.success(res) }
             }
             "runtime.restartEngine" -> withRuntime(result) { rt ->
                 rt.restartEngine { res ->
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.cleanCache" -> withRuntime(result) { rt ->
                 val res = rt.cleanCache()
-                mainHandler.post { result.success(res) }
+                replySafe(result) { it.success(res) }
             }
             "runtime.rebuildContainer" -> withRuntime(result) { rt ->
                 rt.rebuildContainerPreserveHome { res ->
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.engineLogs" -> withRuntime(result) { rt ->
                 val logs = rt.getEngineLogs()
-                mainHandler.post { result.success(logs) }
+                replySafe(result) { it.success(logs) }
             }
             "runtime.upgradeAb" -> {
                 val version = call.argument<String>("version") ?: "0.2.3"
                 val url = call.argument<String>("remoteUrl")
                 withRuntime(result) { rt ->
                     rt.performAbUpgrade(version, url) { res ->
-                        mainHandler.post { result.success(res) }
+                        replySafe(result) { it.success(res) }
                     }
                 }
             }
             "runtime.rollback" -> withRuntime(result) { rt ->
                 rt.rollbackLkg { res ->
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.setExecutor" -> {
                 val mode = call.argument<String>("mode") ?: "tawcroot"
                 withRuntime(result) { rt ->
                     val res = rt.setExecutorMode(mode)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.setSdcardMounted" -> {
                 val enabled = call.argument<Boolean>("enabled") ?: false
                 withRuntime(result) { rt ->
                     val res = rt.setSdcardMounted(enabled)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.setSystemProxy" -> {
                 val enabled = call.argument<Boolean>("enabled") ?: false
                 withRuntime(result) { rt ->
                     val res = rt.setSystemProxy(enabled)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "runtime.installToolkit" -> {
@@ -351,7 +366,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 val packages = call.argument<List<String>>("packages") ?: emptyList()
                 withRuntime(result) { rt ->
                     rt.installToolkit(id, packages) { res ->
-                        mainHandler.post { result.success(res) }
+                        replySafe(result) { it.success(res) }
                     }
                 }
             }
@@ -359,7 +374,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 val pass = call.argument<String>("passphrase") ?: "grassbag"
                 withRuntime(result) { rt ->
                     val res = rt.exportEncryptedBackup(pass)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
 
@@ -371,7 +386,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 val rows = call.argument<Int>("rows") ?: 24
                 withRuntime(result) { rt ->
                     val res = rt.startLocalShell(tabId, cwd, cols, rows)
-                    mainHandler.post { result.success(res) }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "term.write" -> {
@@ -381,7 +396,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     runCatching { runtimeReadyLatch.await() }
                     val rt = runtime
                     val ok = rt?.writeLocalShell(tabId, data) ?: false
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "term.resize" -> {
@@ -392,7 +407,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     runCatching { runtimeReadyLatch.await() }
                     val rt = runtime
                     val ok = rt?.resizeLocalShell(tabId, cols, rows) ?: false
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "term.signal" -> {
@@ -402,14 +417,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 // on one tab can never deadlock Ctrl+C / SIGTERM delivery!
                 withRuntime(result) { rt ->
                     val ok = rt.signalLocalShell(tabId, signal)
-                    mainHandler.post { if (!detached) result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "term.close" -> {
                 val tabId = call.argument<String>("tabId") ?: "local-1"
                 withRuntime(result) { rt ->
                     rt.closeLocalShell(tabId)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
 
@@ -419,21 +434,21 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 val v = call.argument<String>("value") ?: ""
                 runBg(result) {
                     val ok = if (k.isNotEmpty()) runCatching { vault.putSecret(k, v); true }.getOrDefault(false) else false
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "vault.get" -> {
                 val k = call.argument<String>("key") ?: ""
                 runBg(result) {
                     val v = if (k.isEmpty()) null else runCatching { vault.getSecret(k) }.getOrNull()
-                    mainHandler.post { result.success(v) }
+                    replySafe(result) { it.success(v) }
                 }
             }
             "vault.delete" -> {
                 val k = call.argument<String>("key") ?: ""
                 runBg(result) {
                     if (k.isNotEmpty()) runCatching { vault.deleteSecret(k) }
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
 
@@ -442,7 +457,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     val snap = SafetyGate.statusSnapshot().toMutableMap()
                     snap["hudVisible"] = PhoneOverlayController.getInstance(activity.applicationContext).isHudVisible()
-                    mainHandler.post { result.success(snap) }
+                    replySafe(result) { it.success(snap) }
                 }
             }
             "safety.setPolicy" -> {
@@ -451,14 +466,19 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     .getOrDefault(SafetyGate.PolicyTier.ASK)
                 runBg(result) {
                     val ok = SafetyGate.setPolicy(tier)
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
+            }
+            "safety.setChatPermissionPreset" -> {
+                val preset = call.argument<String>("preset") ?: "workspace-write"
+                SafetyGate.setSyncedChatPermissionPreset(preset)
+                replySafe(result) { it.success(true) }
             }
             "safety.setConfirmHighRisk" -> {
                 val enabled = call.argument<Boolean>("enabled") ?: true
                 runBg(result) {
                     SafetyGate.setConfirmHighRisk(enabled)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.setAutoReturn" -> {
@@ -466,7 +486,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     SafetyGate.setAutoReturnEnabled(enabled)
                     PhoneOverlayController.getInstance(activity.applicationContext).refreshVisualPreferences()
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.setShowEdgeAurora" -> {
@@ -474,7 +494,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     SafetyGate.setShowEdgeAurora(enabled)
                     PhoneOverlayController.getInstance(activity.applicationContext).refreshVisualPreferences()
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.setShowGestureFx" -> {
@@ -482,7 +502,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     SafetyGate.setShowGestureFx(enabled)
                     PhoneOverlayController.getInstance(activity.applicationContext).refreshVisualPreferences()
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.setPaused" -> {
@@ -490,13 +510,13 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     SafetyGate.setPaused(paused)
                     PhoneOverlayController.getInstance(activity.applicationContext).syncPausedState(paused)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.returnToApp" -> {
                 runBg(result) {
                     val ok = PhoneOverlayController.getInstance(activity.applicationContext).bringGrassBagToFrontNow()
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "safety.notifyTurnDone" -> {
@@ -516,65 +536,84 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             autoReturn = autoReturn
                         )
                     }
-                    mainHandler.post { result.success(shouldFinalize) }
+                    replySafe(result) { it.success(shouldFinalize) }
                 }
             }
             "safety.emergencyStop" -> {
                 runBg(result) {
                     SafetyGate.triggerEmergencyStop()
                     PhoneOverlayController.getInstance(activity.applicationContext).dismissAll()
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.resetStop" -> {
                 runBg(result) {
                     SafetyGate.resetEmergencyStop()
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "safety.previewOverlay" -> {
                 val mode = call.argument<String>("mode") ?: "interactive"
                 runBg(result) {
                     PhoneOverlayController.getInstance(activity.applicationContext).showPreviewDemo(mode = mode)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "app.syncThemeMode" -> {
                 val isDark = call.argument<Boolean>("isDark") ?: false
+                val followSystemTheme = call.argument<Boolean>("followSystemTheme") ?: false
                 // Dart Color.toARGB32() values (0xFF...... > 0x7FFFFFFF) arrive as java.lang.Long via StandardMessageCodec.
                 val accentPrimary = call.argument<Number>("accentPrimary")?.toLong()?.toInt()
                 val accentHi = call.argument<Number>("accentHi")?.toLong()?.toInt()
+                val bgSolid = call.argument<Number>("bgSolid")?.toLong()?.toInt()
                 val editor = activity.applicationContext
                     .getSharedPreferences("gb_native_ui_v1", Context.MODE_PRIVATE)
                     .edit()
                     .putBoolean("isDark", isDark)
+                    .putBoolean("followSystemTheme", followSystemTheme)
                 if (accentPrimary != null) editor.putInt("accentPrimary", accentPrimary)
                 if (accentHi != null) editor.putInt("accentHi", accentHi)
+                if (bgSolid != null) editor.putInt("bgSolid", bgSolid)
                 editor.apply()
+                val resolvedBg = bgSolid ?: if (isDark) 0xFF192130.toInt() else 0xFFEDF4FB.toInt()
                 mainHandler.post {
                     runCatching {
-                        activity.window?.setBackgroundDrawable(
-                            ColorDrawable(if (isDark) 0xFF192130.toInt() else 0xFFEDF4FB.toInt())
-                        )
+                        val win = activity.window
+                        if (win != null) {
+                            win.setBackgroundDrawable(ColorDrawable(resolvedBg))
+                            val insetsCtrl = androidx.core.view.WindowInsetsControllerCompat(win, win.decorView)
+                            insetsCtrl.isAppearanceLightStatusBars = !isDark
+                            insetsCtrl.isAppearanceLightNavigationBars = !isDark
+                        }
                     }
                 }
                 PhoneOverlayController.getInstance(activity.applicationContext).refreshVisualPreferences()
-                result.success(true)
+                replySafe(result) { it.success(true) }
             }
 
             // Background foreground service & alert notifications (off UI thread to avoid Binder stalls)
             "service.start" -> {
                 val title = call.argument<String>("title") ?: "GrassBag 本机环境运行中"
                 val text = call.argument<String>("text") ?: "对话与终端后台保活通道已就绪"
+                val wakeLockMs = call.argument<Number>("wakeLockMs")?.toLong() ?: 0L
+                val holdWifiLock = call.argument<Boolean>("holdWifiLock") ?: (wakeLockMs > 0L)
+                val releaseWakeLock = call.argument<Boolean>("releaseWakeLock") ?: false
                 runBg(result) {
-                    GrassBagEngineService.startOrUpdate(activity.applicationContext, title, text)
-                    mainHandler.post { result.success(true) }
+                    GrassBagEngineService.startOrUpdate(
+                        ctx = activity.applicationContext,
+                        heading = title,
+                        detail = text,
+                        wakeLockMs = wakeLockMs,
+                        releaseWakeLock = releaseWakeLock,
+                        holdWifiLock = holdWifiLock
+                    )
+                    replySafe(result) { it.success(true) }
                 }
             }
             "service.stop" -> {
                 runBg(result) {
                     GrassBagEngineService.stop(activity.applicationContext)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
             "service.notify" -> {
@@ -582,7 +621,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 val text = call.argument<String>("text") ?: ""
                 runBg(result) {
                     GrassBagEngineService.postAlertNotification(activity.applicationContext, title, text)
-                    mainHandler.post { result.success(true) }
+                    replySafe(result) { it.success(true) }
                 }
             }
 
@@ -590,13 +629,13 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             "permissions.status" -> {
                 runBg(result) {
                     val status = readPermissionsStatus()
-                    mainHandler.post { result.success(status) }
+                    replySafe(result) { it.success(status) }
                 }
             }
             "permissions.openSettings" -> {
                 val target = call.argument<String>("target") ?: "app"
                 openPermissionScreen(target)
-                result.success(true)
+                replySafe(result) { it.success(true) }
             }
             "permissions.requestRuntime" -> {
                 val target = call.argument<String>("target") ?: ""
@@ -623,9 +662,9 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         activity.startActivity(intent)
                         true
                     }.getOrDefault(false)
-                    result.success(ok)
+                    replySafe(result) { it.success(ok) }
                 } else {
-                    result.success(false)
+                    replySafe(result) { it.success(false) }
                 }
             }
             "device.shareText" -> {
@@ -642,6 +681,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             Intent(Intent.ACTION_SEND).apply {
                                 type = "text/markdown"
                                 putExtra(Intent.EXTRA_STREAM, uri)
+                                clipData = ClipData.newRawUri(file.name, uri)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                         } else {
@@ -651,30 +691,37 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             }
                         }
                         mainHandler.post {
-                            runCatching { activity.startActivity(Intent.createChooser(intent, "分享内容")) }
+                            if (!detached) {
+                                runCatching {
+                                    val chooser = Intent.createChooser(intent, "分享内容").apply {
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    activity.startActivity(chooser)
+                                }
+                            }
                         }
                         true
                     }.getOrDefault(false)
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "lan.scan" -> {
                 val port = call.argument<Int>("port") ?: 3080
                 runBg(result) {
                     val found = scanLanHosts(port)
-                    mainHandler.post { result.success(found) }
+                    replySafe(result) { it.success(found) }
                 }
             }
             "device.localIps" -> {
                 runBg(result) {
                     val ips = collectAllLocalDeviceIps().toList()
-                    mainHandler.post { result.success(ips) }
+                    replySafe(result) { it.success(ips) }
                 }
             }
             "webview.getCookies" -> {
                 val url = call.argument<String>("url") ?: ""
                 if (url.isBlank()) {
-                    result.success(null)
+                    replySafe(result) { it.success(null) }
                     return
                 }
                 runBg(result) {
@@ -683,14 +730,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         cm.flush()
                         cm.getCookie(url)
                     }.getOrNull()
-                    mainHandler.post { result.success(cookies) }
+                    replySafe(result) { it.success(cookies) }
                 }
             }
             "webview.setCookies" -> {
                 val url = call.argument<String>("url") ?: ""
                 val header = call.argument<String>("cookieHeader") ?: ""
                 if (url.isBlank() || header.isBlank()) {
-                    result.success(false)
+                    replySafe(result) { it.success(false) }
                     return
                 }
                 runBg(result) {
@@ -707,7 +754,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         cm.flush()
                         true
                     }.getOrDefault(false)
-                    mainHandler.post { result.success(ok) }
+                    replySafe(result) { it.success(ok) }
                 }
             }
             "webview.clearCookies" -> {
@@ -717,10 +764,10 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         cm.removeAllCookies {
                             // Flush SQLite cookie store OFF the UI thread!
                             runBg { runCatching { cm.flush() } }
-                            mainHandler.post { if (!detached) result.success(true) }
+                            replySafe(result) { it.success(true) }
                         }
                     }.onFailure {
-                        mainHandler.post { if (!detached) result.success(false) }
+                        replySafe(result) { it.success(false) }
                     }
                 }
             }
@@ -754,16 +801,16 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         "packageName" to activity.packageName,
                     )
                 }
-                result.success(info)
+                replySafe(result) { it.success(info) }
             }
             "app.getUpdatesDir" -> {
                 val dir = File(activity.cacheDir, "updates").apply { mkdirs() }
-                result.success(dir.absolutePath)
+                replySafe(result) { it.success(dir.absolutePath) }
             }
             "app.installApk" -> {
                 val rawPath = call.argument<String>("path")?.trim() ?: ""
                 if (rawPath.isEmpty()) {
-                    result.success("error:missing_path")
+                    replySafe(result) { it.success("error:missing_path") }
                     return
                 }
                 runBg(result) {
@@ -771,11 +818,11 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     val apkFile = runCatching { File(rawPath).canonicalFile }.getOrNull()
                     val allowedPrefix = allowedDir.path.trimEnd(File.separatorChar) + File.separator
                     if (apkFile == null || !apkFile.path.startsWith(allowedPrefix)) {
-                        mainHandler.post { if (!detached) result.success("error:invalid_apk_path") }
+                        replySafe(result) { it.success("error:invalid_apk_path") }
                         return@runBg
                     }
                     if (!apkFile.isFile || apkFile.length() <= 0L) {
-                        mainHandler.post { if (!detached) result.success("error:file_not_found") }
+                        replySafe(result) { it.success("error:file_not_found") }
                         return@runBg
                     }
                     mainHandler.post {
@@ -792,7 +839,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                                 }
                                 activity.startActivity(settingsIntent)
                             }
-                            result.success("permission_required")
+                            replySafe(result) { it.success("permission_required") }
                             return@post
                         }
                         val outcome = runCatching {
@@ -810,11 +857,11 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         }.getOrElse { err ->
                             "error:${err.message ?: err.javaClass.simpleName}"
                         }
-                        result.success(outcome)
+                        replySafe(result) { it.success(outcome) }
                     }
                 }
             }
-            else -> result.notImplemented()
+            else -> replySafe(result) { it.notImplemented() }
         }
     }
 
@@ -989,7 +1036,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     }
 
     private fun launchDocumentPicker(mime: String, result: MethodChannel.Result) {
-        pendingPickResult?.success(null)
+        pendingPickResult?.let { replySafe(it) { r -> r.success(null) } }
         pendingPickResult = result
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -999,19 +1046,19 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             activity.startActivityForResult(intent, REQ_PICK_FILE)
         }.onFailure {
             pendingPickResult = null
-            result.success(null)
+            replySafe(result) { it.success(null) }
         }
     }
 
     private fun launchCameraPicker(result: MethodChannel.Result) {
         if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            pendingCameraPermResult?.let { runCatching { it.success(null) } }
+            pendingCameraPermResult?.let { replySafe(it) { r -> r.success(null) } }
             pendingCameraPermResult = result
             runCatching {
                 ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.CAMERA), REQ_CAMERA_PERM)
             }.onFailure {
                 pendingCameraPermResult = null
-                result.success(null)
+                replySafe(result) { it.success(null) }
             }
             return
         }
@@ -1019,7 +1066,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     }
 
     private fun launchCameraCaptureIntent(result: MethodChannel.Result) {
-        pendingPickResult?.success(null)
+        pendingPickResult?.let { replySafe(it) { r -> r.success(null) } }
         pendingPickResult = result
         runCatching {
             val camDir = File(activity.cacheDir, "camera").apply { mkdirs() }
@@ -1035,7 +1082,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }.onFailure {
             pendingPickResult = null
             pendingCameraFile = null
-            result.success(null)
+            replySafe(result) { it.success(null) }
         }
     }
 
@@ -1047,7 +1094,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         if (resultCode != Activity.RESULT_OK) {
             pendingCameraFile?.let { runCatching { it.delete() } }
             pendingCameraFile = null
-            res.success(null)
+            replySafe(res) { it.success(null) }
             return true
         }
 
@@ -1055,24 +1102,24 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             val photo = pendingCameraFile
             pendingCameraFile = null
             if (photo == null || !photo.exists()) {
-                res.success(null)
+                replySafe(res) { it.success(null) }
                 return true
             }
             runBg(res) {
                 val payload = readAndCompressCameraPhoto(photo)
-                mainHandler.post { res.success(payload) }
+                replySafe(res) { it.success(payload) }
             }
             return true
         }
 
         val uri = data?.data
         if (uri == null) {
-            res.success(null)
+            replySafe(res) { it.success(null) }
             return true
         }
         runBg(res) {
             val meta = readPickedUri(uri)
-            mainHandler.post { res.success(meta) }
+            replySafe(res) { it.success(meta) }
         }
         return true
     }
@@ -1117,10 +1164,10 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
                     ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
                     ExifInterface.ORIENTATION_TRANSPOSE -> {
-                        matrix.postRotate(90f); matrix.preScale(-1f, 1f)
+                        matrix.postRotate(90f); matrix.postScale(-1f, 1f)
                     }
                     ExifInterface.ORIENTATION_TRANSVERSE -> {
-                        matrix.postRotate(270f); matrix.preScale(-1f, 1f)
+                        matrix.postRotate(270f); matrix.postScale(-1f, 1f)
                     }
                 }
                 if (!matrix.isIdentity) {
@@ -1147,14 +1194,76 @@ class GrassBagBridgePlugin(private val activity: Activity) :
 
     private fun readAndCompressCameraPhoto(photo: File): Map<String, Any>? {
         return try {
-            val rawBytes = photo.readBytes()
-            val (finalBytes, finalMime) = compressAndRotateImageBytes(rawBytes, "image/jpeg")
+            val path = photo.absolutePath
+            val orientation = runCatching {
+                ExifInterface(path).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+            val needsRotation = orientation != ExifInterface.ORIENTATION_NORMAL &&
+                orientation != ExifInterface.ORIENTATION_UNDEFINED
+            val maxBytes = 2 * 1024 * 1024
+            if (!needsRotation && photo.length() in 1L..maxBytes.toLong()) {
+                val directBytes = photo.readBytes()
+                return mapOf(
+                    "name" to photo.name,
+                    "mimeType" to "image/jpeg",
+                    "size" to directBytes.size,
+                    "bytes" to directBytes
+                )
+            }
+            // Decode directly from disk with inSampleSize so 50MP+ camera photos never OOM JVM heap!
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            var sample = 1
+            val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+            while (maxDim > 0 && maxDim / sample > 2048) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            var bmp = BitmapFactory.decodeFile(path, opts)
+                ?: return mapOf("name" to photo.name, "mimeType" to "image/jpeg", "error" to "无法解码拍摄照片")
+            val finalBytes = try {
+                if (needsRotation) {
+                    val matrix = Matrix()
+                    when (orientation) {
+                        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+                        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+                        ExifInterface.ORIENTATION_TRANSPOSE -> {
+                            matrix.postRotate(90f); matrix.postScale(-1f, 1f)
+                        }
+                        ExifInterface.ORIENTATION_TRANSVERSE -> {
+                            matrix.postRotate(270f); matrix.postScale(-1f, 1f)
+                        }
+                    }
+                    if (!matrix.isIdentity) {
+                        val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                        if (rotated !== bmp) {
+                            bmp.recycle()
+                            bmp = rotated
+                        }
+                    }
+                }
+                var quality = 86
+                var compressed: ByteArray
+                do {
+                    val baos = ByteArrayOutputStream()
+                    bmp.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+                    compressed = baos.toByteArray()
+                    quality -= 12
+                } while (compressed.size > maxBytes && quality >= 35)
+                compressed
+            } finally {
+                bmp.recycle()
+            }
             if (finalBytes.size > 4 * 1024 * 1024) {
-                mapOf("name" to photo.name, "mimeType" to finalMime, "error" to "拍摄照片超过 4 MB 大小上限")
+                mapOf("name" to photo.name, "mimeType" to "image/jpeg", "error" to "拍摄照片超过 4 MB 大小上限")
             } else {
                 mapOf(
                     "name" to photo.name,
-                    "mimeType" to finalMime,
+                    "mimeType" to "image/jpeg",
                     "size" to finalBytes.size,
                     "bytes" to finalBytes
                 )
@@ -1429,6 +1538,25 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         val surface: String?,
     )
 
+    private fun readBoundedText(stream: InputStream?, maxBytes: Int = 65536): String {
+        if (stream == null) return ""
+        return runCatching {
+            stream.use { ins ->
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(4096)
+                var total = 0
+                while (total < maxBytes) {
+                    val want = minOf(buf.size, maxBytes - total)
+                    val n = ins.read(buf, 0, want)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    total += n
+                }
+                out.toString(Charsets.UTF_8.name())
+            }
+        }.getOrDefault("")
+    }
+
     private fun probeLanDshHost(baseUrl: String): LanDshProbeMeta {
         var isDsh = false
         var dshVersion: String? = null
@@ -1490,14 +1618,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 if (code == 200 && ct.contains("application/json")) {
                     isDsh = true
                     hasGbridge = true
-                    val body = runCatching { conn.inputStream.bufferedReader().readText() }.getOrDefault("")
+                    val body = readBoundedText(conn.inputStream, 65536)
                     if (dshVersion == null) {
                         val m = Regex("\"dshVersion\"\\s*:\\s*\"([^\"]+)\"").find(body)
                         if (m != null) dshVersion = m.groupValues[1]
                     }
                 } else if (code == 401 || code == 403) {
                     requiresAuth = true
-                    val body = runCatching { conn.errorStream?.bufferedReader()?.readText() ?: "" }.getOrDefault("")
+                    val body = readBoundedText(conn.errorStream, 65536)
                     if (body.contains("gbridge/")) {
                         isDsh = true
                         hasGbridge = true

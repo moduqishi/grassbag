@@ -106,25 +106,117 @@ class BundledApkAssetSource(private val ctx: Context) : RuntimeAssetSource {
 
 class RemoteHttpAssetSource(private val rootUrl: String) : RuntimeAssetSource {
     override val label = "remote-https"
-    override fun loadManifest(): JSONObject? = runCatching {
-        val c = (URL("${rootUrl.trimEnd('/')}/runtime-manifest.json").openConnection() as HttpURLConnection).apply {
-            connectTimeout = 8000
-            readTimeout = 10000
+
+    private fun openHttpsConnection(
+        initialUrl: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int
+    ): HttpURLConnection? {
+        var current = URL(initialUrl)
+        if (!current.protocol.equals("https", ignoreCase = true)) {
+            return null
         }
+        for (hop in 0..5) {
+            val conn = (current.openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
+            }
+            val code = conn.responseCode
+            if (code in 301..303 || code == 307 || code == 308) {
+                val loc = conn.getHeaderField("Location")?.trim().orEmpty()
+                runCatching { conn.disconnect() }
+                if (loc.isEmpty() || hop == 5) return null
+                val next = URL(current, loc)
+                if (!next.protocol.equals("https", ignoreCase = true)) return null
+                current = next
+                continue
+            }
+            return conn
+        }
+        return null
+    }
+
+    override fun loadManifest(): JSONObject? = runCatching {
+        val c = openHttpsConnection(
+            "${rootUrl.trimEnd('/')}/runtime-manifest.json",
+            connectTimeoutMs = 8000,
+            readTimeoutMs = 10000
+        ) ?: return@runCatching null
         try {
-            if (c.responseCode in 200..299) c.inputStream.use { JSONObject(it.bufferedReader().readText()) } else null
+            if (c.responseCode !in 200..299) return@runCatching null
+            if (c.contentLengthLong > MAX_MANIFEST_BYTES) return@runCatching null
+            c.inputStream.use { ins ->
+                val out = java.io.ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                var total = 0L
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n <= 0) break
+                    total += n
+                    if (total > MAX_MANIFEST_BYTES) return@runCatching null
+                    out.write(buf, 0, n)
+                }
+                JSONObject(out.toString(Charsets.UTF_8.name()))
+            }
         } finally {
             c.disconnect()
         }
     }.getOrNull()
 
     override fun openStream(relPath: String): InputStream? = runCatching {
-        val c = (URL("${rootUrl.trimEnd('/')}/${relPath.trimStart('/')}").openConnection() as HttpURLConnection).apply {
-            connectTimeout = 8000
-            readTimeout = 30000
+        val c = openHttpsConnection(
+            "${rootUrl.trimEnd('/')}/${relPath.trimStart('/')}",
+            connectTimeoutMs = 8000,
+            readTimeoutMs = 30000
+        ) ?: return@runCatching null
+        try {
+            if (c.responseCode in 200..299 && c.contentLengthLong <= MAX_PAYLOAD_BYTES) {
+                val raw = c.inputStream
+                object : java.io.FilterInputStream(raw) {
+                    private var bytesRead = 0L
+
+                    private fun checkCap(n: Int): Int {
+                        if (n > 0) {
+                            bytesRead += n
+                            if (bytesRead > MAX_PAYLOAD_BYTES) {
+                                throw java.io.IOException("Remote runtime asset exceeds 512 MiB safety cap")
+                            }
+                        }
+                        return n
+                    }
+
+                    override fun read(): Int {
+                        val b = super.read()
+                        if (b >= 0) checkCap(1)
+                        return b
+                    }
+
+                    override fun read(b: ByteArray, off: Int, len: Int): Int =
+                        checkCap(super.read(b, off, len))
+
+                    override fun close() {
+                        try {
+                            super.close()
+                        } finally {
+                            runCatching { c.disconnect() }
+                        }
+                    }
+                }
+            } else {
+                runCatching { c.disconnect() }
+                null
+            }
+        } catch (t: Throwable) {
+            runCatching { c.disconnect() }
+            throw t
         }
-        if (c.responseCode in 200..299) c.inputStream else null
     }.getOrNull()
+
+    companion object {
+        private const val MAX_MANIFEST_BYTES = 2L * 1024L * 1024L
+        private const val MAX_PAYLOAD_BYTES = 512L * 1024L * 1024L
+    }
 }
 
 class RuntimeController private constructor(
@@ -631,9 +723,18 @@ class RuntimeController private constructor(
     }
 
     private fun updateRelativeSymlink(linkFile: File, relativeTarget: String) {
-        runCatching { Os.remove(linkFile.absolutePath) }
-        if (linkFile.exists()) linkFile.delete()
-        Os.symlink(relativeTarget, linkFile.absolutePath)
+        val parent = linkFile.parentFile ?: error("Missing parent directory for symlink ${linkFile.path}")
+        val tmpLink = File(parent, ".${linkFile.name}.tmp.${System.nanoTime()}")
+        runCatching { Os.remove(tmpLink.absolutePath) }
+        Os.symlink(relativeTarget, tmpLink.absolutePath)
+        try {
+            Os.rename(tmpLink.absolutePath, linkFile.absolutePath)
+        } catch (_: Throwable) {
+            runCatching { Os.remove(tmpLink.absolutePath) }
+            runCatching { Os.remove(linkFile.absolutePath) }
+            if (linkFile.exists()) linkFile.delete()
+            Os.symlink(relativeTarget, linkFile.absolutePath)
+        }
     }
 
     private fun readMeta(): JSONObject = synchronized(metaLock) {
@@ -1161,6 +1262,10 @@ class RuntimeController private constructor(
         for (hop in 0 until 8) {
             if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
             val url = URL(current)
+            val proto = url.protocol.lowercase()
+            if (proto != "http" && proto != "https") {
+                throw java.io.IOException("不支持的下载协议：$proto")
+            }
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = false
                 connectTimeout = 15_000
@@ -1174,7 +1279,13 @@ class RuntimeController private constructor(
                 }
             }
             activeDownloadConn.set(conn)
-            val code = conn.responseCode
+            val code = try {
+                conn.responseCode
+            } catch (t: Throwable) {
+                runCatching { conn.disconnect() }
+                activeDownloadConn.compareAndSet(conn, null)
+                throw t
+            }
             if (code in listOf(301, 302, 303, 307, 308)) {
                 val loc = conn.getHeaderField("Location")?.trim()
                 runCatching { conn.disconnect() }
@@ -1182,7 +1293,12 @@ class RuntimeController private constructor(
                 if (loc.isNullOrEmpty()) {
                     throw java.io.IOException("重定向缺少 Location 头 (HTTP $code)")
                 }
-                current = URL(url, loc).toString()
+                val resolved = URL(url, loc)
+                val nextProto = resolved.protocol.lowercase()
+                if (nextProto != "http" && nextProto != "https") {
+                    throw java.io.IOException("重定向目标协议不受支持：$nextProto")
+                }
+                current = resolved.toString()
                 continue
             }
             return conn
@@ -1245,30 +1361,41 @@ class RuntimeController private constructor(
         for ((idx, urlStr) in candidates.withIndex()) {
             if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
             val label = shortSourceLabel(urlStr)
-            var conn: HttpURLConnection? = null
-            try {
-                if (partFile.isFile && expectedBytes > 0L && partFile.length() > expectedBytes) {
-                    runCatching { partFile.delete() }
-                }
-                if (partFile.isFile && expectedBytes > 0L && partFile.length() == expectedBytes) {
-                    if (wantSha.isEmpty() || computeFileSha256(partFile).equals(wantSha, ignoreCase = true)) {
-                        if (finalFile.exists()) finalFile.delete()
-                        if (!partFile.renameTo(finalFile)) {
-                            partFile.copyTo(finalFile, overwrite = true)
-                            partFile.delete()
-                        }
-                        return finalFile
+            var retriedFromZero = false
+            while (true) {
+                var conn: HttpURLConnection? = null
+                var resumedInAttempt = false
+                try {
+                    if (partFile.isFile && expectedBytes > 0L && partFile.length() > expectedBytes) {
+                        runCatching { partFile.delete() }
                     }
-                    runCatching { partFile.delete() }
-                }
+                    if (partFile.isFile && expectedBytes > 0L && partFile.length() == expectedBytes) {
+                        if (wantSha.isEmpty() || computeFileSha256(partFile).equals(wantSha, ignoreCase = true)) {
+                            if (finalFile.exists()) finalFile.delete()
+                            if (!partFile.renameTo(finalFile)) {
+                                partFile.copyTo(finalFile, overwrite = true)
+                                partFile.delete()
+                            }
+                            return finalFile
+                        }
+                        runCatching { partFile.delete() }
+                    }
 
-                var resumeFrom = if (partFile.isFile) partFile.length().coerceAtLeast(0L) else 0L
+                    var resumeFrom = if (partFile.isFile) partFile.length().coerceAtLeast(0L) else 0L
+                    resumedInAttempt = resumeFrom > 0L
                 appendLog("[runtime] downloading $filename from $label ($urlStr, resume=$resumeFrom)")
+                val initialPct = if (expectedBytes > 0L && resumeFrom > 0L) {
+                    (pctStart + ((resumeFrom.toDouble() / expectedBytes.toDouble()) * pctSpan).toInt())
+                        .coerceIn(pctStart, pctStart + pctSpan)
+                } else {
+                    pctStart
+                }
                 sendProgress(
                     "downloading",
-                    pctStart,
+                    initialPct,
                     if (resumeFrom > 0L) "正在从 $label 续传 $displayName…" else "正在连接 $label 下载 $displayName…",
-                    mapOf("canCancel" to true, "currentMirror" to label)
+                    mapOf("canCancel" to true, "currentMirror" to label),
+                    force = true
                 )
 
                 conn = openHttpFollowingRedirects(urlStr, resumeFrom)
@@ -1289,9 +1416,17 @@ class RuntimeController private constructor(
                     throw java.io.IOException("下载源返回了 HTML 错误页")
                 }
 
+                val cr = conn.getHeaderField("Content-Range") ?: ""
                 val appendMode = if (code == 206 && resumeFrom > 0L) {
-                    val cr = conn.getHeaderField("Content-Range") ?: ""
-                    cr.isEmpty() || cr.startsWith("bytes $resumeFrom-")
+                    if (!cr.startsWith("bytes $resumeFrom-")) {
+                        false
+                    } else {
+                        val declaredTotal = cr.substringAfter('/', "").trim().toLongOrNull()
+                        if (expectedBytes > 0L && declaredTotal != null && declaredTotal != expectedBytes) {
+                            throw java.io.IOException("镜像 Content-Range 总大小不匹配 ($declaredTotal != $expectedBytes)")
+                        }
+                        true
+                    }
                 } else {
                     false
                 }
@@ -1304,12 +1439,21 @@ class RuntimeController private constructor(
                 } else {
                     conn.contentLength.toLong()
                 }
+                if (expectedBytes > 0L && contentLen > 0L && (resumeFrom + contentLen) != expectedBytes) {
+                    throw java.io.IOException("下载源返回大小异常（${resumeFrom + contentLen} / $expectedBytes 字节）")
+                }
                 val totalBytes = when {
                     expectedBytes > 0L -> expectedBytes
                     contentLen > 0L -> resumeFrom + contentLen
                     else -> 0L
                 }
 
+                val expectGzipHeader = resumeFrom == 0L &&
+                    (filename.endsWith(".gbag", ignoreCase = true) ||
+                        filename.endsWith(".gz", ignoreCase = true) ||
+                        filename.endsWith(".tgz", ignoreCase = true))
+                val magicBuf = ByteArray(2)
+                var magicCount = 0
                 var downloaded = resumeFrom
                 var speedBytesPerSec = 0.0
                 var windowBytes = 0L
@@ -1326,6 +1470,21 @@ class RuntimeController private constructor(
                             val n = ins.read(buf)
                             if (n < 0) break
                             if (n > 0) {
+                                if (expectGzipHeader && magicCount < 2) {
+                                    var i = 0
+                                    while (i < n && magicCount < 2) {
+                                        magicBuf[magicCount++] = buf[i++]
+                                    }
+                                    if (magicCount == 2) {
+                                        val b0 = magicBuf[0].toInt() and 0xFF
+                                        val b1 = magicBuf[1].toInt() and 0xFF
+                                        if (b0 != 0x1F || b1 != 0x8B) {
+                                            fos.close()
+                                            runCatching { partFile.delete() }
+                                            throw java.io.IOException("下载源返回了损坏或非 gzip 数据（可能为镜像拦截页）")
+                                        }
+                                    }
+                                }
                                 fos.write(buf, 0, n)
                                 downloaded += n
                                 windowBytes += n
@@ -1368,6 +1527,9 @@ class RuntimeController private constructor(
 
                 if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
                 if (expectedBytes > 0L && partFile.length() != expectedBytes) {
+                    if (!appendMode && partFile.length() < 65536L) {
+                        runCatching { partFile.delete() }
+                    }
                     throw java.io.IOException("下载不完整（${partFile.length()} / $expectedBytes 字节）")
                 }
                 if (wantSha.isNotEmpty()) {
@@ -1375,11 +1537,24 @@ class RuntimeController private constructor(
                         "verifying",
                         pctStart + pctSpan,
                         "正在校验 $displayName SHA-256 完整性…",
-                        mapOf("canCancel" to false)
+                        mapOf("canCancel" to false),
+                        force = true
                     )
                     val actualSha = computeFileSha256(partFile)
                     if (!actualSha.equals(wantSha, ignoreCase = true)) {
                         runCatching { partFile.delete() }
+                        if (resumedInAttempt && !retriedFromZero) {
+                            retriedFromZero = true
+                            appendLog("[runtime] SHA-256 mismatch after resume from $label; retrying clean from byte 0")
+                            sendProgress(
+                                "downloading",
+                                pctStart,
+                                "$displayName 断点校验异常，正在从 $label 重新完整下载…",
+                                mapOf("canCancel" to true, "currentMirror" to label),
+                                force = true
+                            )
+                            continue
+                        }
                         throw java.io.IOException("SHA-256 校验失败（已丢弃损坏分片）")
                     }
                 }
@@ -1405,12 +1580,14 @@ class RuntimeController private constructor(
                         mapOf("canCancel" to true)
                     )
                 }
+                break
             } finally {
                 val c = conn
                 if (c != null) {
                     activeDownloadConn.compareAndSet(c, null)
                     runCatching { c.disconnect() }
                 }
+            }
             }
         }
         error("下载 $displayName 失败（已自动尝试全部下载源：${errors.joinToString("；")}）。请检查网络或前往「本机设置 -> 下载源」配置可用镜像后重试")
@@ -1568,8 +1745,8 @@ class RuntimeController private constructor(
         }
     }
 
-    fun bootstrapRuntime(done: (Map<String, Any?>) -> Unit) {
-        if (!bootstrapRunning.compareAndSet(false, true)) {
+    fun bootstrapRuntime(alreadyAcquiredLock: Boolean = false, done: (Map<String, Any?>) -> Unit) {
+        if (!alreadyAcquiredLock && !bootstrapRunning.compareAndSet(false, true)) {
             done(mapOf("ok" to false, "error" to "本机环境正在下载或部署中，请稍候…", "status" to getStatus()))
             return
         }
@@ -1709,7 +1886,7 @@ class RuntimeController private constructor(
                                 )
                             }
 
-                            sendProgress("rootfs", 10, "正在并行部署 Ubuntu + Node 24 与 DSH $manifestDshVer…")
+                            sendProgress("rootfs", 10, "正在并行部署 Ubuntu + Node 24 与 DSH $manifestDshVer…", mapOf("canCancel" to false), force = true)
                             val fRootfs = worker.submit<Unit> {
                                 TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
                                 ubuntuRoot.mkdirs()
@@ -1786,7 +1963,7 @@ class RuntimeController private constructor(
                                     if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
                                     val extractBase = if (rootfsIsBundled) 10 else 34
                                     val extractSpan = if (rootfsIsBundled) 38 else 12
-                                    sendProgress("rootfs", extractBase, "正在解压 Ubuntu 24.04.5 + Node 24.22.3 ARM64…")
+                                    sendProgress("rootfs", extractBase, "正在解压 Ubuntu 24.04.5 + Node 24.22.3 ARM64…", mapOf("canCancel" to false), force = true)
                                     TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
                                     ubuntuRoot.mkdirs()
                                     val extractingFlag = File(ubuntuRoot, ".extracting").apply { writeText("1") }
@@ -1840,7 +2017,7 @@ class RuntimeController private constructor(
                                     if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
                                     val extractBase = if (engineIsBundled) 50 else 80
                                     val extractSpan = if (engineIsBundled) 34 else 9
-                                    sendProgress("engine", extractBase, "正在解压并部署真实 DSH $manifestDshVer…")
+                                    sendProgress("engine", extractBase, "正在解压并部署真实 DSH $manifestDshVer…", mapOf("canCancel" to false), force = true)
                                     TarGzExtractor.deleteTreeNoFollow(targetSlotDir)
                                     targetSlotDir.mkdirs()
                                     val extractingFlag = File(targetSlotDir, ".extracting").apply { writeText("1") }
@@ -1971,7 +2148,15 @@ class RuntimeController private constructor(
                 cachedInstalledToolkits = null
 
                 // Release bootstrapLock BEFORE starting DSH engine so status/start calls never stall!
-                sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…")
+                if (bootstrapCancelRequested.get()) {
+                    if (startedFgForBootstrap) {
+                        GrassBagEngineService.stop(ctx)
+                    }
+                    sendProgress("cancelled", 0, "已暂停部署，容器环境已保留", mapOf("canCancel" to false), force = true)
+                    done(mapOf("ok" to false, "cancelled" to true, "status" to getStatus()))
+                    return@execute
+                }
+                sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…", mapOf("canCancel" to false), force = true)
                 val engineRes = try {
                     startEngineSync()
                 } catch (t: Throwable) {
@@ -2089,10 +2274,19 @@ class RuntimeController private constructor(
         }
     }
 
-    private fun stopEngineSync(keepForegroundService: Boolean = false, emitStoppedEvent: Boolean = true) {
-        if (emitStoppedEvent) {
+    private fun stopEngineSync(
+        keepForegroundService: Boolean = false,
+        emitStoppedEvent: Boolean = true,
+        cancelStartup: Boolean = true,
+        nextState: String = "stopped"
+    ) {
+        if (cancelStartup) {
             stopEpoch.incrementAndGet()
             synchronized(readinessSignal) { readinessSignal.notifyAll() }
+            val inFlightLatch = synchronized(engineLock) { activeStartupLatch }
+            if (inFlightLatch != null) {
+                runCatching { inFlightLatch.await(2500, TimeUnit.MILLISECONDS) }
+            }
         }
         synchronized(engineLock) {
             dshProcess?.let { proc ->
@@ -2115,20 +2309,23 @@ class RuntimeController private constructor(
                         proc.waitFor(500, TimeUnit.MILLISECONDS)
                     }
                 }
+                extractProcessPid(proc)?.let { procPid ->
+                    if (procPid > 1) killProcessGroupSafe(procPid)
+                }
             }
             killRecordedEnginePid()
             dshProcess = null
             adoptedRunning = false
             dshWebUrl = null
             activeExecutorUsed = null
-            engineState = "stopped"
+            engineState = nextState
             SafetyGate.endTurn()
             runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
             if (!keepForegroundService) {
                 GrassBagEngineService.stop(ctx)
             }
             if (emitStoppedEvent) {
-                emit("engine_state", mapOf("state" to "stopped"))
+                emit("engine_state", mapOf("state" to nextState))
             }
         }
     }
@@ -2313,6 +2510,7 @@ class RuntimeController private constructor(
             if (includeBridgeSecrets) {
                 // Scope shim + V8 compile cache strictly to the DSH engine process (not shells/npm/droid scripts).
                 put("GBRIDGE_DSH_BOOT", "1")
+                put("GBRIDGE_BOOT_CACHE_TIMEOUT_MS", if (forceProot == true) "120000" else "90000")
                 put("NODE_COMPILE_CACHE", "/root/.cache/node-compile-cache")
                 put("GBRIDGE_UNIX_SOCKET", "/run/grassbag/bridge.sock")
                 put("GBRIDGE_PHONE_SOCKET", "/run/grassbag/phone-control.sock")
@@ -2377,7 +2575,7 @@ class RuntimeController private constructor(
             }
         }
         if (waitLatch != null) {
-            runCatching { waitLatch.await(300, TimeUnit.SECONDS) }
+            runCatching { waitLatch.await(360, TimeUnit.SECONDS) }
             val ok = isEngineAlive() && engineState == "running"
             return mapOf(
                 "ok" to ok,
@@ -2408,7 +2606,7 @@ class RuntimeController private constructor(
             if (existingCaps != null) {
                 if (hasPendingFastOverlayUpdate(activeSlot)) {
                     appendLog("[runtime] APK overlays updated; restarting previously running DSH to apply updates...")
-                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false, cancelStartup = false)
                     synchronized(engineLock) {
                         engineState = "starting"
                         lastEngineError = null
@@ -2495,6 +2693,7 @@ class RuntimeController private constructor(
                 attempts.add(true to true)
             }
 
+            val attemptErrors = mutableListOf<String>()
             var lastAttemptErr: String? = null
             var tawcTimedOutNoOutput = false
             for ((idx, attempt) in attempts.withIndex()) {
@@ -2506,6 +2705,15 @@ class RuntimeController private constructor(
                     return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
                 }
                 val (forceProot, disableSeccomp) = attempt
+                if (idx > 0) {
+                    // Renew WakeLock per fallback attempt so slower PRoot cold boots stay unthrottled!
+                    GrassBagEngineService.startOrUpdate(
+                        ctx,
+                        "GrassBag 正在切换兼容模式启动引擎…",
+                        "兼容执行器加载中，完成后自动保活",
+                        wakeLockMs = 180_000L
+                    )
+                }
                 val res = launchAndWaitForEngine(activeSlot, forceProot, disableSeccomp, myStartEpoch)
                 if (res["ok"] == true) {
                     // If tawcroot hung silently (timeout with zero stdout progress) while proot succeeded,
@@ -2526,8 +2734,12 @@ class RuntimeController private constructor(
                     return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
                 }
                 lastAttemptErr = res["error"]?.toString()
+                if (!lastAttemptErr.isNullOrBlank()) {
+                    attemptErrors.add("#${idx + 1}: $lastAttemptErr")
+                }
                 // Cache tawcroot fallback on kernel/seccomp/loader/signal crash codes (60..79, 86/88/89/91/92/94/95,
                 // SIGILL=132, SIGABRT=134, SIGBUS=135, SIGSEGV=139, SIGSYS=159); never on transient rootfs/bind errors (90/93).
+                var skipFurtherFallback = false
                 if (!forceProot && lastAttemptErr != null) {
                     val isHardTawcCrash = Regex("""code (6\d|7\d|86|88|89|91|92|94|95|132|134|135|139|159)\b""")
                         .containsMatchIn(lastAttemptErr)
@@ -2537,19 +2749,37 @@ class RuntimeController private constructor(
                         }
                     } else if (res["timedOutNoOutput"] == true) {
                         tawcTimedOutNoOutput = true
+                    } else if (res["reachedUserland"] == true && res["timedOut"] != true) {
+                        // tawcroot successfully entered Node/JS userland and exited with an application-level
+                        // error (e.g. invalid config or EADDRINUSE) — retrying under slower PRoot won't fix it.
+                        skipFurtherFallback = true
+                        appendLog("[runtime] tawcroot reached Node/JS userland before exiting; skipping redundant proot fallback")
                     }
                 }
-                // Clean up failed/timed-out attempt; keep FGS & suppress stopped flicker while falling back!
-                val hasMoreAttempts = idx + 1 < attempts.size
-                stopEngineSync(keepForegroundService = hasMoreAttempts, emitStoppedEvent = false)
+                // Clean up failed/timed-out attempt; keep FGS & keep engineState="starting" while falling back!
+                val hasMoreAttempts = !skipFurtherFallback && idx + 1 < attempts.size
+                stopEngineSync(
+                    keepForegroundService = hasMoreAttempts,
+                    emitStoppedEvent = false,
+                    cancelStartup = false,
+                    nextState = if (hasMoreAttempts) "starting" else "stopped"
+                )
+                if (skipFurtherFallback) {
+                    break
+                }
                 if (hasMoreAttempts) {
                     appendLog("[runtime] startup attempt #${idx + 1} failed ($lastAttemptErr); retrying with fallback executor...")
                 }
             }
 
+            val combinedErr = if (attemptErrors.size > 1) {
+                attemptErrors.joinToString(" || ")
+            } else {
+                lastAttemptErr ?: "DSH startup failed"
+            }
             synchronized(engineLock) {
                 engineState = "error"
-                lastEngineError = lastAttemptErr ?: "DSH startup failed"
+                lastEngineError = combinedErr
             }
             if (activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
                 GrassBagEngineService.stop(ctx)
@@ -2590,6 +2820,8 @@ class RuntimeController private constructor(
         val proc: Process
         val executorTag: String
         val sawAnyStdout = AtomicBoolean(false)
+        val sawUserlandOutput = AtomicBoolean(false)
+        val stdoutDrainedLatch = CountDownLatch(1)
         synchronized(engineLock) {
             if (stopEpoch.get() != startEpoch) {
                 return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
@@ -2634,33 +2866,52 @@ class RuntimeController private constructor(
             dshProcess = proc
 
             worker.execute {
-                runCatching {
-                    BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
-                        while (true) {
-                            val line = br.readLine() ?: break
-                            sawAnyStdout.set(true)
-                            var wake = false
-                            DSH_WEB_URL_REGEX.find(line)?.value?.let { foundUrl ->
-                                dshWebUrl = foundUrl
-                                emit("engine_web_url", mapOf("dshWebUrl" to foundUrl))
-                                wake = true
-                            }
-                            if (line.contains("UDS listener ready") || line.contains("gbridge")) {
-                                wake = true
-                            }
-                            appendLog("[dsh] $line")
-                            if (wake) {
-                                synchronized(readinessSignal) { readinessSignal.notifyAll() }
+                try {
+                    runCatching {
+                        BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
+                            while (true) {
+                                val line = br.readLine() ?: break
+                                sawAnyStdout.set(true)
+                                if (!sawUserlandOutput.get() &&
+                                    (line.contains("dsh web:") ||
+                                        line.contains("?token=") ||
+                                        line.contains("gbridge") ||
+                                        line.contains("cordis") ||
+                                        line.contains("UDS listener") ||
+                                        line.contains("EADDRINUSE") ||
+                                        line.contains("SyntaxError:") ||
+                                        line.contains("TypeError:") ||
+                                        line.contains("ReferenceError:") ||
+                                        line.contains("Error:") ||
+                                        line.contains("node:internal"))
+                                ) {
+                                    sawUserlandOutput.set(true)
+                                }
+                                var wake = false
+                                DSH_WEB_URL_REGEX.find(line)?.value?.let { foundUrl ->
+                                    dshWebUrl = foundUrl
+                                    emit("engine_web_url", mapOf("dshWebUrl" to foundUrl))
+                                    wake = true
+                                }
+                                if (line.contains("UDS listener ready") || line.contains("gbridge")) {
+                                    wake = true
+                                }
+                                appendLog("[dsh] $line")
+                                if (wake) {
+                                    synchronized(readinessSignal) { readinessSignal.notifyAll() }
+                                }
                             }
                         }
                     }
+                } finally {
+                    stdoutDrainedLatch.countDown()
                 }
                 val code = runCatching { proc.waitFor() }.getOrDefault(-1)
                 appendLog("[runtime] DSH process ($tag) exited with code $code")
-                SafetyGate.endTurn()
                 synchronized(readinessSignal) { readinessSignal.notifyAll() }
                 synchronized(engineLock) {
                     if (dshProcess === proc) {
+                        SafetyGate.endTurn()
                         dshProcess = null
                         runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
                         runCatching { if (pidFile.exists()) pidFile.delete() }
@@ -2700,13 +2951,21 @@ class RuntimeController private constructor(
             }
             if (!isEngineAlive()) {
                 runCatching { proc.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS) }
+                // Wait briefly for stdout/stderr reader to drain final crash lines before capturing tail logs!
+                runCatching { stdoutDrainedLatch.await(300, TimeUnit.MILLISECONDS) }
                 val exitCode = runCatching { proc.exitValue() }.getOrNull()
                 val tail = getEngineLogs().takeLast(6).joinToString(" | ")
                 lastEngineError = lastEngineError ?: (
                     if (exitCode != null) "DSH ($executorTag) exited with code $exitCode: $tail"
                     else "DSH ($executorTag) exited early: $tail"
                 )
-                return mapOf("ok" to false, "error" to lastEngineError, "status" to getStatus())
+                return mapOf(
+                    "ok" to false,
+                    "error" to lastEngineError,
+                    "reachedUserland" to (sawUserlandOutput.get() || dshWebUrl != null),
+                    "timedOut" to false,
+                    "status" to getStatus()
+                )
             }
             val nowMs = SystemClock.elapsedRealtime()
             val elapsed = nowMs - t0
@@ -2790,7 +3049,9 @@ class RuntimeController private constructor(
         return mapOf(
             "ok" to false,
             "error" to lastEngineError,
+            "timedOut" to true,
             "timedOutNoOutput" to (!sawAnyStdout.get() && dshWebUrl == null && !bridgeSocket.exists()),
+            "reachedUserland" to (sawUserlandOutput.get() || dshWebUrl != null),
             "status" to getStatus()
         )
     }
@@ -2910,9 +3171,14 @@ class RuntimeController private constructor(
 
     fun rebuildContainerPreserveHome(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
+            if (!bootstrapRunning.compareAndSet(false, true)) {
+                done(mapOf("ok" to false, "error" to "当前已有运行环境下载或部署任务在进行中，请先等待完成或暂停后再重试", "status" to getStatus()))
+                return@execute
+            }
+            var handedOffToBootstrap = false
             try {
-                if (bootstrapRunning.get()) {
-                    done(mapOf("ok" to false, "error" to "当前已有运行环境下载或部署任务在进行中，请先等待完成或暂停后再重试", "status" to getStatus()))
+                if (upgradeInProgress.get()) {
+                    done(mapOf("ok" to false, "error" to "当前有版本升级或回滚任务在进行中，请等待完成后再重建容器", "status" to getStatus()))
                     return@execute
                 }
                 if (activeToolkitInstalls.get() > 0) {
@@ -2931,7 +3197,8 @@ class RuntimeController private constructor(
                     ptySupportedCache = null
                     cachedInstalledToolkits = null
                 }
-                bootstrapRuntime(done)
+                handedOffToBootstrap = true
+                bootstrapRuntime(alreadyAcquiredLock = true, done = done)
             } catch (e: Throwable) {
                 if (!isEngineAlive() && activeToolkitInstalls.get() <= 0 && !upgradeInProgress.get()) {
                     GrassBagEngineService.stop(ctx)
@@ -2939,6 +3206,10 @@ class RuntimeController private constructor(
                 val msg = e.message ?: "rebuild_failed"
                 sendProgress("error", 0, "重建容器失败：$msg")
                 done(mapOf("ok" to false, "error" to msg, "status" to getStatus()))
+            } finally {
+                if (!handedOffToBootstrap) {
+                    bootstrapRunning.set(false)
+                }
             }
         }
     }
@@ -3033,49 +3304,72 @@ class RuntimeController private constructor(
                         writeAndroidCordisPatch(File(standbyBridge, "cordis.patch.yml"))
 
                         val pkgSpec = "@deepseek-ai/dsh@$targetVersion"
-                        sendProgress("download", 48, "正在通过 npm 安装 $pkgSpec 到备用槽位 $standby…")
-                        appendLog("[upgrade] npm install --no-audit --no-fund --prefix /opt/dsh-slots/$standby $pkgSpec")
-                        val pb = buildProotProcess(
-                            listOf(
-                                "/usr/local/bin/npm",
-                                "install",
-                                "--no-audit",
-                                "--no-fund",
-                                "--loglevel=error",
-                                "--prefix",
-                                "/opt/dsh-slots/$standby",
-                                pkgSpec
-                            ),
-                            "/opt/dsh-slots/$standby"
-                        ).first
-                        val proc = spawnProcess(pb)
-                        val outputTail = LinkedList<String>()
-                        val reader = Thread({
-                            runCatching {
-                                BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
-                                    while (true) {
-                                        val line = br.readLine() ?: break
-                                        appendLog("[upgrade] $line")
-                                        synchronized(outputTail) {
-                                            outputTail.add(line)
-                                            while (outputTail.size > 12) outputTail.removeFirst()
+                        val registries = listOf(
+                            "国内镜像 (npmmirror)" to "https://registry.npmmirror.com",
+                            "npm 官方源" to "https://registry.npmjs.org"
+                        )
+                        var installSucceeded = false
+                        var lastInstallErr = ""
+                        for ((regIdx, regPair) in registries.withIndex()) {
+                            val (regLabel, regUrl) = regPair
+                            sendProgress(
+                                "download",
+                                if (regIdx == 0) 48 else 54,
+                                "正在通过 $regLabel 安装 $pkgSpec 到备用槽位 $standby…"
+                            )
+                            appendLog("[upgrade] npm install --registry=$regUrl --no-audit --no-fund --prefix /opt/dsh-slots/$standby $pkgSpec")
+                            val pb = buildProotProcess(
+                                listOf(
+                                    "/usr/local/bin/npm",
+                                    "install",
+                                    "--registry=$regUrl",
+                                    "--no-audit",
+                                    "--no-fund",
+                                    "--loglevel=error",
+                                    "--prefix",
+                                    "/opt/dsh-slots/$standby",
+                                    pkgSpec
+                                ),
+                                "/opt/dsh-slots/$standby"
+                            ).first
+                            val proc = spawnProcess(pb)
+                            val outputTail = LinkedList<String>()
+                            val reader = Thread({
+                                runCatching {
+                                    BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { br ->
+                                        while (true) {
+                                            val line = br.readLine() ?: break
+                                            appendLog("[upgrade] $line")
+                                            synchronized(outputTail) {
+                                                outputTail.add(line)
+                                                while (outputTail.size > 12) outputTail.removeFirst()
+                                            }
                                         }
                                     }
                                 }
+                            }, "gb-upgrade-reader").apply { isDaemon = true; start() }
+                            val exitedInTime = proc.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)
+                            if (!exitedInTime) {
+                                killSubprocessGroup(proc)
+                                runCatching { proc.inputStream.close() }
+                                runCatching { reader.join(1000) }
+                                lastInstallErr = "$regLabel 安装 $pkgSpec 超时（超过 5 分钟）"
+                                appendLog("[upgrade] $lastInstallErr")
+                                continue
                             }
-                        }, "gb-upgrade-reader").apply { isDaemon = true; start() }
-                        val exitedInTime = proc.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)
-                        if (!exitedInTime) {
-                            killSubprocessGroup(proc)
-                            runCatching { proc.inputStream.close() }
-                            runCatching { reader.join(1000) }
-                            error("npm 安装 $pkgSpec 超时（超过 5 分钟），请检查网络连接后重试")
+                            runCatching { reader.join(1500) }
+                            val exitCode = proc.exitValue()
+                            if (exitCode == 0) {
+                                installSucceeded = true
+                                break
+                            }
+                            val reason = synchronized(outputTail) { outputTail.joinToString("\n") }
+                                .ifBlank { "npm exited with code $exitCode" }
+                            lastInstallErr = "$regLabel 安装 $pkgSpec 失败 (code=$exitCode)：$reason"
+                            appendLog("[upgrade] $lastInstallErr")
                         }
-                        runCatching { reader.join(1500) }
-                        val exitCode = proc.exitValue()
-                        if (exitCode != 0) {
-                            val reason = synchronized(outputTail) { outputTail.joinToString("\n") }.ifBlank { "npm exited with code $exitCode" }
-                            error("npm 安装 $pkgSpec 失败 (code=$exitCode)：$reason")
+                        if (!installSucceeded) {
+                            error(lastInstallErr.ifBlank { "npm 安装 $pkgSpec 失败，请检查网络连接后重试" })
                         }
                     }
 
@@ -3439,20 +3733,48 @@ class RuntimeController private constructor(
     fun exportEncryptedBackup(passphrase: String): Map<String, Any?> = runCatching {
         val cleanPass = passphrase.trim()
         require(cleanPass.length >= 6) { "备份加密口令至少需要 6 位字符" }
+        val maxTotalBytes = 16L * 1024L * 1024L
+        var packedBytes = 0L
         val zipOut = ByteArrayOutputStream()
         ZipOutputStream(zipOut).use { zos ->
             fun pack(f: File, name: String) {
-                if (!f.exists() || !f.isFile) return
+                val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: return
+                if (!android.system.OsConstants.S_ISREG(st.st_mode)) return
+                val fLen = st.st_size.coerceAtLeast(0L)
+                if (fLen > 2L * 1024L * 1024L || packedBytes + fLen > maxTotalBytes) return
                 zos.putNextEntry(ZipEntry(name))
-                FileInputStream(f).use { it.copyTo(zos) }
+                FileInputStream(f).use { ins ->
+                    val buf = ByteArray(8192)
+                    var copied = 0L
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        if (packedBytes + copied + n > maxTotalBytes) break
+                        zos.write(buf, 0, n)
+                        copied += n
+                    }
+                    packedBytes += copied
+                }
                 zos.closeEntry()
             }
             pack(metaFile, "runtime-state.json")
             pack(aptFile, "apt-manifest.json")
-            File(homeDir, ".dsh").walkTopDown().maxDepth(3).forEach { f ->
-                if (f.isFile && f.length() < 2 * 1024 * 1024) {
-                    pack(f, "home/${f.relativeTo(homeDir).path}")
-                }
+            val dshDir = File(homeDir, ".dsh")
+            val dshDirSt = runCatching { Os.lstat(dshDir.absolutePath) }.getOrNull()
+            if (dshDirSt != null && android.system.OsConstants.S_ISDIR(dshDirSt.st_mode)) {
+                dshDir.walkTopDown()
+                    .maxDepth(3)
+                    .onEnter { dir ->
+                        val st = runCatching { Os.lstat(dir.absolutePath) }.getOrNull()
+                        st != null && android.system.OsConstants.S_ISDIR(st.st_mode)
+                    }
+                    .forEach { f ->
+                        if (packedBytes >= maxTotalBytes) return@forEach
+                        val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: return@forEach
+                        if (android.system.OsConstants.S_ISREG(st.st_mode) && st.st_size < 2L * 1024L * 1024L) {
+                            pack(f, "home/${f.relativeTo(homeDir).path}")
+                        }
+                    }
             }
         }
         val cipherBytes = vault.encryptWithPassphrase(zipOut.toByteArray(), cleanPass)
@@ -3522,7 +3844,11 @@ class RuntimeController private constructor(
             }
             val proc = spawnProcess(pb)
             val session = ShellSession(proc = proc, usesPtyBridge = usesPtyBridge, cwd = effectiveCwd)
-            shells[tabId] = session
+            val displaced = shells.put(tabId, session)
+            if (displaced != null && displaced !== session) {
+                runCatching { displaced.proc.destroy() }
+                runCatching { displaced.proc.destroyForcibly() }
+            }
             worker.execute {
                 val cbuf = CharArray(4096)
                 var handshakeHandled = !usesPtyBridge
@@ -3667,11 +3993,12 @@ class RuntimeController private constructor(
         stage: String,
         percent: Int,
         message: String,
-        extra: Map<String, Any?> = emptyMap()
+        extra: Map<String, Any?> = emptyMap(),
+        force: Boolean = false
     ) {
         val now = System.currentTimeMillis()
         val shouldEmit = synchronized(progressLock) {
-            val isEdge = percent <= 0 || percent >= 100 || stage != lastProgressStage
+            val isEdge = force || percent <= 0 || percent >= 100 || stage != lastProgressStage
             val elapsed = now - lastProgressAtMs
             if (isEdge || elapsed >= 180L || (percent != lastProgressPct && elapsed >= 120L)) {
                 lastProgressStage = stage

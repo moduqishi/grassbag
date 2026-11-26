@@ -14,6 +14,7 @@ class AppUpdateDownloadCancelledException implements Exception {
 Future<AppUpdateHttpResponse> fetchAppUpdateJson(
   Uri uri, {
   Duration timeout = const Duration(seconds: 12),
+  int maxBytes = 2 * 1024 * 1024,
 }) async {
   throw UnsupportedError('HTTP transport unavailable on this platform');
 }

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../services/native_bridge.dart';
@@ -16,7 +17,8 @@ Future<void> showAppUpdateSheet(BuildContext context, WidgetRef ref) {
   return showGrassBagSheet<void>(
     context,
     title: '应用版本与更新',
-    subtitle: 'GitHub Releases 自动检测与一键安装',
+    subtitle: '优先国内镜像加速 · 自动回退 GitHub Releases',
+    icon: CupertinoIcons.arrow_down_circle_fill,
     bodyBuilder: (_) => const _AppUpdateSheetBody(),
   );
 }
@@ -41,6 +43,7 @@ class _AppUpdateSheetBody extends ConsumerWidget {
           appUpdateDownloadProgress: st.appUpdateDownloadProgress,
           appUpdateDownloadBytes: st.appUpdateDownloadBytes,
           appUpdateTotalBytes: st.appUpdateTotalBytes,
+          appUpdateDownloadSource: st.appUpdateDownloadSource,
           appUpdateLocalApkPath: st.appUpdateLocalApkPath,
         ),
       ),
@@ -55,12 +58,13 @@ class _AppUpdateSheetBody extends ConsumerWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        GrassBagCard(
-          borderRadius: 20,
+        GrassBagSheetSection(
+          borderRadius: 16,
           padding: const EdgeInsets.all(14),
-          child: Row(
-            children: [
-              ClipRRect(
+          children: [
+            Row(
+              children: [
+              ClipRSuperellipse(
                 borderRadius: BorderRadius.circular(14),
                 child: Image.asset(
                   'assets/brand/grassbag_app_icon_1024.png',
@@ -104,12 +108,11 @@ class _AppUpdateSheetBody extends ConsumerWidget {
                                         : release != null
                                             ? ('最新', t.ok, t.okSoft)
                                             : ('待检查', t.text3, t.fill1);
-                            return Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: bg,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
+                            return GrassBagFresnelGlassSurface(
+                              isPill: true,
+                              innerWell: true,
+                              tintColor: bg,
+                              padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 2.5),
                               child: Text(
                                 label,
                                 style: TextStyle(
@@ -152,6 +155,7 @@ class _AppUpdateSheetBody extends ConsumerWidget {
               ),
             ],
           ),
+          ],
         ),
         if (s.appUpdateError != null && s.appUpdateError!.isNotEmpty) ...[
           const SizedBox(height: 10),
@@ -173,15 +177,18 @@ class _AppUpdateSheetBody extends ConsumerWidget {
             ),
           ),
           const SizedBox(height: 6),
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 210),
-            child: GrassBagCard(
-              borderRadius: 16,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              child: SingleChildScrollView(
-                child: _ReleaseNotesBlock(markdown: release.body),
+          GrassBagSheetSection(
+            borderRadius: 16,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 186),
+                child: SingleChildScrollView(
+                  physics: const BouncingScrollPhysics(),
+                  child: _ReleaseNotesBlock(markdown: release.body),
+                ),
               ),
-            ),
+            ],
           ),
         ],
         if (s.appUpdateDownloading) ...[
@@ -190,6 +197,8 @@ class _AppUpdateSheetBody extends ConsumerWidget {
             progress: s.appUpdateDownloadProgress,
             receivedBytes: s.appUpdateDownloadBytes,
             totalBytes: s.appUpdateTotalBytes,
+            sourceLabel: s.appUpdateDownloadSource,
+            insideSheet: true,
           ),
           const SizedBox(height: 10),
           GrassBagSecondaryGlassButton(
@@ -221,14 +230,19 @@ class _AppUpdateSheetBody extends ConsumerWidget {
               icon: CupertinoIcons.refresh,
               tier: s.glassTier,
               insideGlass: true,
+              enabled: !s.checkingAppUpdate,
               onTap: s.checkingAppUpdate
                   ? null
                   : () => unawaited(ctrl.checkForAppUpdate(manual: true)),
             ),
           const SizedBox(height: 10),
-          Row(
-            children: [
-              if (release != null && s.hasAppUpdate && hasLocalApk && isAndroid && release.apkDownloadUrl != null) ...[
+          if (release != null &&
+              s.hasAppUpdate &&
+              hasLocalApk &&
+              isAndroid &&
+              release.apkDownloadUrl != null) ...[
+            Row(
+              children: [
                 Expanded(
                   child: GrassBagSecondaryGlassButton(
                     label: '重新下载',
@@ -240,34 +254,69 @@ class _AppUpdateSheetBody extends ConsumerWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-              ],
-              Expanded(
-                child: GrassBagSecondaryGlassButton(
-                  label: 'GitHub Release',
-                  icon: CupertinoIcons.arrow_up_right_square,
-                  height: 38,
-                  tier: s.glassTier,
-                  insideGlass: true,
-                  onTap: () => unawaited(ctrl.openAppReleasePage()),
-                ),
-              ),
-              if (release != null && s.hasAppUpdate) ...[
-                const SizedBox(width: 8),
                 Expanded(
                   child: GrassBagSecondaryGlassButton(
-                    label: '跳过此版本',
+                    label: '发布页',
+                    icon: CupertinoIcons.arrow_up_right_square,
                     height: 38,
                     tier: s.glassTier,
                     insideGlass: true,
-                    onTap: () {
-                      ctrl.skipAppUpdateVersion(release.versionKey);
-                      Navigator.of(context).pop();
-                    },
+                    onTap: () => unawaited(ctrl.openAppReleasePage()),
                   ),
                 ),
               ],
-            ],
-          ),
+            ),
+            const SizedBox(height: 8),
+            GrassBagSpringTap(
+              enablePointerGlow: false,
+              haptic: true,
+              onTap: () {
+                ctrl.skipAppUpdateVersion(release.versionKey);
+                Navigator.of(context).pop();
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                child: Text(
+                  '跳过此版本',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w500,
+                    color: t.text3,
+                  ),
+                ),
+              ),
+            ),
+          ] else
+            Row(
+              children: [
+                Expanded(
+                  child: GrassBagSecondaryGlassButton(
+                    label: '发布页',
+                    icon: CupertinoIcons.arrow_up_right_square,
+                    height: 38,
+                    tier: s.glassTier,
+                    insideGlass: true,
+                    onTap: () => unawaited(ctrl.openAppReleasePage()),
+                  ),
+                ),
+                if (release != null && s.hasAppUpdate) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: GrassBagSecondaryGlassButton(
+                      label: '跳过此版本',
+                      height: 38,
+                      tier: s.glassTier,
+                      insideGlass: true,
+                      onTap: () {
+                        ctrl.skipAppUpdateVersion(release.versionKey);
+                        Navigator.of(context).pop();
+                      },
+                    ),
+                  ),
+                ],
+              ],
+            ),
         ],
       ],
     );
@@ -299,6 +348,7 @@ class AppAboutAndUpdateView extends ConsumerWidget {
           appUpdateDownloadProgress: st.appUpdateDownloadProgress,
           appUpdateDownloadBytes: st.appUpdateDownloadBytes,
           appUpdateTotalBytes: st.appUpdateTotalBytes,
+          appUpdateDownloadSource: st.appUpdateDownloadSource,
           appUpdateLocalApkPath: st.appUpdateLocalApkPath,
         ),
       ),
@@ -308,14 +358,14 @@ class AppAboutAndUpdateView extends ConsumerWidget {
     final release = s.appUpdateInfo;
 
     final statusText = s.checkingAppUpdate
-        ? '正在连接 GitHub Releases 检查更新…'
+        ? '正在通过国内镜像检查新版本…'
         : s.hasAppUpdate && release != null
             ? '发现新版本 v${release.versionLabel}${release.formattedApkSize.isNotEmpty ? '（${release.formattedApkSize}）' : ''}'
             : (s.appUpdateError != null && s.appUpdateError!.isNotEmpty)
                 ? s.appUpdateError!
                 : (s.lastAppUpdateCheckedAt != null
                     ? '已是最新版本 · 上次检测 ${_formatTime(s.lastAppUpdateCheckedAt!.toLocal())}'
-                    : '启动时自动检测 GitHub Releases 新版本');
+                    : '优先通过国内镜像自动检测并加速下载新版本，失败自动回退 GitHub 官方源');
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -325,18 +375,44 @@ class AppAboutAndUpdateView extends ConsumerWidget {
           padding: const EdgeInsets.all(18),
           child: Row(
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(18),
-                child: Image.asset(
-                  'assets/brand/grassbag_app_icon_1024.png',
-                  width: 60,
-                  height: 60,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) => GrassBagSquircleIcon(
-                    icon: CupertinoIcons.sparkles,
-                    color: t.primary,
-                    size: 60,
-                    iconSize: 28,
+              DecoratedBox(
+                decoration: ShapeDecoration(
+                  shape: RoundedSuperellipseBorder(
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  shadows: [
+                    BoxShadow(
+                      color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.24),
+                      blurRadius: 16,
+                      offset: const Offset(0, 5),
+                    ),
+                  ],
+                ),
+                child: CustomPaint(
+                  foregroundPainter: s.glassTier == GrassBagGlassTier.solid
+                      ? null
+                      : GrassBagFresnelRimPainter(
+                          isDark: t.isDark,
+                          borderRadius: 18,
+                          accent: t.primaryHi,
+                          tinted: true,
+                          frosted: s.glassTier == GrassBagGlassTier.frosted,
+                          strokeWidth: 0.9,
+                        ),
+                  child: ClipRSuperellipse(
+                    borderRadius: BorderRadius.circular(18),
+                    child: Image.asset(
+                      'assets/brand/grassbag_app_icon_1024.png',
+                      width: 60,
+                      height: 60,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => GrassBagSquircleIcon(
+                        icon: CupertinoIcons.sparkles,
+                        color: t.primary,
+                        size: 60,
+                        iconSize: 28,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -357,12 +433,11 @@ class AppAboutAndUpdateView extends ConsumerWidget {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: t.primary.withValues(alpha: 0.13),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
+                        GrassBagFresnelGlassSurface(
+                          isPill: true,
+                          innerWell: true,
+                          tintColor: t.primary.withValues(alpha: t.isDark ? 0.22 : 0.13),
+                          padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 2.5),
                           child: Text(
                             kGrassBagBuildChannel == 'beta' ? 'Beta' : 'Stable',
                             style: TextStyle(
@@ -386,7 +461,11 @@ class AppAboutAndUpdateView extends ConsumerWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'Android 原生 DeepSeek Harness (DSH) 液态玻璃客户端',
+                      kIsWeb
+                          ? 'DeepSeek Harness (DSH) 液态玻璃网页端'
+                          : (defaultTargetPlatform == TargetPlatform.android
+                              ? 'Android 原生 DeepSeek Harness (DSH) 液态玻璃客户端'
+                              : '跨平台 DeepSeek Harness (DSH) 液态玻璃客户端'),
                       style: TextStyle(fontSize: 12, color: t.text3),
                     ),
                   ],
@@ -396,6 +475,26 @@ class AppAboutAndUpdateView extends ConsumerWidget {
           ),
         ),
         const SizedBox(height: 14),
+        if (s.appUpdateError != null && s.appUpdateError!.isNotEmpty) ...[
+          GrassBagStatusBanner(
+            tone: GrassBagBannerTone.warn,
+            icon: CupertinoIcons.exclamationmark_triangle_fill,
+            message: s.appUpdateError!,
+            borderRadius: 16,
+            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+            trailing: GrassBagSecondaryGlassButton(
+              label: '重试',
+              height: 30,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              tier: s.glassTier,
+              insideGlass: true,
+              onTap: s.checkingAppUpdate
+                  ? null
+                  : () => unawaited(ctrl.checkForAppUpdate(manual: true)),
+            ),
+          ),
+          const SizedBox(height: 12),
+        ],
         GrassBagGroupedSection(
           header: '版本更新（GitHub Releases）',
           footer: statusText,
@@ -418,10 +517,10 @@ class AppAboutAndUpdateView extends ConsumerWidget {
               subtitle: Text(
                 s.hasAppUpdate
                     ? '点击查看更新日志并一键下载安装 APK'
-                    : '已接入自动更新埋点（每 6 小时静默检测一次）',
+                    : '已开启自动检查更新（每 6 小时静默检测一次）',
               ),
               trailing: s.checkingAppUpdate
-                  ? CupertinoActivityIndicator(radius: 9, color: t.primary)
+                  ? GrassBagActivityIndicator(radius: 9, color: t.primary)
                   : GrassBagSecondaryGlassButton(
                       label: s.hasAppUpdate ? '去更新' : '检查更新',
                       height: 32,
@@ -471,6 +570,8 @@ class AppAboutAndUpdateView extends ConsumerWidget {
                       progress: s.appUpdateDownloadProgress,
                       receivedBytes: s.appUpdateDownloadBytes,
                       totalBytes: s.appUpdateTotalBytes,
+                      sourceLabel: s.appUpdateDownloadSource,
+                      insideSheet: true,
                     ),
                     const SizedBox(height: 8),
                     GrassBagSecondaryGlassButton(
@@ -544,11 +645,15 @@ class _DownloadProgressCard extends StatelessWidget {
     required this.progress,
     required this.receivedBytes,
     required this.totalBytes,
+    this.sourceLabel = '',
+    this.insideSheet = false,
   });
 
   final double? progress;
   final int receivedBytes;
   final int totalBytes;
+  final String sourceLabel;
+  final bool insideSheet;
 
   @override
   Widget build(BuildContext context) {
@@ -558,48 +663,63 @@ class _DownloadProgressCard extends StatelessWidget {
     final bytesLabel = totalBytes > 0
         ? '${_formatBytes(receivedBytes)} / ${_formatBytes(totalBytes)}'
         : '已下载 ${_formatBytes(receivedBytes)}';
+    final titleText = sourceLabel.isNotEmpty
+        ? '正在通过 $sourceLabel 下载安装包…'
+        : '正在下载 APK 安装包…';
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                titleText,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              pct != null ? '$pct%' : '下载中',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                fontFeatures: const [FontFeature.tabularFigures()],
+                color: t.primary,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        GrassBagProgressBar(
+          value: determinate ? progress!.clamp(0.0, 1.0) : null,
+          height: 6,
+          color: t.primary,
+          trackColor: t.fill1,
+        ),
+        const SizedBox(height: 5),
+        Text(
+          bytesLabel,
+          style: TextStyle(
+            fontSize: 11,
+            fontFeatures: const [FontFeature.tabularFigures()],
+            color: t.text3,
+          ),
+        ),
+      ],
+    );
+    if (insideSheet) {
+      return GrassBagSheetSection(
+        borderRadius: 16,
+        padding: const EdgeInsets.all(12),
+        children: [content],
+      );
+    }
     return GrassBagCard(
       borderRadius: 16,
       padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              Text(
-                '正在下载 APK 安装包…',
-                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text),
-              ),
-              const Spacer(),
-              Text(
-                pct != null ? '$pct%' : '下载中',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  color: t.primary,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          GrassBagProgressBar(
-            value: determinate ? progress!.clamp(0.0, 1.0) : null,
-            height: 6,
-            color: t.primary,
-            trackColor: t.fill1,
-          ),
-          const SizedBox(height: 5),
-          Text(
-            bytesLabel,
-            style: TextStyle(
-              fontSize: 11,
-              fontFeatures: const [FontFeature.tabularFigures()],
-              color: t.text3,
-            ),
-          ),
-        ],
-      ),
+      child: content,
     );
   }
 }

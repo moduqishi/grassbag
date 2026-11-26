@@ -40,9 +40,12 @@ class PhoneControlDaemon(
     )
 
     private val running = AtomicBoolean(false)
+    private val lifecycleLock = Any()
     @Volatile
     private var pool: java.util.concurrent.ExecutorService = Executors.newCachedThreadPool()
+    @Volatile
     private var boundSocket: LocalSocket? = null
+    @Volatile
     private var serverSocket: LocalServerSocket? = null
     private val appsCacheLock = Any()
     @Volatile
@@ -50,11 +53,13 @@ class PhoneControlDaemon(
     @Volatile
     private var cachedAppsAtMs: Long = 0L
 
-    fun start(): Boolean {
-        if (running.getAndSet(true)) return true
+    fun start(): Boolean = synchronized(lifecycleLock) {
+        if (running.get()) return true
         return try {
-            if (pool.isShutdown || pool.isTerminated) {
-                pool = Executors.newCachedThreadPool()
+            val exec = if (pool.isShutdown || pool.isTerminated) {
+                Executors.newCachedThreadPool().also { pool = it }
+            } else {
+                pool
             }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
@@ -64,20 +69,23 @@ class PhoneControlDaemon(
             socketFile.setWritable(false, false)
             socketFile.setReadable(true, true)
             socketFile.setWritable(true, true)
+            val ss = LocalServerSocket(bindSocket.fileDescriptor)
             boundSocket = bindSocket
-            serverSocket = LocalServerSocket(bindSocket.fileDescriptor)
-            pool.execute { acceptLoop() }
+            serverSocket = ss
+            running.set(true)
+            exec.execute { acceptLoop(ss, exec) }
             true
         } catch (_: Throwable) {
+            running.set(false)
+            runCatching { serverSocket?.close() }
             runCatching { boundSocket?.close() }
             boundSocket = null
             serverSocket = null
-            running.set(false)
             false
         }
     }
 
-    fun stop() {
+    fun stop() = synchronized(lifecycleLock) {
         if (!running.getAndSet(false)) return
         try { serverSocket?.close() } catch (_: Throwable) {}
         serverSocket = null
@@ -87,13 +95,18 @@ class PhoneControlDaemon(
         try { if (socketFile.exists()) socketFile.delete() } catch (_: Throwable) {}
     }
 
-    private fun acceptLoop() {
-        while (running.get()) {
+    private fun acceptLoop(ss: LocalServerSocket, exec: java.util.concurrent.ExecutorService) {
+        while (running.get() && serverSocket === ss) {
             try {
-                val client = serverSocket?.accept() ?: break
-                pool.execute { handleClient(client) }
+                val client = ss.accept() ?: break
+                try {
+                    exec.execute { handleClient(client) }
+                } catch (_: Throwable) {
+                    runCatching { client.close() }
+                    if (!running.get() || exec.isShutdown) break
+                }
             } catch (_: Throwable) {
-                if (!running.get()) break
+                if (!running.get() || serverSocket !== ss) break
                 runCatching { Thread.sleep(150) }
             }
         }
@@ -141,6 +154,14 @@ class PhoneControlDaemon(
                                 reason = reason,
                                 autoReturn = shouldAutoReturn
                             )
+                            if (GrassBagEngineService.isServiceActive()) {
+                                GrassBagEngineService.startOrUpdate(
+                                    ctx = context,
+                                    heading = "GrassBag 本机引擎运行中",
+                                    detail = "手机操控已完成 · 后台待命保活",
+                                    releaseWakeLock = true
+                                )
+                            }
                         }
                         onEvent("phone_turn_end", mapOf(
                             "sessionId" to (sid ?: ""),
@@ -156,9 +177,19 @@ class PhoneControlDaemon(
                         val tool = body.optString("tool")
                         val args = body.optJSONObject("args") ?: JSONObject()
                         val caller = body.optJSONObject("caller")
-                        // Never accept client-supplied `userApproved` from socket callers; native overlay owns confirmation.
+                        // Never accept client-supplied `userApproved` or self-elevating `permissionPreset`
+                        // (`danger-full-access` / `full-access`) from UDS payloads; elevation ONLY follows
+                        // Flutter's live synced SafetyGate chat permission preset.
                         val userApproved = false
-                        val permissionPreset = body.optString("permissionPreset", "").ifBlank { null }
+                        val syncedPreset = SafetyGate.getSyncedChatPermissionPreset()
+                        val requestedPreset = body.optString("permissionPreset", "").ifBlank { null }
+                        val permissionPreset = if (
+                            requestedPreset == "danger-full-access" || requestedPreset == "full-access"
+                        ) {
+                            syncedPreset
+                        } else {
+                            requestedPreset ?: syncedPreset
+                        }
                         val turnId = if (caller == null || caller.isNull("turnId")) null else caller.optString("turnId").ifBlank { null }
                         val sessionId = if (caller == null || caller.isNull("sessionId")) null else caller.optString("sessionId").ifBlank { null }
 
@@ -167,7 +198,12 @@ class PhoneControlDaemon(
                         val hadActiveTurnBeforePause = wasPaused && SafetyGate.isTurnActiveForSession(sessionId, turnId)
                         if (wasPaused) {
                             val pauseDeadlineMs = System.currentTimeMillis() + 180_000L
-                            SafetyGate.waitWhilePaused(pauseDeadlineMs)
+                            SafetyGate.waitWhilePaused(
+                                deadlineMs = pauseDeadlineMs,
+                                sessionId = sessionId,
+                                turnId = turnId,
+                                hadActiveTurn = hadActiveTurnBeforePause
+                            )
                         }
                         if (SafetyGate.isEmergencyStopped()) {
                             writeJson(
@@ -205,6 +241,16 @@ class PhoneControlDaemon(
                             )
                             return
                         }
+
+                        // Keep CPU WakeLock + low-latency WifiLock alive throughout phone control
+                        // (including when GrassBag moves to background over target apps or waits for confirm cards).
+                        GrassBagEngineService.startOrUpdate(
+                            ctx = context,
+                            heading = "GrassBag 正在操控手机",
+                            detail = "执行中并保持后台连接稳定 · 可在悬浮岛随时暂停或急停",
+                            wakeLockMs = 10 * 60 * 1000L,
+                            holdWifiLock = true
+                        )
 
                         val res = dispatchTool(
                             tool = tool,
@@ -592,7 +638,17 @@ class PhoneControlDaemon(
                     val postPkg = svc.currentForegroundPackage()
                     val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
                     val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    val preSensitive = hitsSensitive || (cachedNode?.sensitive == true)
+                    val (postLabel, postSensitive) = svc.inspectPointTarget(x.toFloat(), y.toFloat())
+                    val prevSensWord = SafetyGate.sensitiveActionHit(gateLabel)
+                    val postSensWord = SafetyGate.sensitiveActionHit(postLabel)
+                    val newSensitiveAppeared = (postSensitive && !preSensitive) ||
+                        (postSensWord != null && postSensWord != prevSensWord)
+                    if (SafetyGate.isPackageBlocked(postPkg) ||
+                        postBlockedWin != null ||
+                        appSwappedDuringConfirm ||
+                        newSensitiveAppeared
+                    ) {
                         return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
                     }
                 }
@@ -709,7 +765,16 @@ class PhoneControlDaemon(
                     val postPkg = svc.currentForegroundPackage()
                     val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
                     val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    val (_, postSensitive, postFieldLabel) = svc.inspectFocusedInput()
+                    val prevSensWord = SafetyGate.sensitiveActionHit(fieldLabel)
+                    val postSensWord = SafetyGate.sensitiveActionHit(postFieldLabel)
+                    val newSensitiveAppeared = (postSensitive && !sensitive) ||
+                        (postSensWord != null && postSensWord != prevSensWord)
+                    if (SafetyGate.isPackageBlocked(postPkg) ||
+                        postBlockedWin != null ||
+                        appSwappedDuringConfirm ||
+                        newSensitiveAppeared
+                    ) {
                         return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
                     }
                 }
@@ -727,12 +792,33 @@ class PhoneControlDaemon(
                         return JSONObject().put("ok", false).put("blocked", true).put("reason", "disallowed_url_scheme")
                     }
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    val matchedPkgs = runCatching {
+                        context.packageManager.queryIntentActivities(intent, 0)
+                            .mapNotNull { it.activityInfo?.packageName }
+                            .distinct()
+                    }.getOrDefault(emptyList())
+                    val blockedTarget = matchedPkgs.firstOrNull { SafetyGate.isPackageBlocked(it) }
+                    if (blockedTarget != null) {
+                        SafetyGate.recordAudit(tool, blockedTarget, false, "blocked_sensitive_url_target")
+                        return JSONObject()
+                            .put("ok", false)
+                            .put("blocked", true)
+                            .put("reason", "blocked_sensitive_package")
+                            .put("hint", "该链接可能唤起受保护的金融/支付应用（$blockedTarget），已禁止自动打开。")
+                    }
                     val resolvedPkg = context.packageManager.resolveActivity(intent, 0)?.activityInfo?.packageName
                         ?: return JSONObject().put("ok", false).put("reason", "no_browser_found")
+                    val everyWriteTarget = matchedPkgs.firstOrNull { SafetyGate.isConfirmEveryWritePackage(it) }
+                    val gateTargetPkg = everyWriteTarget ?: resolvedPkg
+                    val gateAppLabel = if (everyWriteTarget != null) {
+                        GrassBagAccessibilityService.current()?.resolveAppLabel(everyWriteTarget) ?: everyWriteTarget
+                    } else {
+                        "浏览器"
+                    }
                     val denied = gateAndConfirm(
                         tool = tool,
-                        targetPackage = resolvedPkg,
-                        targetAppLabel = "浏览器",
+                        targetPackage = gateTargetPkg,
+                        targetAppLabel = gateAppLabel,
                         actionSummary = "打开链接：$url",
                         hudActionLabel = "打开网页链接",
                         sessionId = sessionId,
@@ -908,7 +994,7 @@ class PhoneControlDaemon(
             "phone_return_app" -> {
                 val summary = args.optString("summary", "").trim()
                 val steps = overlay.currentStepCount()
-                SafetyGate.endTurn(sessionId)
+                SafetyGate.endTurn(sessionId, turnId)
                 overlay.showCompletionAndReturn(
                     summary = summary,
                     reason = "completed",
@@ -970,43 +1056,64 @@ class PhoneControlDaemon(
                         lines[i].substring(idx + 1).trim()
                 }
             }
-            val rawLen = headers["content-length"]?.toIntOrNull()
-            if (rawLen != null && rawLen > 2 * 1024 * 1024) {
+            val rawLenHeader = headers["content-length"]
+            val rawLenLong = if (rawLenHeader != null) {
+                rawLenHeader.toLongOrNull() ?: throw IllegalArgumentException("invalid_content_length")
+            } else {
+                null
+            }
+            if (rawLenLong != null && (rawLenLong < 0L || rawLenLong > 2L * 1024L * 1024L)) {
                 throw IllegalArgumentException("payload_too_large")
             }
             val bodyStr = if (headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true) {
                 val out = java.io.ByteArrayOutputStream()
                 while (true) {
                     val lineBytes = ArrayList<Byte>(16)
+                    var gotNewline = false
                     while (true) {
                         val ch = input.read()
                         if (ch == -1) break
-                        if (ch == '\n'.code) break
-                        if (ch != '\r'.code) lineBytes.add(ch.toByte())
+                        if (ch == '\n'.code) {
+                            gotNewline = true
+                            break
+                        }
+                        if (ch != '\r'.code) {
+                            if (lineBytes.size >= 128) throw IllegalArgumentException("chunk_header_too_long")
+                            lineBytes.add(ch.toByte())
+                        }
+                    }
+                    if (!gotNewline && lineBytes.isEmpty()) {
+                        throw java.io.EOFException("unexpected_eof_in_chunk_header")
                     }
                     val sizeHex = String(lineBytes.toByteArray(), Charsets.US_ASCII).substringBefore(';').trim()
-                    val chunkSize = sizeHex.toIntOrNull(16) ?: 0
-                    if (chunkSize <= 0) break
-                    if (out.size() + chunkSize > 2 * 1024 * 1024) throw IllegalArgumentException("payload_too_large")
+                    val chunkSizeLong = sizeHex.toLongOrNull(16)
+                        ?: throw IllegalArgumentException("invalid_chunk_size")
+                    if (chunkSizeLong < 0L) throw IllegalArgumentException("invalid_chunk_size")
+                    if (chunkSizeLong == 0L) break
+                    if (out.size().toLong() + chunkSizeLong > 2L * 1024L * 1024L) {
+                        throw IllegalArgumentException("payload_too_large")
+                    }
+                    val chunkSize = chunkSizeLong.toInt()
                     val buf = ByteArray(chunkSize)
                     var got = 0
                     while (got < chunkSize) {
                         val n = input.read(buf, got, chunkSize - got)
-                        if (n <= 0) break
+                        if (n <= 0) throw java.io.EOFException("unexpected_eof_in_chunk_body")
                         got += n
                     }
                     out.write(buf, 0, got)
-                    input.read()
-                    input.read()
+                    val cr = input.read()
+                    val lf = if (cr == '\r'.code) input.read() else cr
+                    if (cr == -1 || lf == -1) throw java.io.EOFException("unexpected_eof_after_chunk")
                 }
                 String(out.toByteArray(), Charsets.UTF_8)
             } else {
-                val contentLength = (rawLen ?: 0).coerceAtLeast(0)
+                val contentLength = (rawLenLong ?: 0L).toInt()
                 val bodyBytes = ByteArray(contentLength)
                 var read = 0
                 while (read < contentLength) {
                     val n = input.read(bodyBytes, read, contentLength - read)
-                    if (n <= 0) break
+                    if (n <= 0) throw java.io.EOFException("unexpected_eof_in_body")
                     read += n
                 }
                 String(bodyBytes, 0, read, Charsets.UTF_8)

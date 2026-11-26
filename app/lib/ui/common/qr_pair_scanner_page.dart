@@ -114,7 +114,7 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
     for (final code in barcodes) {
       final raw = code.rawValue?.trim() ?? '';
       if (raw.isEmpty) continue;
-      final parsed = parseRemoteHostInput(raw);
+      final parsed = parseRemoteHostInput(raw, strictQr: true);
       if (parsed != null) {
         _handled = true;
         _syncBeamTicker();
@@ -172,7 +172,7 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
       if (mounted) {
         setState(() => _analyzingImage = false);
         _syncBeamTicker();
-        if (!_handled && _lifecycleResumed) {
+        if (!_handled && _lifecycleResumed && !_cameraHasError) {
           unawaited(_scannerCtrl.start().catchError((_) {}));
         }
       }
@@ -222,7 +222,15 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
     final supportsGallery = !kIsWeb && GrassBagNativeBridge.instance.isAndroidNative;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
-      value: SystemUiOverlayStyle.light,
+      value: const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+        systemNavigationBarColor: Colors.transparent,
+        systemNavigationBarDividerColor: Colors.transparent,
+        systemNavigationBarIconBrightness: Brightness.light,
+        systemNavigationBarContrastEnforced: false,
+      ),
       child: Theme(
         data: darkTheme,
         child: Scaffold(
@@ -244,82 +252,101 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                       final isDenied = err.errorCode == MobileScannerErrorCode.permissionDenied;
                       return Center(
                         child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 28),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                CupertinoIcons.camera_fill,
-                                size: 42,
-                                color: Colors.white.withValues(alpha: 0.72),
-                              ),
-                              const SizedBox(height: 12),
-                              Text(
-                                isDenied ? '未获得相机权限' : '无法启动相机预览',
-                                style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w600,
-                                  color: Colors.white,
+                          padding: EdgeInsets.fromLTRB(
+                            24,
+                            pad.top + 68,
+                            24,
+                            pad.bottom + 150,
+                          ),
+                          child: GrassBagFresnelGlassSurface(
+                            borderRadius: 24,
+                            paintTopSheen: false,
+                            tintColor: Colors.white.withValues(alpha: 0.09),
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 22),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                GrassBagSquircleIcon(
+                                  icon: CupertinoIcons.camera_fill,
+                                  color: darkTokens.primaryHi,
+                                  size: 48,
+                                  iconSize: 22,
                                 ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                isDenied
-                                    ? (supportsGallery
-                                        ? '请授予 GrassBag 相机权限，或使用下方「相册选图」「粘贴配对链接」完成连接。'
-                                        : '请在系统设置中授予 GrassBag 相机权限，或点击下方「粘贴配对链接」完成连接。')
-                                    : (supportsGallery
-                                        ? '当前设备相机暂不可用，可通过相册选图或粘贴配对链接完成连接。'
-                                        : '当前设备相机暂不可用，可点击下方「粘贴配对链接」完成连接。'),
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  fontSize: 12.5,
-                                  height: 1.45,
-                                  color: Colors.white.withValues(alpha: 0.76),
+                                const SizedBox(height: 12),
+                                Text(
+                                  isDenied ? '未获得相机权限' : '无法启动相机预览',
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.white,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 14),
-                              Wrap(
-                                spacing: 10,
-                                runSpacing: 10,
-                                alignment: WrapAlignment.center,
-                                children: [
-                                  if (isDenied && supportsGallery)
+                                const SizedBox(height: 6),
+                                Text(
+                                  isDenied
+                                      ? (supportsGallery
+                                          ? '请授予 GrassBag 相机权限，或使用下方「相册选图」「粘贴配对链接」完成连接。'
+                                          : '请在系统设置中授予 GrassBag 相机权限，或点击下方「粘贴配对链接」完成连接。')
+                                      : (supportsGallery
+                                          ? '当前设备相机暂不可用，可通过相册选图或粘贴配对链接完成连接。'
+                                          : '当前设备相机暂不可用，可点击下方「粘贴配对链接」完成连接。'),
+                                  textAlign: TextAlign.center,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    height: 1.45,
+                                    color: Colors.white.withValues(alpha: 0.78),
+                                  ),
+                                ),
+                                const SizedBox(height: 14),
+                                Wrap(
+                                  spacing: 10,
+                                  runSpacing: 10,
+                                  alignment: WrapAlignment.center,
+                                  children: [
+                                    if (isDenied && supportsGallery)
+                                      SizedBox(
+                                        width: 158,
+                                        child: GrassBagPrimaryGlassButton(
+                                          label: '去开启相机权限',
+                                          icon: CupertinoIcons.settings,
+                                          height: 38,
+                                          tier: tier,
+                                          insideGlass: true,
+                                          onTap: () => GrassBagNativeBridge.instance
+                                              .openPermissionSettings('app_details'),
+                                        ),
+                                      ),
                                     SizedBox(
-                                      width: 158,
-                                      child: GrassBagPrimaryGlassButton(
-                                        label: '去开启相机权限',
-                                        icon: CupertinoIcons.settings,
+                                      width: 144,
+                                      child: GrassBagSecondaryGlassButton(
+                                        label: '重试启动相机',
+                                        icon: CupertinoIcons.refresh,
                                         height: 38,
                                         tier: tier,
                                         insideGlass: true,
-                                        onTap: () => GrassBagNativeBridge.instance
-                                            .openPermissionSettings('app_details'),
+                                        onTap: () => unawaited(() async {
+                                          await _scannerCtrl.stop().catchError((_) {});
+                                          if (!mounted || _handled) return;
+                                          try {
+                                            await _scannerCtrl.start();
+                                          } catch (_) {
+                                            _showInlineHint('相机启动失败，请检查权限或使用相册/粘贴');
+                                          }
+                                        }()),
                                       ),
                                     ),
-                                  SizedBox(
-                                    width: 144,
-                                    child: GrassBagSecondaryGlassButton(
-                                      label: '重试启动相机',
-                                      icon: CupertinoIcons.refresh,
-                                      height: 38,
-                                      tier: tier,
-                                      insideGlass: true,
-                                      onTap: () => unawaited(
-                                        _scannerCtrl.start().catchError((_) {}),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
+                                  ],
+                                ),
+                              ],
+                            ),
                           ),
                         ),
                       );
                     },
                   ),
 
-                  // Translucent framing overlay + rounded glass viewfinder cutout (isolated RepaintBoundary)
+                  // Translucent framing overlay + rounded glass viewfinder cutout (lifted cleanly
+                  // above bottom HUD so compact screens never collide with corner brackets!)
                   if (!hasCameraError)
                     RepaintBoundary(
                       child: IgnorePointer(
@@ -327,62 +354,63 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                           painter: _ScannerCutoutPainter(
                             boxEdge: boxEdge,
                             accent: darkTokens.primary,
+                            centerYOffset: -26.0,
                           ),
                         ),
                       ),
                     ),
 
                   // Animated luminous scan beam inside the viewfinder square:
-                  // Static beam Container hoisted into `AnimatedBuilder.child` inside its own
-                  // `RepaintBoundary` and moved purely via GPU Transform.translate (ZERO per-frame
-                  // BoxShadow/Gradient allocations or Align layout passes at 120Hz!).
                   if (!hasCameraError)
                     Center(
-                      child: RepaintBoundary(
-                        child: SizedBox(
-                          width: boxEdge - 24,
-                          height: boxEdge - 24,
-                          child: AnimatedBuilder(
-                            animation: _beamCtrl,
-                            child: Align(
-                              alignment: Alignment.topCenter,
-                              child: Container(
-                                height: 2.5,
-                                decoration: BoxDecoration(
-                                  borderRadius: BorderRadius.circular(999),
-                                  gradient: LinearGradient(
-                                    colors: [
-                                      darkTokens.primary.withValues(alpha: 0.0),
-                                      darkTokens.primary.withValues(alpha: 0.92),
-                                      Colors.white.withValues(alpha: 0.95),
-                                      darkTokens.primary.withValues(alpha: 0.92),
-                                      darkTokens.primary.withValues(alpha: 0.0),
+                      child: Transform.translate(
+                        offset: const Offset(0, -26.0),
+                        child: RepaintBoundary(
+                          child: SizedBox(
+                            width: boxEdge - 24,
+                            height: boxEdge - 24,
+                            child: AnimatedBuilder(
+                              animation: _beamCtrl,
+                              child: Align(
+                                alignment: Alignment.topCenter,
+                                child: Container(
+                                  height: 2.5,
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(999),
+                                    gradient: LinearGradient(
+                                      colors: [
+                                        darkTokens.primary.withValues(alpha: 0.0),
+                                        darkTokens.primary.withValues(alpha: 0.92),
+                                        Colors.white.withValues(alpha: 0.95),
+                                        darkTokens.primary.withValues(alpha: 0.92),
+                                        darkTokens.primary.withValues(alpha: 0.0),
+                                      ],
+                                    ),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: darkTokens.primary.withValues(alpha: 0.55),
+                                        blurRadius: 12,
+                                        spreadRadius: 1,
+                                      ),
                                     ],
                                   ),
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: darkTokens.primary.withValues(alpha: 0.55),
-                                      blurRadius: 12,
-                                      spreadRadius: 1,
-                                    ),
-                                  ],
                                 ),
                               ),
+                              builder: (_, beamChild) {
+                                final travel = math.max(0.0, (boxEdge - 24.0) * 0.88 - 2.5);
+                                final topMargin = (boxEdge - 24.0) * 0.06;
+                                return Transform.translate(
+                                  offset: Offset(0, topMargin + _beamCtrl.value * travel),
+                                  child: beamChild,
+                                );
+                              },
                             ),
-                            builder: (_, beamChild) {
-                              final travel = math.max(0.0, (boxEdge - 24.0) * 0.88 - 2.5);
-                              final topMargin = (boxEdge - 24.0) * 0.06;
-                              return Transform.translate(
-                                offset: Offset(0, topMargin + _beamCtrl.value * travel),
-                                child: beamChild,
-                              );
-                            },
                           ),
                         ),
                       ),
                     ),
 
-                  // Top floating Liquid Glass bar
+                  // Top floating Liquid Glass bar (harmonized dark translucent glass across all 3 HUD pills)
                   Positioned(
                     top: pad.top + 12,
                     left: 16,
@@ -396,20 +424,19 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                           size: 42,
                           iconSize: 19,
                           iconColor: Colors.white,
+                          tintColor: Colors.black.withValues(alpha: 0.46),
                           platformViewBackdrop: true,
                           onTap: () => Navigator.of(context).pop(),
                         ),
                         const Spacer(),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.42),
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(
-                              color: Colors.white.withValues(alpha: 0.16),
-                              width: 0.7,
-                            ),
-                          ),
+                        GrassBagGlass(
+                          tier: tier,
+                          borderRadius: 999,
+                          height: 40,
+                          tintColor: Colors.black.withValues(alpha: 0.46),
+                          platformViewBackdrop: true,
+                          padding: const EdgeInsets.symmetric(horizontal: 15),
+                          alignment: Alignment.center,
                           child: const Text(
                             '扫码连接电脑',
                             style: TextStyle(
@@ -420,22 +447,25 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                           ),
                         ),
                         const Spacer(),
-                        IgnorePointer(
-                          ignoring: !(torchAvailable && !hasCameraError),
-                          child: Opacity(
-                            opacity: torchAvailable && !hasCameraError ? 1.0 : 0.42,
-                            child: GrassBagGlassCircleButton(
-                              icon: torchOn ? CupertinoIcons.bolt_fill : CupertinoIcons.bolt,
-                              tooltip: torchOn ? '关闭闪光灯' : '开启闪光灯',
-                              tier: tier,
-                              size: 42,
-                              iconSize: 18,
-                              iconColor: torchOn ? const Color(0xFFFBBF24) : Colors.white,
-                              platformViewBackdrop: true,
-                              onTap: _toggleTorch,
-                            ),
-                          ),
-                        ),
+                        if (torchAvailable && !hasCameraError)
+                          GrassBagGlassCircleButton(
+                            icon: torchOn ? CupertinoIcons.bolt_fill : CupertinoIcons.bolt,
+                            tooltip: torchOn ? '关闭闪光灯' : '开启闪光灯',
+                            tier: tier,
+                            size: 42,
+                            iconSize: 18,
+                            iconColor: torchOn ? const Color(0xFFFDE68A) : Colors.white,
+                            tintColor: torchOn
+                                ? const Color(0x52D97706)
+                                : Colors.black.withValues(alpha: 0.46),
+                            platformViewBackdrop: true,
+                            onTap: () {
+                              HapticFeedback.selectionClick();
+                              _toggleTorch();
+                            },
+                          )
+                        else
+                          const SizedBox(width: 42, height: 42),
                       ],
                     ),
                   ),
@@ -449,31 +479,47 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if (_hintMessage != null) ...[
-                          Center(
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.76),
-                                borderRadius: BorderRadius.circular(14),
-                                border: Border.all(
-                                  color: Colors.white.withValues(alpha: 0.18),
-                                  width: 0.7,
-                                ),
-                              ),
-                              child: Text(
-                                _hintMessage!,
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  fontSize: 12.5,
-                                  color: Colors.white,
-                                  height: 1.35,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                        ],
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 200),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          child: _hintMessage != null
+                              ? Padding(
+                                  key: ValueKey(_hintMessage),
+                                  padding: const EdgeInsets.only(bottom: 10),
+                                  child: Center(
+                                    child: GrassBagFresnelGlassSurface(
+                                      borderRadius: 14,
+                                      paintTopSheen: false,
+                                      tintColor: Colors.black.withValues(alpha: 0.72),
+                                      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(
+                                            CupertinoIcons.info_circle_fill,
+                                            size: 14,
+                                            color: darkTokens.primaryHi,
+                                          ),
+                                          const SizedBox(width: 6),
+                                          Flexible(
+                                            child: Text(
+                                              _hintMessage!,
+                                              textAlign: TextAlign.center,
+                                              style: const TextStyle(
+                                                fontSize: 12.5,
+                                                color: Colors.white,
+                                                height: 1.35,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : const SizedBox.shrink(),
+                        ),
                         GrassBagGlass(
                           tier: tier,
                           borderRadius: 24,
@@ -484,7 +530,11 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Text(
-                                '对准电脑端 DeepSeek Harness 左侧「手机连接」二维码，自动识别地址与令牌',
+                                hasCameraError
+                                    ? (supportsGallery
+                                        ? '相机不可用，可从相册识别二维码或直接粘贴配对链接'
+                                        : '相机不可用，可直接粘贴电脑端配对链接完成连接')
+                                    : '对准电脑端 DeepSeek Harness 左侧「手机连接」二维码，自动识别地址与令牌',
                                 textAlign: TextAlign.center,
                                 style: TextStyle(
                                   fontSize: 12.5,
@@ -541,19 +591,22 @@ class _ScannerCutoutPainter extends CustomPainter {
   const _ScannerCutoutPainter({
     required this.boxEdge,
     required this.accent,
+    this.centerYOffset = 0.0,
   });
 
   final double boxEdge;
   final Color accent;
+  final double centerYOffset;
 
   @override
   void paint(Canvas canvas, Size size) {
     final rect = Rect.fromCenter(
-      center: Offset(size.width / 2, size.height / 2),
+      center: Offset(size.width / 2, size.height / 2 + centerYOffset),
       width: boxEdge,
       height: boxEdge,
     );
-    final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(26));
+    const cornerR = 26.0;
+    final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(cornerR));
     final scrimPath = Path()
       ..addRect(Offset.zero & size)
       ..addRRect(rrect)
@@ -563,40 +616,53 @@ class _ScannerCutoutPainter extends CustomPainter {
       Paint()..color = Colors.black.withValues(alpha: 0.56),
     );
 
-    // Subtle glass rim
+    // Subtle 135° Fresnel glass rim
     canvas.drawRRect(
       rrect,
       Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.2
-        ..color = Colors.white.withValues(alpha: 0.34),
+        ..shader = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Colors.white.withValues(alpha: 0.56),
+            Colors.white.withValues(alpha: 0.18),
+            Colors.white.withValues(alpha: 0.36),
+          ],
+        ).createShader(rect),
     );
 
-    // Crisp luminous corner brackets
-    const cornerLen = 26.0;
-    const cornerR = 22.0;
+    // Crisp luminous circular-arc corner brackets matching the exact 26pt cutout radius
+    const cornerLen = 34.0;
     final bracketPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3.4
       ..strokeCap = StrokeCap.round
       ..color = accent;
 
-    void drawCorner(Offset origin, double dx, double dy) {
+    void drawCorner(Offset origin, double dx, double dy, bool clockwise) {
       final path = Path()
         ..moveTo(origin.dx, origin.dy + dy * cornerLen)
         ..lineTo(origin.dx, origin.dy + dy * cornerR)
-        ..quadraticBezierTo(origin.dx, origin.dy, origin.dx + dx * cornerR, origin.dy)
+        ..arcToPoint(
+          Offset(origin.dx + dx * cornerR, origin.dy),
+          radius: const Radius.circular(cornerR),
+          clockwise: clockwise,
+        )
         ..lineTo(origin.dx + dx * cornerLen, origin.dy);
       canvas.drawPath(path, bracketPaint);
     }
 
-    drawCorner(rect.topLeft, 1, 1);
-    drawCorner(rect.topRight, -1, 1);
-    drawCorner(rect.bottomLeft, 1, -1);
-    drawCorner(rect.bottomRight, -1, -1);
+    drawCorner(rect.topLeft, 1, 1, true);
+    drawCorner(rect.topRight, -1, 1, false);
+    drawCorner(rect.bottomLeft, 1, -1, false);
+    drawCorner(rect.bottomRight, -1, -1, true);
   }
 
   @override
   bool shouldRepaint(covariant _ScannerCutoutPainter oldDelegate) =>
-      oldDelegate.boxEdge != boxEdge || oldDelegate.accent != accent;
+      oldDelegate.boxEdge != boxEdge ||
+      oldDelegate.accent != accent ||
+      oldDelegate.centerYOffset != centerYOffset;
 }

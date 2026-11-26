@@ -1103,10 +1103,11 @@ export class StreamHub {
         }
         entry.abort.abort();
       };
-      // Brief 8s grace window for `session:` streams so mobile Wi-Fi/5G drops reconnect with zero-gap deltas!
+      // Generous 30s grace window for `session:` streams so mobile app switches during phone
+      // control or Wi-Fi/5G handoffs reconnect with zero-gap deltas and zero forced resyncs!
       if (channel.startsWith('session:') && !this._disposed) {
         if (entry.releaseTimer) clearTimeout(entry.releaseTimer);
-        entry.releaseTimer = setTimeout(teardown, 8000);
+        entry.releaseTimer = setTimeout(teardown, 30000);
         entry.releaseTimer.unref?.();
       } else {
         teardown();
@@ -1200,7 +1201,9 @@ export class StreamHub {
   _sendHeartbeats() {
     for (const client of [...this.clients.values()]) {
       if (client.ws.closed) continue;
-      if (client.missedPongs >= 2) {
+      // Allow up to 4 missed pings (80s) so backgrounded mobile clients waiting on phone-control
+      // confirmation cards or brief OEM timer coalescing are never dropped mid-turn.
+      if (client.missedPongs >= 4) {
         client.ws.terminate();
         this._detachClient(client);
         continue;

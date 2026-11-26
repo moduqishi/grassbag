@@ -135,8 +135,8 @@ class GbridgeHttpTransport {
             return false;
           }
           if (res.statusCode < 200 || res.statusCode >= 400) return false;
-          final gotSetCookie = _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
-          return _cookieHeader != null && _cookieHeader!.isNotEmpty && gotSetCookie;
+          final gotLiveCookie = _captureCookies(_safeCookies(res), res.headers[HttpHeaders.setCookieHeader]);
+          return _cookieHeader != null && _cookieHeader!.isNotEmpty && gotLiveCookie;
         } catch (_) {
           try {
             req?.abort();
@@ -178,7 +178,9 @@ class GbridgeHttpTransport {
 
   bool _lastAuthExchangeRejected = false;
 
-  void _evictDshAuthCookies() {
+  /// Evict only stale DSH/gbridge session cookies while preserving reverse-proxy / SSO cookies
+  /// (e.g. Cloudflare Access, Authelia) so token re-exchange can still pass through the proxy.
+  void evictDshAuthCookies() {
     final cur = _cookieHeader;
     if (cur == null || cur.isEmpty) return;
     final kept = <String>[];
@@ -396,7 +398,7 @@ class GbridgeHttpTransport {
   }
 
   bool _captureCookies(List<Cookie> parsedCookies, List<String>? rawSetCookie) {
-    final hadHeader = parsedCookies.isNotEmpty || (rawSetCookie != null && rawSetCookie.isNotEmpty);
+    var addedLiveCookie = false;
     final pairs = <String, String>{};
     if (_cookieHeader != null && _cookieHeader!.isNotEmpty) {
       for (final part in _cookieHeader!.split(';')) {
@@ -415,6 +417,7 @@ class GbridgeHttpTransport {
         pairs.remove(c.name);
       } else {
         pairs[c.name] = c.value;
+        addedLiveCookie = true;
       }
     }
     if (rawSetCookie != null) {
@@ -454,6 +457,7 @@ class GbridgeHttpTransport {
           pairs.remove(name);
         } else {
           pairs[name] = value;
+          addedLiveCookie = true;
         }
       }
     }
@@ -464,7 +468,7 @@ class GbridgeHttpTransport {
       _cookieHeader = next;
       onCookieUpdated?.call(next ?? '');
     }
-    return hadHeader;
+    return addedLiveCookie;
   }
 
   Future<Map<String, dynamic>> requestJson(
@@ -512,7 +516,7 @@ class GbridgeHttpTransport {
         );
       }
       if (_lastAuthExchangeRejected && _cookieHeader == usedCookie && _cookieHeader != null) {
-        _evictDshAuthCookies();
+        evictDshAuthCookies();
       }
     }
     return _decodeJsonResponse(res);
@@ -568,7 +572,7 @@ class GbridgeHttpTransport {
         );
       }
       if (_lastAuthExchangeRejected && _cookieHeader == usedCookie && _cookieHeader != null) {
-        _evictDshAuthCookies();
+        evictDshAuthCookies();
       }
     }
     if (res.statusCode >= 400) {
@@ -577,21 +581,78 @@ class GbridgeHttpTransport {
     return res.bytes;
   }
 
+  /// Lightweight probe run only after a WebSocket upgrade fails with 302/redirect or
+  /// "was not upgraded to websocket", distinguishing reverse-proxy SSO login walls
+  /// (Cloudflare Access / Authelia / 401 / 403) from transient 502/503 restarts.
+  Future<bool> _probeWsUpgradeAuthRedirect(String wsPath) async {
+    if (_closed || endpoint.isUnixSocket) return false;
+    HttpClientRequest? req;
+    try {
+      final probeUri = endpoint.resolveHttpUri(wsPath);
+      const budget = Duration(seconds: 4);
+      req = await _openUrlWithTimeout('GET', probeUri, budget);
+      req.followRedirects = false;
+      buildAuthHeaders().forEach(req.headers.set);
+      final res = await req.close().timeout(budget);
+      final status = res.statusCode;
+      final location = (res.headers.value(HttpHeaders.locationHeader) ?? '').toLowerCase();
+      final ct = (res.headers.contentType?.mimeType ?? '').toLowerCase();
+      unawaited(res.drain<void>().catchError((_) {}));
+      if (status == 401 || status == 403) return true;
+      if (status == 302 || status == 303 || status == 307 || status == 308) {
+        return location.isNotEmpty;
+      }
+      if (status == 200 && ct.contains('text/html')) {
+        return true;
+      }
+      return false;
+    } catch (_) {
+      try {
+        req?.abort();
+      } catch (_) {}
+      return false;
+    }
+  }
+
   Future<WebSocket> openWebSocket(String path) async {
     if (!endpoint.isUnixSocket && (_cookieHeader == null || _cookieHeader!.isEmpty) && (endpoint.token?.isNotEmpty ?? false)) {
       await exchangeAuthToken();
     }
     final wsUri = endpoint.resolveWsUri(path);
+    final usedCookie = _cookieHeader;
     try {
       return await _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
-    } on WebSocketException {
+    } on WebSocketException catch (e) {
+      WebSocketException lastWsErr = e;
       if (!endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
         final exchanged = await exchangeAuthToken();
         if (exchanged) {
-          return _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
+          try {
+            return await _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
+          } on WebSocketException catch (retryErr) {
+            lastWsErr = retryErr;
+          }
+        } else if (_lastAuthExchangeRejected && _cookieHeader == usedCookie && _cookieHeader != null) {
+          evictDshAuthCookies();
         }
       }
-      rethrow;
+      final msgLower = lastWsErr.message.toLowerCase();
+      if (!endpoint.isUnixSocket &&
+          (msgLower.contains('http status code: 302') ||
+              msgLower.contains('http status code: 303') ||
+              msgLower.contains('http status code: 307') ||
+              msgLower.contains('http status code: 308') ||
+              msgLower.contains('was not upgraded to websocket'))) {
+        final authRequired = await _probeWsUpgradeAuthRedirect(path);
+        if (authRequired) {
+          throw const GbridgeException(
+            status: 401,
+            code: 'gbridge/ws_auth_redirect',
+            message: 'WebSocket upgrade requires authentication (HTTP redirect or login gate)',
+          );
+        }
+      }
+      throw lastWsErr;
     }
   }
 
@@ -663,6 +724,7 @@ class GbridgeHttpTransport {
     final deadline = DateTime.now().add(timeout);
     final req = await _openUrlWithTimeout(method, uri, timeout);
     try {
+      req.followRedirects = false;
       req.headers.set(HttpHeaders.acceptHeader, 'application/json, application/octet-stream');
       for (final entry in buildAuthHeaders().entries) {
         req.headers.set(entry.key, entry.value);
@@ -898,6 +960,8 @@ class GbridgeStreamClient {
   int _lastAckedSeq = 0;
   int _reconnectAttempt = 0;
   int _connEpoch = 0;
+  int _lastInboundAtMs = 0;
+  int _missedHeartbeats = 0;
   bool _disposed = false;
   bool _manualDisconnect = false;
   Completer<WelcomeInfo>? _pendingWelcome;
@@ -989,6 +1053,7 @@ class GbridgeStreamClient {
     // Guard against uncaught Zone errors if disconnect()/superseded fires before awaiting `.future`.
     welcomeCompleter.future.ignore();
 
+    _activeConnects++;
     try {
       final ws = await _transport.openWebSocket(wsPath);
       if (_disposed || _manualDisconnect || epoch != _connEpoch) {
@@ -1000,7 +1065,10 @@ class GbridgeStreamClient {
         );
       }
       _pendingWelcome = welcomeCompleter;
-      ws.pingInterval = const Duration(seconds: 20);
+      // Generous RFC6455 ping interval avoids false disconnects during brief Android background CPU throttling.
+      ws.pingInterval = const Duration(seconds: 30);
+      _lastInboundAtMs = DateTime.now().millisecondsSinceEpoch;
+      _missedHeartbeats = 0;
       _ws = ws;
       _wsSub = ws.listen(
         (raw) {
@@ -1055,8 +1123,12 @@ class GbridgeStreamClient {
         }
       }
       rethrow;
+    } finally {
+      _activeConnects = _activeConnects > 0 ? _activeConnects - 1 : 0;
     }
   }
+
+  int _activeConnects = 0;
 
   void subscribe(String channel, {bool force = false}) {
     if (channel.isEmpty) return;
@@ -1116,11 +1188,13 @@ class GbridgeStreamClient {
       return;
     }
     if (_disposed || _manualDisconnect) return;
+    if (_activeConnects > 0) return;
     if (_phase == ConnectionPhase.connected && _ws != null) {
       unawaited(checkLiveness());
       return;
     }
     if (_reconnectTimer != null ||
+        _phase == ConnectionPhase.reconnecting ||
         _phase == ConnectionPhase.disconnected ||
         _phase == ConnectionPhase.error) {
       _reconnectTimer?.cancel();
@@ -1140,7 +1214,7 @@ class GbridgeStreamClient {
   /// Probe the live WebSocket for half-open / blackholed connections (e.g. after Android resume).
   /// Triggers immediate reconnect if no pong arrives within [timeout].
   Future<bool> checkLiveness({
-    Duration timeout = const Duration(seconds: 3),
+    Duration timeout = const Duration(seconds: 6),
     bool force = false,
   }) async {
     if (_vanillaMux != null) {
@@ -1161,6 +1235,13 @@ class GbridgeStreamClient {
             pendingInteractions: [],
           )));
       return false;
+    }
+    // If real traffic just arrived over this socket (< 2.5s ago), avoid risking a false timeout
+    // during heavy local-engine turns or phone-control auto-return.
+    if (!force &&
+        _lastInboundAtMs > 0 &&
+        (DateTime.now().millisecondsSinceEpoch - _lastInboundAtMs) < 2500) {
+      return true;
     }
     // Coalesce concurrent probes so a second caller never orphans & times out an active probe!
     final existingProbe = _livenessProbe;
@@ -1186,6 +1267,8 @@ class GbridgeStreamClient {
 
   void _onRawMessage(dynamic raw) {
     if (raw is! String) return;
+    _lastInboundAtMs = DateTime.now().millisecondsSinceEpoch;
+    _missedHeartbeats = 0;
     _pongTimeoutTimer?.cancel();
     _pongTimeoutTimer = null;
     final probe = _livenessProbe;
@@ -1251,15 +1334,27 @@ class GbridgeStreamClient {
   void _startHeartbeat(int heartbeatMs) {
     _heartbeatTimer?.cancel();
     _pongTimeoutTimer?.cancel();
+    _missedHeartbeats = 0;
     final epoch = _connEpoch;
-    final period = Duration(milliseconds: heartbeatMs.clamp(5000, 60000));
+    final period = Duration(milliseconds: heartbeatMs.clamp(8000, 60000));
     _heartbeatTimer = Timer.periodic(period, (_) {
       if (_phase == ConnectionPhase.connected && epoch == _connEpoch) {
         sendPing();
         _pongTimeoutTimer?.cancel();
-        _pongTimeoutTimer = Timer(const Duration(seconds: 10), () {
-          if (epoch == _connEpoch && _phase == ConnectionPhase.connected) {
+        _pongTimeoutTimer = Timer(const Duration(seconds: 20), () {
+          if (epoch != _connEpoch || _phase != ConnectionPhase.connected) return;
+          final sinceLastInbound = DateTime.now().millisecondsSinceEpoch - _lastInboundAtMs;
+          if (sinceLastInbound < 20000) {
+            _missedHeartbeats = 0;
+            return;
+          }
+          _missedHeartbeats++;
+          // Require 2 consecutive missed heartbeats before tearing down the socket so brief
+          // Android background timer coalescing or phone-control confirmation waits never drop!
+          if (_missedHeartbeats >= 2) {
             _handleDisconnect(epoch);
+          } else {
+            sendPing('retry-${DateTime.now().millisecondsSinceEpoch}');
           }
         });
       }

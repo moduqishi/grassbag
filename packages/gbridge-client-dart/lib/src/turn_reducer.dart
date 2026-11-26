@@ -239,8 +239,24 @@ class TurnStreamReducer {
     _activeReasonStepIdx = -1;
     _activeReasonMaxSeq = 0;
     _activeReasonDirty = false;
-    _reasoningStartedAtMs.clear();
-    _toolStartedAtMs.clear();
+    // Preserve monotonic start timestamps for reasoning/tool steps that are still live
+    // across periodic bundle resyncs so duration badges never silently disappear!
+    final activeReasoningIds = <String>{};
+    final activeToolIds = <String>{};
+    for (final turn in turns) {
+      if (!turn.isStreaming) continue;
+      for (final step in turn.steps) {
+        if (step is ReasoningStep &&
+            step.durationMs == null &&
+            !step.id.startsWith('narration-')) {
+          activeReasoningIds.add(step.id);
+        } else if (step is ToolStep && step.status == 'running') {
+          activeToolIds.add(step.callId);
+        }
+      }
+    }
+    _reasoningStartedAtMs.removeWhere((id, _) => !activeReasoningIds.contains(id));
+    _toolStartedAtMs.removeWhere((id, _) => !activeToolIds.contains(id));
     _turns
       ..clear()
       ..addAll(turns);
@@ -475,15 +491,19 @@ class TurnStreamReducer {
                 final t = NormalizedTurn.fromJson(raw);
                 final prev = prevById[t.turnId];
                 if (prev != null) {
+                  final enrichedSteps = _preserveStepDurations(prev.steps, t.steps);
                   if (prev.status == t.status &&
                       prev.assistantText == t.assistantText &&
-                      _stepsEquivalent(prev.steps, t.steps) &&
+                      _stepsEquivalent(prev.steps, enrichedSteps) &&
                       prev.errorMessage == t.errorMessage &&
                       prev.deliverables.length == t.deliverables.length &&
                       (prev.userMessage?.text ?? '') == (t.userMessage?.text ?? '')) {
                     return prev;
                   }
-                  return t.copyWith(stableKey: prev.stableKey);
+                  return t.copyWith(
+                    stableKey: prev.stableKey,
+                    steps: enrichedSteps,
+                  );
                 }
                 return t;
               })
@@ -520,7 +540,7 @@ class TurnStreamReducer {
             final olderPrefix = <NormalizedTurn>[];
             for (final t in _turns) {
               if (snapIds.contains(t.turnId)) break;
-              if (minSnapSeq < 0x7fffffff && t.seqEnd > 0 && t.seqEnd < minSnapSeq) {
+              if (minSnapSeq > 0 && minSnapSeq < 0x7fffffff && t.seqEnd >= 0 && t.seqEnd < minSnapSeq) {
                 olderPrefix.add(t);
               }
             }
@@ -535,18 +555,22 @@ class TurnStreamReducer {
           final snap = NormalizedTurn.fromJson(data['turn'] as Map<String, dynamic>);
           final idx = _turns.indexWhere((t) => t.turnId == snap.turnId);
           if (idx >= 0) {
+            final prev = _turns[idx];
             _turns[idx] = snap.copyWith(
-              stableKey: _turns[idx].stableKey,
-              userMessage: _mergeUserMessages(_turns[idx].userMessage, snap.userMessage),
-              assistantMessageId: snap.assistantMessageId ?? _turns[idx].assistantMessageId,
+              stableKey: prev.stableKey,
+              steps: _preserveStepDurations(prev.steps, snap.steps),
+              userMessage: _mergeUserMessages(prev.userMessage, snap.userMessage),
+              assistantMessageId: snap.assistantMessageId ?? prev.assistantMessageId,
             );
           } else {
             final optIdx = _findOptimisticStreamingTurnIndex();
             if (optIdx >= 0) {
+              final prev = _turns[optIdx];
               _turns[optIdx] = snap.copyWith(
-                stableKey: _turns[optIdx].stableKey,
-                userMessage: _mergeUserMessages(_turns[optIdx].userMessage, snap.userMessage),
-                assistantMessageId: snap.assistantMessageId ?? _turns[optIdx].assistantMessageId,
+                stableKey: prev.stableKey,
+                steps: _preserveStepDurations(prev.steps, snap.steps),
+                userMessage: _mergeUserMessages(prev.userMessage, snap.userMessage),
+                assistantMessageId: snap.assistantMessageId ?? prev.assistantMessageId,
               );
             } else {
               _turns.add(snap);
@@ -759,7 +783,11 @@ class TurnStreamReducer {
     var changed = false;
     for (final rawChunk in chunks) {
       if (rawChunk is! Map<String, dynamic>) continue;
-      final cType = (rawChunk['type'] ?? rawChunk['kind'] ?? '').toString();
+      final rawType = rawChunk['type']?.toString() ?? '';
+      final rawKind = rawChunk['kind']?.toString() ?? '';
+      final cType = (rawType.isEmpty || rawType == 'chunk')
+          ? (rawKind.isNotEmpty ? rawKind : rawType)
+          : rawType;
       final text = _extractChunkText(rawChunk);
       if (cType == 'assistant-stream/abandoned') {
         _flushBuffers();
@@ -1066,6 +1094,13 @@ class TurnStreamReducer {
             : (snap.assistantText.isNotEmpty && snap.assistantText.length >= cur.assistantText.length
                 ? snap.assistantText
                 : cur.assistantText);
+        final settledMergedSteps = nextStatus == 'streaming'
+            ? mergedSteps
+            : mergedSteps
+                .map((s) => s is ToolStep && s.status == 'running'
+                    ? s.copyWith(status: nextStatus == 'error' ? 'error' : 'ok')
+                    : s)
+                .toList(growable: false);
         _turns[_turns.length - 1] = NormalizedTurn(
           turnId: adoptedTurnId,
           stableKey: cur.stableKey,
@@ -1074,7 +1109,7 @@ class TurnStreamReducer {
           seqEnd: effSeq > cur.seqEnd ? effSeq : cur.seqEnd,
           status: nextStatus,
           userMessage: _mergeUserMessages(cur.userMessage, snap.userMessage),
-          steps: List.unmodifiable(mergedSteps),
+          steps: List.unmodifiable(settledMergedSteps),
           assistantText: nextAssistantText,
           deliverables: snap.deliverables.isNotEmpty ? snap.deliverables : cur.deliverables,
           usage: snap.usage ?? cur.usage,
@@ -1085,10 +1120,17 @@ class TurnStreamReducer {
         return true;
       }
       // A distinct new server turn arrived before the prior streaming turn's turn.completed!
-      // Settle the prior turn instead of overwriting Turn 1's user prompt with Turn 2's prompt.
+      // Settle the prior turn (including any still-running tool spinners) instead of overwriting.
       if (snap.userMessage != null) {
         _finalizeOpenReasoningSteps(_turns.length - 1);
-        _turns[_turns.length - 1] = cur.copyWith(status: 'completed');
+        final settledPrevSteps = _turns[_turns.length - 1]
+            .steps
+            .map((s) => s is ToolStep && s.status == 'running' ? s.copyWith(status: 'ok') : s)
+            .toList(growable: false);
+        _turns[_turns.length - 1] = _turns[_turns.length - 1].copyWith(
+          status: 'completed',
+          steps: List.unmodifiable(settledPrevSteps),
+        );
       }
     }
     _pruneFinishedToolStartTimes(snap.steps);
@@ -1216,10 +1258,41 @@ class TurnStreamReducer {
     return true;
   }
 
+  static List<NormalizedStep> _preserveStepDurations(
+    List<NormalizedStep> prevSteps,
+    List<NormalizedStep> nextSteps,
+  ) {
+    if (prevSteps.isEmpty || nextSteps.isEmpty) return nextSteps;
+    List<NormalizedStep>? out;
+    for (var i = 0; i < nextSteps.length; i++) {
+      final s = nextSteps[i];
+      if (s is ReasoningStep && s.durationMs == null) {
+        final matchIdx = _findMatchingReasoningIndex(prevSteps, s);
+        if (matchIdx >= 0) {
+          final prev = prevSteps[matchIdx] as ReasoningStep;
+          if (prev.durationMs != null) {
+            out ??= List<NormalizedStep>.of(nextSteps);
+            out[i] = s.copyWith(durationMs: prev.durationMs);
+          }
+        }
+      } else if (s is ToolStep && s.durationMs == null) {
+        final matchIdx = prevSteps.indexWhere((x) => x is ToolStep && x.callId == s.callId);
+        if (matchIdx >= 0) {
+          final prev = prevSteps[matchIdx] as ToolStep;
+          if (prev.durationMs != null) {
+            out ??= List<NormalizedStep>.of(nextSteps);
+            out[i] = s.copyWith(durationMs: prev.durationMs);
+          }
+        }
+      }
+    }
+    return out == null ? nextSteps : List.unmodifiable(out);
+  }
+
   static bool _needsPreviewUpdate(String prevText, String prevPreview) {
-    if (prevPreview.isEmpty) return true;
-    // Refresh collapsed preview whenever a new reasoning line/paragraph arrives so long thinking never looks frozen.
-    return prevText.length < 4096 || prevText.endsWith('\n');
+    // `_previewLine` scans at most the trailing 512 chars in O(1), so always keep the collapsed
+    // preview fresh even when long reasoning streams exceed 4096 chars.
+    return true;
   }
 
   static String _previewLine(String text, {int maxChars = 160}) {

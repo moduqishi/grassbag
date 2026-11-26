@@ -450,21 +450,24 @@ void main() {
     testWidgets(
       'Model pill NEVER flashes 未连接 during ConnectionPhase.reconnecting & crystal-clear Liquid Glass optics contract holds',
       (tester) async {
-        // 1. Crystal-clear Kyant0-grade translucent Liquid Glass contract (zero milky frost slab!)
+        // 1. Crystal-clear Kyant0-grade translucent Liquid Glass contract (thin-lens spherical optics
+        //    so `isClearIndicator` never trips the dark charcoal ring in Light Mode, controlled glare!)
         for (final brightness in [Brightness.light, Brightness.dark]) {
           final tok = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
           final surf = GrassBagGlassConfig.surfaceSettings(tok, GrassBagGlassTier.liquid);
           final sheet = GrassBagGlassConfig.sheetSettings(tok, GrassBagGlassTier.liquid);
           expect(surf.lensModel, GlassLensModel.spherical);
-          expect(surf.chromaticAberration, greaterThan(0.0));
-          expect(surf.blur, inInclusiveRange(1.0, 2.5));
-          expect(surf.glassColor.a, lessThanOrEqualTo(0.10));
-          expect(surf.lightIntensity, greaterThanOrEqualTo(0.8));
+          expect(surf.thickness, inInclusiveRange(26.0, 34.0));
+          expect(surf.refractiveIndex, inInclusiveRange(1.36, 1.48));
+          expect(surf.chromaticAberration, greaterThan(0.12));
+          expect(surf.blur, inInclusiveRange(1.0, 1.8));
+          expect(surf.glassColor.a, lessThanOrEqualTo(0.06));
+          expect(surf.lightIntensity, inInclusiveRange(0.70, 1.25));
           expect(sheet.lensModel, GlassLensModel.spherical);
           expect(sheet.frost, 0.0);
           expect(sheet.frostOpacity, 0.0);
-          expect(sheet.blur, inInclusiveRange(3.5, 5.5));
-          expect(sheet.glassColor.a, lessThanOrEqualTo(0.38));
+          expect(sheet.blur, inInclusiveRange(6.5, 10.0));
+          expect(sheet.glassColor.a, lessThanOrEqualTo(0.30));
         }
 
         // 2. Composer model pill during ConnectionPhase.reconnecting keeps showing cached model
@@ -1715,7 +1718,8 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(find.textContaining('正在编辑'), findsOneWidget);
-        expect(find.text('分支重发'), findsOneWidget);
+        // While streaming, editing queues at the tail rather than branching before the turn -> shows truthful banner!
+        expect(find.text('生成中 · 发送将末尾排队'), findsOneWidget);
         // Streaming follow-up mode pill reflects default busyEnter ('排队')
         expect(find.text('排队'), findsOneWidget);
 
@@ -2263,6 +2267,235 @@ void main() {
         } finally {
           debugDefaultTargetPlatformOverride = null;
         }
+      },
+    );
+
+    testWidgets(
+      'v52 regression: Liquid Glass inverse-clipped outer shadow, Moss accent hue, & Markdown entities/callouts',
+      (tester) async {
+        // 1. Moss Light accent resolves to true jade-green (g > r && g > b) distinct from Dusk blue!
+        final mossLight = GrassBagTokens.resolve(GrassBagAccent.moss, Brightness.light);
+        final duskLight = GrassBagTokens.resolve(GrassBagAccent.dusk, Brightness.light);
+        expect(mossLight.primaryHi.g, greaterThan(mossLight.primaryHi.r));
+        expect(mossLight.primaryHi.g, greaterThan(mossLight.primaryHi.b));
+        expect(mossLight.primary, isNot(equals(duskLight.primary)));
+
+        // 2. GrassBagGlass / CircleButton / PillButton render cleanly in Light & Dark without BlurStyle.outer leaks
+        for (final brightness in Brightness.values) {
+          final tok = GrassBagTokens.resolve(GrassBagAccent.moss, brightness);
+          await tester.pumpWidget(
+            MaterialApp(
+              theme: tok.toMaterialTheme(),
+              home: Scaffold(
+                body: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      GrassBagGlass(
+                        tier: GrassBagGlassTier.liquid,
+                        borderRadius: 24,
+                        elevated: true,
+                        padding: const EdgeInsets.all(12),
+                        child: const Text('Liquid Surface'),
+                      ),
+                      const SizedBox(height: 12),
+                      GrassBagGlassCircleButton(
+                        icon: CupertinoIcons.add,
+                        tier: GrassBagGlassTier.liquid,
+                        onTap: () {},
+                      ),
+                      const SizedBox(height: 12),
+                      GrassBagGlassPillButton(
+                        tier: GrassBagGlassTier.liquid,
+                        onTap: () {},
+                        child: const Text('动作胶囊'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('Liquid Surface'), findsOneWidget);
+          expect(find.text('动作胶囊'), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        }
+
+        // 3. Markdown decodes HTML entities outside code spans, handles <br> in GFM tables,
+        //    single-line > [!NOTE] callouts, and **bold *italic*** nesting cleanly.
+        const mdTurn = NormalizedTurn(
+          turnId: 't-v52-md',
+          status: 'done',
+          assistantText:
+              'A &amp; B &lt;tag&gt; `&amp;` **bold *italic***\n\n'
+              '> [!NOTE] 单行提示内容\n\n'
+              '| 列1 | 列2 |\n'
+              '| --- | --- |\n'
+              '| 行1<br>行2 | 值 |',
+        );
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: mossLight.toMaterialTheme(),
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: TurnView(
+                    turn: mdTurn,
+                    animateEntrance: false,
+                    onOpenTerminal: () {},
+                    onPrefillPrompt: (_) {},
+                    onEditTurn: (_) {},
+                    onOpenModelSettings: () {},
+                    onOpenHostSettings: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('A & B <tag>', findRichText: true), findsOneWidget);
+        expect(find.textContaining('`&amp;`', findRichText: true), findsNothing);
+        expect(find.textContaining('&amp;', findRichText: true), findsOneWidget);
+        expect(find.textContaining('单行提示内容', findRichText: true), findsOneWidget);
+        expect(find.textContaining('行1\n行2', findRichText: true), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v53 regression: Dark Dusk WCAG AA contrast, Dark chromatic GrassBagSquircleIcon white glyph + <=0.42 lightness, GrassBagScrollEdgeMist, malformed file:// link safety & edit-mode draft guard',
+      (tester) async {
+        // 1. Dark Mode Dusk primary (#C2A2F7) achieves WCAG AA contrast >= 4.5:1 on bgSolid & card
+        double contrastRatio(Color a, Color b) {
+          final la = a.computeLuminance();
+          final lb = b.computeLuminance();
+          final hi = la > lb ? la : lb;
+          final lo = la > lb ? lb : la;
+          return (hi + 0.05) / (lo + 0.05);
+        }
+
+        final duskDark = GrassBagTokens.resolve(GrassBagAccent.dusk, Brightness.dark);
+        expect(contrastRatio(duskDark.primary, duskDark.bgSolid), greaterThanOrEqualTo(4.5));
+        expect(contrastRatio(duskDark.primary, duskDark.card), greaterThanOrEqualTo(4.5));
+
+        // 2. Dark Mode filled chromatic GrassBagSquircleIcon keeps white icon glyph & clamps bright pigment lightness <= 0.42
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: duskDark.toMaterialTheme(),
+            home: Scaffold(
+              body: Column(
+                children: [
+                  const GrassBagScrollEdgeMist(
+                    tier: GrassBagGlassTier.liquid,
+                    topPad: 32,
+                  ),
+                  Center(
+                    child: GrassBagSquircleIcon(
+                      icon: CupertinoIcons.doc_fill,
+                      color: const Color(0xFFFFD54F), // bright yellow-gold that used to flip to dark text!
+                      filled: true,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final iconWidget = tester.widget<Icon>(find.byIcon(CupertinoIcons.doc_fill));
+        expect(iconWidget.color, Colors.white);
+        final containerWidget = tester.widget<Container>(
+          find.ancestor(of: find.byIcon(CupertinoIcons.doc_fill), matching: find.byType(Container)).first,
+        );
+        final dec = containerWidget.decoration as ShapeDecoration;
+        final grad = dec.gradient as LinearGradient;
+        expect(HSLColor.fromColor(grad.colors[1]).lightness, lessThanOrEqualTo(0.43));
+        expect(find.byType(GrassBagScrollEdgeMist), findsOneWidget);
+        expect(tester.takeException(), isNull);
+
+        // 3. Markdown file:// link with malformed percent encoding (100%bad) must not crash on tap or render
+        const malformedTurn = NormalizedTurn(
+          turnId: 't-v53-filelink',
+          status: 'done',
+          assistantText: '请检查 [报告](file:///tmp/100%bad.txt) 的内容。',
+        );
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: duskDark.toMaterialTheme(),
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: TurnView(
+                    turn: malformedTurn,
+                    animateEntrance: false,
+                    onOpenTerminal: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('报告', findRichText: true), findsOneWidget);
+        expect(tester.takeException(), isNull);
+
+        // 4. ComposerBar editing-mode draft guard: entering/exiting edit must NOT clobber the session's saved draft!
+        final editContainer = ProviderContainer();
+        addTearDown(editContainer.dispose);
+        final ctrl = editContainer.read(appProvider.notifier);
+        ctrl.state = ctrl.state.copyWith(
+          activeSessionId: 'sess-v53-draft',
+        );
+        final hostId = ctrl.state.activeHostId;
+        ctrl.setComposerDraftForScope(hostId, 'sess-v53-draft', '我原本未发送的草稿');
+        final textCtrl = TextEditingController(text: '我原本未发送的草稿');
+        final focusNode = FocusNode();
+        final editingNotifier = ValueNotifier<EditingMessageContext?>(
+          const EditingMessageContext(
+            turnId: 't-edit-1',
+            originalText: '旧消息',
+            stashedDraft: '我原本未发送的草稿',
+          ),
+        );
+        addTearDown(textCtrl.dispose);
+        addTearDown(focusNode.dispose);
+        addTearDown(editingNotifier.dispose);
+
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: editContainer,
+            child: MaterialApp(
+              theme: duskDark.toMaterialTheme(),
+              home: Scaffold(
+                body: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ChatComposerDock(
+                    controller: textCtrl,
+                    focusNode: focusNode,
+                    onOpenTerminal: () {},
+                    editingContextNotifier: editingNotifier,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        textCtrl.text = '正在编辑旧消息';
+        await tester.pump(const Duration(milliseconds: 200));
+        // Unmount while editing -> _flushDraftSync() MUST skip writing to saved session draft!
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(milliseconds: 1400));
+        expect(ctrl.getComposerDraftForScope(hostId, 'sess-v53-draft'), '我原本未发送的草稿');
+        expect(tester.takeException(), isNull);
       },
     );
   });

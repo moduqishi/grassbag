@@ -33,20 +33,25 @@ class DroidBridgeDaemon(
     val bearerToken: String
 ) {
     private val running = AtomicBoolean(false)
+    private val lifecycleLock = Any()
     @Volatile
     private var pool: java.util.concurrent.ExecutorService = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
     private var boundSocket: LocalSocket? = null
+    @Volatile
     private var serverSocket: LocalServerSocket? = null
     private var tts: TextToSpeech? = null
     private var ttsReady: Boolean = false
     private var pendingTtsText: String? = null
 
-    fun start(): Boolean {
-        if (running.getAndSet(true)) return true
+    fun start(): Boolean = synchronized(lifecycleLock) {
+        if (running.get()) return true
         return try {
-            if (pool.isShutdown || pool.isTerminated) {
-                pool = Executors.newCachedThreadPool()
+            val exec = if (pool.isShutdown || pool.isTerminated) {
+                Executors.newCachedThreadPool().also { pool = it }
+            } else {
+                pool
             }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
@@ -57,20 +62,23 @@ class DroidBridgeDaemon(
             socketFile.setReadable(true, true)
             socketFile.setWritable(true, true)
             // Keep strong reference so GC cannot close bindSocket FD underneath serverSocket.
+            val ss = LocalServerSocket(bindSocket.fileDescriptor)
             boundSocket = bindSocket
-            serverSocket = LocalServerSocket(bindSocket.fileDescriptor)
-            pool.execute { acceptLoop() }
+            serverSocket = ss
+            running.set(true)
+            exec.execute { acceptLoop(ss, exec) }
             true
         } catch (_: Throwable) {
+            running.set(false)
+            runCatching { serverSocket?.close() }
             runCatching { boundSocket?.close() }
             boundSocket = null
             serverSocket = null
-            running.set(false)
             false
         }
     }
 
-    fun stop() {
+    fun stop() = synchronized(lifecycleLock) {
         if (!running.getAndSet(false)) return
         try { serverSocket?.close() } catch (_: Throwable) {}
         serverSocket = null
@@ -88,13 +96,18 @@ class DroidBridgeDaemon(
         try { if (socketFile.exists()) socketFile.delete() } catch (_: Throwable) {}
     }
 
-    private fun acceptLoop() {
-        while (running.get()) {
+    private fun acceptLoop(ss: LocalServerSocket, exec: java.util.concurrent.ExecutorService) {
+        while (running.get() && serverSocket === ss) {
             try {
-                val client = serverSocket?.accept() ?: break
-                pool.execute { handleClient(client) }
+                val client = ss.accept() ?: break
+                try {
+                    exec.execute { handleClient(client) }
+                } catch (_: Throwable) {
+                    runCatching { client.close() }
+                    if (!running.get() || exec.isShutdown) break
+                }
             } catch (_: Throwable) {
-                if (!running.get()) break
+                if (!running.get() || serverSocket !== ss) break
                 runCatching { Thread.sleep(150) }
             }
         }

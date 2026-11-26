@@ -76,8 +76,8 @@ void main() {
     expect(find.text('登录 DeepSeek'), findsOneWidget);
     expect(find.text('API Key / 中转'), findsOneWidget);
 
-    // Finish onboarding
-    await tester.tap(find.text('进入 GrassBag'));
+    // Finish onboarding (when model is not yet configured, deferred secondary CTA is shown)
+    await tester.tap(find.text('稍后配置模型，直接进入'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 200));
     expect(finished, isTrue);

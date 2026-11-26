@@ -249,13 +249,34 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
   }
 
   void _openCreateSheet(BuildContext context, {ScheduleTaskRecord? existing}) {
+    if (!ref.read(appProvider).isDshConnected) {
+      ref.read(appProvider.notifier).showToast(
+            '当前未连接到 DSH 主机，请先恢复连接后再管理定时任务',
+            tone: ToastTone.warn,
+          );
+      return;
+    }
+    var isDirty = false;
     showGrassBagSheet<void>(
       context,
       title: existing == null ? '新建定时任务' : '编辑定时任务',
       subtitle: existing == null
           ? '按计划自动唤醒助手执行并记录结果'
           : '修改任务名称、触发 Cron 计划或执行指令',
-      bodyBuilder: (sheetCtx) => _CreateScheduleSheetBody(existing: existing),
+      onWillDismiss: () async {
+        if (!isDirty || !context.mounted) return true;
+        return showGrassBagConfirmDialog(
+          context,
+          title: '放弃未保存的定时任务内容？',
+          message: '关闭后当前已填写的计划与执行指令将不会保留。',
+          confirmLabel: '放弃并关闭',
+          isDestructive: true,
+        );
+      },
+      bodyBuilder: (sheetCtx) => _CreateScheduleSheetBody(
+        existing: existing,
+        onDirtyChanged: (dirty) => isDirty = dirty,
+      ),
     );
   }
 
@@ -268,6 +289,11 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
           _runningIds.clear();
           _loadingHistoryIds.clear();
         });
+        unawaited(ref.read(appProvider.notifier).refreshSchedules(silent: true));
+      }
+    });
+    ref.listen<ConnectionPhase>(appProvider.select((s) => s.connectionPhase), (prev, next) {
+      if (prev != ConnectionPhase.connected && next == ConnectionPhase.connected && mounted) {
         unawaited(ref.read(appProvider.notifier).refreshSchedules(silent: true));
       }
     });
@@ -308,13 +334,15 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(maxWidth: isWide ? 720 : double.infinity),
                   child: RefreshIndicator.adaptive(
-                    edgeOffset: topPad + 64,
-                    onRefresh: () => ctrl.refreshSchedules(silent: true),
+                    edgeOffset: topPad + 74,
+                    onRefresh: () => ctrl.refreshSchedules(
+                      silent: state.connectionPhase == ConnectionPhase.connected,
+                    ),
                     child: CustomScrollView(
                       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                       slivers: [
                         SliverPadding(
-                          padding: EdgeInsets.fromLTRB(16, topPad + 72, 16, 40 + botPad),
+                          padding: EdgeInsets.fromLTRB(16, topPad + 76, 16, 40 + botPad),
                           sliver: SliverMainAxisGroup(
                             slivers: [
                               SliverToBoxAdapter(
@@ -342,12 +370,18 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                                       const SizedBox(height: 12),
                                     ],
                                     GrassBagSegmentedControl(
-                                      labels: [
-                                        '全部 (${state.schedules.length})',
-                                        '运行中 (${state.activeScheduleCount})',
-                                        '已暂停 ($pausedCount)',
-                                        if (endedCount > 0) '已结束 ($endedCount)',
-                                      ],
+                                      labels: endedCount > 0
+                                          ? [
+                                              '全部 ${state.schedules.length}',
+                                              '运行 ${state.activeScheduleCount}',
+                                              '暂停 $pausedCount',
+                                              '结束 $endedCount',
+                                            ]
+                                          : [
+                                              '全部 (${state.schedules.length})',
+                                              '运行中 (${state.activeScheduleCount})',
+                                              '已暂停 ($pausedCount)',
+                                            ],
                                       selectedIndex: safeFilterIdx,
                                       tier: state.glassTier,
                                       onSelected: (i) => setState(() => _filterIdx = i),
@@ -363,16 +397,20 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                                           padding: const EdgeInsets.symmetric(horizontal: 12),
                                           tier: state.glassTier,
                                           insideGlass: true,
-                                          onTap: () async {
-                                            final ok = await showGrassBagConfirmDialog(
-                                              context,
-                                              title: '清理已结束任务',
-                                              message: '确定移除全部 $endedCount 条已结束的一次性/过期定时任务吗？',
-                                              confirmLabel: '清理',
-                                              isDestructive: true,
-                                            );
-                                            if (ok) unawaited(ctrl.pruneInactiveSchedules());
-                                          },
+                                          destructive: true,
+                                          enabled: state.isDshConnected,
+                                          onTap: !state.isDshConnected
+                                              ? null
+                                              : () async {
+                                                  final ok = await showGrassBagConfirmDialog(
+                                                    context,
+                                                    title: '清理已结束任务',
+                                                    message: '确定移除全部 $endedCount 条已结束的一次性/过期定时任务吗？',
+                                                    confirmLabel: '清理',
+                                                    isDestructive: true,
+                                                  );
+                                                  if (ok) unawaited(ctrl.pruneInactiveSchedules());
+                                                },
                                         ),
                                       ),
                                     ],
@@ -385,7 +423,7 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                                   child: GrassBagCard(
                                     padding: const EdgeInsets.symmetric(vertical: 34),
                                     child: Center(
-                                      child: CupertinoActivityIndicator(radius: 11, color: t.primary),
+                                      child: GrassBagActivityIndicator(radius: 11, color: t.primary),
                                     ),
                                   ),
                                 )
@@ -437,6 +475,7 @@ class _SchedulesPageState extends ConsumerState<SchedulesPage> {
                                         child: _ScheduleCard(
                                           item: item,
                                           tier: state.glassTier,
+                                          connected: state.isDshConnected,
                                           historyExpanded: _expandedHistory.contains(item.id),
                                           runningNow: _runningIds.contains(item.id),
                                           loadingHistory: _loadingHistoryIds.contains(item.id),
@@ -537,6 +576,7 @@ class _ScheduleCard extends StatelessWidget {
   const _ScheduleCard({
     required this.item,
     required this.tier,
+    required this.connected,
     required this.historyExpanded,
     required this.runningNow,
     required this.loadingHistory,
@@ -549,6 +589,7 @@ class _ScheduleCard extends StatelessWidget {
 
   final ScheduleTaskRecord item;
   final GrassBagGlassTier tier;
+  final bool connected;
   final bool historyExpanded;
   final bool runningNow;
   final bool loadingHistory;
@@ -599,28 +640,33 @@ class _ScheduleCard extends StatelessWidget {
                       crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
                         Text(
-                          '${item.humanSchedule.trim().isNotEmpty ? item.humanSchedule : describeCronZh(item.cronExpr)} · ${item.timezone}',
+                          [
+                            item.humanSchedule.trim().isNotEmpty
+                                ? item.humanSchedule.trim()
+                                : describeCronZh(item.cronExpr),
+                            if (item.timezone.trim().isNotEmpty) item.timezone.trim(),
+                          ].join(' · '),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
                         ),
                         if (item.cronExpr.trim().isNotEmpty)
-                          Container(
+                          ConstrainedBox(
                             constraints: const BoxConstraints(maxWidth: 132),
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: t.fill1,
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                            child: Text(
-                              item.cronExpr,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                fontFamily: 'monospace',
-                                fontWeight: FontWeight.w500,
-                                color: t.text3,
+                            child: GrassBagFresnelGlassSurface(
+                              isPill: true,
+                              innerWell: true,
+                              padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
+                              child: Text(
+                                item.cronExpr,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontFamily: 'monospace',
+                                  fontWeight: FontWeight.w500,
+                                  color: t.text3,
+                                ),
                               ),
                             ),
                           ),
@@ -631,12 +677,10 @@ class _ScheduleCard extends StatelessWidget {
               ),
               const SizedBox(width: 10),
               if (item.isEnded)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: t.fill2,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 4),
                   child: Text(
                     '已结束',
                     style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.text3),
@@ -646,18 +690,16 @@ class _ScheduleCard extends StatelessWidget {
                 GrassBagGlassSwitch(
                   value: item.enabled,
                   tier: tier,
-                  onChanged: (_) => onToggleEnabled(),
+                  onChanged: connected ? (_) => onToggleEnabled() : null,
                 ),
             ],
           ),
           const SizedBox(height: 10),
-          Container(
+          GrassBagFresnelGlassSurface(
+            borderRadius: 13,
+            innerWell: true,
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
-            decoration: BoxDecoration(
-              color: t.fill1,
-              borderRadius: BorderRadius.circular(13),
-            ),
             child: Text(
               item.prompt,
               style: TextStyle(fontSize: 12.5, height: 1.4, color: t.text2),
@@ -675,18 +717,27 @@ class _ScheduleCard extends StatelessWidget {
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(color: statusColor, shape: BoxShape.circle),
+                  GrassBagStatusDot(
+                    size: 7,
+                    color: statusColor,
+                    pulsing: runningNow,
                   ),
                   const SizedBox(width: 6),
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 220),
                     child: Text(
-                      item.nextRunAt.isNotEmpty && item.enabled && !item.isEnded
-                          ? '下次：${item.nextRunAt} · 最近：${item.lastRunAt}'
-                          : '最近运行：${item.lastRunAt}',
+                      () {
+                        final hasNext = item.nextRunAt.trim().isNotEmpty &&
+                            item.enabled &&
+                            !item.isEnded;
+                        final hasLast = item.lastRunAt.trim().isNotEmpty;
+                        if (hasNext && hasLast) {
+                          return '下次：${item.nextRunAt.trim()} · 最近：${item.lastRunAt.trim()}';
+                        }
+                        if (hasNext) return '下次：${item.nextRunAt.trim()}';
+                        if (hasLast) return '最近运行：${item.lastRunAt.trim()}';
+                        return '尚未运行';
+                      }(),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 11.5, color: t.text3),
@@ -694,13 +745,15 @@ class _ScheduleCard extends StatelessWidget {
                   ),
                 ],
               ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
+              Wrap(
+                spacing: 4,
+                runSpacing: 6,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   GrassBagSpringTap(
                     onTap: onToggleHistory,
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                       child: Text(
                         historyExpanded
                             ? '收起记录'
@@ -709,53 +762,70 @@ class _ScheduleCard extends StatelessWidget {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 4),
                   GrassBagSpringTap(
-                    enabled: !runningNow,
+                    enabled: connected && !runningNow,
                     onTap: onRunNow,
+                    enablePointerGlow: false,
                     haptic: true,
-                    child: Container(
+                    child: GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      interactive: connected && !runningNow,
+                      tintColor: t.primarySoft,
                       padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: t.primarySoft,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           if (runningNow)
-                            CupertinoActivityIndicator(radius: 6, color: t.primary)
+                            GrassBagActivityIndicator(radius: 6, color: t.primary)
                           else
-                            Icon(CupertinoIcons.play_fill, size: 11, color: t.primary),
+                            Icon(CupertinoIcons.play_fill, size: 11, color: connected ? t.primary : t.text3),
                           const SizedBox(width: 4),
                           Text(
                             runningNow ? '执行中…' : '立即执行',
-                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: connected ? t.primary : t.text3,
+                            ),
                           ),
                         ],
                       ),
                     ),
                   ),
-                  const SizedBox(width: 4),
                   Tooltip(
                     message: '编辑定时任务',
                     child: GrassBagSpringTap(
+                      enabled: connected,
                       onTap: onEdit,
                       child: SizedBox(
                         width: 40,
                         height: 40,
-                        child: Center(child: Icon(CupertinoIcons.pencil, size: 15.5, color: t.text2)),
+                        child: Center(
+                          child: Icon(
+                            CupertinoIcons.pencil,
+                            size: 15.5,
+                            color: connected ? t.text2 : t.text3.withValues(alpha: 0.45),
+                          ),
+                        ),
                       ),
                     ),
                   ),
                   Tooltip(
                     message: '删除定时任务',
                     child: GrassBagSpringTap(
+                      enabled: connected,
                       onTap: onDelete,
                       child: SizedBox(
                         width: 40,
                         height: 40,
-                        child: Center(child: Icon(CupertinoIcons.trash, size: 15.5, color: t.text3)),
+                        child: Center(
+                          child: Icon(
+                            CupertinoIcons.trash,
+                            size: 15.5,
+                            color: connected ? t.err : t.text3.withValues(alpha: 0.45),
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -771,20 +841,17 @@ class _ScheduleCard extends StatelessWidget {
             child: historyExpanded
                 ? Padding(
                     padding: const EdgeInsets.only(top: 10),
-                    child: Container(
+                    child: GrassBagFresnelGlassSurface(
+                      borderRadius: 12,
+                      innerWell: true,
+                      paintTopSheen: !t.isDark,
                       width: double.infinity,
+                      tintColor: t.isDark ? t.codeBg : null,
                       padding: const EdgeInsets.all(10),
-                      decoration: ShapeDecoration(
-                        color: t.isDark ? t.codeBg : t.fill1,
-                        shape: RoundedSuperellipseBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          side: BorderSide(color: t.sep, width: 0.6),
-                        ),
-                      ),
                       child: loadingHistory && item.history.isEmpty
                           ? Padding(
                               padding: const EdgeInsets.symmetric(vertical: 8),
-                              child: Center(child: CupertinoActivityIndicator(radius: 8, color: t.primary)),
+                              child: Center(child: GrassBagActivityIndicator(radius: 8, color: t.primary)),
                             )
                           : item.history.isEmpty
                               ? Text('暂无执行历史', style: TextStyle(fontSize: 12, color: t.text3))
@@ -835,8 +902,9 @@ class _ScheduleCard extends StatelessWidget {
 }
 
 class _CreateScheduleSheetBody extends ConsumerStatefulWidget {
-  const _CreateScheduleSheetBody({this.existing});
+  const _CreateScheduleSheetBody({this.existing, this.onDirtyChanged});
   final ScheduleTaskRecord? existing;
+  final ValueChanged<bool>? onDirtyChanged;
 
   @override
   ConsumerState<_CreateScheduleSheetBody> createState() => _CreateScheduleSheetBodyState();
@@ -875,19 +943,33 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
   bool _submitting = false;
   String? _err;
 
+  late final String _initialName;
+  late final String _initialPrompt;
+  late final String _initialCron;
+
   @override
   void initState() {
     super.initState();
     final ex = widget.existing;
-    _nameCtrl = TextEditingController(text: ex?.name ?? '');
-    _promptCtrl = TextEditingController(text: ex?.prompt ?? '');
+    _initialName = ex?.name ?? '';
+    _initialPrompt = ex?.prompt ?? '';
+    _nameCtrl = TextEditingController(text: _initialName);
+    _promptCtrl = TextEditingController(text: _initialPrompt);
     final isNonCronExisting = ex != null && ex.kind != 'cron' && !isValidCron5Field(ex.cronExpr);
     _keepExistingNonCronTiming = isNonCronExisting;
     final initCron = (ex != null && isValidCron5Field(ex.cronExpr))
         ? ex.cronExpr.trim()
         : '0 9 * * *';
+    _initialCron = initCron;
     _cronCtrl = TextEditingController(text: initCron);
     _selectedPreset = _presets.indexWhere((p) => p.$2 == initCron);
+  }
+
+  void _syncDirty() {
+    final dirty = _nameCtrl.text.trim() != _initialName.trim() ||
+        _promptCtrl.text.trim() != _initialPrompt.trim() ||
+        (!_keepExistingNonCronTiming && _cronCtrl.text.trim() != _initialCron);
+    widget.onDirtyChanged?.call(dirty);
   }
 
   @override
@@ -955,6 +1037,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
       });
       return;
     }
+    widget.onDirtyChanged?.call(false);
     Navigator.of(context).pop();
   }
 
@@ -978,6 +1061,8 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
             children: [
               for (final tpl in _starterTemplates)
                 GrassBagSpringTap(
+                  enablePointerGlow: false,
+                  haptic: true,
                   onTap: () {
                     setState(() {
                       _nameCtrl.text = tpl.name;
@@ -986,13 +1071,14 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
                       _selectedPreset = _presets.indexWhere((p) => p.$2 == tpl.cron);
                       _err = null;
                     });
+                    _syncDirty();
                   },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: t.primarySoft,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 6),
                     child: Text(
                       tpl.label,
                       style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
@@ -1008,11 +1094,13 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
         GrassBagTextField(
           controller: _nameCtrl,
           insideGlass: true,
+          hasError: _err != null && _nameCtrl.text.trim().isEmpty,
           textInputAction: TextInputAction.next,
           onSubmitted: (_) => _keepExistingNonCronTiming
               ? _promptFocus.requestFocus()
               : _cronFocus.requestFocus(),
           onChanged: (_) {
+            _syncDirty();
             if (_err != null) setState(() => _err = null);
           },
           placeholder: '例如：每日依赖安全巡检',
@@ -1056,6 +1144,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
                     _cronCtrl.text = _presets[i].$2;
                     _err = null;
                   });
+                  _syncDirty();
                 },
               ),
           ],
@@ -1066,6 +1155,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
           focusNode: _cronFocus,
           insideGlass: true,
           monospace: true,
+          hasError: !cronValid || (_err != null && cronText.isEmpty),
           textInputAction: TextInputAction.next,
           onSubmitted: (_) => _promptFocus.requestFocus(),
           onChanged: (v) {
@@ -1074,6 +1164,7 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
               _selectedPreset = matchIdx;
               _err = null;
             });
+            _syncDirty();
           },
           placeholder: 'Cron 表达式，例如 0 9 * * *',
           fontSize: 13,
@@ -1090,11 +1181,20 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
             ),
             const SizedBox(width: 5),
             Expanded(
-              child: Text(
-                '$cronPreview  ·  顺序：分 时 日 月 周',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 11.5, color: cronValid ? t.text2 : t.warn),
+              child: Builder(
+                builder: (_) {
+                  final rawTz = widget.existing?.timezone.trim() ?? '';
+                  final tzLabel = rawTz.isNotEmpty ? rawTz : DateTime.now().timeZoneName;
+                  final tzPart = tzLabel.isNotEmpty ? ' · 时区：$tzLabel' : '';
+                  return Text(
+                    cronPreview.contains('分 时 日 月 周')
+                        ? cronPreview
+                        : '$cronPreview$tzPart · 分 时 日 月 周',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11.5, color: cronValid ? t.text2 : t.warn),
+                  );
+                },
               ),
             ),
           ],
@@ -1107,9 +1207,11 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
           controller: _promptCtrl,
           focusNode: _promptFocus,
           insideGlass: true,
+          hasError: _err != null && _promptCtrl.text.trim().isEmpty,
           maxLines: 3,
           minLines: 2,
           onChanged: (_) {
+            _syncDirty();
             if (_err != null) setState(() => _err = null);
           },
           placeholder: '输入到达时间后交给助手执行的任务描述…',
@@ -1128,7 +1230,8 @@ class _CreateScheduleSheetBodyState extends ConsumerState<_CreateScheduleSheetBo
                 label: '取消',
                 tier: tier,
                 insideGlass: true,
-                onTap: () => Navigator.of(context).pop(),
+                enabled: !_submitting,
+                onTap: _submitting ? null : () => Navigator.of(context).pop(),
               ),
             ),
             const SizedBox(width: 10),

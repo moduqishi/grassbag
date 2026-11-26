@@ -124,13 +124,23 @@ object TarGzExtractor {
                             if (typeFlag == 'x') {
                                 pax["path"]?.let { paxPath = it }
                                 pax["linkpath"]?.let { paxLinkPath = it }
-                                pax["size"]?.toLongOrNull()?.let { paxSize = it }
+                                pax["size"]?.let { rawPaxSize ->
+                                    val parsed = rawPaxSize.toLongOrNull()
+                                        ?: throw IOException("Invalid PAX size header: $rawPaxSize")
+                                    if (parsed < 0L) {
+                                        throw IOException("Negative PAX entry size: $parsed")
+                                    }
+                                    paxSize = parsed
+                                }
                             }
                             continue
                         }
                     }
 
                     val size = paxSize ?: rawSize
+                    if (size < 0L) {
+                        throw IOException("Invalid negative tar entry size: $size")
+                    }
 
                     val effectiveName = sanitizeRelativePath(paxPath ?: pendingLongName ?: baseName)
                     val effectiveLink = paxLinkPath ?: pendingLongLink ?: rawLink
@@ -163,7 +173,7 @@ object TarGzExtractor {
                         ) {
                             throw IOException("Tar entry parent escapes destination: $effectiveName")
                         }
-                        if (parent.isDirectory) {
+                        if (parent.isDirectory && parentCanon.path == parentRawPath) {
                             verifiedParents.add(parentRawPath)
                         }
                     }
@@ -176,7 +186,9 @@ object TarGzExtractor {
                             if (targetCanon.path != canonicalRoot.path && !targetCanon.path.startsWith(rootPrefix)) {
                                 throw IOException("Tar directory escapes destination: $effectiveName")
                             }
-                            verifiedParents.add(targetFile.path)
+                            if (targetFile.isDirectory && targetCanon.path == targetFile.path) {
+                                verifiedParents.add(targetFile.path)
+                            }
                             if (!freshDir || (mode and 0xE00) != 0) {
                                 runCatching { Os.chmod(targetFile.absolutePath, (mode and 0xFFF) or 0x1C0) }
                             }
@@ -188,8 +200,14 @@ object TarGzExtractor {
                             Os.symlink(effectiveLink, targetFile.absolutePath)
                             val symPath = targetFile.path
                             createdSymlinks.add(symPath)
-                            // Invalidate only cached parent paths that pass through this newly created symlink!
-                            verifiedParents.removeAll { it == symPath || it.startsWith("$symPath/") }
+                            val symParentCanon = targetFile.parentFile?.canonicalFile
+                            if (symParentCanon != null) {
+                                createdSymlinks.add(File(symParentCanon, targetFile.name).path)
+                            }
+                            // Clear all cached parent paths (retaining only canonicalRoot) so no symlink
+                            // alias or replacement anywhere in the tree can bypass containment checks.
+                            verifiedParents.clear()
+                            verifiedParents.add(canonicalRoot.path)
                             skipFully(tar, size)
                         }
                         '1' -> {
@@ -213,9 +231,13 @@ object TarGzExtractor {
                         }
                         '0', '\u0000' -> {
                             verifyParentContained(targetFile, requireDirExists = true)
-                            // On fresh empty target dirs, skip ~60k Os.lstat ENOENT throws unless
-                            // a symlink was previously created at this path in the same archive.
-                            if (!freshDir || createdSymlinks.contains(targetFile.path)) {
+                            // On fresh empty target dirs, skip ~60k Os.lstat ENOENT throws ONLY when
+                            // the parent is a verified real (non-symlink-aliased) directory AND no
+                            // symlink or directory was previously created at this path in the archive.
+                            val parentHasSymlinkAlias = targetFile.parentFile?.let { !verifiedParents.contains(it.path) } ?: false
+                            val mayCollideWithSymlink = createdSymlinks.isNotEmpty() &&
+                                (parentHasSymlinkAlias || createdSymlinks.contains(targetFile.path))
+                            if (!freshDir || mayCollideWithSymlink || targetFile.isDirectory) {
                                 val existingStat = runCatching { Os.lstat(targetFile.absolutePath) }.getOrNull()
                                 if (existingStat != null) {
                                     removeEntry(targetFile)
@@ -389,11 +411,21 @@ object TarGzExtractor {
     }
 
     private fun parseOctal(buf: ByteArray, off: Int, len: Int): Long {
-        // Handle GNU base-256 binary size encoding
+        // Handle GNU base-256 binary size encoding (reject negative 0xFF two's complement sizes)
         if ((buf[off].toInt() and 0x80) != 0) {
+            val lead = buf[off].toInt() and 0xFF
+            if (lead != 0x80) {
+                throw IOException("Unsupported or negative base-256 tar header value (0x${lead.toString(16)})")
+            }
             var v = 0L
             for (i in 1 until len) {
+                if (v > (Long.MAX_VALUE ushr 8)) {
+                    throw IOException("Base-256 tar header value overflow")
+                }
                 v = (v shl 8) or (buf[off + i].toLong() and 0xFF)
+            }
+            if (v < 0L) {
+                throw IOException("Negative base-256 tar header value")
             }
             return v
         }

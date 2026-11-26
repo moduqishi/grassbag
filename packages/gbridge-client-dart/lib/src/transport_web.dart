@@ -22,10 +22,12 @@ class GbridgeHttpTransport {
   final HostEndpoint endpoint;
   final Duration timeout;
   final void Function(String cookieHeader)? onCookieUpdated;
+  Future<bool>? _authExchangeFuture;
   bool _closed = false;
 
   String? get cookieHeader => null;
   void setCookieHeader(String? cookie) {}
+  void evictDshAuthCookies() {}
   void resetConnectionPool() {}
 
   Future<String?> probeDshSseVersion({Duration timeout = const Duration(seconds: 4)}) async {
@@ -161,21 +163,39 @@ class GbridgeHttpTransport {
     return false;
   }
 
-  Future<bool> exchangeAuthToken([String? tokenOverride]) async {
+  Future<bool> exchangeAuthToken([String? tokenOverride]) {
     final token = tokenOverride ?? endpoint.token;
-    if (token == null || token.isEmpty || endpoint.isUnixSocket) return false;
-    try {
-      final uri = endpoint.resolveHttpUri('/', {'token': token});
-      final init = JSObject();
-      init.setProperty('method'.toJS, 'GET'.toJS);
-      init.setProperty('credentials'.toJS, 'include'.toJS);
-      final fetched = await _fetchWithAbort(uri, init);
-      final status = (fetched.response.getProperty<JSNumber>('status'.toJS)).toDartInt;
-      _abortQuietly(fetched.abortCtrl);
-      return status >= 200 && status < 400;
-    } catch (_) {
-      return false;
+    if (token == null || token.isEmpty || endpoint.isUnixSocket) {
+      return Future.value(false);
     }
+    if (tokenOverride == null && _authExchangeFuture != null) {
+      return _authExchangeFuture!;
+    }
+    Future<bool> run() async {
+      try {
+        final uri = endpoint.resolveHttpUri('/', {'token': token});
+        final init = JSObject();
+        init.setProperty('method'.toJS, 'GET'.toJS);
+        init.setProperty('credentials'.toJS, 'include'.toJS);
+        final fetched = await _fetchWithAbort(uri, init);
+        final status = (fetched.response.getProperty<JSNumber>('status'.toJS)).toDartInt;
+        _abortQuietly(fetched.abortCtrl);
+        return status >= 200 && status < 400;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    final future = run();
+    if (tokenOverride == null) {
+      _authExchangeFuture = future;
+      future.whenComplete(() {
+        if (identical(_authExchangeFuture, future)) {
+          _authExchangeFuture = null;
+        }
+      }).ignore();
+    }
+    return future;
   }
 
   Map<String, String> buildAuthHeaders() {
@@ -624,6 +644,7 @@ class GbridgeStreamClient {
     final welcomeCompleter = Completer<WelcomeInfo>();
     welcomeCompleter.future.ignore();
 
+    _activeConnects++;
     try {
       final token = _transport.endpoint.token;
       var cookieReady = false;
@@ -737,8 +758,12 @@ class GbridgeStreamClient {
         }
       }
       rethrow;
+    } finally {
+      _activeConnects = _activeConnects > 0 ? _activeConnects - 1 : 0;
     }
   }
+
+  int _activeConnects = 0;
 
   void subscribe(String channel, {bool force = false}) {
     if (channel.isEmpty) return;
@@ -796,6 +821,7 @@ class GbridgeStreamClient {
       return;
     }
     if (_disposed || _manualDisconnect) return;
+    if (_activeConnects > 0) return;
     if (_phase == ConnectionPhase.connected && _ws != null) {
       unawaited(checkLiveness());
       return;
@@ -1068,9 +1094,17 @@ class GbridgeStreamClient {
     }
     final oldWs = _ws;
     _ws = null;
-    try {
-      oldWs?.callMethod<JSAny?>('close'.toJS, 1000.toJS, 'client disconnect'.toJS);
-    } catch (_) {}
+    if (oldWs != null) {
+      try {
+        oldWs.setProperty('onopen'.toJS, null);
+        oldWs.setProperty('onmessage'.toJS, null);
+        oldWs.setProperty('onerror'.toJS, null);
+        oldWs.setProperty('onclose'.toJS, null);
+      } catch (_) {}
+      try {
+        oldWs.callMethod<JSAny?>('close'.toJS, 1000.toJS, 'client disconnect'.toJS);
+      } catch (_) {}
+    }
     _setPhase(ConnectionPhase.disconnected);
   }
 

@@ -149,11 +149,25 @@ class KeystoreVault(ctx: Context) {
             String(cipher.doFinal(enc), Charsets.UTF_8)
         }.getOrNull()
 
+        val hadCachedKey = cachedKey != null
         val primary = masterKey()
         tryDecrypt(primary, withAad = true)?.let { return it }
         tryDecrypt(primary, withAad = false)?.let { plain ->
             runCatching { putSecret(k, plain) }
             return plain
+        }
+        // If a stale cached SecretKey reference failed after a keystore daemon reload/lock cycle,
+        // clear cache and reload once from AndroidKeyStore before trying fallback key.
+        if (hadCachedKey) {
+            cachedKey = null
+            val refreshed = masterKey()
+            if (refreshed !== primary) {
+                tryDecrypt(refreshed, withAad = true)?.let { return it }
+                tryDecrypt(refreshed, withAad = false)?.let { plain ->
+                    runCatching { putSecret(k, plain) }
+                    return plain
+                }
+            }
         }
         // Fallback file key recovery if putSecret fell back after an OEM KeyStore GCM error.
         val fbDir = runCatching { appCtx.noBackupFilesDir }.getOrNull() ?: appCtx.filesDir

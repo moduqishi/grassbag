@@ -33,6 +33,41 @@ void main() {
       expect(parsed.token, 'json_tok_abc');
       expect(parsed.suggestedName, 'DevBox');
     });
+
+    test('v53 strictQr rejects unrelated barcodes, bare words, and consumer URLs while accepting valid pairing payloads', () {
+      expect(parseRemoteHostInput('hello', strictQr: true), isNull);
+      expect(parseRemoteHostInput('6901234567890', strictQr: true), isNull);
+      expect(parseRemoteHostInput('https://example.com/promo?utm_source=qr', strictQr: true), isNull);
+      expect(parseRemoteHostInput('wxp://f2f0abcdef1234567890', strictQr: true), isNull);
+
+      final deepLink = parseRemoteHostInput(
+        'grassbag://pair?url=http%3A%2F%2F192.168.1.8%3A3080&token=tok_strict_1',
+        strictQr: true,
+      );
+      expect(deepLink?.address, 'http://192.168.1.8:3080');
+      expect(deepLink?.token, 'tok_strict_1');
+
+      final lanUrl = parseRemoteHostInput(
+        'http://192.168.1.8:3080/?token=tok_lan_2',
+        strictQr: true,
+      );
+      expect(lanUrl?.address, 'http://192.168.1.8:3080');
+      expect(lanUrl?.token, 'tok_lan_2');
+
+      final httpsTokenUrl = parseRemoteHostInput(
+        'https://my-host.example.com/?token=tok_https_3',
+        strictQr: true,
+      );
+      expect(httpsTokenUrl?.address, 'https://my-host.example.com');
+      expect(httpsTokenUrl?.token, 'tok_https_3');
+
+      final jsonPayload = parseRemoteHostInput(
+        '{"url":"http://10.0.0.5:3080","token":"tok_json_4","name":"Lab"}',
+        strictQr: true,
+      );
+      expect(jsonPayload?.address, 'http://10.0.0.5:3080');
+      expect(jsonPayload?.token, 'tok_json_4');
+    });
   });
 
   group('installHelperBundleDetailed mirror fallback & ChangeResult handling', () {

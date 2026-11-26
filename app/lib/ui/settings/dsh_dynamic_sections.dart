@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -387,7 +389,7 @@ class DshWebSearchSettingsView extends ConsumerWidget {
             dynamicOptions: buildDynamicSchemaOptions(state),
             submitLabel: '保存默认搜索与抓取引擎',
             showJsonToggle: false,
-            insideGlass: true,
+            insideGlass: false,
             onSubmit: (vals) async {
               final ops = computeSchemasteryMutationOps(
                 webNs.value,
@@ -567,22 +569,34 @@ class DshMcpSettingsView extends ConsumerWidget {
                     children: [
                       GrassBagSecondaryGlassButton(
                         label: mcp.status == 'probing' ? '探测中' : '探测',
-                        height: 28,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        height: 32,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
                         tier: state.glassTier,
                         insideGlass: true,
                         enabled: mcp.status != 'probing',
                         onTap: mcp.status == 'probing' ? null : () => ctrl.probeMcpServer(mcp.name),
                       ),
-                      const SizedBox(width: 4),
+                      const SizedBox(width: 8),
                       GrassBagSecondaryGlassButton(
                         label: '重启',
-                        height: 28,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        height: 32,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
                         tier: state.glassTier,
                         insideGlass: true,
                         enabled: mcp.status != 'probing',
-                        onTap: mcp.status == 'probing' ? null : () => ctrl.restartMcpServer(mcp.name),
+                        onTap: mcp.status == 'probing'
+                            ? null
+                            : () async {
+                                final ok = await showGrassBagConfirmDialog(
+                                  context,
+                                  title: '重启 MCP 服务「${mcp.name}」？',
+                                  message: '重启期间该服务暴露的工具将短暂不可用，完成后自动重连。',
+                                  confirmLabel: '确认重启',
+                                );
+                                if (ok) {
+                                  unawaited(ctrl.restartMcpServer(mcp.name));
+                                }
+                              },
                       ),
                     ],
                   ),
@@ -601,7 +615,7 @@ class DshMcpSettingsView extends ConsumerWidget {
             tier: state.glassTier,
             readOnly: !mcpNs.writable || !state.isDshConnected,
             submitLabel: '保存 MCP 服务器配置',
-            insideGlass: true,
+            insideGlass: false,
             onSubmit: (vals) async {
               final ops = computeSchemasteryMutationOps(
                 mcpNs.value,
@@ -633,12 +647,19 @@ class DshMcpSettingsView extends ConsumerWidget {
 }
 
 /// DSH Plugins & Auto-Discovered Third-Party Plugin Settings View (`plugins` manifest section).
-class DshPluginsSettingsView extends ConsumerWidget {
+class DshPluginsSettingsView extends ConsumerStatefulWidget {
   const DshPluginsSettingsView({super.key, this.thirdPartyNamespaces = const []});
   final List<String> thirdPartyNamespaces;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<DshPluginsSettingsView> createState() => _DshPluginsSettingsViewState();
+}
+
+class _DshPluginsSettingsViewState extends ConsumerState<DshPluginsSettingsView> {
+  final Set<String> _busyPluginIds = <String>{};
+
+  @override
+  Widget build(BuildContext context) {
     ref.watch(
       appProvider.select(
         (s) => (
@@ -655,7 +676,10 @@ class DshPluginsSettingsView extends ConsumerWidget {
     final ctrl = ref.read(appProvider.notifier);
     final t = GrassBagTokens.of(context);
     final nsMap = {for (final n in state.effectiveDshNamespaces) n.ns: n};
-    final extraNs = [for (final id in thirdPartyNamespaces) if (nsMap.containsKey(id)) nsMap[id]!];
+    final extraNs = [
+      for (final id in widget.thirdPartyNamespaces)
+        if (nsMap.containsKey(id)) nsMap[id]!,
+    ];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -720,27 +744,55 @@ class DshPluginsSettingsView extends ConsumerWidget {
               for (final plugin in state.plugins)
                 () {
                   final idLower = plugin.id.toLowerCase();
+                  final busy = _busyPluginIds.contains(plugin.id);
                   final isCore = !plugin.optional ||
                       idLower.endsWith('dsh-base') ||
                       idLower.endsWith('dsh-web-app') ||
                       idLower.endsWith('dsh-headless') ||
                       idLower.endsWith('dsh-gbridge') ||
                       idLower == 'base';
+                  final versionLabel = plugin.version.trim();
+                  final descText = (plugin.readOnlyReason != null &&
+                          plugin.readOnlyReason!.trim().isNotEmpty)
+                      ? '${plugin.desc} · ${plugin.readOnlyReason!.trim()}'
+                      : plugin.desc;
                   return GrassBagListTile(
-                    title: Text('${plugin.name}  ${plugin.version}'),
-                    subtitle: Text(
-                      plugin.desc,
-                      maxLines: 2,
+                    title: Text(
+                      plugin.name,
+                      maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    trailing: isCore
-                        ? Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: t.fill1,
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(color: t.sep, width: 0.6),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (versionLabel.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 2),
+                            child: Text(
+                              versionLabel.startsWith('v') ? versionLabel : 'v$versionLabel',
+                              maxLines: 1,
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontFamily: 'monospace',
+                                color: t.text3,
+                              ),
                             ),
+                          ),
+                        Text(
+                          descText,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                    trailing: isCore
+                        ? GrassBagFresnelGlassSurface(
+                            isPill: true,
+                            innerWell: true,
+                            padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 4),
                             child: Text(
                               '内置核心',
                               style: TextStyle(
@@ -750,12 +802,30 @@ class DshPluginsSettingsView extends ConsumerWidget {
                               ),
                             ),
                           )
-                        : GrassBagGlassSwitch(
-                            value: plugin.enabled,
-                            tier: state.glassTier,
-                            activeColor: t.ok,
-                            onChanged: (_) => ctrl.togglePlugin(plugin.id),
-                          ),
+                        : busy
+                            ? SizedBox(
+                                width: 60,
+                                child: Center(
+                                  child: GrassBagActivityIndicator(radius: 7.5, color: t.primary),
+                                ),
+                              )
+                            : GrassBagGlassSwitch(
+                                value: plugin.enabled,
+                                tier: state.glassTier,
+                                activeColor: t.ok,
+                                onChanged: !state.isDshConnected
+                                    ? null
+                                    : (_) async {
+                                        setState(() => _busyPluginIds.add(plugin.id));
+                                        try {
+                                          await ctrl.togglePlugin(plugin.id);
+                                        } finally {
+                                          if (mounted) {
+                                            setState(() => _busyPluginIds.remove(plugin.id));
+                                          }
+                                        }
+                                      },
+                              ),
                   );
                 }(),
             ],
@@ -839,60 +909,148 @@ void showAllRawNamespacesSheet(BuildContext context, WidgetRef ref) {
   );
 }
 
-/// Recent errors inspection card shown in Diagnostics + tappable copy.
+/// Recent errors inspection card shown in Diagnostics with explicit copy & clear actions.
 class RecentErrorsDiagnosticsCard extends StatelessWidget {
-  const RecentErrorsDiagnosticsCard({super.key, required this.errors});
+  const RecentErrorsDiagnosticsCard({
+    super.key,
+    required this.errors,
+    this.onClear,
+  });
   final List<AppErrorRecord> errors;
+  final VoidCallback? onClear;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     if (errors.isEmpty) return const SizedBox.shrink();
-    return GrassBagGroupedSection(
-      header: '最近捕获的错误 (${errors.length})',
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final e in errors.take(8))
-          GrassBagListTile(
-            leading: GrassBagSquircleIcon(
-              icon: CupertinoIcons.exclamationmark_triangle_fill,
-              color: t.err,
-              size: 30,
-              iconSize: 14,
-            ),
-            title: Text(e.summary, style: TextStyle(fontWeight: FontWeight.w600, color: t.err)),
-            subtitle: Text(
-              e.detail,
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.text2),
-            ),
-            onTap: () {
-              Clipboard.setData(ClipboardData(text: '${e.summary}\n${e.detail}'));
-              showGrassBagSheet<void>(
-                context,
-                title: e.summary,
-                subtitle: '已自动复制到剪贴板',
-                bodyBuilder: (ctx) {
-                  final st = GrassBagTokens.of(ctx);
-                  return Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: ShapeDecoration(
-                      color: st.errSoft,
-                      shape: RoundedSuperellipseBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        side: BorderSide(color: st.err.withValues(alpha: 0.28), width: 0.65),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '最近捕获的错误 (${errors.length})',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text3),
+                ),
+              ),
+              if (onClear != null)
+                GrassBagSpringTap(
+                  pressedScale: 0.94,
+                  haptic: true,
+                  onTap: onClear!,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    child: Text(
+                      '清空记录',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: t.primary,
                       ),
                     ),
-                    child: SelectableText(
-                      e.detail,
-contextMenuBuilder: buildGrassBagEditableContextMenu,
-                      style: TextStyle(fontFamily: 'monospace', fontSize: 12, height: 1.5, color: st.err),
-                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        GrassBagGroupedSection(
+          children: [
+            for (final e in errors.take(8))
+              GrassBagListTile(
+                leading: GrassBagSquircleIcon(
+                  icon: CupertinoIcons.exclamationmark_triangle_fill,
+                  color: t.err,
+                  size: 30,
+                  iconSize: 14,
+                ),
+                title: Text(e.summary, style: TextStyle(fontWeight: FontWeight.w600, color: t.err)),
+                subtitle: Text(
+                  e.detail,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.text2),
+                ),
+                showChevron: true,
+                onTap: () {
+                  showGrassBagSheet<void>(
+                    context,
+                    title: e.summary,
+                    subtitle: '可长按选取或点击下方复制完整错误详情',
+                    icon: CupertinoIcons.exclamationmark_triangle_fill,
+                    iconColor: t.err,
+                    expandable: true,
+                    bodyBuilder: (ctx) {
+                      final st = GrassBagTokens.of(ctx);
+                      final container = ProviderScope.containerOf(ctx, listen: false);
+                      final tier = container.read(appProvider).glassTier;
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          GrassBagFresnelGlassSurface(
+                            borderRadius: 15,
+                            innerWell: true,
+                            tintColor: st.errSoft,
+                            padding: const EdgeInsets.all(12),
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxHeight: 280),
+                              child: SingleChildScrollView(
+                                physics: const BouncingScrollPhysics(),
+                                child: SelectableText(
+                                  e.detail,
+                                  contextMenuBuilder: buildGrassBagEditableContextMenu,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 12,
+                                    height: 1.5,
+                                    color: st.err,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: GrassBagSecondaryGlassButton(
+                                  label: '关闭',
+                                  tier: tier,
+                                  insideGlass: true,
+                                  onTap: () => Navigator.of(ctx).pop(),
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: GrassBagPrimaryGlassButton(
+                                  label: '复制详情',
+                                  icon: CupertinoIcons.doc_on_doc,
+                                  tier: tier,
+                                  insideGlass: true,
+                                  onTap: () {
+                                    Clipboard.setData(
+                                      ClipboardData(text: '${e.summary}\n${e.detail}'),
+                                    );
+                                    Navigator.of(ctx).pop();
+                                    container
+                                        .read(appProvider.notifier)
+                                        .showToast('已复制错误详情', tone: ToastTone.ok);
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      );
+                    },
                   );
                 },
-              );
-            },
-          ),
+              ),
+          ],
+        ),
       ],
     );
   }

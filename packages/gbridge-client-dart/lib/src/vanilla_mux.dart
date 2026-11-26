@@ -68,6 +68,7 @@ class VanillaDshMuxEngine {
   bool _disposed = false;
   bool _manualDisconnect = false;
   final Map<String, Set<String>> _sessionAlwaysAllowed = <String, Set<String>>{};
+  final Set<String> _cancelledAutoApproveIds = <String>{};
   Timer? _idleWatchdogTimer;
 
   static String _approvalToolKey(Map<String, dynamic> payload) {
@@ -129,6 +130,7 @@ class VanillaDshMuxEngine {
   }
 
   void markInteractionResolved(String id, {String reason = 'responded'}) {
+    _cancelledAutoApproveIds.remove(id);
     final removed = _pendingInteractions.remove(id);
     if (removed != null) {
       _publish('host', 'interaction.resolved', {'id': id, 'kind': removed.kind, 'reason': reason});
@@ -163,6 +165,7 @@ class VanillaDshMuxEngine {
     final welcomeCompleter = Completer<WelcomeInfo>();
     welcomeCompleter.future.ignore();
 
+    _activeConnects++;
     try {
       final ws = await openSocket('/api/remote.mux');
       if (_disposed || _manualDisconnect || epoch != _connEpoch) {
@@ -244,8 +247,12 @@ class VanillaDshMuxEngine {
         }
       }
       rethrow;
+    } finally {
+      _activeConnects = _activeConnects > 0 ? _activeConnects - 1 : 0;
     }
   }
+
+  int _activeConnects = 0;
 
   void _finishHandshake(int epoch, Completer<WelcomeInfo> completer) {
     if (epoch != _connEpoch || completer.isCompleted) return;
@@ -380,6 +387,7 @@ class VanillaDshMuxEngine {
   void unsubscribe(String channel) {
     if (channel == 'host') return;
     _channels.remove(channel);
+    _pendingDeltas.remove(channel);
     final existing = _activeChannelStreams.remove(channel);
     if (existing != null) {
       _streamIdToChannel.remove(existing.streamId);
@@ -426,11 +434,13 @@ class VanillaDshMuxEngine {
 
   void reconnectNow() {
     if (_disposed || _manualDisconnect) return;
+    if (_activeConnects > 0) return;
     if (_phase == ConnectionPhase.connected && _ws != null) {
       unawaited(checkLiveness());
       return;
     }
     if (_reconnectTimer != null ||
+        _phase == ConnectionPhase.reconnecting ||
         _phase == ConnectionPhase.disconnected ||
         _phase == ConnectionPhase.error) {
       _reconnectTimer?.cancel();
@@ -448,7 +458,7 @@ class VanillaDshMuxEngine {
   }
 
   Future<bool> checkLiveness({
-    Duration timeout = const Duration(seconds: 3),
+    Duration timeout = const Duration(seconds: 6),
     bool force = false,
   }) async {
     if (_disposed || _manualDisconnect) return false;
@@ -496,6 +506,7 @@ class VanillaDshMuxEngine {
   }
 
   void _openChannelStream(String channel, {bool useLegacySessionFollow = false}) {
+    _pendingDeltas.remove(channel);
     final prev = _activeChannelStreams.remove(channel);
     if (prev != null) {
       _streamIdToChannel.remove(prev.streamId);
@@ -740,15 +751,6 @@ class VanillaDshMuxEngine {
       final payloadRaw = frame['request'] ?? frame['payload'] ?? frame;
       final payload = payloadRaw is Map ? _asStringMap(payloadRaw) : <String, dynamic>{};
       final sessionId = (frame['agentId'] ?? payload['sessionId'])?.toString();
-      if (kind == 'approval' &&
-          _eventsClientId != null &&
-          onAutoApprove != null &&
-          _isSessionAlwaysAllowed(sessionId, payload)) {
-        unawaited(
-          onAutoApprove!(_eventsClientId!, eventId).catchError((_) {}),
-        );
-        return;
-      }
       final item = _PendingVanillaInteraction(
         id: eventId,
         kind: kind,
@@ -759,17 +761,44 @@ class VanillaDshMuxEngine {
         payload: payload,
         createdAt: DateTime.now().millisecondsSinceEpoch,
       );
+      if (kind == 'approval' &&
+          _eventsClientId != null &&
+          onAutoApprove != null &&
+          _isSessionAlwaysAllowed(sessionId, payload)) {
+        _cancelledAutoApproveIds.remove(eventId);
+        final approveEpoch = epoch;
+        unawaited(
+          onAutoApprove!(_eventsClientId!, eventId).catchError((_) {
+            if (_disposed ||
+                approveEpoch != _connEpoch ||
+                _cancelledAutoApproveIds.remove(eventId) ||
+                _pendingInteractions.containsKey(eventId)) {
+              return;
+            }
+            _pendingInteractions[eventId] = item;
+            _publish('host', 'interaction.requested', item.toJson());
+          }),
+        );
+        return;
+      }
       _pendingInteractions[eventId] = item;
       _publish('host', 'interaction.requested', item.toJson());
       return;
     }
     if (type == 'cancel' || type == 'resolved') {
       final eventId = frame['eventId']?.toString() ?? '';
-      if (eventId.isNotEmpty && _pendingInteractions.remove(eventId) != null) {
-        _publish('host', 'interaction.resolved', {
-          'id': eventId,
-          'reason': frame['reason']?.toString() ?? 'settled_elsewhere',
-        });
+      if (eventId.isNotEmpty) {
+        if (_pendingInteractions.remove(eventId) != null) {
+          _publish('host', 'interaction.resolved', {
+            'id': eventId,
+            'reason': frame['reason']?.toString() ?? 'settled_elsewhere',
+          });
+        } else {
+          _cancelledAutoApproveIds.add(eventId);
+          while (_cancelledAutoApproveIds.length > 128) {
+            _cancelledAutoApproveIds.remove(_cancelledAutoApproveIds.first);
+          }
+        }
       }
     }
   }
@@ -1108,14 +1137,16 @@ class VanillaDshMuxEngine {
 
   void _startIdleWatchdog(int epoch) {
     _idleWatchdogTimer?.cancel();
-    _idleWatchdogTimer = Timer.periodic(const Duration(seconds: 28), (_) {
+    // RFC6455 control pings run every 15s on the socket; keep application-level
+    // `workspace/follow` probing sparse (5 min) to avoid waking mobile radios when idle.
+    _idleWatchdogTimer = Timer.periodic(const Duration(minutes: 5), (_) {
       if (_disposed || _manualDisconnect || epoch != _connEpoch || _phase != ConnectionPhase.connected) {
         _idleWatchdogTimer?.cancel();
         _idleWatchdogTimer = null;
         return;
       }
       final idleMs = DateTime.now().millisecondsSinceEpoch - _lastInboundAtMs;
-      if (idleMs >= 25000) {
+      if (idleMs >= 240000) {
         unawaited(checkLiveness(force: true));
       }
     });

@@ -120,8 +120,10 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
 
     if (_supportsNativeWebView) {
       try {
+        final isDarkNow = ref.read(appProvider).isDark;
         final ctrl = WebViewController()
           ..setJavaScriptMode(JavaScriptMode.unrestricted)
+          ..setBackgroundColor(isDarkNow ? const Color(0xFF141B26) : const Color(0xFFF6F9FC))
           ..setNavigationDelegate(
             NavigationDelegate(
               onPageStarted: (startedUrl) {
@@ -532,155 +534,222 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                 Expanded(
                   child: Padding(
                     padding: EdgeInsets.fromLTRB(12, 0, 12, botPad > 0 ? botPad + 8 : 14),
-                    child: ClipRSuperellipse(
-                      borderRadius: BorderRadius.circular(24),
-                      child: Container(
-                        decoration: ShapeDecoration(
-                          color: t.cardSolid,
-                          shape: RoundedSuperellipseBorder(
-                            borderRadius: BorderRadius.circular(24),
-                            side: BorderSide(color: t.sepStrong, width: 0.65),
+                    child: CustomPaint(
+                      foregroundPainter: state.glassTier == GrassBagGlassTier.solid
+                          ? null
+                          : GrassBagFresnelRimPainter(
+                              isDark: t.isDark,
+                              borderRadius: 24,
+                              accent: t.primaryHi,
+                              frosted: state.glassTier == GrassBagGlassTier.frosted,
+                              paintTopSheen: false,
+                              strokeWidth: 0.88,
+                            ),
+                      child: ClipRSuperellipse(
+                        borderRadius: BorderRadius.circular(24),
+                        child: Container(
+                          decoration: ShapeDecoration(
+                            color: t.cardSolid,
+                            shape: RoundedSuperellipseBorder(
+                              borderRadius: BorderRadius.circular(24),
+                              side: state.glassTier == GrassBagGlassTier.solid
+                                  ? BorderSide(color: t.sepStrong, width: 0.65)
+                                  : BorderSide.none,
+                            ),
                           ),
-                        ),
                         child: Column(
                           children: [
                             Container(
-                              height: 42,
+                              height: 46,
                               padding: const EdgeInsets.symmetric(horizontal: 10),
                               decoration: BoxDecoration(
-                                color: t.fill1,
+                                color: t.isDark
+                                    ? Colors.white.withValues(alpha: 0.04)
+                                    : t.fill1.withValues(alpha: 0.72),
                                 border: Border(bottom: BorderSide(color: t.sep, width: 0.5)),
                               ),
                               child: Row(
                                 children: [
                                   if (_webController != null) ...[
-                                    GrassBagSpringTap(
-                                      enabled: _canGoBack,
-                                      onTap: _goBack,
-                                      child: SizedBox(
-                                        width: 34,
-                                        height: 34,
-                                        child: Center(
-                                          child: Icon(
-                                            CupertinoIcons.chevron_back,
-                                            size: 16,
-                                            color: _canGoBack
-                                                ? t.text2
-                                                : t.text3.withValues(alpha: 0.38),
+                                    Tooltip(
+                                      message: '后退',
+                                      child: GrassBagSpringTap(
+                                        enabled: _canGoBack,
+                                        borderRadius: 999,
+                                        haptic: true,
+                                        onTap: _goBack,
+                                        child: SizedBox(
+                                          width: 34,
+                                          height: 34,
+                                          child: Center(
+                                            child: Icon(
+                                              CupertinoIcons.chevron_back,
+                                              size: 16,
+                                              color: _canGoBack
+                                                  ? t.text2
+                                                  : t.text3.withValues(alpha: 0.38),
+                                            ),
                                           ),
                                         ),
                                       ),
                                     ),
-                                    GrassBagSpringTap(
-                                      enabled: _canGoForward,
-                                      onTap: _goForward,
-                                      child: SizedBox(
-                                        width: 34,
-                                        height: 34,
-                                        child: Center(
-                                          child: Icon(
-                                            CupertinoIcons.chevron_forward,
-                                            size: 16,
-                                            color: _canGoForward
-                                                ? t.text2
-                                                : t.text3.withValues(alpha: 0.38),
+                                    Tooltip(
+                                      message: '前进',
+                                      child: GrassBagSpringTap(
+                                        enabled: _canGoForward,
+                                        borderRadius: 999,
+                                        haptic: true,
+                                        onTap: _goForward,
+                                        child: SizedBox(
+                                          width: 34,
+                                          height: 34,
+                                          child: Center(
+                                            child: Icon(
+                                              CupertinoIcons.chevron_forward,
+                                              size: 16,
+                                              color: _canGoForward
+                                                  ? t.text2
+                                                  : t.text3.withValues(alpha: 0.38),
+                                            ),
                                           ),
                                         ),
                                       ),
                                     ),
-                                    const SizedBox(width: 2),
+                                    const SizedBox(width: 4),
                                   ],
-                                  Icon(
-                                    _resolvedUrl.contains('token=')
-                                        ? CupertinoIcons.checkmark_shield
-                                        : (_resolvedUrl.startsWith('https://')
-                                            ? CupertinoIcons.lock_fill
-                                            : CupertinoIcons.lock_open),
-                                    size: 13,
-                                    color: _resolvedUrl.startsWith('https://')
-                                        ? t.ok
-                                        : (_resolvedUrl.contains('token=') ? t.primary : t.text3),
-                                  ),
-                                  const SizedBox(width: 5),
                                   Expanded(
-                                    child: Text(
-                                      _displayUrl(_resolvedUrl),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: 11,
-                                        color: t.text2,
+                                    child: Tooltip(
+                                      message: '轻点复制当前地址',
+                                      child: GrassBagSpringTap(
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        onTap: () {
+                                          if (_resolvedUrl.isEmpty) return;
+                                          Clipboard.setData(
+                                            ClipboardData(text: _stripTokenParam(_resolvedUrl)),
+                                          );
+                                          ref
+                                              .read(appProvider.notifier)
+                                              .showToast('已复制网页地址', tone: ToastTone.ok);
+                                        },
+                                        child: GrassBagFresnelGlassSurface(
+                                          isPill: true,
+                                          innerWell: true,
+                                          interactive: true,
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                          child: Row(
+                                            children: [
+                                              Icon(
+                                                _resolvedUrl.contains('token=')
+                                                    ? CupertinoIcons.checkmark_shield
+                                                    : (_resolvedUrl.startsWith('https://')
+                                                        ? CupertinoIcons.lock_fill
+                                                        : CupertinoIcons.lock_open),
+                                                size: 12.5,
+                                                color: _resolvedUrl.startsWith('https://')
+                                                    ? t.ok
+                                                    : (_resolvedUrl.contains('token=') ? t.primary : t.text3),
+                                              ),
+                                              const SizedBox(width: 5),
+                                              Expanded(
+                                                child: Text(
+                                                  _displayUrl(_resolvedUrl),
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontFamily: 'monospace',
+                                                    fontSize: 11,
+                                                    color: t.text2,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   ),
                                   const SizedBox(width: 6),
                                   if (supportsWebIframeEmbed)
-                                    GrassBagSpringTap(
-                                      onTap: _openInExternalNewTab,
-                                      pressedScale: 0.94,
-                                      haptic: true,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
-                                        decoration: BoxDecoration(
-                                          color: t.primarySoft,
-                                          borderRadius: BorderRadius.circular(999),
-                                        ),
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(CupertinoIcons.arrow_up_right_square, size: 12, color: t.primary),
-                                            const SizedBox(width: 4),
-                                            Text(
-                                              '新标签打开',
-                                              style: TextStyle(
-                                                fontSize: 11,
-                                                fontWeight: FontWeight.w600,
-                                                color: t.primary,
+                                    Tooltip(
+                                      message: '在浏览器新标签页打开',
+                                      child: GrassBagSpringTap(
+                                        onTap: _openInExternalNewTab,
+                                        pressedScale: 0.94,
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        child: GrassBagFresnelGlassSurface(
+                                          isPill: true,
+                                          innerWell: true,
+                                          interactive: true,
+                                          tintColor: t.primarySoft,
+                                          padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 5.5),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(CupertinoIcons.arrow_up_right_square, size: 12, color: t.primary),
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                '新标签打开',
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: t.primary,
+                                                ),
                                               ),
-                                            ),
-                                          ],
+                                            ],
+                                          ),
                                         ),
                                       ),
                                     )
                                   else if (_webController != null) ...[
-                                    GrassBagSpringTap(
-                                      onTap: _togglePureOriginal,
-                                      pressedScale: 0.94,
-                                      haptic: true,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                        decoration: BoxDecoration(
-                                          color: _pureOriginal ? t.okSoft : t.fill1,
-                                          borderRadius: BorderRadius.circular(999),
-                                        ),
-                                        child: Text(
-                                          _pureOriginal ? '纯净原版' : '适配',
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w600,
-                                            color: _pureOriginal ? t.ok : t.text2,
+                                    Tooltip(
+                                      message: _pureOriginal
+                                          ? '纯净原版模式（零样式注入）'
+                                          : '移动端适配模式（轻点切换纯净原版）',
+                                      child: GrassBagSpringTap(
+                                        onTap: _togglePureOriginal,
+                                        pressedScale: 0.94,
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        child: GrassBagFresnelGlassSurface(
+                                          isPill: true,
+                                          innerWell: true,
+                                          interactive: true,
+                                          tintColor: _pureOriginal ? t.okSoft : null,
+                                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
+                                          child: Text(
+                                            _pureOriginal ? '纯净原版' : '适配',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                              color: _pureOriginal ? t.ok : t.text2,
+                                            ),
                                           ),
                                         ),
                                       ),
                                     ),
                                     const SizedBox(width: 5),
-                                    GrassBagSpringTap(
-                                      onTap: _toggleDesktopMode,
-                                      pressedScale: 0.94,
-                                      haptic: true,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                        decoration: BoxDecoration(
-                                          color: _desktopMode ? t.primarySoft : t.fill1,
-                                          borderRadius: BorderRadius.circular(999),
-                                        ),
-                                        child: Text(
-                                          _desktopMode ? '桌面' : '移动',
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: FontWeight.w600,
-                                            color: _desktopMode ? t.primary : t.text2,
+                                    Tooltip(
+                                      message: _desktopMode ? '切换移动视图' : '切换桌面视图',
+                                      child: GrassBagSpringTap(
+                                        onTap: _toggleDesktopMode,
+                                        pressedScale: 0.94,
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        child: GrassBagFresnelGlassSurface(
+                                          isPill: true,
+                                          innerWell: true,
+                                          interactive: true,
+                                          tintColor: _desktopMode ? t.primarySoft : null,
+                                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
+                                          child: Text(
+                                            _desktopMode ? '桌面' : '移动',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                              color: _desktopMode ? t.primary : t.text2,
+                                            ),
                                           ),
                                         ),
                                       ),
@@ -689,41 +758,67 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                                 ],
                               ),
                             ),
-                            if (_loadError != null)
-                              Padding(
-                                padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
-                                child: GrassBagStatusBanner(
-                                  tone: GrassBagBannerTone.error,
-                                  message: _loadError!,
-                                  borderRadius: 14,
-                                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-                                  trailing: GrassBagSpringTap(
-                                    onTap: () => unawaited(_loadWithWebTicket(forceReload: true)),
-                                    pressedScale: 0.92,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                      decoration: BoxDecoration(
-                                        color: t.err.withValues(alpha: 0.16),
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
-                                      child: Text(
-                                        '重试',
-                                        style: TextStyle(
-                                          fontSize: 11.5,
-                                          fontWeight: FontWeight.w600,
-                                          color: t.err,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
                             Expanded(
                               child: Stack(
                                 children: [
-                                  Positioned.fill(child: _buildWebSurface(t)),
-                                  // Overlay progress bar so toggling loading NEVER resizes WebView by 2.5px!
+                                  Positioned.fill(
+                                    child: _loadError != null
+                                        ? Center(
+                                            child: Padding(
+                                              padding: const EdgeInsets.all(24),
+                                              child: ConstrainedBox(
+                                                constraints: const BoxConstraints(maxWidth: 360),
+                                                child: GrassBagCard(
+                                                  borderRadius: 24,
+                                                  padding: const EdgeInsets.all(20),
+                                                  child: Column(
+                                                    mainAxisSize: MainAxisSize.min,
+                                                    children: [
+                                                      GrassBagSquircleIcon(
+                                                        icon: CupertinoIcons.wifi_exclamationmark,
+                                                        color: t.warn,
+                                                        size: 42,
+                                                        iconSize: 20,
+                                                      ),
+                                                      const SizedBox(height: 12),
+                                                      Text(
+                                                        '网页版加载失败',
+                                                        style: TextStyle(
+                                                          fontSize: 15.5,
+                                                          fontWeight: FontWeight.w600,
+                                                          color: t.text,
+                                                        ),
+                                                      ),
+                                                      const SizedBox(height: 6),
+                                                      Text(
+                                                        _loadError!,
+                                                        textAlign: TextAlign.center,
+                                                        style: TextStyle(
+                                                          fontSize: 12.5,
+                                                          height: 1.45,
+                                                          color: t.text3,
+                                                        ),
+                                                      ),
+                                                      const SizedBox(height: 16),
+                                                      GrassBagPrimaryGlassButton(
+                                                        label: '重新加载',
+                                                        icon: CupertinoIcons.refresh,
+                                                        tier: state.glassTier,
+                                                        insideGlass: true,
+                                                        onTap: () => unawaited(
+                                                          _loadWithWebTicket(forceReload: true),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          )
+                                        : _buildWebSurface(t),
+                                  ),
+                                  // Keep GrassBagProgressBar mounted inside AnimatedOpacity (pausing its
+                                  // ticker via TickerMode when idle) so the 160ms fade-out actually animates!
                                   Positioned(
                                     top: 0,
                                     left: 0,
@@ -732,13 +827,14 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                                       child: AnimatedOpacity(
                                         opacity: _loading ? 1.0 : 0.0,
                                         duration: const Duration(milliseconds: 160),
-                                        child: _loading
-                                            ? GrassBagProgressBar(
-                                                height: 2.5,
-                                                color: t.primary,
-                                                trackColor: Colors.transparent,
-                                              )
-                                            : const SizedBox(height: 2.5),
+                                        child: TickerMode(
+                                          enabled: _loading,
+                                          child: GrassBagProgressBar(
+                                            height: 2.5,
+                                            color: t.primary,
+                                            trackColor: Colors.transparent,
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   ),
@@ -748,6 +844,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                           ],
                         ),
                       ),
+                    ),
                     ),
                   ),
                 ),

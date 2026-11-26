@@ -85,12 +85,11 @@ class ChatComposerDock extends ConsumerStatefulWidget {
 
 class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     with SingleTickerProviderStateMixin {
-  static final RegExp _slashTriggerRe = RegExp(r'^/([a-zA-Z0-9_:.-]*)$');
+  static final RegExp _slashTriggerRe = RegExp(r'^/([^\s/]*)$');
   // Allow Chinese prose or punctuation immediately before `@` (e.g. `看看@composer`),
   // while ignoring email addresses (`foo@bar.com`).
   static final RegExp _atTriggerRe = RegExp(r'(?:^|[^a-zA-Z0-9._+-])(@([^\s]*))$');
 
-  late final SingleSpringController _plusSpring;
   final ValueNotifier<int> _suggestionTickNotifier = ValueNotifier<int>(0);
   final ScrollController _suggestionScrollCtrl = ScrollController();
   bool _plusOpen = false;
@@ -102,7 +101,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   String? _mentionTrigger; // '/' or '@'
   String _mentionQuery = '';
   int _mentionStartOffset = -1;
-  String? _dismissedMentionText;
+  int? _dismissedTokenStart;
+  String? _dismissedTrigger;
   final ValueNotifier<int> _activeSuggestionIdxNotifier = ValueNotifier<int>(0);
   bool _submitting = false;
   Timer? _refDebounceTimer;
@@ -209,7 +209,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           final cmd = _latestCommands[idx];
           final isEmptyChat = ref.read(appProvider).isEmptyChat;
           final canInstant = const {'/new', '/plan', '/status'}.contains(cmd.command) ||
-              (!isEmptyChat && const {'/fork', '/export'}.contains(cmd.command));
+              (!isEmptyChat &&
+                  const {'/fork', '/export', '/compact', '/stop'}.contains(cmd.command));
           _applySuggestion(
             cmd.command,
             executeImmediately: !isTab && canInstant,
@@ -313,11 +314,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   void initState() {
     super.initState();
     _plusOpen = widget.plusOpenNotifier?.value ?? false;
-    _plusSpring = SingleSpringController(
-      vsync: this,
-      spring: GlassSpring.snappy(duration: const Duration(milliseconds: 280)),
-      initialValue: _plusOpen ? 1.0 : 0.0,
-    );
     _hasText = widget.controller.text.trim().isNotEmpty;
     widget.controller.addListener(_onTextChanged);
     widget.focusNode.addListener(_onFocusChanged);
@@ -363,7 +359,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     widget.plusOpenNotifier?.removeListener(_onExternalPlusChanged);
     widget.suggestionsOpenNotifier?.removeListener(_onExternalSuggestionsChanged);
-    _plusSpring.dispose();
     _suggestionTickNotifier.dispose();
     _activeSuggestionIdxNotifier.dispose();
     _suggestionScrollCtrl.dispose();
@@ -372,7 +367,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
 
   void _scrollActiveSuggestionIntoView() {
     if (!_suggestionScrollCtrl.hasClients) return;
-    const itemExtent = 38.0;
+    final scale = MediaQuery.textScalerOf(context).scale(1.0).clamp(1.0, 2.0);
+    final itemExtent = 38.0 * scale;
     final targetTop = _activeSuggestionIdxNotifier.value * itemExtent;
     final targetBottom = targetTop + itemExtent;
     final pos = _suggestionScrollCtrl.position;
@@ -408,7 +404,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   void _dismissSuggestions() {
     _refDebounceTimer?.cancel();
     setState(() {
-      _dismissedMentionText = widget.controller.text;
+      if (_mentionStartOffset >= 0 && _mentionTrigger != null) {
+        _dismissedTokenStart = _mentionStartOffset;
+        _dismissedTrigger = _mentionTrigger;
+      }
       _mentionTrigger = null;
       _mentionQuery = '';
       _mentionStartOffset = -1;
@@ -432,10 +431,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     if (_plusOpen == open) return;
     setState(() => _plusOpen = open);
-    _plusSpring.spring = open
-        ? GlassSpring.snappy(duration: const Duration(milliseconds: 280))
-        : GlassSpring.smooth(duration: const Duration(milliseconds: 200));
-    _plusSpring.animateTo(open ? 1.0 : 0.0);
     if (!fromExternal && widget.plusOpenNotifier != null) {
       widget.plusOpenNotifier!.value = open;
     }
@@ -445,6 +440,36 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
   void _togglePlus() {
     HapticFeedback.selectionClick();
     _setPlusOpen(!_plusOpen);
+  }
+
+  void _openVoiceInput() {
+    if (_plusOpen) _setPlusOpen(false);
+    HapticFeedback.selectionClick();
+    showVoiceInputSheet(
+      context,
+      ref,
+      onTranscriptConfirmed: (text) {
+        final val = widget.controller.value;
+        final cur = val.text;
+        final sel = val.selection;
+        final start = sel.isValid ? sel.start.clamp(0, cur.length) : cur.length;
+        final end = sel.isValid ? sel.end.clamp(start, cur.length) : cur.length;
+        final needsLeadSpace = start > 0 &&
+            cur.codeUnitAt(start - 1) != 0x20 &&
+            cur.codeUnitAt(start - 1) != 0x0A;
+        final insert = needsLeadSpace ? ' $text' : text;
+        final updated = cur.replaceRange(start, end, insert);
+        widget.controller.value = TextEditingValue(
+          text: updated,
+          selection: TextSelection.collapsed(
+            offset: start + insert.length,
+          ),
+        );
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) widget.focusNode.requestFocus();
+        });
+      },
+    );
   }
 
   bool _suppressDraftSync = false;
@@ -488,7 +513,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _draftSyncTimer?.cancel();
     _draftSyncTimer = null;
     _hasUnsyncedDraftEdit = false;
-    if (!mounted) return;
+    if (!mounted || widget.editingContextNotifier?.value != null) return;
     final raw = widget.controller.text;
     final ctrl = ref.read(appProvider.notifier);
     if (ctrl.getComposerDraftForActiveHost() != raw) {
@@ -534,9 +559,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       });
     }
     final nextHasText = raw.trim().isNotEmpty;
-    if (_dismissedMentionText != null && _dismissedMentionText != raw) {
-      _dismissedMentionText = null;
-    }
     final cursor = val.selection.isValid
         ? val.selection.baseOffset.clamp(0, raw.length)
         : raw.length;
@@ -547,7 +569,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     // Fast-path: skip RegExp matching entirely on normal prose keystrokes!
     RegExpMatch? slashMatch;
     var slashLeadingOffset = 0;
-    if (_dismissedMentionText == null && beforeCursor.isNotEmpty) {
+    if (beforeCursor.isNotEmpty) {
       var firstNonWs = 0;
       while (firstNonWs < beforeCursor.length && beforeCursor.codeUnitAt(firstNonWs) <= 32) {
         firstNonWs++;
@@ -558,9 +580,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         slashMatch = _slashTriggerRe.firstMatch(trimmedBefore);
       }
     }
-    final atMatch = _dismissedMentionText == null &&
-            slashMatch == null &&
-            beforeCursor.contains('@')
+    final atMatch = slashMatch == null && beforeCursor.contains('@')
         ? _atTriggerRe.firstMatch(beforeCursor)
         : null;
     if (slashMatch != null) {
@@ -571,6 +591,19 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
       nextTrigger = '@';
       nextQuery = (atMatch.group(2) ?? '').toLowerCase();
       nextStart = atMatch.end - (atMatch.group(1)?.length ?? 0);
+    }
+    if (_dismissedTokenStart != null) {
+      if (cursor < _dismissedTokenStart! || _dismissedTokenStart! >= raw.length) {
+        _dismissedTokenStart = null;
+        _dismissedTrigger = null;
+      } else if (nextTrigger == _dismissedTrigger && nextStart == _dismissedTokenStart) {
+        nextTrigger = null;
+        nextQuery = '';
+        nextStart = -1;
+      } else {
+        _dismissedTokenStart = null;
+        _dismissedTrigger = null;
+      }
     }
 
     if (nextTrigger != '@') {
@@ -694,7 +727,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     _refDebounceTimer?.cancel();
     setState(() {
-      _dismissedMentionText = null;
+      _dismissedTokenStart = null;
+      _dismissedTrigger = null;
       _mentionTrigger = null;
       _mentionQuery = '';
       _mentionStartOffset = -1;
@@ -839,8 +873,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     ];
     // Clear input optimistically BEFORE awaiting async send so typing stays instant
     // and Android IME composing state resets cleanly without dismissing the keyboard.
+    // When editing a previous turn, NEVER flush `""` over the stashed draft before fork/send!
     widget.controller.clear();
-    _flushDraftSync();
+    if (editCtx == null) {
+      _flushDraftSync();
+    }
     if (widget.editingContextNotifier?.value != null) {
       widget.editingContextNotifier!.value = null;
     }
@@ -871,6 +908,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         return;
       }
       expectedRenderGen = ref.read(appProvider).sessionRenderGen;
+      // Fork succeeded: leave stashedDraft intact on the original session and clear only the new branch!
+      _flushDraftSync();
     }
     final sent = await ref.read(appProvider.notifier).sendPrompt(
           text,
@@ -890,9 +929,24 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     if (sent) {
       _pickedReferences.clear();
+      // If the user edited-and-resent in place (without forking), restore any stashed unsent draft!
+      if (editCtx != null && !shouldForkBefore && editCtx.stashedDraft.isNotEmpty) {
+        if (widget.controller.text.isEmpty) {
+          widget.controller.value = TextEditingValue(
+            text: editCtx.stashedDraft,
+            selection: TextSelection.collapsed(offset: editCtx.stashedDraft.length),
+          );
+          _flushDraftSync();
+        }
+      } else if (editCtx != null && !shouldForkBefore) {
+        _flushDraftSync();
+      }
       widget.onMessageSent?.call();
     } else if (rawText.isNotEmpty) {
       // Never drop user's failed prompt even if they started typing while the send was in flight!
+      if (editCtx != null && !shouldForkBefore) {
+        widget.editingContextNotifier?.value = editCtx;
+      }
       final curText = widget.controller.text;
       final restored = curText.isEmpty ? rawText : '$rawText\n\n$curText';
       widget.controller.value = TextEditingValue(
@@ -1030,9 +1084,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     final screenW = MediaQuery.sizeOf(context).width;
     final isWide = screenW >= 540;
 
-    if (hasTakeover && (_plusOpen || _mentionTrigger != null)) {
+    if (hasTakeover &&
+        (_plusOpen || _mentionTrigger != null || ((showApproval || showCordis) && widget.focusNode.hasFocus))) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
+        if ((showApproval || showCordis) && widget.focusNode.hasFocus) {
+          widget.focusNode.unfocus();
+        }
         if (_plusOpen) _setPlusOpen(false);
         if (_mentionTrigger != null) {
           setState(() {
@@ -1115,6 +1173,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                           tier: state.glassTier,
                           height: inlineWithPills ? 34 : 38,
                           padding: const EdgeInsets.symmetric(horizontal: 12),
+                          tintColor: t.isDark ? null : Colors.white.withValues(alpha: 0.72),
                           onTap: () => widget.onScrollToBottom?.call(),
                           child: Row(
                             mainAxisSize: MainAxisSize.min,
@@ -1191,8 +1250,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
           builder: (context, dockBox) {
             final maxDockH = dockBox.maxHeight.isFinite ? dockBox.maxHeight : 560.0;
             final isTightDock = dockBox.maxHeight.isFinite && dockBox.maxHeight < 290.0;
-            final effectiveTextMaxLines =
-                maxDockH < 210.0 ? 2 : (maxDockH < 270.0 ? 3 : 5);
+            final overlayOpen = showSuggestions || _plusOpen;
+            final effectiveTextMaxLines = (overlayOpen && maxDockH < 260.0)
+                ? 1
+                : (maxDockH < 210.0 ? 2 : (maxDockH < 270.0 ? 3 : 5));
+            final suggestionListMaxH =
+                math.min(220.0, math.max(84.0, maxDockH - (hasStatusPills ? 196.0 : 156.0)));
             final takeoverMaxH = math.min(
               560.0,
               math.max(140.0, maxDockH - (hasStatusPills ? 48.0 : 0.0)),
@@ -1201,9 +1264,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                // Standalone floating "Scroll to latest" droplet when no status pill row is present.
-                // Kept OUTSIDE _ComposerHeightReporter so scrolling up never alters ListView tail height.
-                if (!hasStatusPills && maxDockH >= 210.0) scrollDropletWidget(),
+                // Always keep floating "Scroll to latest" droplet OUTSIDE _ComposerHeightReporter
+                // so scrolling up never alters status-pill wrapping or ListView tail height!
+                if (maxDockH >= 148.0) scrollDropletWidget(),
 
                 // Single Flexible slot shared by `/` & `@` suggestions and the `+` Deck (mutually exclusive)
                 // so the active overlay receives 100% of available height above the composer pill without
@@ -1304,7 +1367,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   tier: state.glassTier,
                                   borderRadius: 22,
                                   elevated: true,
+                                  interactiveGlow: false,
                                   useSheetSettings: true,
+                                  clipBehavior: Clip.antiAlias,
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                                   child: Column(
                                     mainAxisSize: MainAxisSize.min,
@@ -1314,30 +1379,46 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                         padding: const EdgeInsets.fromLTRB(8, 0, 2, 4),
                                         child: Row(
                                           children: [
-                                            Text(
-                                              _mentionTrigger == '/'
-                                                  ? '快捷指令${filteredCommands.isNotEmpty ? ' (${filteredCommands.length})' : ''}'
-                                                  : '引用文件与会话${filteredRefs.isNotEmpty ? ' (${filteredRefs.length})' : ''}',
-                                              style: TextStyle(
-                                                fontSize: 11,
-                                                fontWeight: FontWeight.w600,
-                                                color: t.text3,
+                                            Flexible(
+                                              child: Text(
+                                                _mentionTrigger == '/'
+                                                    ? '快捷指令${filteredCommands.isNotEmpty ? ' (${filteredCommands.length})' : ''}'
+                                                    : '引用文件与会话${filteredRefs.isNotEmpty ? ' (${filteredRefs.length})' : ''}',
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: t.text3,
+                                                ),
                                               ),
                                             ),
                                             if (_mentionTrigger == '@' && _loadingRefs) ...[
                                               const SizedBox(width: 7),
                                               GrassBagActivityIndicator(radius: 5.5, color: t.primary),
                                             ],
-                                            const Spacer(),
-                                            GestureDetector(
-                                              behavior: HitTestBehavior.opaque,
-                                              onTap: _dismissSuggestions,
-                                              child: Padding(
-                                                padding: const EdgeInsets.all(4),
-                                                child: Icon(
-                                                  CupertinoIcons.xmark,
-                                                  size: 13,
-                                                  color: t.text3,
+                                            const SizedBox(width: 8),
+                                            Tooltip(
+                                              message: '关闭提示',
+                                              excludeFromSemantics: true,
+                                              child: Semantics(
+                                                button: true,
+                                                label: '关闭提示',
+                                                child: GrassBagSpringTap(
+                                                  onTap: _dismissSuggestions,
+                                                  pressedScale: 0.88,
+                                                  haptic: true,
+                                                  child: SizedBox(
+                                                    width: 40,
+                                                    height: 40,
+                                                    child: Center(
+                                                      child: Icon(
+                                                        CupertinoIcons.xmark,
+                                                        size: 13.5,
+                                                        color: t.text3,
+                                                      ),
+                                                    ),
+                                                  ),
                                                 ),
                                               ),
                                             ),
@@ -1347,7 +1428,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       Flexible(
                                         fit: FlexFit.loose,
                                         child: ConstrainedBox(
-                                          constraints: const BoxConstraints(maxHeight: 220),
+                                          constraints: BoxConstraints(maxHeight: suggestionListMaxH),
                                           child: SingleChildScrollView(
                                             controller: _suggestionScrollCtrl,
                                             physics: const BouncingScrollPhysics(),
@@ -1386,9 +1467,28 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                             executeImmediately: isInstant,
                                                           ),
                                                           child: Container(
-                                                            decoration: BoxDecoration(
-                                                              color: active ? t.fill1 : Colors.transparent,
-                                                              borderRadius: BorderRadius.circular(11),
+                                                            decoration: ShapeDecoration(
+                                                              color: active ? null : Colors.transparent,
+                                                              gradient: active
+                                                                  ? LinearGradient(
+                                                                      begin: Alignment.topLeft,
+                                                                      end: Alignment.bottomRight,
+                                                                      colors: [
+                                                                        t.primary.withValues(alpha: t.isDark ? 0.24 : 0.14),
+                                                                        t.primary.withValues(alpha: t.isDark ? 0.12 : 0.07),
+                                                                      ],
+                                                                    )
+                                                                  : null,
+                                                              shape: RoundedSuperellipseBorder(
+                                                                borderRadius: BorderRadius.circular(13),
+                                                                side: BorderSide(
+                                                                  color: active
+                                                                      ? t.primary.withValues(
+                                                                          alpha: t.isDark ? 0.34 : 0.24)
+                                                                      : Colors.transparent,
+                                                                  width: 0.65,
+                                                                ),
+                                                              ),
                                                             ),
                                                             padding: const EdgeInsets.symmetric(
                                                               horizontal: 8,
@@ -1396,22 +1496,34 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                             ),
                                                             child: Row(
                                                               children: [
-                                                                Container(
-                                                                  padding: const EdgeInsets.symmetric(
-                                                                    horizontal: 7,
-                                                                    vertical: 2,
-                                                                  ),
-                                                                  decoration: BoxDecoration(
-                                                                    color: isSkill ? t.okSoft : t.primarySoft,
-                                                                    borderRadius: BorderRadius.circular(7),
-                                                                  ),
-                                                                  child: Text(
-                                                                    cmd.command,
-                                                                    style: TextStyle(
-                                                                      fontFamily: 'monospace',
-                                                                      fontSize: 12,
-                                                                      fontWeight: FontWeight.w600,
-                                                                      color: isSkill ? t.ok : t.primary,
+                                                                ConstrainedBox(
+                                                                  constraints: const BoxConstraints(maxWidth: 168),
+                                                                  child: Container(
+                                                                    padding: const EdgeInsets.symmetric(
+                                                                      horizontal: 7,
+                                                                      vertical: 2,
+                                                                    ),
+                                                                    decoration: ShapeDecoration(
+                                                                      color: isSkill ? t.okSoft : t.primarySoft,
+                                                                      shape: RoundedSuperellipseBorder(
+                                                                        borderRadius: BorderRadius.circular(8),
+                                                                        side: BorderSide(
+                                                                          color: (isSkill ? t.ok : t.primary)
+                                                                              .withValues(alpha: t.isDark ? 0.30 : 0.20),
+                                                                          width: 0.55,
+                                                                        ),
+                                                                      ),
+                                                                    ),
+                                                                    child: Text(
+                                                                      cmd.command,
+                                                                      maxLines: 1,
+                                                                      overflow: TextOverflow.ellipsis,
+                                                                      style: TextStyle(
+                                                                        fontFamily: 'monospace',
+                                                                        fontSize: 12,
+                                                                        fontWeight: FontWeight.w600,
+                                                                        color: isSkill ? t.ok : t.primary,
+                                                                      ),
                                                                     ),
                                                                   ),
                                                                 ),
@@ -1426,14 +1538,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                                 ),
                                                                 if (isInstant) ...[
                                                                   const SizedBox(width: 6),
-                                                                  Container(
+                                                                  GrassBagFresnelGlassSurface(
+                                                                    isPill: true,
+                                                                    innerWell: true,
                                                                     padding: const EdgeInsets.symmetric(
-                                                                      horizontal: 6,
+                                                                      horizontal: 6.5,
                                                                       vertical: 2,
-                                                                    ),
-                                                                    decoration: BoxDecoration(
-                                                                      color: t.fill2,
-                                                                      borderRadius: BorderRadius.circular(999),
                                                                     ),
                                                                     child: Text(
                                                                       '直达',
@@ -1478,14 +1588,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                                   _dismissSuggestions();
                                                                   showWorkspaceSheet(context, ref);
                                                                 },
-                                                                child: Container(
+                                                                child: GrassBagFresnelGlassSurface(
+                                                                  isPill: true,
+                                                                  innerWell: true,
+                                                                  tintColor: t.primarySoft,
                                                                   padding: const EdgeInsets.symmetric(
                                                                     horizontal: 9,
                                                                     vertical: 4,
-                                                                  ),
-                                                                  decoration: BoxDecoration(
-                                                                    color: t.primarySoft,
-                                                                    borderRadius: BorderRadius.circular(999),
                                                                   ),
                                                                   child: Text(
                                                                     '选择工作区',
@@ -1514,9 +1623,28 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                             refItem: refItem,
                                                           ),
                                                           child: Container(
-                                                            decoration: BoxDecoration(
-                                                              color: active ? t.fill1 : Colors.transparent,
-                                                              borderRadius: BorderRadius.circular(11),
+                                                            decoration: ShapeDecoration(
+                                                              color: active ? null : Colors.transparent,
+                                                              gradient: active
+                                                                  ? LinearGradient(
+                                                                      begin: Alignment.topLeft,
+                                                                      end: Alignment.bottomRight,
+                                                                      colors: [
+                                                                        t.primary.withValues(alpha: t.isDark ? 0.24 : 0.14),
+                                                                        t.primary.withValues(alpha: t.isDark ? 0.12 : 0.07),
+                                                                      ],
+                                                                    )
+                                                                  : null,
+                                                              shape: RoundedSuperellipseBorder(
+                                                                borderRadius: BorderRadius.circular(13),
+                                                                side: BorderSide(
+                                                                  color: active
+                                                                      ? t.primary.withValues(
+                                                                          alpha: t.isDark ? 0.34 : 0.24)
+                                                                      : Colors.transparent,
+                                                                  width: 0.65,
+                                                                ),
+                                                              ),
                                                             ),
                                                             padding: const EdgeInsets.symmetric(
                                                               horizontal: 8,
@@ -1573,66 +1701,59 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   : const SizedBox.shrink(key: ValueKey('suggestions-empty')),
             ),
 
-            // Spring-Animated Floating Liquid Glass '+' Deck directly above composer.
-            // Pure GPU scale+translate+fade at fixed layout bounds (NO Align heightFactor thrash
-            // and NO ClipRRect shearing outer glass shadows mid-flight!).
+            // Materialized Floating Liquid Glass '+' Deck directly above composer:
+            // drives `GrassBagMaterializeTransition` (`GlassMaterializeScope` + `LiquidGlassSelfScaleScope`)
+            // so Impeller dissolves glass natively via `uVisibility` with ZERO `OpacityLayer` over `BackdropFilter`!
             if (!hasTakeover)
-              ListenableBuilder(
-                  listenable: _plusSpring,
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(
-                      maxWidth: isWide ? 344.0 : double.infinity,
-                    ),
-                    child: RepaintBoundary(
-                      child: GlassBackdropGroup(
-                        enabled: false,
-                        child: GrassBagGlass(
-                          tier: state.glassTier,
-                          borderRadius: 26,
-                          elevated: true,
-                          useSheetSettings: true,
-                          child: SingleChildScrollView(
-                            primary: false,
-                            child: _PlusDeckContent(
-                              onClose: () => _setPlusOpen(false),
-                              onOpenTerminal: widget.onOpenTerminal,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  builder: (ctx, staticDeck) {
-                    final raw = _plusSpring.value;
-                    if (raw <= 0.005 && !_plusOpen) return const SizedBox.shrink();
-                    final v = raw.clamp(0.0, 1.0);
-                    final scale = (0.92 + 0.08 * raw).clamp(0.88, 1.02);
-                    return IgnorePointer(
-                      ignoring: !_plusOpen,
-                      child: Align(
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 220),
+                reverseDuration: const Duration(milliseconds: 160),
+                switchInCurve: Curves.linear,
+                switchOutCurve: Curves.linear,
+                transitionBuilder: (child, anim) => _ComposerSlideMaterialize(
+                  animation: anim,
+                  tier: state.glassTier,
+                  alignment: Alignment.bottomLeft,
+                  beginOffset: const Offset(0, 0.06),
+                  scaleFrom: 0.93,
+                  contentSigma: 4.0,
+                  child: child,
+                ),
+                child: _plusOpen
+                    ? Align(
+                        key: const ValueKey('plus-deck-open'),
                         alignment: Alignment.bottomLeft,
                         heightFactor: 1.0,
                         child: Padding(
                           padding: const EdgeInsets.only(bottom: 10),
-                          child: FadeTransition(
-                            opacity: AlwaysStoppedAnimation<double>(v),
-                            child: Transform.translate(
-                              offset: Offset(0, (1.0 - v) * 16.0),
-                              child: Transform.scale(
-                                scale: scale,
-                                alignment: Alignment.bottomLeft,
-                                child: GrassBagMaterializeScope(
-                                  progress: v,
-                                  child: staticDeck!,
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxWidth: isWide ? 344.0 : double.infinity,
+                            ),
+                            child: GlassBackdropGroup(
+                              enabled: false,
+                              child: GrassBagGlass(
+                                tier: state.glassTier,
+                                borderRadius: 30,
+                                elevated: true,
+                                useSheetSettings: true,
+                                interactiveGlow: false,
+                                clipBehavior: Clip.antiAlias,
+                                child: SingleChildScrollView(
+                                  primary: false,
+                                  child: _PlusDeckContent(
+                                    onClose: () => _setPlusOpen(false),
+                                    onOpenTerminal: widget.onOpenTerminal,
+                                    onOpenVoice: state.speechConfigured ? _openVoiceInput : null,
+                                  ),
                                 ),
                               ),
                             ),
                           ),
                         ),
-                      ),
-                    );
-                  },
-                ),
+                      )
+                    : const SizedBox.shrink(key: ValueKey('plus-deck-closed')),
+              ),
               ],
             ),
           ),
@@ -1671,16 +1792,18 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                     alignment: Alignment.centerLeft,
                                     child: GrassBagGlassBarLayer(
                                       tier: state.glassTier,
-                                      child: Wrap(
+                                      child: MediaQuery.withClampedTextScaling(
+                                        maxScaleFactor: 1.2,
+                                        child: Wrap(
                                         spacing: 8,
                                         runSpacing: 6,
                                         children: [
-                                          if (showCompactNudgePill)
+                                          if (showCompactNudgePill) ...[
                                             GrassBagGlassPillButton(
                                               tier: state.glassTier,
                                               height: 34,
                                               useOwnLayer: false,
-                                              padding: const EdgeInsets.only(left: 11, right: 6),
+                                              padding: const EdgeInsets.symmetric(horizontal: 11),
                                               onTap: () => unawaited(ctrl.compactContext()),
                                               child: Row(
                                                 mainAxisSize: MainAxisSize.min,
@@ -1700,18 +1823,22 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                       color: state.contextPctHigh >= 90 ? t.err : t.warn,
                                                     ),
                                                   ),
-                                                  const SizedBox(width: 4),
-                                                  GestureDetector(
-                                                    behavior: HitTestBehavior.opaque,
-                                                    onTap: () => setState(() => _compactNudgeDismissed = true),
-                                                    child: Padding(
-                                                      padding: const EdgeInsets.all(4),
-                                                      child: Icon(CupertinoIcons.xmark, size: 11, color: t.text3),
-                                                    ),
-                                                  ),
                                                 ],
                                               ),
                                             ),
+                                            // Separate sibling dismiss orb so closing the nudge NEVER
+                                            // accidentally triggers context compaction!
+                                            GrassBagGlassCircleButton(
+                                              tier: state.glassTier,
+                                              size: 34,
+                                              iconSize: 12.5,
+                                              icon: CupertinoIcons.xmark,
+                                              iconColor: t.text2,
+                                              tooltip: '忽略精简提醒',
+                                              useOwnLayer: false,
+                                              onTap: () => setState(() => _compactNudgeDismissed = true),
+                                            ),
+                                          ],
                                           if (showPlanPill)
                                             GrassBagGlassPillButton(
                                               tier: state.glassTier,
@@ -1792,10 +1919,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                             ),
                                         ],
                                       ),
+                                      ),
                                     ),
                                   ),
                                 ),
-                                scrollDropletWidget(inlineWithPills: true),
                               ],
                             ),
                           )
@@ -1826,7 +1953,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                 ),
                 child: showApproval
                   ? _ApprovalTakeoverCard(
-                      key: ValueKey('approval-${state.pendingApprovalInteractionId ?? 'none'}'),
+                      key: ValueKey(
+                        'approval-${state.pendingApprovalInteractionId ?? 'none'}-${state.pendingApprovalCommand.hashCode}',
+                      ),
                       command: state.pendingApprovalCommand!,
                       toolName: state.pendingApprovalToolName,
                       workspaceName: state.activeWorkspace,
@@ -1844,7 +1973,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                           maxHeight: takeoverMaxH,
                           tier: state.glassTier,
                           onSubmit: ctrl.resolveUserQuestion,
-                          onCancel: () => unawaited(ctrl.skipUserQuestion()),
+                          onCancel: ctrl.skipUserQuestion,
                         )
                       : showCordis
                           ? _CordisRunTakeoverCard(
@@ -1860,6 +1989,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               tier: state.glassTier,
                               borderRadius: 28,
                               elevated: true,
+                              interactiveGlow: false,
                               padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
                               child: Column(
                                 mainAxisSize: MainAxisSize.min,
@@ -1871,18 +2001,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                         if (editCtx == null) return const SizedBox.shrink();
                                         return Padding(
                                           padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
-                                          child: Container(
+                                          child: GrassBagFresnelGlassSurface(
+                                            borderRadius: 14,
+                                            innerWell: true,
+                                            tintColor: t.primarySoft,
                                             padding: const EdgeInsets.symmetric(
                                               horizontal: 10,
                                               vertical: 6,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: t.primarySoft,
-                                              borderRadius: BorderRadius.circular(12),
-                                              border: Border.all(
-                                                color: t.primary.withValues(alpha: 0.25),
-                                                width: 0.6,
-                                              ),
                                             ),
                                             child: Row(
                                               children: [
@@ -1904,48 +2029,97 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                     ),
                                                   ),
                                                 ),
-                                                if (editCtx.canForkBefore) ...[
+                                                if (state.isStreaming) ...[
                                                   const SizedBox(width: 6),
-                                                  GestureDetector(
-                                                    behavior: HitTestBehavior.opaque,
-                                                    onTap: () {
-                                                      HapticFeedback.selectionClick();
-                                                      setState(() => _editBranchResend = !_editBranchResend);
-                                                    },
-                                                    child: Container(
-                                                      padding: const EdgeInsets.symmetric(
-                                                        horizontal: 7,
-                                                        vertical: 2.5,
+                                                  GrassBagFresnelGlassSurface(
+                                                    isPill: true,
+                                                    innerWell: true,
+                                                    padding: const EdgeInsets.symmetric(
+                                                      horizontal: 8.5,
+                                                      vertical: 4,
+                                                    ),
+                                                    child: Text(
+                                                      state.busyEnterMode == 'steer'
+                                                          ? '生成中 · 发送将插话引导'
+                                                          : '生成中 · 发送将末尾排队',
+                                                      style: TextStyle(
+                                                        fontSize: 10.5,
+                                                        fontWeight: FontWeight.w500,
+                                                        color: t.text3,
                                                       ),
-                                                      decoration: BoxDecoration(
-                                                        color: _editBranchResend
-                                                            ? t.primary.withValues(alpha: 0.16)
-                                                            : t.fill1,
-                                                        borderRadius: BorderRadius.circular(999),
+                                                    ),
+                                                  ),
+                                                ] else if (editCtx.canForkBefore) ...[
+                                                  const SizedBox(width: 6),
+                                                  GrassBagSpringTap(
+                                                    enablePointerGlow: false,
+                                                    haptic: true,
+                                                    onTap: () => setState(
+                                                      () => _editBranchResend = !_editBranchResend,
+                                                    ),
+                                                    child: GrassBagFresnelGlassSurface(
+                                                      isPill: true,
+                                                      innerWell: true,
+                                                      interactive: true,
+                                                      tintColor: _editBranchResend
+                                                          ? t.primarySoft
+                                                          : null,
+                                                      padding: const EdgeInsets.symmetric(
+                                                        horizontal: 8.5,
+                                                        vertical: 4,
                                                       ),
                                                       child: Text(
                                                         _editBranchResend ? '分支重发' : '末尾重发',
                                                         style: TextStyle(
                                                           fontSize: 10.5,
                                                           fontWeight: FontWeight.w600,
-                                                          color: _editBranchResend ? t.primary : t.text3,
+                                                          color: _editBranchResend
+                                                              ? t.primary
+                                                              : t.text3,
                                                         ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ] else ...[
+                                                  const SizedBox(width: 6),
+                                                  GrassBagFresnelGlassSurface(
+                                                    isPill: true,
+                                                    innerWell: true,
+                                                    padding: const EdgeInsets.symmetric(
+                                                      horizontal: 8.5,
+                                                      vertical: 4,
+                                                    ),
+                                                    child: Text(
+                                                      '末尾重发',
+                                                      style: TextStyle(
+                                                        fontSize: 10.5,
+                                                        fontWeight: FontWeight.w500,
+                                                        color: t.text3,
                                                       ),
                                                     ),
                                                   ),
                                                 ],
                                                 const SizedBox(width: 4),
-                                                GestureDetector(
-                                                  behavior: HitTestBehavior.opaque,
-                                                  onTap: _cancelEditingMessage,
-                                                  child: SizedBox(
-                                                    width: 24,
-                                                    height: 24,
-                                                    child: Center(
-                                                      child: Icon(
-                                                        CupertinoIcons.xmark,
-                                                        size: 13,
-                                                        color: t.primary,
+                                                Tooltip(
+                                                  message: '取消编辑',
+                                                  excludeFromSemantics: true,
+                                                  child: Semantics(
+                                                    button: true,
+                                                    label: '取消编辑',
+                                                    child: GrassBagSpringTap(
+                                                      onTap: _cancelEditingMessage,
+                                                      pressedScale: 0.88,
+                                                      haptic: true,
+                                                      child: SizedBox(
+                                                        width: 36,
+                                                        height: 36,
+                                                        child: Center(
+                                                          child: Icon(
+                                                            CupertinoIcons.xmark,
+                                                            size: 13.5,
+                                                            color: t.primary,
+                                                          ),
+                                                        ),
                                                       ),
                                                     ),
                                                   ),
@@ -1960,14 +2134,23 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   // files or popping queued messages never triggers 20 consecutive toImageSync GPU stalls!
                                   if (state.pendingAttachments.isNotEmpty)
                                     SizedBox(
-                                            height: state.pendingAttachments.any(
-                                              (a) => a.isImage && a.bytes != null && a.bytes!.isNotEmpty,
-                                            )
-                                                ? 62
-                                                : 38,
-                                            child: ListView.separated(
-                                              scrollDirection: Axis.horizontal,
-                                              padding: const EdgeInsets.fromLTRB(6, 9, 10, 4),
+                                      height: state.pendingAttachments.any(
+                                        (a) => a.isImage && a.bytes != null && a.bytes!.isNotEmpty,
+                                      )
+                                          ? 70
+                                          : 46,
+                                      child: ShaderMask(
+                                        blendMode: BlendMode.dstIn,
+                                        shaderCallback: (bounds) => const LinearGradient(
+                                          begin: Alignment.centerLeft,
+                                          end: Alignment.centerRight,
+                                          colors: [Colors.white, Colors.white, Colors.transparent],
+                                          stops: [0.0, 0.90, 1.0],
+                                        ).createShader(bounds),
+                                        child: ListView.separated(
+                                          scrollDirection: Axis.horizontal,
+                                          physics: const BouncingScrollPhysics(),
+                                          padding: const EdgeInsets.fromLTRB(6, 5, 18, 5),
                                               itemCount: state.pendingAttachments.length,
                                               separatorBuilder: (_, __) => const SizedBox(width: 8),
                                               itemBuilder: (_, idx) {
@@ -1975,11 +2158,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                 final hasImgBytes =
                                                     att.isImage && att.bytes != null && att.bytes!.isNotEmpty;
                                                 if (hasImgBytes) {
-                                                  // Keep the 28x28 remove badge 100% INSIDE the 52x52
-                                                  // Stack hit-test bounds so the entire badge is tappable!
+                                                  // Keep the 24x24 corner remove hit target strictly in
+                                                  // the top-right corner so tapping the 46x46 thumbnail
+                                                  // center reliably previews instead of deleting!
                                                   return SizedBox(
-                                                    width: 52,
-                                                    height: 52,
+                                                    width: 58,
+                                                    height: 58,
                                                     child: Stack(
                                                       children: [
                                                         Positioned(
@@ -1992,8 +2176,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                               title: att.name,
                                                             ),
                                                             child: Container(
-                                                              width: 44,
-                                                              height: 44,
+                                                              width: 46,
+                                                              height: 46,
                                                               decoration: BoxDecoration(
                                                                 borderRadius: BorderRadius.circular(11),
                                                                 border: Border.all(
@@ -2004,7 +2188,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                               clipBehavior: Clip.antiAlias,
                                                               child: Image.memory(
                                                                 att.bytes!,
-                                                                cacheWidth: 132,
+                                                                cacheWidth: 138,
                                                                 fit: BoxFit.cover,
                                                                 gaplessPlayback: true,
                                                                 errorBuilder: (_, __, ___) => Center(
@@ -2021,34 +2205,35 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                         Positioned(
                                                           top: 0,
                                                           right: 0,
-                                                          child: GestureDetector(
-                                                            behavior: HitTestBehavior.opaque,
-                                                            onTap: () {
-                                                              HapticFeedback.selectionClick();
-                                                              ctrl.removePendingAttachment(att.id);
-                                                            },
-                                                            child: SizedBox(
-                                                              width: 28,
-                                                              height: 28,
-                                                              child: Align(
-                                                                alignment: Alignment.topRight,
-                                                                child: Container(
-                                                                  width: 19,
-                                                                  height: 19,
-                                                                  decoration: BoxDecoration(
-                                                                    color: t.isDark
-                                                                        ? const Color(0xFF1F232B)
-                                                                        : Colors.white,
-                                                                    shape: BoxShape.circle,
-                                                                    border: Border.all(
-                                                                      color: t.sepStrong,
-                                                                      width: 0.6,
+                                                          child: Semantics(
+                                                            button: true,
+                                                            label: '移除附件',
+                                                            child: Tooltip(
+                                                              message: '移除附件',
+                                                              excludeFromSemantics: true,
+                                                              child: GestureDetector(
+                                                                behavior: HitTestBehavior.opaque,
+                                                                onTap: () {
+                                                                  HapticFeedback.selectionClick();
+                                                                  ctrl.removePendingAttachment(att.id);
+                                                                },
+                                                                child: SizedBox(
+                                                                  width: 24,
+                                                                  height: 24,
+                                                                  child: Align(
+                                                                    alignment: Alignment.topRight,
+                                                                    child: GrassBagFresnelGlassSurface(
+                                                                      isCircle: true,
+                                                                      elevated: true,
+                                                                      width: 20,
+                                                                      height: 20,
+                                                                      alignment: Alignment.center,
+                                                                      child: Icon(
+                                                                        CupertinoIcons.xmark,
+                                                                        size: 10.5,
+                                                                        color: t.text,
+                                                                      ),
                                                                     ),
-                                                                  ),
-                                                                  child: Icon(
-                                                                    CupertinoIcons.xmark,
-                                                                    size: 10.5,
-                                                                    color: t.text,
                                                                   ),
                                                                 ),
                                                               ),
@@ -2060,98 +2245,83 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   );
                                                 }
                                                 return Center(
-                                                  child: GestureDetector(
-                                                    onTap: () {
-                                                      HapticFeedback.selectionClick();
-                                                      ctrl.showToast(
-                                                        att.sizeBytes > 0
-                                                            ? '${att.name} (${att.humanSize})'
-                                                            : att.name,
-                                                        tone: ToastTone.info,
-                                                      );
-                                                    },
-                                                    child: Container(
-                                                      height: 28,
-                                                      padding: const EdgeInsets.only(left: 9, right: 2),
-                                                      decoration: BoxDecoration(
-                                                        color: t.primarySoft,
-                                                        borderRadius: BorderRadius.circular(999),
-                                                        border: Border.all(
-                                                          color: t.primary.withValues(alpha: 0.25),
-                                                          width: 0.6,
+                                                  child: GrassBagFresnelGlassSurface(
+                                                    isPill: true,
+                                                    innerWell: true,
+                                                    tintColor: t.primarySoft,
+                                                    height: 34,
+                                                    padding: const EdgeInsets.only(left: 10, right: 0),
+                                                    child: Row(
+                                                      mainAxisSize: MainAxisSize.min,
+                                                      children: [
+                                                        Icon(
+                                                          att.isImage
+                                                              ? CupertinoIcons.photo_fill
+                                                              : CupertinoIcons.doc_fill,
+                                                          size: 13,
+                                                          color: t.primary,
                                                         ),
-                                                      ),
-                                                      child: Row(
-                                                        mainAxisSize: MainAxisSize.min,
-                                                        children: [
-                                                          Icon(
-                                                            att.isImage
-                                                                ? CupertinoIcons.photo_fill
-                                                                : CupertinoIcons.doc_fill,
-                                                            size: 13,
-                                                            color: t.primary,
-                                                          ),
-                                                          const SizedBox(width: 5),
-                                                          ConstrainedBox(
-                                                            constraints: const BoxConstraints(maxWidth: 132),
-                                                            child: Text(
-                                                              att.name,
-                                                              maxLines: 1,
-                                                              overflow: TextOverflow.ellipsis,
-                                                              style: TextStyle(
-                                                                fontSize: 11.5,
-                                                                fontWeight: FontWeight.w600,
-                                                                color: t.primary,
-                                                              ),
+                                                        const SizedBox(width: 5),
+                                                        ConstrainedBox(
+                                                          constraints: const BoxConstraints(maxWidth: 132),
+                                                          child: Text(
+                                                            att.name,
+                                                            maxLines: 1,
+                                                            overflow: TextOverflow.ellipsis,
+                                                            style: TextStyle(
+                                                              fontSize: 11.5,
+                                                              fontWeight: FontWeight.w600,
+                                                              color: t.primary,
                                                             ),
                                                           ),
-                                                          if (att.sizeBytes > 0) ...[
-                                                            const SizedBox(width: 4),
-                                                            Text(
-                                                              att.humanSize,
-                                                              style: TextStyle(
-                                                                fontSize: 10,
-                                                                fontFeatures: const [FontFeature.tabularFigures()],
-                                                                color: t.primary.withValues(alpha: 0.72),
-                                                              ),
+                                                        ),
+                                                        if (att.sizeBytes > 0) ...[
+                                                          const SizedBox(width: 4),
+                                                          Text(
+                                                            att.humanSize,
+                                                            style: TextStyle(
+                                                              fontSize: 10,
+                                                              fontFeatures: const [FontFeature.tabularFigures()],
+                                                              color: t.primary.withValues(alpha: 0.72),
                                                             ),
-                                                          ],
-                                                          GestureDetector(
+                                                          ),
+                                                        ],
+                                                        Tooltip(
+                                                          message: '移除附件',
+                                                          child: GestureDetector(
                                                             behavior: HitTestBehavior.opaque,
                                                             onTap: () {
                                                               HapticFeedback.selectionClick();
                                                               ctrl.removePendingAttachment(att.id);
                                                             },
                                                             child: SizedBox(
-                                                              width: 26,
-                                                              height: 26,
+                                                              width: 36,
+                                                              height: 34,
                                                               child: Center(
                                                                 child: Icon(
                                                                   CupertinoIcons.xmark_circle_fill,
-                                                                  size: 15,
-                                                                  color: t.primary.withValues(alpha: 0.75),
+                                                                  size: 15.5,
+                                                                  color: t.primary.withValues(alpha: 0.78),
                                                                 ),
                                                               ),
                                                             ),
                                                           ),
-                                                        ],
-                                                      ),
+                                                        ),
+                                                      ],
                                                     ),
                                                   ),
                                                 );
                                               },
                                             ),
-                                          ),
+                                      ),
+                                    ),
                                   if (state.queuedMessages.isNotEmpty)
                                     Padding(
                                             padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
-                                            child: Container(
+                                            child: GrassBagFresnelGlassSurface(
+                                              borderRadius: 15,
+                                              innerWell: true,
                                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                                              decoration: BoxDecoration(
-                                                color: t.fill1,
-                                                borderRadius: BorderRadius.circular(14),
-                                                border: Border.all(color: t.sep, width: 0.5),
-                                              ),
                                               child: ConstrainedBox(
                                                 constraints: const BoxConstraints(maxHeight: 112),
                                                 child: SingleChildScrollView(
@@ -2175,11 +2345,19 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                                   horizontal: 6,
                                                                   vertical: 2,
                                                                 ),
-                                                                decoration: BoxDecoration(
+                                                                decoration: ShapeDecoration(
                                                                   color: q.mode == 'steer'
                                                                       ? t.primarySoft
                                                                       : t.fill2,
-                                                                  borderRadius: BorderRadius.circular(6),
+                                                                  shape: RoundedSuperellipseBorder(
+                                                                    borderRadius: BorderRadius.circular(7),
+                                                                    side: BorderSide(
+                                                                      color: q.mode == 'steer'
+                                                                          ? t.primary.withValues(alpha: 0.28)
+                                                                          : t.sep,
+                                                                      width: 0.55,
+                                                                    ),
+                                                                  ),
                                                                 ),
                                                                 child: Text(
                                                                   q.mode == 'steer' ? '插话' : '排队',
@@ -2208,50 +2386,57 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                                   ),
                                                                 ),
                                                               ),
-                                                              GestureDetector(
-                                                                behavior: HitTestBehavior.opaque,
-                                                                onTap: () {
-                                                                  HapticFeedback.selectionClick();
-                                                                  _showEditQueuedDialog(context, q);
-                                                                },
-                                                                child: SizedBox(
-                                                                  width: 30,
-                                                                  height: 30,
-                                                                  child: Center(
-                                                                    child: Icon(CupertinoIcons.pencil, size: 13, color: t.text3),
+                                                              Tooltip(
+                                                                message: '编辑待发消息',
+                                                                child: GrassBagSpringTap(
+                                                                  pressedScale: 0.88,
+                                                                  haptic: true,
+                                                                  onTap: () => _showEditQueuedDialog(context, q),
+                                                                  child: SizedBox(
+                                                                    width: 32,
+                                                                    height: 32,
+                                                                    child: Center(
+                                                                      child: Icon(CupertinoIcons.pencil, size: 13.5, color: t.text3),
+                                                                    ),
                                                                   ),
                                                                 ),
                                                               ),
-                                                              if (q.mode != 'steer')
-                                                                GestureDetector(
-                                                                  behavior: HitTestBehavior.opaque,
-                                                                  onTap: () {
-                                                                    HapticFeedback.selectionClick();
-                                                                    ctrl.promoteQueuedMessage(q.id);
-                                                                  },
-                                                                  child: Padding(
-                                                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                                              if (q.mode != 'steer') ...[
+                                                                const SizedBox(width: 4),
+                                                                GrassBagSpringTap(
+                                                                  enablePointerGlow: false,
+                                                                  haptic: true,
+                                                                  onTap: () => ctrl.promoteQueuedMessage(q.id),
+                                                                  child: GrassBagFresnelGlassSurface(
+                                                                    isPill: true,
+                                                                    innerWell: true,
+                                                                    interactive: true,
+                                                                    tintColor: t.primarySoft,
+                                                                    padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 4),
                                                                     child: Text(
                                                                       '改插话',
                                                                       style: TextStyle(
-                                                                        fontSize: 11.5,
+                                                                        fontSize: 11,
                                                                         fontWeight: FontWeight.w600,
                                                                         color: t.primary,
                                                                       ),
                                                                     ),
                                                                   ),
                                                                 ),
-                                                              GestureDetector(
-                                                                behavior: HitTestBehavior.opaque,
-                                                                onTap: () {
-                                                                  HapticFeedback.selectionClick();
-                                                                  ctrl.removeQueuedMessage(q.id);
-                                                                },
-                                                                child: SizedBox(
-                                                                  width: 30,
-                                                                  height: 30,
-                                                                  child: Center(
-                                                                    child: Icon(CupertinoIcons.xmark, size: 13.5, color: t.text3),
+                                                              ],
+                                                              const SizedBox(width: 4),
+                                                              Tooltip(
+                                                                message: '移出队列',
+                                                                child: GrassBagSpringTap(
+                                                                  pressedScale: 0.88,
+                                                                  haptic: true,
+                                                                  onTap: () => ctrl.removeQueuedMessage(q.id),
+                                                                  child: SizedBox(
+                                                                    width: 32,
+                                                                    height: 32,
+                                                                    child: Center(
+                                                                      child: Icon(CupertinoIcons.xmark, size: 13.5, color: t.text3),
+                                                                    ),
                                                                   ),
                                                                 ),
                                                               ),
@@ -2325,8 +2510,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                       bytes: bytes,
                                                     ),
                                                   );
-                                                  ctrl.showToast('已粘贴图片附件',
-                                                      tone: ToastTone.info);
                                                 },
                                               ),
                                               style: TextStyle(
@@ -2396,7 +2579,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       ),
                                     ),
                                   ),
-                          LayoutBuilder(
+                          MediaQuery.withClampedTextScaling(
+                            maxScaleFactor: 1.25,
+                            child: LayoutBuilder(
                             builder: (ctx, rowBox) {
                               final hasExtraStreamActions = state.isStreaming && hasText;
                               final veryTightRow = rowBox.maxWidth < 240;
@@ -2410,64 +2595,75 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 key: const ValueKey('composer-plus-btn'),
                                 onTap: _togglePlus,
                                 pressedScale: 0.88,
-                                child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 220),
-                                  curve: Curves.easeOutCubic,
-                                  width: 36,
-                                  height: 36,
-                                  decoration: BoxDecoration(
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                      colors: _plusOpen
-                                          ? (t.isDark
-                                              ? [
-                                                  t.primary.withValues(alpha: 0.34),
-                                                  t.primary.withValues(alpha: 0.20),
-                                                ]
-                                              : [
-                                                  Color.lerp(Colors.white, t.primary, 0.14)!
-                                                      .withValues(alpha: 0.88),
-                                                  Color.lerp(Colors.white, t.primary, 0.22)!
-                                                      .withValues(alpha: 0.72),
-                                                ])
-                                          : (t.isDark
-                                              ? [
-                                                  Colors.white.withValues(alpha: 0.16),
-                                                  Colors.white.withValues(alpha: 0.08),
-                                                ]
-                                              : [
-                                                  Colors.white.withValues(alpha: 0.80),
-                                                  Colors.white.withValues(alpha: 0.54),
-                                                ]),
-                                    ),
-                                    shape: BoxShape.circle,
-                                    border: Border.all(
-                                      color: _plusOpen
-                                          ? t.primary.withValues(alpha: t.isDark ? 0.42 : 0.28)
-                                          : (t.isDark
-                                              ? Colors.white.withValues(alpha: 0.14)
-                                              : const Color(0x16162E42)),
-                                      width: 0.6,
-                                    ),
-                                    boxShadow: t.isDark
-                                        ? null
-                                        : const [
-                                            BoxShadow(
-                                              color: Color(0x0B000000),
-                                              blurRadius: 6,
-                                              offset: Offset(0, 2),
-                                            ),
-                                          ],
-                                  ),
-                                  child: AnimatedRotation(
-                                    turns: _plusOpen ? 0.125 : 0.0,
-                                    duration: const Duration(milliseconds: 260),
+                                child: CustomPaint(
+                                  foregroundPainter: state.glassTier == GrassBagGlassTier.solid
+                                      ? null
+                                      : GrassBagFresnelRimPainter(
+                                          isDark: t.isDark,
+                                          isCircle: true,
+                                          accent: _plusOpen ? t.primary : t.primaryHi,
+                                          innerWell: true,
+                                          frosted: state.glassTier == GrassBagGlassTier.frosted,
+                                        ),
+                                  child: AnimatedContainer(
+                                    duration: const Duration(milliseconds: 220),
                                     curve: Curves.easeOutCubic,
-                                    child: Icon(
-                                      CupertinoIcons.plus,
-                                      size: 19,
-                                      color: _plusOpen ? t.primary : t.text2,
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: _plusOpen
+                                            ? (t.isDark
+                                                ? [
+                                                    t.primary.withValues(alpha: 0.38),
+                                                    t.primary.withValues(alpha: 0.20),
+                                                  ]
+                                                : [
+                                                    Color.lerp(Colors.white, t.primary, 0.16)!
+                                                        .withValues(alpha: 0.78),
+                                                    Color.lerp(Colors.white, t.primary, 0.26)!
+                                                        .withValues(alpha: 0.56),
+                                                  ])
+                                            : (t.isDark
+                                                ? [
+                                                    Colors.white.withValues(alpha: 0.16),
+                                                    Colors.white.withValues(alpha: 0.065),
+                                                  ]
+                                                : [
+                                                    Colors.white.withValues(alpha: 0.72),
+                                                    Colors.white.withValues(alpha: 0.42),
+                                                  ]),
+                                      ),
+                                      shape: BoxShape.circle,
+                                      border: state.glassTier == GrassBagGlassTier.solid
+                                          ? Border.all(
+                                              color: _plusOpen
+                                                  ? t.primary.withValues(alpha: t.isDark ? 0.46 : 0.32)
+                                                  : t.sepStrong,
+                                              width: 0.65,
+                                            )
+                                          : null,
+                                      boxShadow: t.isDark
+                                          ? null
+                                          : const [
+                                              BoxShadow(
+                                                color: Color(0x0B0E243B),
+                                                blurRadius: 6,
+                                                offset: Offset(0, 2),
+                                              ),
+                                            ],
+                                    ),
+                                    child: AnimatedRotation(
+                                      turns: _plusOpen ? 0.125 : 0.0,
+                                      duration: const Duration(milliseconds: 260),
+                                      curve: Curves.easeOutCubic,
+                                      child: Icon(
+                                        CupertinoIcons.plus,
+                                        size: 19,
+                                        color: _plusOpen ? t.primary : t.text2,
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -2568,41 +2764,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           pillTap();
                                         },
                                         pressedScale: 0.94,
+                                        enablePointerGlow: false,
                                         haptic: true,
-                                        child: Container(
+                                        child: GrassBagFresnelGlassSurface(
+                                          isPill: true,
+                                          innerWell: true,
+                                          interactive: true,
                                           height: 36,
                                           padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                          decoration: BoxDecoration(
-                                            gradient: LinearGradient(
-                                              begin: Alignment.topCenter,
-                                              end: Alignment.bottomCenter,
-                                              colors: t.isDark
-                                                  ? [
-                                                      Colors.white.withValues(alpha: 0.15),
-                                                      Colors.white.withValues(alpha: 0.08),
-                                                    ]
-                                                  : [
-                                                      Colors.white.withValues(alpha: 0.80),
-                                                      Colors.white.withValues(alpha: 0.54),
-                                                    ],
-                                            ),
-                                            borderRadius: BorderRadius.circular(999),
-                                            border: Border.all(
-                                              color: t.isDark
-                                                  ? Colors.white.withValues(alpha: 0.14)
-                                                  : const Color(0x16162E42),
-                                              width: 0.6,
-                                            ),
-                                            boxShadow: t.isDark
-                                                ? null
-                                                : const [
-                                                    BoxShadow(
-                                                      color: Color(0x0B000000),
-                                                      blurRadius: 6,
-                                                      offset: Offset(0, 2),
-                                                    ),
-                                                  ],
-                                          ),
                                           child: Row(
                                             mainAxisSize: MainAxisSize.min,
                                             children: [
@@ -2625,16 +2794,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   !veryTightRow &&
                                                   !(tightRow && hasExtraStreamActions)) ...[
                                                 const SizedBox(width: 5),
-                                                Container(
+                                                GrassBagFresnelGlassSurface(
+                                                  isPill: true,
+                                                  innerWell: true,
+                                                  tintColor: t.primarySoft,
                                                   padding: const EdgeInsets.symmetric(
                                                     horizontal: 5.5,
                                                     vertical: 1.5,
-                                                  ),
-                                                  decoration: BoxDecoration(
-                                                    color: t.primary.withValues(
-                                                      alpha: t.isDark ? 0.22 : 0.12,
-                                                    ),
-                                                    borderRadius: BorderRadius.circular(999),
                                                   ),
                                                   child: Text(
                                                     effortBadge,
@@ -2660,26 +2826,38 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               // Liquid-morphing Apple GlassMenu for Steer / Queue / Interrupt while streaming!
                               if (state.isStreaming && hasText) ...[
                                 GlassMenu(
-                                  menuWidth: 214,
+                                  menuWidth: 256,
                                   menuBorderRadius: 24,
                                   menuAlignment: GlassMenuAlignment.bottomRight,
                                   autoAdjustToScreen: true,
-                                  opaqueColor: state.glassTier == GrassBagGlassTier.solid
-                                      ? t.cardSolid
-                                      : null,
-                                  settings: GrassBagGlassConfig.sheetSettings(t, state.glassTier),
-                                  quality: GrassBagGlassConfig.chromeQualityFor(state.glassTier),
+                                  opaqueColor:
+                                      resolveEffectiveGlassTier(context, state.glassTier) ==
+                                              GrassBagGlassTier.solid
+                                          ? t.cardSolid
+                                          : null,
+                                  selectionColor: t.isDark
+                                      ? Colors.white.withValues(alpha: 0.14)
+                                      : t.primary.withValues(alpha: 0.12),
+                                  settings: GrassBagGlassConfig.sheetSettings(
+                                    t,
+                                    resolveEffectiveGlassTier(context, state.glassTier),
+                                  ).copyWith(shadow: const []),
+                                  quality: GrassBagGlassConfig.chromeQualityFor(
+                                    resolveEffectiveGlassTier(context, state.glassTier),
+                                  ),
                                   triggerBuilder: (ctx, toggleMenu) => GrassBagSpringTap(
                                     onTap: toggleMenu,
                                     pressedScale: 0.94,
+                                    enablePointerGlow: false,
                                     haptic: true,
-                                    child: Container(
+                                    child: GrassBagFresnelGlassSurface(
+                                      isPill: true,
+                                      innerWell: true,
+                                      interactive: true,
+                                      tintColor: t.primarySoft,
                                       height: 36,
                                       padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                      decoration: BoxDecoration(
-                                        color: t.primarySoft,
-                                        borderRadius: BorderRadius.circular(999),
-                                      ),
+                                      alignment: Alignment.center,
                                       child: Row(
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
@@ -2701,14 +2879,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   items: [
                                     GlassMenuItem(
                                       title: state.busyEnterMode == 'steer'
-                                          ? '插话 · 引导当前任务（默认）'
+                                          ? '插话 · 引导当前（默认）'
                                           : '插话 · 引导当前任务',
                                       icon: const Icon(CupertinoIcons.arrow_turn_down_right),
                                       onTap: () => _submit(mode: 'steer'),
                                     ),
                                     GlassMenuItem(
                                       title: state.busyEnterMode != 'steer'
-                                          ? '排队 · 本轮结束后发（默认）'
+                                          ? '排队 · 本轮后发（默认）'
                                           : '排队 · 本轮结束后发',
                                       icon: const Icon(CupertinoIcons.clock),
                                       onTap: () => _submit(mode: 'queue'),
@@ -2739,26 +2917,24 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   message: state.isStopping ? '正在停止生成…' : '停止当前生成',
                                   child: GrassBagSpringTap(
                                     enabled: !state.isStopping,
+                                    enablePointerGlow: false,
                                     onTap: () {
                                       if (state.isStopping) return;
                                       HapticFeedback.lightImpact();
                                       ctrl.cancelStreaming();
                                     },
                                     pressedScale: 0.88,
-                                    child: Container(
+                                    child: GrassBagFresnelGlassSurface(
+                                      isCircle: true,
+                                      innerWell: true,
+                                      interactive: !state.isStopping,
+                                      tintColor: t.errSoft,
                                       width: 36,
                                       height: 36,
-                                      decoration: BoxDecoration(
-                                        color: t.errSoft,
-                                        shape: BoxShape.circle,
-                                        border: Border.all(
-                                          color: t.err.withValues(alpha: 0.32),
-                                          width: 0.6,
-                                        ),
-                                      ),
+                                      alignment: Alignment.center,
                                       child: state.isStopping
                                           ? Center(
-                                              child: CupertinoActivityIndicator(
+                                              child: GrassBagActivityIndicator(
                                                 radius: 6.5,
                                                 color: t.err,
                                               ),
@@ -2779,7 +2955,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 final isStopOrb = state.isStreaming && !hasText;
                                 final isFollowUpSend = state.isStreaming && hasText;
                                 final showPrimarySpinner = _submitting && !isStopOrb;
-                                final orbEnabled = isStopOrb ? !state.isStopping : !_submitting;
+                                final orbInteractive =
+                                    hasText || state.isStreaming || state.speechConfigured;
+                                final orbEnabled = isStopOrb
+                                    ? !state.isStopping
+                                    : (!_submitting && (hasText || state.speechConfigured));
                                 final primaryActive = hasText || showPrimarySpinner;
                                 final sendIcon = isFollowUpSend
                                     ? (state.busyEnterMode == 'steer'
@@ -2798,10 +2978,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   child: GrassBagSpringTap(
                                     key: const ValueKey('composer-action-btn'),
                                     enabled: orbEnabled,
-                                    pressedScale:
-                                        (hasText || state.isStreaming || state.speechConfigured)
-                                            ? 0.86
-                                            : 1.0,
+                                    enablePointerGlow: orbInteractive,
+                                    pressedScale: orbInteractive ? 0.86 : 1.0,
                                     onTap: () {
                                       if (isStopOrb) {
                                         if (state.isStopping) return;
@@ -2812,92 +2990,81 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       } else if (hasText) {
                                         _submit();
                                       } else if (state.speechConfigured) {
-                                        HapticFeedback.selectionClick();
-                                        showVoiceInputSheet(
-                                          context,
-                                          ref,
-                                          onTranscriptConfirmed: (text) {
-                                            final val = widget.controller.value;
-                                            final cur = val.text;
-                                            final sel = val.selection;
-                                            final start = sel.isValid
-                                                ? sel.start.clamp(0, cur.length)
-                                                : cur.length;
-                                            final end = sel.isValid
-                                                ? sel.end.clamp(start, cur.length)
-                                                : cur.length;
-                                            final needsLeadSpace = start > 0 &&
-                                                cur.codeUnitAt(start - 1) != 0x20 &&
-                                                cur.codeUnitAt(start - 1) != 0x0A;
-                                            final insert = needsLeadSpace ? ' $text' : text;
-                                            final updated = cur.replaceRange(start, end, insert);
-                                            widget.controller.value = TextEditingValue(
-                                              text: updated,
-                                              selection: TextSelection.collapsed(
-                                                offset: start + insert.length,
-                                              ),
-                                            );
-                                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                                              if (mounted) widget.focusNode.requestFocus();
-                                            });
-                                          },
-                                        );
+                                        _openVoiceInput();
                                       }
                                     },
-                                    child: AnimatedContainer(
-                                      duration: const Duration(milliseconds: 220),
-                                      curve: Curves.easeOutCubic,
-                                      width: 36,
-                                      height: 36,
-                                      decoration: BoxDecoration(
-                                        // Always provide a 2-stop LinearGradient so BoxDecoration.lerp
-                                        // interpolates Send <-> Stop <-> Mic smoothly instead of snapping at t=0.5!
-                                        gradient: LinearGradient(
-                                          begin: Alignment.topCenter,
-                                          end: Alignment.bottomCenter,
-                                          colors: primaryActive
-                                              ? [t.primaryHi, t.primary]
-                                              : () {
-                                                  final flat = isStopOrb
-                                                      ? t.errSoft
-                                                      : Colors.white.withValues(
-                                                          alpha: t.isDark ? 0.11 : 0.62,
-                                                        );
-                                                  return [flat, flat];
-                                                }(),
-                                        ),
-                                        shape: BoxShape.circle,
-                                        border: primaryActive
-                                            ? Border.all(
-                                                color: Colors.white.withValues(alpha: 0.28),
-                                                width: 0.6,
-                                              )
-                                            : Border.all(
-                                                color: isStopOrb
-                                                    ? t.err.withValues(alpha: 0.30)
-                                                    : Colors.white.withValues(
-                                                        alpha: t.isDark ? 0.18 : 0.90,
+                                    child: CustomPaint(
+                                      foregroundPainter: state.glassTier == GrassBagGlassTier.solid
+                                          ? null
+                                          : GrassBagFresnelRimPainter(
+                                              isDark: t.isDark,
+                                              isCircle: true,
+                                              tinted: primaryActive || isStopOrb,
+                                              innerWell: !primaryActive && !isStopOrb,
+                                              accent: isStopOrb ? t.err : t.primaryHi,
+                                              frosted: state.glassTier == GrassBagGlassTier.frosted,
+                                              strokeWidth: 0.9,
+                                            ),
+                                      child: AnimatedContainer(
+                                        duration: const Duration(milliseconds: 220),
+                                        curve: Curves.easeOutCubic,
+                                        width: 36,
+                                        height: 36,
+                                        decoration: BoxDecoration(
+                                          // Always provide a 2-stop LinearGradient so BoxDecoration.lerp
+                                          // interpolates Send <-> Stop <-> Mic smoothly instead of snapping at t=0.5!
+                                          gradient: LinearGradient(
+                                            begin: Alignment.topLeft,
+                                            end: Alignment.bottomRight,
+                                            colors: primaryActive
+                                                ? [
+                                                    Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.14 : 0.18)!,
+                                                    t.primary,
+                                                  ]
+                                                : (isStopOrb
+                                                    ? [
+                                                        Color.lerp(t.errSoft, Colors.white, t.isDark ? 0.06 : 0.22)!,
+                                                        t.errSoft,
+                                                      ]
+                                                    : (t.isDark
+                                                        ? [
+                                                            Colors.white.withValues(alpha: 0.16),
+                                                            Colors.white.withValues(alpha: 0.065),
+                                                          ]
+                                                        : [
+                                                            Colors.white.withValues(alpha: 0.72),
+                                                            Colors.white.withValues(alpha: 0.42),
+                                                          ])),
+                                          ),
+                                          shape: BoxShape.circle,
+                                          border: state.glassTier == GrassBagGlassTier.solid
+                                              ? Border.all(
+                                                  color: isStopOrb
+                                                      ? t.err.withValues(alpha: 0.34)
+                                                      : (primaryActive
+                                                          ? Colors.white.withValues(alpha: 0.24)
+                                                          : t.sepStrong),
+                                                  width: 0.65,
+                                                )
+                                              : null,
+                                          boxShadow: primaryActive
+                                              ? [
+                                                  BoxShadow(
+                                                    color: t.primary.withValues(alpha: t.isDark ? 0.42 : 0.34),
+                                                    blurRadius: 12,
+                                                    offset: const Offset(0, 3.5),
+                                                  ),
+                                                ]
+                                              : (t.isDark
+                                                  ? null
+                                                  : const [
+                                                      BoxShadow(
+                                                        color: Color(0x0B0E243B),
+                                                        blurRadius: 6,
+                                                        offset: Offset(0, 2),
                                                       ),
-                                                width: 0.65,
-                                              ),
-                                        boxShadow: primaryActive
-                                            ? [
-                                                BoxShadow(
-                                                  color: t.primary.withValues(alpha: 0.36),
-                                                  blurRadius: 10,
-                                                  offset: const Offset(0, 3),
-                                                ),
-                                              ]
-                                            : (t.isDark
-                                                ? null
-                                                : const [
-                                                    BoxShadow(
-                                                      color: Color(0x0D000000),
-                                                      blurRadius: 6,
-                                                      offset: Offset(0, 2),
-                                                    ),
-                                                  ]),
-                                      ),
+                                                    ]),
+                                        ),
                                       child: AnimatedSwitcher(
                                         duration: const Duration(milliseconds: 200),
                                         switchInCurve: Curves.easeOutCubic,
@@ -2911,13 +3078,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           ),
                                         ),
                                         child: showPrimarySpinner
-                                            ? CupertinoActivityIndicator(
+                                            ? GrassBagActivityIndicator(
                                                 key: const ValueKey('sending'),
                                                 radius: 7.5,
                                                 color: t.onPrimary,
                                               )
                                             : (isStopOrb && state.isStopping)
-                                                ? CupertinoActivityIndicator(
+                                                ? GrassBagActivityIndicator(
                                                     key: const ValueKey('stopping'),
                                                     radius: 7.0,
                                                     color: t.err,
@@ -2955,11 +3122,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       ),
                                     ),
                                   ),
-                                );
-                              }(),
+                                ),
+                              );
+                            }(),
                             ],
                           );
                             },
+                          ),
                           ),
                         ],
                       ),
@@ -2971,6 +3140,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   return ConstrainedBox(
                     constraints: BoxConstraints(maxHeight: math.max(80.0, maxDockH)),
                     child: SingleChildScrollView(
+                      clipBehavior: Clip.hardEdge,
                       physics: const ClampingScrollPhysics(),
                       child: dockBody,
                     ),
@@ -3086,23 +3256,29 @@ class _PlusQuickAction extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     return GrassBagSpringTap(
       onTap: onTap,
-      pressedScale: 0.91,
+      pressedScale: 0.92,
+      enablePointerGlow: false,
       haptic: true,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
+      child: GrassBagFresnelGlassSurface(
+        borderRadius: 18,
+        innerWell: true,
+        interactive: true,
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             GrassBagSquircleIcon(
               icon: icon,
               color: color,
-              size: 50,
-              iconSize: 22,
+              size: 46,
+              iconSize: 21,
               filled: true,
             ),
-            const SizedBox(height: 7),
+            const SizedBox(height: 6),
             Text(
               label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w500,
@@ -3141,7 +3317,7 @@ class _PopoverActionRow extends StatelessWidget {
       pressedScale: 0.98,
       haptic: true,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 9),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9.5),
         child: Row(
           children: [
             GrassBagSquircleIcon(
@@ -3194,10 +3370,12 @@ class _PlusDeckContent extends ConsumerWidget {
   const _PlusDeckContent({
     required this.onClose,
     required this.onOpenTerminal,
+    this.onOpenVoice,
   });
 
   final VoidCallback onClose;
   final VoidCallback onOpenTerminal;
+  final VoidCallback? onOpenVoice;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -3219,7 +3397,8 @@ class _PlusDeckContent extends ConsumerWidget {
             defaultTargetPlatform == TargetPlatform.iOS);
 
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+      // Concentric geometry: outer 30pt − 12px padding = 18pt inner bento & section radius!
+      padding: const EdgeInsets.all(12),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3229,7 +3408,7 @@ class _PlusDeckContent extends ConsumerWidget {
               Expanded(
                 child: _PlusQuickAction(
                   icon: CupertinoIcons.photo_fill,
-                  color: t.isDark ? const Color(0xFF4DA3E8) : const Color(0xFF2B7FC3),
+                  color: t.isDark ? const Color(0xFF2578C8) : const Color(0xFF2B7FC3),
                   label: isMobileCameraCapable ? '相册' : '图片',
                   onTap: () {
                     onClose();
@@ -3242,7 +3421,7 @@ class _PlusDeckContent extends ConsumerWidget {
                 Expanded(
                   child: _PlusQuickAction(
                     icon: CupertinoIcons.camera_fill,
-                    color: t.isDark ? const Color(0xFF818CF8) : const Color(0xFF535EC0),
+                    color: t.isDark ? const Color(0xFF5865DF) : const Color(0xFF535EC0),
                     label: '拍照',
                     onTap: () {
                       onClose();
@@ -3255,7 +3434,7 @@ class _PlusDeckContent extends ConsumerWidget {
               Expanded(
                 child: _PlusQuickAction(
                   icon: CupertinoIcons.doc_fill,
-                  color: t.isDark ? const Color(0xFF34D399) : const Color(0xFF2D8A7B),
+                  color: t.isDark ? const Color(0xFF178E68) : const Color(0xFF2D8A7B),
                   label: '文件',
                   onTap: () {
                     onClose();
@@ -3267,7 +3446,7 @@ class _PlusDeckContent extends ConsumerWidget {
               Expanded(
                 child: _PlusQuickAction(
                   icon: CupertinoIcons.chevron_left_slash_chevron_right,
-                  color: t.isDark ? const Color(0xFF64748B) : const Color(0xFF3E5368),
+                  color: t.isDark ? const Color(0xFF475D75) : const Color(0xFF3E5368),
                   label: '终端',
                   onTap: () {
                     onClose();
@@ -3277,79 +3456,103 @@ class _PlusDeckContent extends ConsumerWidget {
               ),
             ],
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 11),
-            child: Divider(height: 0.5, indent: 4, endIndent: 4, color: t.sep),
-          ),
-          _PopoverActionRow(
-            icon: CupertinoIcons.compass_fill,
-            iconColor: t.primary,
-            title: '角色预设',
-            trailingText: slice.activePreset.name,
-            onTap: () {
-              onClose();
-              showPresetSheet(context, ref);
-            },
-          ),
-          Divider(height: 0.5, indent: 42, color: t.sep),
-          _PopoverActionRow(
-            icon: perm.risky
-                ? CupertinoIcons.exclamationmark_shield_fill
-                : CupertinoIcons.checkmark_shield_fill,
-            iconColor: perm.risky ? t.warn : t.ok,
-            title: '操作权限',
-            trailingText: perm.name,
-            warnTrailing: perm.risky,
-            onTap: () {
-              onClose();
-              showPermissionSheet(context, ref);
-            },
-          ),
-          Divider(height: 0.5, indent: 42, color: t.sep),
-          GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () {
-              HapticFeedback.lightImpact();
-              ctrl.setPlanMode(!slice.planMode);
-            },
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
-              child: Row(
-                children: [
-                  GrassBagSquircleIcon(
-                    icon: CupertinoIcons.list_bullet_indent,
-                    color: t.dusk,
-                    size: 30,
-                    iconSize: 15,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+          const SizedBox(height: 12),
+          // Concentric luminous well keeps rows crystal-legible over busy Home cards
+          GrassBagSheetSection(
+            borderRadius: 18,
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            children: [
+              _PopoverActionRow(
+                icon: CupertinoIcons.compass_fill,
+                iconColor: t.primary,
+                title: '角色预设',
+                trailingText: slice.activePreset.name,
+                onTap: () {
+                  onClose();
+                  showPresetSheet(context, ref);
+                },
+              ),
+              Divider(height: 0.5, indent: 52, endIndent: 12, color: t.sep),
+              _PopoverActionRow(
+                icon: perm.risky
+                    ? CupertinoIcons.exclamationmark_shield_fill
+                    : CupertinoIcons.checkmark_shield_fill,
+                iconColor: perm.risky ? t.warn : t.ok,
+                title: '操作权限',
+                trailingText: perm.name,
+                warnTrailing: perm.risky,
+                onTap: () {
+                  onClose();
+                  showPermissionSheet(context, ref);
+                },
+              ),
+              if (onOpenVoice != null) ...[
+                Divider(height: 0.5, indent: 52, endIndent: 12, color: t.sep),
+                _PopoverActionRow(
+                  icon: CupertinoIcons.mic_fill,
+                  iconColor: t.primary,
+                  title: '语音输入',
+                  trailingText: '听写插入',
+                  onTap: () {
+                    onClose();
+                    onOpenVoice!();
+                  },
+                ),
+              ],
+              Divider(height: 0.5, indent: 52, endIndent: 12, color: t.sep),
+              Semantics(
+                toggled: slice.planMode,
+                label: '计划模式',
+                hint: '先规划步骤再动手执行',
+                child: GrassBagSpringTap(
+                  pressedScale: 0.985,
+                  enablePointerGlow: false,
+                  haptic: true,
+                  borderRadius: 12,
+                  onTap: () {
+                    ctrl.setPlanMode(!slice.planMode);
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Row(
                       children: [
-                        Text(
-                          '计划模式',
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                            color: t.text,
+                        GrassBagSquircleIcon(
+                          icon: CupertinoIcons.list_bullet_indent,
+                          color: t.dusk,
+                          size: 30,
+                          iconSize: 15,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '计划模式',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w500,
+                                  color: t.text,
+                                ),
+                              ),
+                              Text(
+                                '先规划步骤再动手执行',
+                                style: TextStyle(fontSize: 11.5, color: t.text3),
+                              ),
+                            ],
                           ),
                         ),
-                        Text(
-                          '先规划步骤再动手执行',
-                          style: TextStyle(fontSize: 11.5, color: t.text3),
+                        GrassBagGlassSwitch(
+                          value: slice.planMode,
+                          tier: slice.glassTier,
+                          onChanged: ctrl.setPlanMode,
                         ),
                       ],
                     ),
                   ),
-                  GrassBagGlassSwitch(
-                    value: slice.planMode,
-                    tier: slice.glassTier,
-                    onChanged: ctrl.setPlanMode,
-                  ),
-                ],
+                ),
               ),
-            ),
+            ],
           ),
         ],
       ),
@@ -3384,8 +3587,31 @@ class _ApprovalTakeoverCard extends StatefulWidget {
 }
 
 class _ApprovalTakeoverCardState extends State<_ApprovalTakeoverCard> {
-  late final DateTime _mountedAt = DateTime.now();
+  DateTime _mountedAt = DateTime.now();
   bool _decided = false;
+  bool _copied = false;
+  Timer? _copiedResetTimer;
+
+  static final RegExp _dangerCmdPattern = RegExp(
+    r'(^|\s)(rm\s+-[a-zA-Z]*[rf]|sudo\s|mkfs|dd\s+if=|shutdown|reboot|chmod\s+777|drop\s+table|truncate\s+table)',
+    caseSensitive: false,
+  );
+
+  @override
+  void didUpdateWidget(covariant _ApprovalTakeoverCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.command != widget.command || oldWidget.toolName != widget.toolName) {
+      _decided = false;
+      _copied = false;
+      _mountedAt = DateTime.now();
+    }
+  }
+
+  @override
+  void dispose() {
+    _copiedResetTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> _handleTap(String action) async {
     if (_decided) return;
@@ -3399,6 +3625,16 @@ class _ApprovalTakeoverCardState extends State<_ApprovalTakeoverCard> {
     if (!ok && mounted) {
       setState(() => _decided = false);
     }
+  }
+
+  void _copyCommand() {
+    unawaited(Clipboard.setData(ClipboardData(text: widget.command)));
+    HapticFeedback.selectionClick();
+    _copiedResetTimer?.cancel();
+    setState(() => _copied = true);
+    _copiedResetTimer = Timer(const Duration(milliseconds: 1400), () {
+      if (mounted) setState(() => _copied = false);
+    });
   }
 
   @override
@@ -3419,13 +3655,48 @@ class _ApprovalTakeoverCardState extends State<_ApprovalTakeoverCard> {
         lowerTool.contains('cmd') ||
         lowerTool.contains('exec') ||
         lowerTool.contains('terminal');
-    final headerTitle = isPhoneTool
-        ? '请求操控手机'
-        : (isFileTool
-            ? '请求修改文件'
-            : (isCmdTool ? '请求执行命令' : '请求调用工具'));
-    final showAllowSession = !isPhoneTool && !widget.isDirectMode;
+    final isDangerCmd = !isPhoneTool && _dangerCmdPattern.hasMatch(widget.command);
+
+    final headerTitle = isDangerCmd
+        ? '高风险操作授权'
+        : (isPhoneTool
+            ? '请求操控手机'
+            : (isFileTool
+                ? '请求修改文件'
+                : (isCmdTool ? '请求执行命令' : '请求调用工具')));
+    final badgeColor = isDangerCmd
+        ? t.err
+        : (isPhoneTool
+            ? t.primary
+            : (isFileTool ? t.dusk : (isCmdTool ? t.warn : t.primary)));
+    final badgeIcon = isDangerCmd
+        ? CupertinoIcons.exclamationmark_shield_fill
+        : (isPhoneTool
+            ? CupertinoIcons.device_phone_portrait
+            : (isFileTool
+                ? CupertinoIcons.doc_text_fill
+                : (isCmdTool
+                    ? CupertinoIcons.chevron_left_slash_chevron_right
+                    : CupertinoIcons.shield_lefthalf_fill)));
+    final wellEyebrow = isDangerCmd
+        ? '敏感指令 · 请仔细核对'
+        : (isPhoneTool
+            ? '操控指令预览'
+            : (isFileTool ? '文件变更内容' : '即将执行的命令'));
+
+    final showAllowSession = !isPhoneTool && !widget.isDirectMode && !isDangerCmd;
     final maxCardH = widget.maxHeight;
+    final compactCard = maxCardH < 280.0;
+
+    final wellBg = t.isDark
+        ? Colors.black.withValues(alpha: 0.34)
+        : Colors.white.withValues(alpha: 0.78);
+    final wellBorder = isDangerCmd
+        ? t.err.withValues(alpha: t.isDark ? 0.34 : 0.28)
+        : (t.isDark
+            ? Colors.white.withValues(alpha: 0.14)
+            : Colors.white.withValues(alpha: 0.94));
+    final wellCodeColor = t.codeFg;
 
     return GlassBackdropGroup(
       enabled: false,
@@ -3433,171 +3704,366 @@ class _ApprovalTakeoverCardState extends State<_ApprovalTakeoverCard> {
         constraints: BoxConstraints(maxHeight: maxCardH),
         child: GrassBagGlass(
           tier: widget.tier,
-          borderRadius: 28,
+          borderRadius: 30,
           elevated: true,
+          interactiveGlow: false,
           useSheetSettings: true,
-          padding: const EdgeInsets.all(16),
+          // Concentric geometry: 30pt outer − 14px horizontal padding = 16pt inner command well!
+          padding: EdgeInsets.fromLTRB(14, compactCard ? 12 : 16, 14, compactCard ? 12 : 16),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             mainAxisSize: MainAxisSize.min,
             children: [
               Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                   GrassBagSquircleIcon(
-                    icon: isPhoneTool
-                        ? CupertinoIcons.device_phone_portrait
-                        : (isFileTool
-                            ? CupertinoIcons.doc_text_fill
-                            : CupertinoIcons.shield_lefthalf_fill),
-                    color: isPhoneTool ? t.primary : t.warn,
-                    size: 36,
-                    iconSize: 18,
+                    icon: badgeIcon,
+                    color: badgeColor,
+                    size: 40,
+                    iconSize: 19,
                   ),
-                  const SizedBox(width: 11),
+                  const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        Text(
+                          headerTitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: -0.25,
+                            color: t.text,
+                          ),
+                        ),
+                        const SizedBox(height: 3),
                         Row(
                           children: [
                             Flexible(
                               child: Text(
-                                headerTitle,
+                                isPhoneTool
+                                    ? '无障碍安全确认'
+                                    : (widget.workspaceName.trim().isEmpty
+                                        ? '当前工作区'
+                                        : '工作区：${widget.workspaceName}'),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w600,
-                                  letterSpacing: -0.2,
-                                  color: t.text,
+                                  fontSize: 12,
+                                  color: t.text3,
                                 ),
                               ),
                             ),
                             if (rawTool.isNotEmpty) ...[
-                              const SizedBox(width: 6),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                                decoration: BoxDecoration(
-                                  color: t.fill1,
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: Text(
-                                  rawTool,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontFamily: 'monospace',
-                                    fontSize: 10.5,
-                                    fontWeight: FontWeight.w600,
-                                    color: t.text2,
+                              const SizedBox(width: 7),
+                              Flexible(
+                                flex: 0,
+                                child: ConstrainedBox(
+                                  constraints: const BoxConstraints(maxWidth: 150),
+                                  child: GrassBagFresnelGlassSurface(
+                                    isPill: true,
+                                    innerWell: true,
+                                    tintColor: badgeColor.withValues(alpha: t.isDark ? 0.18 : 0.11),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7.5,
+                                      vertical: 2,
+                                    ),
+                                    child: Text(
+                                      rawTool,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: badgeColor,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
                             ],
                           ],
                         ),
-                        Text(
-                          isPhoneTool
-                              ? '无障碍操控确认 · 可在手机操控设置中调整策略'
-                              : '工作区：${widget.workspaceName}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 12, color: t.text3),
-                        ),
                       ],
                     ),
                   ),
                   if (widget.pendingCount > 1) ...[
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: t.warnSoft,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
+                    const SizedBox(width: 8),
+                    GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      tintColor: badgeColor.withValues(alpha: t.isDark ? 0.20 : 0.12),
+                      padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
                       child: Text(
-                        '待确认 1/${widget.pendingCount}',
+                        '待确认 ${widget.pendingCount} 项',
                         style: TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
                           fontFeatures: const [FontFeature.tabularFigures()],
-                          color: t.warn,
+                          color: badgeColor,
                         ),
                       ),
                     ),
                   ],
                 ],
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 14),
+              // Adaptive crystal command/action preview well (luminous pearl in Light, smoked obsidian in Dark)
               Flexible(
-                child: Container(
-                  constraints: const BoxConstraints(maxHeight: 160),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: t.codeBg,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.09),
-                      width: 0.6,
-                    ),
-                  ),
-                  child: SingleChildScrollView(
-                    child: SelectableText(
-                      widget.command,
-                      contextMenuBuilder: buildGrassBagEditableContextMenu,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 12,
-                        height: 1.45,
-                        color: t.codeFg,
+                child: CustomPaint(
+                  foregroundPainter: widget.tier == GrassBagGlassTier.solid
+                      ? null
+                      : GrassBagFresnelRimPainter(
+                          isDark: t.isDark,
+                          borderRadius: 16,
+                          accent: badgeColor,
+                          innerWell: true,
+                          frosted: widget.tier == GrassBagGlassTier.frosted,
+                          paintTopSheen: false,
+                          strokeWidth: 0.8,
+                        ),
+                  child: Container(
+                    constraints: const BoxConstraints(maxHeight: 184),
+                    decoration: ShapeDecoration(
+                      color: wellBg,
+                      shape: RoundedSuperellipseBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        side: widget.tier == GrassBagGlassTier.solid
+                            ? BorderSide(color: wellBorder, width: 0.8)
+                            : BorderSide.none,
                       ),
+                      shadows: t.isDark
+                          ? null
+                          : const [
+                              BoxShadow(
+                                color: Color(0x0A0E2235),
+                                blurRadius: 10,
+                                offset: Offset(0, 2),
+                              ),
+                            ],
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 8, 8, 7),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 6,
+                                height: 6,
+                                decoration: BoxDecoration(
+                                  color: badgeColor,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  wellEyebrow,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: isDangerCmd ? t.err : t.text3,
+                                  ),
+                                ),
+                              ),
+                              GrassBagSpringTap(
+                                onTap: _copyCommand,
+                                pressedScale: 0.92,
+                                enablePointerGlow: false,
+                                haptic: true,
+                                child: GrassBagFresnelGlassSurface(
+                                  isPill: true,
+                                  innerWell: true,
+                                  interactive: true,
+                                  tintColor: _copied ? t.okSoft : null,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        _copied
+                                            ? CupertinoIcons.checkmark_alt
+                                            : CupertinoIcons.doc_on_doc,
+                                        size: 11,
+                                        color: _copied ? t.ok : t.text2,
+                                      ),
+                                      const SizedBox(width: 3.5),
+                                      Text(
+                                        _copied ? '已复制' : '复制',
+                                        style: TextStyle(
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: _copied ? t.ok : t.text2,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Divider(
+                          height: 0.6,
+                          thickness: 0.6,
+                          color: t.isDark
+                              ? Colors.white.withValues(alpha: 0.09)
+                              : const Color(0x14132C44),
+                        ),
+                        Flexible(
+                          child: _ScrollableCommandWell(
+                            fadeColor: wellBg,
+                            child: SelectableText(
+                              widget.command,
+                              contextMenuBuilder: buildGrassBagEditableContextMenu,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 12.4,
+                                height: 1.5,
+                                color: wellCodeColor,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
               ),
-              const SizedBox(height: 14),
-              Row(
-                children: [
-                  Expanded(
-                    child: GrassBagSecondaryGlassButton(
-                      label: '拒绝',
-                      height: 40,
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
-                      tier: widget.tier,
-                      insideGlass: true,
-                      destructive: true,
-                      enabled: !_decided,
-                      onTap: () => unawaited(_handleTap('deny')),
-                    ),
-                  ),
-                  if (showAllowSession) ...[
-                    const SizedBox(width: 6),
+              SizedBox(height: compactCard ? 10 : 15),
+              if (showAllowSession && compactCard)
+                Row(
+                  children: [
                     Expanded(
                       child: GrassBagSecondaryGlassButton(
-                        label: '本会话允许',
+                        label: '拒绝',
                         height: 40,
-                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
                         tier: widget.tier,
                         insideGlass: true,
+                        destructive: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('deny')),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '本会话',
+                        height: 40,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        tier: widget.tier,
+                        insideGlass: true,
+                        accentForeground: true,
                         enabled: !_decided,
                         onTap: () => unawaited(_handleTap('always')),
                       ),
                     ),
-                  ],
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: GrassBagPrimaryGlassButton(
-                      label: _decided ? '处理中…' : '允许一次',
-                      height: 40,
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
-                      tier: widget.tier,
-                      insideGlass: true,
-                      enabled: !_decided,
-                      onTap: () => unawaited(_handleTap('allow')),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: GrassBagPrimaryGlassButton(
+                        label: _decided ? '处理中…' : '允许',
+                        height: 40,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        tier: widget.tier,
+                        insideGlass: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('allow')),
+                      ),
                     ),
-                  ),
-                ],
-              ),
+                  ],
+                )
+              else if (showAllowSession) ...[
+                // Tier 1: Unmistakable Full-Width Hero Primary Pill (danger tint on high-risk cmds)
+                GrassBagPrimaryGlassButton(
+                  label: _decided ? '处理中…' : (isDangerCmd ? '确认执行高风险操作' : '允许本次'),
+                  icon: _decided
+                      ? null
+                      : (isDangerCmd
+                          ? CupertinoIcons.exclamationmark_shield_fill
+                          : CupertinoIcons.checkmark_shield_fill),
+                  color: isDangerCmd ? t.err : null,
+                  foregroundColor: isDangerCmd ? Colors.white : null,
+                  height: 46,
+                  tier: widget.tier,
+                  insideGlass: true,
+                  enabled: !_decided,
+                  onTap: () => unawaited(_handleTap('allow')),
+                ),
+                const SizedBox(height: 9),
+                // Tier 2: Balanced Frosted Secondary Pills (Zero cramped 3-in-a-row!)
+                Row(
+                  children: [
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '本会话允许',
+                        height: 42,
+                        tier: widget.tier,
+                        insideGlass: true,
+                        accentForeground: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('always')),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '拒绝',
+                        height: 42,
+                        tier: widget.tier,
+                        insideGlass: true,
+                        destructive: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('deny')),
+                      ),
+                    ),
+                  ],
+                ),
+              ] else
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 2,
+                      child: GrassBagSecondaryGlassButton(
+                        label: '拒绝',
+                        height: 46,
+                        tier: widget.tier,
+                        insideGlass: true,
+                        destructive: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('deny')),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      flex: 3,
+                      child: GrassBagPrimaryGlassButton(
+                        label: _decided ? '处理中…' : (isDangerCmd ? '确认执行' : '允许本次'),
+                        icon: _decided
+                            ? null
+                            : (isDangerCmd
+                                ? CupertinoIcons.exclamationmark_shield_fill
+                                : CupertinoIcons.checkmark_shield_fill),
+                        color: isDangerCmd ? t.err : null,
+                        foregroundColor: isDangerCmd ? Colors.white : null,
+                        height: 46,
+                        tier: widget.tier,
+                        insideGlass: true,
+                        enabled: !_decided,
+                        onTap: () => unawaited(_handleTap('allow')),
+                      ),
+                    ),
+                  ],
+                ),
             ],
           ),
         ),
@@ -3622,7 +4088,7 @@ class _UserQuestionTakeoverCard extends StatefulWidget {
   final double maxHeight;
   final GrassBagGlassTier tier;
   final Future<bool> Function(Object) onSubmit;
-  final VoidCallback onCancel;
+  final Future<bool> Function() onCancel;
 
   @override
   State<_UserQuestionTakeoverCard> createState() => _UserQuestionTakeoverCardState();
@@ -3635,13 +4101,16 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
   late final DateTime _mountedAt = DateTime.now();
   bool _submitting = false;
 
-  void _handleSkip() {
+  Future<void> _handleSkip() async {
     if (_submitting) return;
     if (DateTime.now().difference(_mountedAt).inMilliseconds < 260) {
       return;
     }
     setState(() => _submitting = true);
-    widget.onCancel();
+    final ok = await widget.onCancel();
+    if (mounted && !ok) {
+      setState(() => _submitting = false);
+    }
   }
 
   List<UserQuestionItem> get _items => widget.question.allQuestions;
@@ -3702,10 +4171,10 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
         constraints: BoxConstraints(maxHeight: widget.maxHeight),
         child: GrassBagGlass(
           tier: widget.tier,
-          borderRadius: 28,
+          borderRadius: 30,
           elevated: true,
           useSheetSettings: true,
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3715,31 +4184,35 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
                   GrassBagSquircleIcon(
                     icon: CupertinoIcons.question_circle_fill,
                     color: t.primary,
-                    size: 34,
-                    iconSize: 17,
+                    size: 38,
+                    iconSize: 18,
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 11),
                   Expanded(
                     child: Text(
                       multiQ ? '${widget.question.title}（共 ${items.length} 题）' : widget.question.title,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+                      style: TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: -0.2,
+                        color: t.text,
+                      ),
                     ),
                   ),
                   if (widget.pendingCount > 1) ...[
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: t.primarySoft,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
+                    const SizedBox(width: 8),
+                    GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      tintColor: t.primarySoft,
+                      padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
                       child: Text(
-                        '待确认 1/${widget.pendingCount}',
+                        '1 / ${widget.pendingCount}',
                         style: TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
                           fontFeatures: const [FontFeature.tabularFigures()],
                           color: t.primary,
                         ),
@@ -3801,6 +4274,8 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
                                         : '';
                                     final picked = pickedSet.contains(opt);
                                     return GrassBagSpringTap(
+                                      enablePointerGlow: false,
+                                      haptic: true,
                                       onTap: () {
                                         setState(() {
                                           if (q.multiSelect) {
@@ -3814,30 +4289,43 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
                                           }
                                         });
                                       },
-                                      child: Container(
+                                      child: GrassBagFresnelGlassSurface(
+                                        isPill: desc.isEmpty,
+                                        borderRadius: 14,
+                                        innerWell: !picked,
+                                        elevated: picked,
+                                        interactive: true,
+                                        tintColor: picked ? t.primarySoft : null,
                                         padding: const EdgeInsets.symmetric(
                                           horizontal: 12,
-                                          vertical: 7,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: picked ? t.primarySoft : t.fill1,
-                                          borderRadius: BorderRadius.circular(desc.isEmpty ? 999 : 14),
-                                          border: Border.all(
-                                            color: picked ? t.primary : t.sep,
-                                            width: 0.8,
-                                          ),
+                                          vertical: 8.5,
                                         ),
                                         child: Column(
                                           mainAxisSize: MainAxisSize.min,
                                           crossAxisAlignment: CrossAxisAlignment.start,
                                           children: [
-                                            Text(
-                                              opt,
-                                              style: TextStyle(
-                                                fontSize: 12.5,
-                                                fontWeight: FontWeight.w600,
-                                                color: picked ? t.primary : t.text,
-                                              ),
+                                            Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                if (picked) ...[
+                                                  Icon(
+                                                    CupertinoIcons.checkmark_alt,
+                                                    size: 13,
+                                                    color: t.primary,
+                                                  ),
+                                                  const SizedBox(width: 4),
+                                                ],
+                                                Flexible(
+                                                  child: Text(
+                                                    opt,
+                                                    style: TextStyle(
+                                                      fontSize: 12.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: picked ? t.primary : t.text,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
                                             ),
                                             if (desc.isNotEmpty) ...[
                                               const SizedBox(height: 2),
@@ -3882,8 +4370,8 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
             children: [
               GrassBagSecondaryGlassButton(
                 label: '跳过',
-                height: 40,
-                padding: const EdgeInsets.symmetric(horizontal: 14),
+                height: 44,
+                padding: const EdgeInsets.symmetric(horizontal: 16),
                 tier: widget.tier,
                 insideGlass: true,
                 enabled: !_submitting,
@@ -3899,7 +4387,7 @@ class _UserQuestionTakeoverCardState extends State<_UserQuestionTakeoverCard> {
                         : (_canSubmit
                             ? '提交选择'
                             : (multiQ ? '还有 $_unansweredCount 题未完成' : '请先完成以上选择或输入')),
-                    height: 40,
+                    height: 44,
                     tier: widget.tier,
                     insideGlass: true,
                     enabled: _canSubmit,
@@ -3940,6 +4428,18 @@ class _CordisRunTakeoverCard extends StatefulWidget {
 class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
   late final DateTime _mountedAt = DateTime.now();
   bool _decided = false;
+  bool _copied = false;
+
+  void _copyPreview() {
+    Clipboard.setData(ClipboardData(text: widget.request.codePreview));
+    HapticFeedback.selectionClick();
+    if (!_copied) {
+      setState(() => _copied = true);
+      Future<void>.delayed(const Duration(milliseconds: 1400), () {
+        if (mounted) setState(() => _copied = false);
+      });
+    }
+  }
 
   Future<void> _handleTap(bool allow) async {
     if (_decided) return;
@@ -3957,16 +4457,21 @@ class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final request = widget.request;
+    final wellBg = t.isDark
+        ? Colors.black.withValues(alpha: 0.34)
+        : Colors.white.withValues(alpha: 0.78);
+    final wellCodeColor = t.codeFg;
+
     return GlassBackdropGroup(
       enabled: false,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxHeight: widget.maxHeight),
         child: GrassBagGlass(
           tier: widget.tier,
-          borderRadius: 28,
+          borderRadius: 30,
           elevated: true,
           useSheetSettings: true,
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3976,18 +4481,24 @@ class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
                   GrassBagSquircleIcon(
                     icon: CupertinoIcons.cube_box_fill,
                     color: t.dusk,
-                    size: 34,
-                    iconSize: 17,
+                    size: 40,
+                    iconSize: 19,
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 12),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
                           '请求运行动态扩展模块',
-                          style: TextStyle(fontSize: 14.5, fontWeight: FontWeight.w600, color: t.text),
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: -0.25,
+                            color: t.text,
+                          ),
                         ),
+                        const SizedBox(height: 3),
                         Text(
                           '${request.pluginName} · ${request.summary.isNotEmpty ? request.summary : '助手按需加载扩展能力以完成任务'}',
                           maxLines: 2,
@@ -3998,18 +4509,17 @@ class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
                     ),
                   ),
                   if (widget.pendingCount > 1) ...[
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: t.fill1,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
+                    const SizedBox(width: 8),
+                    GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      tintColor: t.duskSoft,
+                      padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
                       child: Text(
-                        '待确认 1/${widget.pendingCount}',
+                        '1 / ${widget.pendingCount}',
                         style: TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
                           fontFeatures: const [FontFeature.tabularFigures()],
                           color: t.dusk,
                         ),
@@ -4019,31 +4529,143 @@ class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
                 ],
               ),
               if (request.codePreview.isNotEmpty) ...[
-                const SizedBox(height: 10),
+                const SizedBox(height: 14),
                 Flexible(
-                  child: ClipRSuperellipse(
-                    borderRadius: BorderRadius.circular(14),
+                  child: CustomPaint(
+                    foregroundPainter: widget.tier == GrassBagGlassTier.solid
+                        ? null
+                        : GrassBagFresnelRimPainter(
+                            isDark: t.isDark,
+                            borderRadius: 16,
+                            accent: t.dusk,
+                            innerWell: true,
+                            frosted: widget.tier == GrassBagGlassTier.frosted,
+                            paintTopSheen: false,
+                            strokeWidth: 0.8,
+                          ),
                     child: Container(
-                      constraints: const BoxConstraints(maxHeight: 110),
-                      padding: const EdgeInsets.all(10),
-                      color: t.codeBg,
-                      child: SingleChildScrollView(
-                        child: Text(
-                          request.codePreview,
-                          style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, color: t.codeFg),
+                      constraints: const BoxConstraints(maxHeight: 164),
+                      decoration: ShapeDecoration(
+                        color: wellBg,
+                        shape: RoundedSuperellipseBorder(
+                          borderRadius: BorderRadius.circular(16),
+                          side: widget.tier == GrassBagGlassTier.solid
+                              ? BorderSide(
+                                  color: t.isDark
+                                      ? Colors.white.withValues(alpha: 0.14)
+                                      : Colors.white.withValues(alpha: 0.94),
+                                  width: 0.8,
+                                )
+                              : BorderSide.none,
                         ),
+                        shadows: t.isDark
+                            ? null
+                            : const [
+                                BoxShadow(
+                                  color: Color(0x0A0E2235),
+                                  blurRadius: 10,
+                                  offset: Offset(0, 2),
+                                ),
+                              ],
                       ),
+                      child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 8, 8, 7),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 6,
+                                height: 6,
+                                decoration: BoxDecoration(color: t.dusk, shape: BoxShape.circle),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  '待执行动态扩展代码',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.text3,
+                                  ),
+                                ),
+                              ),
+                              GrassBagSpringTap(
+                                onTap: _copyPreview,
+                                pressedScale: 0.92,
+                                enablePointerGlow: false,
+                                haptic: true,
+                                child: GrassBagFresnelGlassSurface(
+                                  isPill: true,
+                                  innerWell: true,
+                                  interactive: true,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        _copied
+                                            ? CupertinoIcons.checkmark_alt
+                                            : CupertinoIcons.doc_on_doc,
+                                        size: 11,
+                                        color: _copied ? t.ok : t.text2,
+                                      ),
+                                      const SizedBox(width: 3.5),
+                                      Text(
+                                        _copied ? '已复制' : '复制',
+                                        style: TextStyle(
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: _copied ? t.ok : t.text2,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Divider(
+                          height: 0.6,
+                          thickness: 0.6,
+                          color: t.isDark
+                              ? Colors.white.withValues(alpha: 0.09)
+                              : const Color(0x14132C44),
+                        ),
+                        Flexible(
+                          child: _ScrollableCommandWell(
+                            fadeColor: wellBg,
+                            child: SelectableText(
+                              request.codePreview,
+                              contextMenuBuilder: buildGrassBagEditableContextMenu,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 12,
+                                height: 1.48,
+                                color: wellCodeColor,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                     ),
                   ),
                 ),
               ],
-              const SizedBox(height: 12),
+              const SizedBox(height: 15),
               Row(
                 children: [
                   Expanded(
+                    flex: 2,
                     child: GrassBagSecondaryGlassButton(
                       label: '拒绝加载',
-                      height: 40,
+                      height: 46,
                       tier: widget.tier,
                       insideGlass: true,
                       destructive: true,
@@ -4053,9 +4675,11 @@ class _CordisRunTakeoverCardState extends State<_CordisRunTakeoverCard> {
                   ),
                   const SizedBox(width: 10),
                   Expanded(
+                    flex: 3,
                     child: GrassBagPrimaryGlassButton(
                       label: _decided ? '处理中…' : '允许运行',
-                      height: 40,
+                      icon: _decided ? null : CupertinoIcons.checkmark_shield_fill,
+                      height: 46,
                       tier: widget.tier,
                       insideGlass: true,
                       enabled: !_decided,
@@ -4106,35 +4730,17 @@ class _ComposerContextRingButton extends ConsumerWidget {
               showContextSheet(context, ref);
             },
             pressedScale: 0.88,
+            enablePointerGlow: false,
             haptic: true,
-            child: Container(
+            child: GrassBagFresnelGlassSurface(
+              isPill: true,
+              innerWell: true,
+              interactive: true,
               height: 36,
               padding: EdgeInsets.symmetric(horizontal: pctInt >= 65 ? 9 : 8.5),
-              decoration: BoxDecoration(
-                color: pctInt >= 85
-                    ? t.errSoft
-                    : pctInt >= 65
-                        ? t.warnSoft
-                        : Colors.white.withValues(alpha: t.isDark ? 0.10 : 0.60),
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(
-                  color: pctInt >= 85
-                      ? t.err.withValues(alpha: 0.28)
-                      : pctInt >= 65
-                          ? t.warn.withValues(alpha: 0.28)
-                          : Colors.white.withValues(alpha: t.isDark ? 0.18 : 0.90),
-                  width: 0.65,
-                ),
-                boxShadow: t.isDark
-                    ? null
-                    : const [
-                        BoxShadow(
-                          color: Color(0x0C000000),
-                          blurRadius: 6,
-                          offset: Offset(0, 2),
-                        ),
-                      ],
-              ),
+              tintColor: pctInt >= 85
+                  ? t.errSoft
+                  : (pctInt >= 65 ? t.warnSoft : null),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -4223,6 +4829,7 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
         subtitle: activeGoal != null
             ? activeGoal.statusLabel
             : '已完成 $doneCount / ${todos.length}',
+        icon: CupertinoIcons.flag_fill,
         bodyBuilder: (ctx) => Consumer(
           builder: (ctx, sheetRef, _) {
             final st = GrassBagTokens.of(ctx);
@@ -4336,7 +4943,7 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
                                 SizedBox(
                                   width: 16,
                                   height: 16,
-                                  child: Center(child: CupertinoActivityIndicator(radius: 6, color: st.primary)),
+                                  child: Center(child: GrassBagActivityIndicator(radius: 6, color: st.primary)),
                                 )
                               else
                                 Icon(
@@ -4379,86 +4986,104 @@ class _LiveGoalTodoStrip extends ConsumerWidget {
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(6, 0, 6, 8),
-      child: GrassBagSpringTap(
-        onTap: openQuickSheet,
-        pressedScale: 0.985,
-        haptic: true,
-        child: GrassBagGlass(
-          tier: slice.glassTier,
-          borderRadius: 18,
-          useCardQuality: true,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8.5),
-          child: Row(
-            children: [
-              if (activeGoal != null)
-                Icon(CupertinoIcons.flag_fill, size: 14, color: accentCol)
-              else if (activeTodo != null)
-                SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: Center(child: CupertinoActivityIndicator(radius: 6, color: accentCol)),
-                )
-              else
-                Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: accentCol),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  activeGoal != null
-                      ? activeGoal.title
-                      : (activeTodo != null
-                          ? activeTodo.title
-                          : '待办清单 · 已完成 $doneCount/${todos.length}'),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12.5,
-                    fontWeight: FontWeight.w600,
-                    color: t.text,
+      child: GrassBagGlass(
+        tier: slice.glassTier,
+        borderRadius: 18,
+        useCardQuality: true,
+        interactiveGlow: false,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        child: Row(
+          children: [
+            Expanded(
+              child: GrassBagSpringTap(
+                onTap: openQuickSheet,
+                pressedScale: 0.985,
+                borderRadius: 14,
+                haptic: true,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2.5),
+                  child: Row(
+                    children: [
+                      if (activeGoal != null)
+                        Icon(CupertinoIcons.flag_fill, size: 14, color: accentCol)
+                      else if (activeTodo != null)
+                        SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: Center(child: GrassBagActivityIndicator(radius: 6, color: accentCol)),
+                        )
+                      else
+                        Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: accentCol),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          activeGoal != null
+                              ? activeGoal.title
+                              : (activeTodo != null
+                                  ? activeTodo.title
+                                  : '待办清单 · 已完成 $doneCount/${todos.length}'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.text,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      GrassBagFresnelGlassSurface(
+                        isPill: true,
+                        innerWell: true,
+                        tintColor: accentCol.withValues(alpha: t.isDark ? 0.22 : 0.12),
+                        padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
+                        child: Text(
+                          activeGoal != null
+                              ? activeGoal.statusLabel
+                              : '$doneCount/${todos.length}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: accentCol,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2),
-                decoration: BoxDecoration(
-                  color: accentCol.withValues(alpha: t.isDark ? 0.22 : 0.12),
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Text(
-                  activeGoal != null
-                      ? activeGoal.statusLabel
-                      : '$doneCount/${todos.length}',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: accentCol,
-                  ),
-                ),
-              ),
-              if (activeGoal != null) ...[
-                const SizedBox(width: 2),
-                GrassBagSpringTap(
-                  onTap: () => ctrl.updateGoalStatus(
-                    activeGoal.id,
-                    activeGoal.isArmed ? 'paused' : 'active',
-                  ),
-                  pressedScale: 0.90,
-                  haptic: true,
-                  child: SizedBox(
-                    width: 32,
-                    height: 32,
-                    child: Center(
-                      child: Icon(
-                        activeGoal.isArmed ? CupertinoIcons.pause_fill : CupertinoIcons.play_fill,
-                        size: 14,
-                        color: accentCol,
+            ),
+            if (activeGoal != null) ...[
+              const SizedBox(width: 2),
+              Tooltip(
+                message: activeGoal.isArmed ? '暂停目标' : '继续目标',
+                excludeFromSemantics: true,
+                child: Semantics(
+                  button: true,
+                  label: activeGoal.isArmed ? '暂停目标' : '继续目标',
+                  child: GrassBagSpringTap(
+                    onTap: () => ctrl.updateGoalStatus(
+                      activeGoal.id,
+                      activeGoal.isArmed ? 'paused' : 'active',
+                    ),
+                    pressedScale: 0.90,
+                    haptic: true,
+                    child: SizedBox(
+                      width: 36,
+                      height: 36,
+                      child: Center(
+                        child: Icon(
+                          activeGoal.isArmed ? CupertinoIcons.pause_fill : CupertinoIcons.play_fill,
+                          size: 14,
+                          color: accentCol,
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ],
+              ),
             ],
-          ),
+          ],
         ),
       ),
     );
@@ -4475,6 +5100,7 @@ class _ComposerSlideMaterialize extends StatefulWidget {
     required this.scaleFrom,
     required this.contentSigma,
     required this.child,
+    this.alignment = Alignment.bottomCenter,
   });
 
   final Animation<double> animation;
@@ -4483,6 +5109,7 @@ class _ComposerSlideMaterialize extends StatefulWidget {
   final double scaleFrom;
   final double contentSigma;
   final Widget child;
+  final Alignment alignment;
 
   @override
   State<_ComposerSlideMaterialize> createState() =>
@@ -4533,16 +5160,19 @@ class _ComposerSlideMaterializeState extends State<_ComposerSlideMaterialize> {
 
   @override
   Widget build(BuildContext context) {
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    final materialized = GrassBagMaterializeTransition(
+      animation: widget.animation,
+      tier: widget.tier,
+      alignment: widget.alignment,
+      scaleFrom: reduceMotion ? 1.0 : widget.scaleFrom,
+      contentSigma: reduceMotion ? 0.0 : widget.contentSigma,
+      child: widget.child,
+    );
+    if (reduceMotion) return materialized;
     return SlideTransition(
       position: _slideAnim,
-      child: GrassBagMaterializeTransition(
-        animation: widget.animation,
-        tier: widget.tier,
-        alignment: Alignment.bottomCenter,
-        scaleFrom: widget.scaleFrom,
-        contentSigma: widget.contentSigma,
-        child: widget.child,
-      ),
+      child: materialized,
     );
   }
 }
@@ -4613,6 +5243,87 @@ class _EditQueuedMessageSheetBodyState extends ConsumerState<_EditQueuedMessageS
           ],
         ),
         const SizedBox(height: 4),
+      ],
+    );
+  }
+}
+
+/// Scrollable approval command well that renders a soft bottom fade gradient whenever
+/// command arguments extend below the fold so users never miss truncated tail parameters.
+class _ScrollableCommandWell extends StatefulWidget {
+  const _ScrollableCommandWell({
+    required this.fadeColor,
+    required this.child,
+  });
+
+  final Color fadeColor;
+  final Widget child;
+
+  @override
+  State<_ScrollableCommandWell> createState() => _ScrollableCommandWellState();
+}
+
+class _ScrollableCommandWellState extends State<_ScrollableCommandWell> {
+  final ValueNotifier<bool> _hasMoreBelow = ValueNotifier<bool>(false);
+
+  void _sync(ScrollMetrics m) {
+    final next = m.maxScrollExtent > 2.0 && m.pixels < m.maxScrollExtent - 2.0;
+    if (_hasMoreBelow.value != next) _hasMoreBelow.value = next;
+  }
+
+  @override
+  void dispose() {
+    _hasMoreBelow.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        NotificationListener<ScrollMetricsNotification>(
+          onNotification: (n) {
+            _sync(n.metrics);
+            return false;
+          },
+          child: NotificationListener<ScrollNotification>(
+            onNotification: (n) {
+              _sync(n.metrics);
+              return false;
+            },
+            child: SingleChildScrollView(
+              physics: const BouncingScrollPhysics(),
+              padding: const EdgeInsets.fromLTRB(13, 10, 13, 11),
+              child: widget.child,
+            ),
+          ),
+        ),
+        Positioned(
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: 22,
+          child: IgnorePointer(
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _hasMoreBelow,
+              builder: (_, show, __) {
+                if (!show) return const SizedBox.shrink();
+                return DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        widget.fadeColor.withValues(alpha: 0.0),
+                        widget.fadeColor.withValues(alpha: 0.92),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
       ],
     );
   }

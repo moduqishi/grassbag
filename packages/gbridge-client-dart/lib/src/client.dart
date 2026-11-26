@@ -65,23 +65,20 @@ class GbridgeClient {
   }) {
     if (_vanilla != null) return _vanilla!.buildCapabilities();
     final normalizer = VanillaDshNormalizer();
+    late final VanillaDshAdapter adapter;
     final mux = VanillaDshMuxEngine(
       openSocket: _transport.openRawWebSocket,
       normalizer: normalizer,
       autoReconnect: _autoReconnect,
       onAutoApprove: (clientId, eventId) async {
-        await _transport.requestJson(
-          'POST',
-          '/api/\$events/result',
-          body: {
-            'clientId': clientId,
-            'eventId': eventId,
-            'outcome': const {'kind': 'result', 'value': 'allowed-once'},
-          },
-        );
+        await adapter.rpc(r'$events/result', {
+          'clientId': clientId,
+          'eventId': eventId,
+          'outcome': const {'kind': 'result', 'value': 'allowed-once'},
+        });
       },
     );
-    final adapter = VanillaDshAdapter(
+    adapter = VanillaDshAdapter(
       transport: _transport,
       mux: mux,
       normalizer: normalizer,

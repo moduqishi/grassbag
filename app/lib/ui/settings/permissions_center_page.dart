@@ -535,26 +535,51 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
         // 4. Background Keepalive & Notifications
         GrassBagGroupedSection(
           header: '后台运行与通知（推荐开启）',
-          footer: '忽略电池优化可显著降低切后台或锁屏时 Ubuntu 容器、DSH 引擎与无障碍服务被系统回收的概率。',
+          footer: perms.backgroundRestricted
+              ? '检测到系统已限制 GrassBag 后台活动，切到其他应用时极易触发网络断连或任务中断，请立即设为「允许后台高耗电 / 无限制」。'
+              : '开启忽略电池优化并加入厂商后台高耗电与自启动白名单，可防止切到其他应用操作时被系统冻结断网或查杀容器。',
           dividerIndent: 58,
           children: [
             GrassBagListTile(
               leading: GrassBagSquircleIcon(
                 icon: CupertinoIcons.battery_100,
-                color: perms.batteryOptIgnored ? t.ok : t.warn,
+                color: (perms.batteryOptIgnored && !perms.backgroundRestricted) ? t.ok : t.warn,
                 size: 34,
                 iconSize: 16,
-                filled: perms.batteryOptIgnored,
+                filled: perms.batteryOptIgnored && !perms.backgroundRestricted,
               ),
               title: const Text('忽略电池优化（后台保活）'),
-              subtitle: const Text('保持本机 DSH 引擎、长对话与无障碍服务稳定在线'),
+              subtitle: Text(
+                perms.backgroundRestricted
+                    ? '当前受系统后台限制，请设为无限制以防止切应用断网'
+                    : '保持本机 DSH 引擎、长对话与无障碍服务稳定在线',
+              ),
               trailing: _PermBadge(
-                label: perms.batteryOptIgnored ? '已允许' : '去设置',
-                bg: perms.batteryOptIgnored ? t.okSoft : t.warnSoft,
-                fg: perms.batteryOptIgnored ? t.ok : t.warn,
-                actionable: !perms.batteryOptIgnored,
+                label: perms.backgroundRestricted
+                    ? '受限·去解除'
+                    : (perms.batteryOptIgnored ? '已允许' : '去设置'),
+                bg: (perms.batteryOptIgnored && !perms.backgroundRestricted) ? t.okSoft : t.warnSoft,
+                fg: (perms.batteryOptIgnored && !perms.backgroundRestricted) ? t.ok : t.warn,
+                actionable: !perms.batteryOptIgnored || perms.backgroundRestricted,
               ),
               onTap: () => native.openPermissionSettings('battery'),
+            ),
+            GrassBagListTile(
+              leading: GrassBagSquircleIcon(
+                icon: CupertinoIcons.shield_lefthalf_fill,
+                color: perms.engineServiceActive ? t.ok : t.primary,
+                size: 34,
+                iconSize: 16,
+                filled: perms.engineServiceActive,
+              ),
+              title: const Text('厂商后台高耗电与自启动白名单'),
+              subtitle: Text(
+                perms.engineServiceActive
+                    ? '前台保活通道运行中 · OriginOS / HyperOS / ColorOS 建议开启允许后台高耗电与自启动'
+                    : '直达系统后台耗电管理，防止切换其他应用时触发传输中断或杀后台',
+              ),
+              showChevron: true,
+              onTap: () => native.openPermissionSettings('oem_keepalive'),
             ),
             GrassBagListTile(
               leading: GrassBagSquircleIcon(

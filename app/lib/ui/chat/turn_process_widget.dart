@@ -449,20 +449,72 @@ class TurnView extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final visibleProcessSteps = turn.steps
+        .where((s) => !(s is NoticeStep && s.level == 'error'))
+        .toList(growable: false);
+
+    // Split visible steps into chronological segments so intermediate assistant prose
+    // (questions, explanations, progress updates emitted before tools or subsequent thinking)
+    // ALWAYS renders inline as full visible Markdown prose instead of being swallowed or
+    // overwritten inside a collapsed thinking/process drawer!
+    final segments = <_TurnTimelineSegment>[];
+    final currentProcessGroup = <NormalizedStep>[];
+    var processSegmentCount = 0;
+    void flushProcessGroup() {
+      if (currentProcessGroup.isEmpty) return;
+      final segIdx = processSegmentCount++;
+      final segKey = segIdx == 0 ? turn.stableKey : '${turn.stableKey}#seg$segIdx';
+      segments.add(_TurnProcessSegment(
+        segmentKey: segKey,
+        isFirstProcessSegment: segIdx == 0,
+        steps: List<NormalizedStep>.unmodifiable(currentProcessGroup),
+      ));
+      currentProcessGroup.clear();
+    }
+
+    for (final step in visibleProcessSteps) {
+      if (step is ReasoningStep && step.isIntermediateProse) {
+        if (step.text.trim().isNotEmpty) {
+          flushProcessGroup();
+          segments.add(_TurnProseSegment(step: step));
+        }
+      } else {
+        currentProcessGroup.add(step);
+      }
+    }
+    flushProcessGroup();
+
+    final processSegments = segments.whereType<_TurnProcessSegment>().toList(growable: false);
+    final hasIntermediateProse = segments.any((s) => s is _TurnProseSegment);
+    final hasNonProseSteps = processSegments.isNotEmpty;
+    final lastProcessSegment = processSegments.isNotEmpty ? processSegments.last : null;
+    final trailingIsProcess = segments.isNotEmpty && segments.last is _TurnProcessSegment;
+
     final slice = ref.watch(
       appProvider.select(
         (s) => (
           activeHostId: s.activeHostId,
           sessionRenderGen: s.sessionRenderGen,
           autoFoldSteps: s.autoFoldSteps,
-          isExpanded: s.expandedTurnProcessIds.contains(turn.stableKey) ||
-              s.expandedTurnProcessIds.contains(turn.turnId),
-          isCollapsed: s.collapsedTurnProcessIds.contains(turn.stableKey) ||
-              s.collapsedTurnProcessIds.contains(turn.turnId),
-          hasExpandedChildStep: turn.steps.any(
-            (st) =>
-                (st is ReasoningStep && s.expandedStepIds.contains(st.id)) ||
-                (st is ToolStep && s.expandedStepIds.contains(st.callId)),
+          expandedSegMask: _computeSegmentBitmask(
+            processSegments,
+            (seg) =>
+                s.expandedTurnProcessIds.contains(seg.segmentKey) ||
+                (seg.isFirstProcessSegment && s.expandedTurnProcessIds.contains(turn.turnId)),
+          ),
+          collapsedSegMask: _computeSegmentBitmask(
+            processSegments,
+            (seg) =>
+                s.collapsedTurnProcessIds.contains(seg.segmentKey) ||
+                (seg.isFirstProcessSegment && s.collapsedTurnProcessIds.contains(turn.turnId)),
+          ),
+          childExpandedSegMask: _computeSegmentBitmask(
+            processSegments,
+            (seg) => seg.steps.any(
+              (st) =>
+                  (st is ReasoningStep && s.expandedStepIds.contains(st.id)) ||
+                  (st is ToolStep && s.expandedStepIds.contains(st.callId)),
+            ),
           ),
           canTranslateCot: s.connectionPhase == ConnectionPhase.connected,
           glassTier: s.glassTier,
@@ -482,18 +534,7 @@ class TurnView extends ConsumerWidget {
     );
     final ctrl = ref.read(appProvider.notifier);
     final t = GrassBagTokens.of(context);
-    // Calm Claude/iOS-26 process folding without violent mid-stream layout jumps:
-    // - Never fold mid-stream while streaming (eliminates the jarring ~140px upward yank at char 200!);
-    //   keep the timeline smoothly open during streaming unless explicitly collapsed by the user,
-    //   and gently fold once the turn settles (`!turn.isStreaming`).
     final isCancelledTurn = turn.status == 'cancelled' || turn.status == 'interrupted';
-    final processOpen = turn.isStreaming
-        ? !slice.isCollapsed
-        : (isCancelledTurn
-            ? !slice.isCollapsed
-            : (slice.autoFoldSteps
-                ? (slice.isExpanded || slice.hasExpandedChildStep)
-                : !slice.isCollapsed));
     final effectiveRegenerate = onRegenerate ??
         (turn.userMessage != null
             ? () {
@@ -515,9 +556,6 @@ class TurnView extends ConsumerWidget {
           }
         : null;
 
-    final visibleProcessSteps = turn.steps
-        .where((s) => !(s is NoticeStep && s.level == 'error'))
-        .toList(growable: false);
     final completedToolCount = visibleProcessSteps.whereType<ToolStep>().length;
     final subagentSteps = visibleProcessSteps
         .whereType<ToolStep>()
@@ -553,22 +591,95 @@ class TurnView extends ConsumerWidget {
     final effectiveDismissLocal = isLocalEphemeralTurn
         ? () => ctrl.dismissLocalFailedTurn(turn.turnId)
         : null;
+    final hasAnyProse = turn.assistantText.isNotEmpty || hasIntermediateProse;
     final isExplicitlyCancelled = !turn.isStreaming &&
         (turn.status == 'cancelled' || turn.status == 'interrupted') &&
         !turn.hasError;
     final isEmptyStoppedTurn = !turn.isStreaming &&
         !turn.hasError &&
-        turn.assistantText.isEmpty &&
+        !hasAnyProse &&
         turn.deliverables.isEmpty &&
-        visibleProcessSteps.isEmpty &&
+        !hasNonProseSteps &&
         turn.userMessage != null;
     final showCancelledRow = (isExplicitlyCancelled &&
-            turn.assistantText.isEmpty &&
+            !hasAnyProse &&
             turn.deliverables.isEmpty &&
             turn.userMessage != null) ||
         isEmptyStoppedTurn;
     final showCancelledPartialBadge = isExplicitlyCancelled &&
-        (turn.assistantText.isNotEmpty || turn.deliverables.isNotEmpty);
+        (hasAnyProse || turn.deliverables.isNotEmpty);
+
+    var renderedProcessIdx = 0;
+    final timelineWidgets = <Widget>[];
+    for (var segIndex = 0; segIndex < segments.length; segIndex++) {
+      final seg = segments[segIndex];
+      final topGap = segIndex == 0 ? 16.0 : 12.0;
+      if (seg is _TurnProcessSegment) {
+        final pIdx = renderedProcessIdx++;
+        final segExpanded = _segmentMaskBit(slice.expandedSegMask, pIdx);
+        final segCollapsed = _segmentMaskBit(slice.collapsedSegMask, pIdx);
+        final segChildExpanded = _segmentMaskBit(slice.childExpandedSegMask, pIdx);
+        final isLiveSeg = turn.isStreaming &&
+            trailingIsProcess &&
+            identical(seg, lastProcessSegment);
+        final segOpen = isLiveSeg
+            ? !segCollapsed
+            : (isCancelledTurn && identical(seg, lastProcessSegment)
+                ? !segCollapsed
+                : (slice.autoFoldSteps
+                    ? (segExpanded || segChildExpanded)
+                    : !segCollapsed));
+        timelineWidgets.add(SizedBox(height: topGap));
+        timelineWidgets.add(
+          RepaintBoundary(
+            child: _TurnProcessBlock(
+              key: ValueKey('proc-${seg.segmentKey}'),
+              turn: turn,
+              visibleSteps: seg.steps,
+              tier: slice.glassTier,
+              open: segOpen,
+              isLiveSegment: isLiveSeg,
+              canTranslateCot: slice.canTranslateCot,
+              onToggleOpen: () => ctrl.toggleTurnProcessFor(
+                seg.segmentKey,
+                currentlyOpen: segOpen,
+              ),
+              onToggleStep: ctrl.toggleStepExpanded,
+              onToggleTranslate: (stepId, text) => ctrl.translateReasoningStep(stepId, text),
+              onOpenTerminal: onOpenTerminal,
+              onLoadToolDetail: ctrl.loadToolDetail,
+              onSduiAction: (viewId, actionId, payload) =>
+                  ctrl.invokeSduiAction(viewId, actionId, payload),
+            ),
+          ),
+        );
+      } else if (seg is _TurnProseSegment) {
+        final proseText = seg.step.text.trim();
+        timelineWidgets.add(SizedBox(height: topGap));
+        timelineWidgets.add(
+          RepaintBoundary(
+            child: _AssistantBody(
+              key: ValueKey('prose-${seg.step.id}'),
+              turnId: '${slice.activeHostId}:${turn.stableKey}:prose:${seg.step.id}',
+              text: proseText,
+              isStreaming: false,
+              showFooter: false,
+              deliverables: const [],
+              onCopy: () {
+                Clipboard.setData(ClipboardData(text: proseText));
+              },
+              onQuoteText: handleQuoteExcerpt,
+              onFork: () {},
+              onFeedback: (_) {},
+              onDeliverableTap: (_) {},
+            ),
+          ),
+        );
+      }
+    }
+
+    final combinedProseForActions =
+        turn.combinedAssistantProse.isNotEmpty ? turn.combinedAssistantProse : turn.assistantText;
 
     final body = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -584,28 +695,9 @@ class TurnView extends ConsumerWidget {
               onQuoteText: handleQuoteExcerpt,
             ),
           ),
-        if (visibleProcessSteps.isNotEmpty) ...[
-          const SizedBox(height: 16),
-          RepaintBoundary(
-            child: _TurnProcessBlock(
-              turn: turn,
-              visibleSteps: visibleProcessSteps,
-              tier: slice.glassTier,
-              open: processOpen,
-              canTranslateCot: slice.canTranslateCot,
-              onToggleOpen: () => ctrl.toggleTurnProcessFor(
-                turn.stableKey,
-                currentlyOpen: processOpen,
-              ),
-              onToggleStep: ctrl.toggleStepExpanded,
-              onToggleTranslate: (stepId, text) => ctrl.translateReasoningStep(stepId, text),
-              onOpenTerminal: onOpenTerminal,
-              onLoadToolDetail: ctrl.loadToolDetail,
-              onSduiAction: (viewId, actionId, payload) =>
-                  ctrl.invokeSduiAction(viewId, actionId, payload),
-            ),
-          ),
-        ] else if (turn.isStreaming && turn.assistantText.isEmpty) ...[
+        if (timelineWidgets.isNotEmpty)
+          ...timelineWidgets
+        else if (turn.isStreaming && turn.assistantText.isEmpty) ...[
           const SizedBox(height: 16),
           RepaintBoundary(
             child: _LiveAwaitingResponseRow(
@@ -770,18 +862,24 @@ class TurnView extends ConsumerWidget {
         ],
         if (turn.assistantText.isNotEmpty ||
             turn.deliverables.isNotEmpty ||
+            (!turn.isStreaming && hasIntermediateProse && !turn.hasError) ||
             (!turn.isStreaming &&
-                visibleProcessSteps.isNotEmpty &&
+                hasNonProseSteps &&
                 !turn.hasError &&
                 turn.status != 'cancelled' &&
                 turn.status != 'interrupted'))
           Padding(
-            padding: const EdgeInsets.only(top: 14),
+            padding: EdgeInsets.only(
+              top: (turn.assistantText.isEmpty && hasIntermediateProse && turn.deliverables.isEmpty)
+                  ? 6
+                  : 14,
+            ),
             child: RepaintBoundary(
               child: _AssistantBody(
                 turnId: '${slice.activeHostId}:${turn.stableKey}',
                 text: turn.assistantText,
                 isStreaming: turn.isStreaming,
+                hasPriorProse: hasIntermediateProse,
                 deliverables: turn.deliverables,
                 modifiedFiles: modifiedFiles,
                 subagentSteps: subagentSteps,
@@ -790,7 +888,7 @@ class TurnView extends ConsumerWidget {
                 usage: turn.usage,
                 feedback: slice.feedback,
                 onCopy: () {
-                  Clipboard.setData(ClipboardData(text: turn.assistantText));
+                  Clipboard.setData(ClipboardData(text: combinedProseForActions));
                 },
                 onExportTurnMarkdown: () {
                   final buf = StringBuffer();
@@ -800,9 +898,9 @@ class TurnView extends ConsumerWidget {
                     buf.writeln(u);
                     buf.writeln();
                   }
-                  if (turn.assistantText.trim().isNotEmpty) {
+                  if (combinedProseForActions.trim().isNotEmpty) {
                     buf.writeln('## 回复\n');
-                    buf.writeln(turn.assistantText.trim());
+                    buf.writeln(combinedProseForActions.trim());
                   }
                   Clipboard.setData(ClipboardData(text: buf.toString().trim()));
                   ctrl.showToast('已复制本轮 Markdown', tone: ToastTone.ok);
@@ -2302,13 +2400,86 @@ class _LiveProcessSummaryText extends ConsumerWidget {
   }
 }
 
+sealed class _TurnTimelineSegment {
+  const _TurnTimelineSegment();
+}
+
+class _TurnProcessSegment extends _TurnTimelineSegment {
+  const _TurnProcessSegment({
+    required this.segmentKey,
+    required this.isFirstProcessSegment,
+    required this.steps,
+  });
+
+  final String segmentKey;
+  final bool isFirstProcessSegment;
+  final List<NormalizedStep> steps;
+}
+
+class _TurnProseSegment extends _TurnTimelineSegment {
+  const _TurnProseSegment({required this.step});
+  final ReasoningStep step;
+}
+
+String _computeSegmentBitmask(
+  List<_TurnProcessSegment> segs,
+  bool Function(_TurnProcessSegment) test,
+) {
+  if (segs.isEmpty) return '';
+  final buf = StringBuffer();
+  for (final s in segs) {
+    buf.write(test(s) ? '1' : '0');
+  }
+  return buf.toString();
+}
+
+bool _segmentMaskBit(String mask, int idx) =>
+    idx >= 0 && idx < mask.length && mask.codeUnitAt(idx) == 0x31;
+
+/// Clips long inline previews by line/char budget so expanded tool/thinking cards stay
+/// directly inside the root `CustomScrollView` with zero nested vertical scroll traps.
+({String text, bool clipped, int totalLines}) _clipInlinePreview(
+  String raw, {
+  required int maxLines,
+  required int maxChars,
+}) {
+  if (raw.isEmpty) return (text: '', clipped: false, totalLines: 0);
+  var lineCount = 1;
+  var cutOffset = raw.length;
+  var foundCut = false;
+  for (var i = 0; i < raw.length; i++) {
+    if (raw.codeUnitAt(i) == 0x0A) {
+      if (lineCount == maxLines && !foundCut) {
+        cutOffset = i;
+        foundCut = true;
+      }
+      lineCount++;
+    }
+    if (!foundCut && i >= maxChars) {
+      final prevNl = raw.lastIndexOf('\n', i);
+      cutOffset = prevNl > (maxChars ~/ 2) ? prevNl : i;
+      foundCut = true;
+    }
+  }
+  if (!foundCut) {
+    return (text: raw, clipped: false, totalLines: lineCount);
+  }
+  return (
+    text: raw.substring(0, cutOffset).trimRight(),
+    clipped: true,
+    totalLines: lineCount,
+  );
+}
+
 /// Borderless `dsh-Go` TurnProcess summary + `1px` vertical StreamThread rail (`x = 12px`).
 class _TurnProcessBlock extends StatelessWidget {
   const _TurnProcessBlock({
+    super.key,
     required this.turn,
     required this.visibleSteps,
     required this.tier,
     required this.open,
+    this.isLiveSegment = true,
     required this.canTranslateCot,
     required this.onToggleOpen,
     required this.onToggleStep,
@@ -2322,6 +2493,7 @@ class _TurnProcessBlock extends StatelessWidget {
   final List<NormalizedStep> visibleSteps;
   final GrassBagGlassTier tier;
   final bool open;
+  final bool isLiveSegment;
   final bool canTranslateCot;
   final VoidCallback onToggleOpen;
   final ValueChanged<String> onToggleStep;
@@ -2334,6 +2506,7 @@ class _TurnProcessBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
+    final segStreaming = turn.isStreaming && isLiveSegment;
     var toolCount = 0;
     var reasonCount = 0;
     var errTools = 0;
@@ -2353,10 +2526,10 @@ class _TurnProcessBlock extends StatelessWidget {
         reasonCount++;
       }
     }
-    final isCancelledTurn = !turn.isStreaming &&
+    final isCancelledTurn = !segStreaming &&
         (turn.status == 'cancelled' || turn.status == 'interrupted') &&
         !turn.hasError;
-    final durSec = turn.usage?.durationMs != null
+    final durSec = (isLiveSegment && turn.usage?.durationMs != null)
         ? '${(turn.usage!.durationMs! / 1000).toStringAsFixed(1)}s'
         : null;
     final settledSummaryText = () {
@@ -2380,8 +2553,6 @@ class _TurnProcessBlock extends StatelessWidget {
       return bits.join(' · ');
     }();
 
-    // Only the very last non-narration ReasoningStep is actively thinking when no tool is
-    // running and answer text hasn't started yet — prevents stacked pulsing boxes on multi-step turns!
     final lastVisibleStep = visibleSteps.isNotEmpty ? visibleSteps.last : null;
 
     return Column(
@@ -2399,16 +2570,16 @@ class _TurnProcessBlock extends StatelessWidget {
                   width: 24,
                   height: 24,
                   child: Center(
-                    child: turn.isStreaming
+                    child: segStreaming
                         ? _BreathingStatusDot(color: t.primary)
                         : Icon(
-                            errTools > 0 || turn.hasError
+                            errTools > 0 || (isLiveSegment && turn.hasError)
                                 ? CupertinoIcons.exclamationmark_circle_fill
                                 : (isCancelledTurn
                                     ? CupertinoIcons.stop_circle
                                     : CupertinoIcons.sparkles),
                             size: 15.5,
-                            color: errTools > 0 || turn.hasError
+                            color: errTools > 0 || (isLiveSegment && turn.hasError)
                                 ? t.err
                                 : (isCancelledTurn ? t.text3 : t.primary),
                           ),
@@ -2416,7 +2587,7 @@ class _TurnProcessBlock extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: turn.isStreaming
+                  child: segStreaming
                       ? _LiveProcessSummaryText(
                           runningTool: runningTool,
                           runningToolCount: runningToolCount,
@@ -2435,7 +2606,7 @@ class _TurnProcessBlock extends StatelessWidget {
                           ),
                         ),
                 ),
-                if (turn.isStreaming) ...[
+                if (segStreaming) ...[
                   const SizedBox(width: 6),
                   _LiveElapsedClock(startedAtMs: turn.userMessage?.createdAt),
                   const SizedBox(width: 6),
@@ -2454,11 +2625,9 @@ class _TurnProcessBlock extends StatelessWidget {
             ),
           ),
         ),
-        // Explicit toggle-only disclosure: glides smoothly open on live first step mount without
-        // fighting inner thinking/tool resizes once settled open.
         _SmoothDisclosure(
           expanded: open,
-          animateOnMount: turn.isStreaming,
+          animateOnMount: segStreaming,
           builder: () => CustomPaint(
             painter: _StreamThreadRailPainter(color: t.sepStrong),
             child: Padding(
@@ -2471,13 +2640,13 @@ class _TurnProcessBlock extends StatelessWidget {
                       _ThinkingStepRow(
                         key: ValueKey('reason-${step.id}'),
                         step: step,
-                        canTranslate: canTranslateCot && !turn.isStreaming,
-                        isStreaming: turn.isStreaming,
-                        isActivelyThinking: turn.isStreaming &&
+                        canTranslate: canTranslateCot && !segStreaming,
+                        isStreaming: segStreaming,
+                        isActivelyThinking: segStreaming &&
                             runningTool == null &&
                             turn.assistantText.isEmpty &&
                             identical(step, lastVisibleStep) &&
-                            !step.id.startsWith('narration-'),
+                            !step.isIntermediateProse,
                         onToggleExpand: () => onToggleStep(step.id),
                         onToggleTranslate: () => onToggleTranslate(step.id, step.text),
                       )
@@ -2485,7 +2654,7 @@ class _TurnProcessBlock extends StatelessWidget {
                       _ToolStepRow(
                         key: ValueKey('tool-${step.callId}'),
                         step: step,
-                        isStreaming: turn.isStreaming,
+                        isStreaming: segStreaming,
                         onToggleExpand: () => onToggleStep(step.callId),
                         onOpenTerminal: onOpenTerminal,
                         onLoadToolDetail: onLoadToolDetail,
@@ -2517,13 +2686,11 @@ class _TurnProcessBlock extends StatelessWidget {
                           ),
                         ),
                       ),
-                  // Quiet live tail row between tool calls so the open timeline NEVER looks frozen
-                  // after a tool finishes while the LLM plans the next call or final answer!
-                  if (turn.isStreaming &&
+                  if (segStreaming &&
                       runningTool == null &&
                       turn.assistantText.isEmpty &&
                       !(lastVisibleStep is ReasoningStep &&
-                          !lastVisibleStep.id.startsWith('narration-')))
+                          !lastVisibleStep.isIntermediateProse))
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
                       child: Row(
@@ -2757,6 +2924,163 @@ class _StreamThreadRailPainter extends CustomPainter {
       oldDelegate.color != color;
 }
 
+/// Clean editorial paragraph & inline emphasis renderer for Thinking Detail cards and sheets.
+/// Gives reasoning traces comfortable paragraph spacing, crisp **bold** / `code` / bullet hierarchy,
+/// and zero heavy layout cost so scrolling stays 120Hz silky.
+class _ThinkingRichProse extends StatelessWidget {
+  const _ThinkingRichProse({
+    required this.text,
+    required this.fontSize,
+    required this.lineHeight,
+    required this.bodyColor,
+    required this.headingColor,
+    required this.mutedColor,
+    required this.codeBg,
+    required this.codeFg,
+    required this.accentColor,
+  });
+
+  final String text;
+  final double fontSize;
+  final double lineHeight;
+  final Color bodyColor;
+  final Color headingColor;
+  final Color mutedColor;
+  final Color codeBg;
+  final Color codeFg;
+  final Color accentColor;
+
+  static final RegExp _inlineTokenRe = RegExp(r'(\*\*[^*\n]+\*\*|`[^`\n]+`)');
+  static final RegExp _bulletLineRe = RegExp(r'^(\s*)([-*•]|\d+[.)])\s+(.*)$');
+  static final RegExp _headingLineRe = RegExp(r'^#{1,4}\s+(.*)$');
+
+  List<InlineSpan> _parseInline(String line, TextStyle baseStyle) {
+    final matches = _inlineTokenRe.allMatches(line);
+    if (matches.isEmpty) return [TextSpan(text: line, style: baseStyle)];
+    final spans = <InlineSpan>[];
+    var cursor = 0;
+    for (final m in matches) {
+      if (m.start > cursor) {
+        spans.add(TextSpan(text: line.substring(cursor, m.start), style: baseStyle));
+      }
+      final tok = m.group(0)!;
+      if (tok.startsWith('**') && tok.endsWith('**') && tok.length > 4) {
+        spans.add(TextSpan(
+          text: tok.substring(2, tok.length - 2),
+          style: baseStyle.copyWith(fontWeight: FontWeight.w600, color: headingColor),
+        ));
+      } else if (tok.startsWith('`') && tok.endsWith('`') && tok.length > 2) {
+        spans.add(TextSpan(
+          text: ' ${tok.substring(1, tok.length - 1)} ',
+          style: TextStyle(
+            fontFamily: 'monospace',
+            fontSize: fontSize - 0.8,
+            height: lineHeight,
+            color: codeFg,
+            backgroundColor: codeBg,
+          ),
+        ));
+      } else {
+        spans.add(TextSpan(text: tok, style: baseStyle));
+      }
+      cursor = m.end;
+    }
+    if (cursor < line.length) {
+      spans.add(TextSpan(text: line.substring(cursor), style: baseStyle));
+    }
+    return spans;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return const SizedBox.shrink();
+    final baseStyle = TextStyle(
+      fontSize: fontSize,
+      height: lineHeight,
+      color: bodyColor,
+    );
+    final rawBlocks = trimmed.split(RegExp(r'\n{2,}'));
+    final children = <Widget>[];
+    for (var bi = 0; bi < rawBlocks.length; bi++) {
+      final block = rawBlocks[bi].trim();
+      if (block.isEmpty) continue;
+      if (children.isNotEmpty) {
+        children.add(const SizedBox(height: 8));
+      }
+      final lines = block.split('\n');
+      for (var li = 0; li < lines.length; li++) {
+        final rawLine = lines[li];
+        final lineTrim = rawLine.trim();
+        if (lineTrim.isEmpty) continue;
+        if (li > 0) children.add(const SizedBox(height: 3.5));
+        final headMatch = _headingLineRe.firstMatch(lineTrim);
+        if (headMatch != null) {
+          children.add(Text.rich(
+            TextSpan(
+              children: _parseInline(
+                headMatch.group(1)!,
+                baseStyle.copyWith(
+                  fontSize: fontSize + 0.4,
+                  fontWeight: FontWeight.w600,
+                  color: headingColor,
+                ),
+              ),
+            ),
+          ));
+          continue;
+        }
+        final bulletMatch = _bulletLineRe.firstMatch(rawLine);
+        if (bulletMatch != null) {
+          final indentSpaces = bulletMatch.group(1)!.length;
+          final marker = bulletMatch.group(2)!;
+          final content = bulletMatch.group(3)!;
+          final isOrdered = marker.length > 1;
+          children.add(Padding(
+            padding: EdgeInsets.only(left: (indentSpaces * 4.0).clamp(0.0, 20.0)),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: EdgeInsets.only(top: isOrdered ? 0 : 7, right: 7),
+                  child: isOrdered
+                      ? Text(
+                          marker,
+                          style: TextStyle(
+                            fontSize: fontSize - 0.5,
+                            fontWeight: FontWeight.w600,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                            color: accentColor.withValues(alpha: 0.82),
+                          ),
+                        )
+                      : Container(
+                          width: 4.5,
+                          height: 4.5,
+                          decoration: BoxDecoration(
+                            color: accentColor.withValues(alpha: 0.68),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                ),
+                Expanded(
+                  child: Text.rich(TextSpan(children: _parseInline(content, baseStyle))),
+                ),
+              ],
+            ),
+          ));
+          continue;
+        }
+        children.add(Text.rich(TextSpan(children: _parseInline(rawLine, baseStyle))));
+      }
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: children,
+    );
+  }
+}
+
 class _ThinkingStepRow extends ConsumerStatefulWidget {
   const _ThinkingStepRow({
     super.key,
@@ -2781,9 +3105,9 @@ class _ThinkingStepRow extends ConsumerStatefulWidget {
 
 class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
   final ScrollController _thinkScrollCtrl = ScrollController();
-  bool _userScrolledUp = false;
   bool _scrollScheduled = false;
   int _lastLiveTextLen = 0;
+  bool _inlineFullExpanded = false;
   String? _cachedZhStepId;
   int _cachedZhTextLen = -1;
   bool _cachedMostlyZh = false;
@@ -2802,8 +3126,8 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
   void didUpdateWidget(covariant _ThinkingStepRow oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.step.id != widget.step.id) {
-      _userScrolledUp = false;
       _lastLiveTextLen = 0;
+      _inlineFullExpanded = false;
     }
   }
 
@@ -2813,37 +3137,50 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
     super.dispose();
   }
 
-  void _openFullscreenThinking(BuildContext context, String text, bool isNarration) {
+  void _openFullscreenThinking(BuildContext context, String text, bool isTranslated) {
+    final charCount = text.trim().length;
     showGrassBagSheet<void>(
       context,
-      title: isNarration ? '完整说明' : '完整思考过程',
-      subtitle: '可长按选取或一键复制',
-      icon: isNarration ? CupertinoIcons.text_quote : CupertinoIcons.lightbulb_fill,
+      title: isTranslated ? '思考详情 · 中文译文' : '思考详情',
+      subtitle: '约 $charCount 字 · 可长按选取或一键复制',
+      icon: CupertinoIcons.sparkles,
       expandable: true,
       bodyBuilder: (ctx) {
         final st = GrassBagTokens.of(ctx);
         final tier = ProviderScope.containerOf(ctx, listen: false).read(appProvider).glassTier;
         final metrics = GrassBagSheetMetrics.maybeOf(ctx);
         final maxH = (metrics != null && metrics.expanded)
-            ? math.max(360.0, metrics.maxBodyHeight - 96.0)
-            : 380.0;
+            ? math.max(380.0, metrics.maxBodyHeight - 96.0)
+            : 420.0;
         return Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             GrassBagFresnelGlassSurface(
-              borderRadius: 16,
+              borderRadius: 18,
               innerWell: true,
-              padding: const EdgeInsets.all(14),
+              tintColor: st.isDark
+                  ? const Color(0xFF101926).withValues(alpha: 0.42)
+                  : Colors.white.withValues(alpha: 0.62),
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
               child: ConstrainedBox(
                 constraints: BoxConstraints(maxHeight: maxH),
                 child: SingleChildScrollView(
                   physics: const BouncingScrollPhysics(),
                   child: SelectionArea(
                     contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                    child: Text(
-                      text,
-                      style: TextStyle(fontSize: 13, height: 1.62, color: st.text2),
+                    child: _ThinkingRichProse(
+                      text: text,
+                      fontSize: 13.5,
+                      lineHeight: 1.7,
+                      bodyColor: st.text2,
+                      headingColor: st.text,
+                      mutedColor: st.text3,
+                      codeBg: st.isDark
+                          ? Colors.white.withValues(alpha: 0.08)
+                          : st.primary.withValues(alpha: 0.08),
+                      codeFg: st.isDark ? st.primaryHi : st.primary,
+                      accentColor: st.primary,
                     ),
                   ),
                 ),
@@ -2851,7 +3188,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
             ),
             const SizedBox(height: 12),
             GrassBagSecondaryGlassButton(
-              label: '复制全部内容',
+              label: '复制全部思考内容',
               icon: CupertinoIcons.doc_on_doc,
               height: 40,
               tier: tier,
@@ -2886,6 +3223,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
 
   void _handleCopyThinking(String text) {
     Clipboard.setData(ClipboardData(text: text));
+    HapticFeedback.selectionClick();
     if (!_copied) {
       setState(() => _copied = true);
       Future<void>.delayed(const Duration(milliseconds: 1400), () {
@@ -2894,20 +3232,20 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
     }
   }
 
-  void _maybeAutoFollowLive(bool isLive, bool showBody, int textLen) {
-    if (!isLive || !showBody) {
+  void _maybeAutoFollowLiveTicker(bool showLiveTicker, int textLen) {
+    if (!showLiveTicker) {
       _lastLiveTextLen = textLen;
       return;
     }
-    if (textLen > _lastLiveTextLen && !_userScrolledUp) {
+    if (textLen > _lastLiveTextLen) {
       _lastLiveTextLen = textLen;
       if (!_scrollScheduled) {
         _scrollScheduled = true;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _scrollScheduled = false;
-          if (!mounted || !_thinkScrollCtrl.hasClients || _userScrolledUp) return;
+          if (!mounted || !_thinkScrollCtrl.hasClients) return;
           final max = _thinkScrollCtrl.position.maxScrollExtent;
-          if (max > 0 && (max - _thinkScrollCtrl.offset) > 2.0) {
+          if (max > 0 && (max - _thinkScrollCtrl.offset) > 1.5) {
             _thinkScrollCtrl.jumpTo(max);
           }
         });
@@ -2915,6 +3253,56 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
     } else {
       _lastLiveTextLen = textLen;
     }
+  }
+
+  Widget _buildMiniGlassAction({
+    required GrassBagTokens t,
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+    bool loading = false,
+    bool enabled = true,
+  }) {
+    return GrassBagSpringTap(
+      enabled: enabled,
+      onTap: onTap,
+      pressedScale: 0.94,
+      haptic: true,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
+        decoration: BoxDecoration(
+          color: t.isDark
+              ? Colors.white.withValues(alpha: 0.06)
+              : t.primary.withValues(alpha: 0.055),
+          borderRadius: BorderRadius.circular(99),
+          border: Border.all(
+            color: t.isDark
+                ? Colors.white.withValues(alpha: 0.09)
+                : t.sep.withValues(alpha: 0.34),
+            width: 0.55,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (loading)
+              GrassBagActivityIndicator(radius: 5.5, color: color)
+            else
+              Icon(icon, size: 11.5, color: color),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -2938,21 +3326,17 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
     final effectiveTranslation = (translatedTextOverride?.isNotEmpty == true)
         ? translatedTextOverride
         : step.translatedText;
-    final bodyText =
-        (translated && effectiveTranslation != null && effectiveTranslation.isNotEmpty)
-            ? effectiveTranslation
-            : step.text;
-    final isNarration = step.id.startsWith('narration-');
-    final isLiveThinking = widget.isActivelyThinking && !isNarration && step.durationMs == null;
-    // Show a sleek auto-scrolling 4-line live reasoning viewport ONLY while this exact step
-    // is actively thinking — prevents multiple stacked live boxes across multi-step agent turns!
-    final showLiveViewport = isLiveThinking && !expanded && bodyText.trim().isNotEmpty;
+    final showingTranslation =
+        translated && effectiveTranslation != null && effectiveTranslation.isNotEmpty;
+    final bodyText = showingTranslation ? effectiveTranslation : step.text;
+    final isLiveThinking = widget.isActivelyThinking && step.durationMs == null;
+    final showLiveTicker = isLiveThinking && !expanded && bodyText.trim().isNotEmpty;
     final dur = step.durationMs != null
         ? (step.durationMs! < 1000
             ? '${step.durationMs}ms'
             : '${(step.durationMs! / 1000).toStringAsFixed(1)}s')
         : null;
-    _maybeAutoFollowLive(isLiveThinking, expanded || showLiveViewport, bodyText.length);
+    _maybeAutoFollowLiveTicker(showLiveTicker, bodyText.length);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -2971,24 +3355,38 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                   child: Center(
                     child: isLiveThinking
                         ? _BreathingStatusDot(color: t.primary)
-                        : Icon(
-                            isNarration ? CupertinoIcons.text_quote : CupertinoIcons.lightbulb,
-                            size: 14,
-                            color: t.text3,
+                        : Container(
+                            width: 19,
+                            height: 19,
+                            decoration: BoxDecoration(
+                              color: expanded
+                                  ? t.primary.withValues(alpha: t.isDark ? 0.18 : 0.11)
+                                  : (t.isDark
+                                      ? Colors.white.withValues(alpha: 0.06)
+                                      : t.fill1),
+                              shape: BoxShape.circle,
+                            ),
+                            child: Center(
+                              child: Icon(
+                                CupertinoIcons.sparkles,
+                                size: 11.5,
+                                color: expanded ? t.primary : t.text3,
+                              ),
+                            ),
                           ),
                   ),
                 ),
-                const SizedBox(width: 6),
+                const SizedBox(width: 7),
                 if (isLiveThinking) ...[
                   Text(
                     '思考中',
                     style: TextStyle(
                       fontSize: 12.5,
-                      fontWeight: FontWeight.w500,
+                      fontWeight: FontWeight.w600,
                       color: t.primary,
                     ),
                   ),
-                  const SizedBox(width: 4),
+                  const SizedBox(width: 5),
                   _LiveElapsedClock(
                     startedAtMs: _startedMsFor(step.id),
                     minTenths: 5,
@@ -3001,32 +3399,36 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                   ),
                 ] else
                   Text(
-                    isNarration
-                        ? '说明'
-                        : (dur != null ? '思考 $dur' : '思考'),
+                    dur != null ? '深度思考 · $dur' : '深度思考',
                     style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w500,
                       fontFeatures: const [FontFeature.tabularFigures()],
-                      color: t.text2,
+                      color: expanded ? t.text : t.text2,
                     ),
                   ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  child: Container(
-                    width: 3,
-                    height: 3,
-                    decoration: BoxDecoration(color: t.text3, shape: BoxShape.circle),
+                if (!expanded && step.collapsedPreview.trim().isNotEmpty) ...[
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    child: Container(
+                      width: 3,
+                      height: 3,
+                      decoration: BoxDecoration(
+                        color: t.text3.withValues(alpha: 0.65),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
                   ),
-                ),
-                Expanded(
-                  child: Text(
-                    step.collapsedPreview,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 12.5, color: t.text3),
+                  Expanded(
+                    child: Text(
+                      step.collapsedPreview,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 12.2, color: t.text3),
+                    ),
                   ),
-                ),
+                ] else
+                  const Spacer(),
                 const SizedBox(width: 4),
                 AnimatedRotation(
                   turns: expanded ? 0.5 : 0.0,
@@ -3035,7 +3437,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                   child: Icon(
                     CupertinoIcons.chevron_down,
                     size: 12,
-                    color: t.text3,
+                    color: expanded ? t.primary : t.text3,
                   ),
                 ),
               ],
@@ -3043,245 +3445,336 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
           ),
         ),
         _SmoothDisclosure(
-          expanded: expanded || showLiveViewport,
+          expanded: expanded || showLiveTicker,
           animateOnMount: isLiveThinking,
           builder: () {
-            final showTranslateBtn = expanded &&
-                step.text.isNotEmpty &&
-                (effectiveTranslation != null || (widget.canTranslate && !_isStepMostlyChinese(step)));
-            // When collapsed & actively streaming thinking, slice ONLY the trailing ~800 chars
-            // so TextPainter doesn't re-layout 10,000+ chars on every 42ms token flush!
-            String viewportText = bodyText;
-            if (showLiveViewport && bodyText.length > 820) {
-              var cut = bodyText.length - 800;
-              final nl = bodyText.indexOf('\n', cut);
-              if (nl >= 0 && nl < bodyText.length - 120) {
-                cut = nl + 1;
-              }
-              viewportText = '…${bodyText.substring(cut)}';
-            }
-            final rawTextWidget = Text(
-              viewportText,
-              key: ValueKey('${step.id}-$translated'),
-              style: TextStyle(
-                fontSize: showLiveViewport ? 12.2 : 12.5,
-                height: 1.58,
-                color: t.text2,
-              ),
-            );
-            final textNode = showLiveViewport
-                ? rawTextWidget
-                : SelectionArea(
-                    contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                    key: ValueKey('${step.id}-$translated'),
-                    child: rawTextWidget,
-                  );
-            final scrollViewport = NotificationListener<ScrollNotification>(
-              onNotification: (n) {
-                if (n is ScrollUpdateNotification && n.dragDetails != null) {
-                  final atBottom = (n.metrics.maxScrollExtent - n.metrics.pixels) <= 18.0;
-                  _userScrolledUp = !atBottom;
-                }
-                return false;
-              },
-              child: SingleChildScrollView(
-                controller: _thinkScrollCtrl,
-                physics: const BouncingScrollPhysics(),
-                child: isLiveThinking
-                    ? textNode
-                    : AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 180),
-                        child: textNode,
-                      ),
-              ),
-            );
             final thinkTier = resolveAmbientGlassTier(context);
             final thinkSolid = thinkTier == GrassBagGlassTier.solid;
-            final thinkBox = AnimatedContainer(
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              padding: EdgeInsets.all(showLiveViewport ? 10 : 12),
+
+            // 1. Live collapsed streaming whisper strip (borderless, zero scroll trapping!)
+            if (showLiveTicker) {
+              String tickerText = bodyText;
+              if (tickerText.length > 720) {
+                var cut = tickerText.length - 700;
+                final nl = tickerText.indexOf('\n', cut);
+                if (nl >= 0 && nl < tickerText.length - 100) {
+                  cut = nl + 1;
+                }
+                tickerText = '…${tickerText.substring(cut)}';
+              }
+              return Padding(
+                padding: const EdgeInsets.only(left: 10, top: 2, bottom: 8),
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: widget.onToggleExpand,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      padding: const EdgeInsets.fromLTRB(12, 9, 12, 9),
+                      decoration: BoxDecoration(
+                        color: thinkSolid
+                            ? t.fill1
+                            : (t.isDark
+                                ? const Color(0xFF0E1724).withValues(alpha: 0.44)
+                                : Colors.white.withValues(alpha: 0.56)),
+                        border: Border(
+                          left: BorderSide(
+                            color: t.primary.withValues(alpha: 0.72),
+                            width: 2.5,
+                          ),
+                        ),
+                      ),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 84),
+                        child: RepaintBoundary(
+                          child: ShaderMask(
+                            blendMode: BlendMode.dstIn,
+                            shaderCallback: (rect) => const LinearGradient(
+                              begin: Alignment.topCenter,
+                              end: Alignment.bottomCenter,
+                              stops: [0.0, 0.30, 1.0],
+                              colors: [
+                                Colors.transparent,
+                                Colors.black,
+                                Colors.black,
+                              ],
+                            ).createShader(rect),
+                            // IgnorePointer + NeverScrollableScrollPhysics so the live preview
+                            // NEVER intercepts vertical chat scrolling!
+                            child: IgnorePointer(
+                              child: SingleChildScrollView(
+                                controller: _thinkScrollCtrl,
+                                physics: const NeverScrollableScrollPhysics(),
+                                child: Text(
+                                  tickerText,
+                                  style: TextStyle(
+                                    fontSize: 12.2,
+                                    height: 1.56,
+                                    color: t.text2.withValues(alpha: 0.90),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            // 2. Expanded Thinking Detail Card: crisp iOS 27 translucent glass well, editorial header,
+            //    structured paragraph typography, and ZERO nested vertical SingleChildScrollView!
+            final showTranslateBtn = step.text.isNotEmpty &&
+                (effectiveTranslation != null ||
+                    (widget.canTranslate && !_isStepMostlyChinese(step)));
+            final cleanBody = bodyText.trim();
+            final charCount = cleanBody.length;
+            final clipped = _inlineFullExpanded
+                ? (text: cleanBody, clipped: false, totalLines: 0)
+                : _clipInlinePreview(cleanBody, maxLines: 38, maxChars: 2400);
+            final displayBody = clipped.text;
+
+            final cardSurface = Container(
               decoration: ShapeDecoration(
-                color: thinkSolid ? t.fill1 : null,
+                color: thinkSolid ? t.cardSolid : null,
                 gradient: thinkSolid
                     ? null
                     : LinearGradient(
                         begin: Alignment.topLeft,
                         end: Alignment.bottomRight,
-                        colors: showLiveViewport
+                        colors: t.isDark
                             ? [
-                                t.primary.withValues(alpha: t.isDark ? 0.13 : 0.08),
-                                (t.isDark ? Colors.white : Colors.white)
-                                    .withValues(alpha: t.isDark ? 0.04 : 0.50),
+                                const Color(0xFF162233).withValues(alpha: 0.62),
+                                const Color(0xFF0D1521).withValues(alpha: 0.50),
                               ]
-                            : (t.isDark
-                                ? [
-                                    Colors.white.withValues(alpha: 0.085),
-                                    Colors.white.withValues(alpha: 0.03),
-                                  ]
-                                : [
-                                    Colors.white.withValues(alpha: 0.68),
-                                    Colors.white.withValues(alpha: 0.42),
-                                  ]),
+                            : [
+                                Colors.white.withValues(alpha: 0.80),
+                                const Color(0xFFF3F7FC).withValues(alpha: 0.66),
+                              ],
                       ),
                 shape: RoundedSuperellipseBorder(
-                  borderRadius: BorderRadius.circular(15),
+                  borderRadius: BorderRadius.circular(18),
                   side: thinkSolid
-                      ? BorderSide(
-                          color: showLiveViewport
-                              ? t.primary.withValues(alpha: 0.22)
-                              : t.sep,
-                          width: 0.6,
-                        )
+                      ? BorderSide(color: t.sep, width: 0.65)
                       : BorderSide.none,
                 ),
               ),
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  AnimatedContainer(
-                    duration: const Duration(milliseconds: 220),
-                    curve: Curves.easeOutCubic,
-                    constraints: BoxConstraints(maxHeight: showLiveViewport ? 96 : 280),
-                    child: showLiveViewport
-                        ? GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onTap: widget.onToggleExpand,
-                            child: RepaintBoundary(
-                              child: ShaderMask(
-                                blendMode: BlendMode.dstIn,
-                                shaderCallback: (rect) => const LinearGradient(
-                                  begin: Alignment.topCenter,
-                                  end: Alignment.bottomCenter,
-                                  stops: [0.0, 0.28, 1.0],
-                                  colors: [
-                                    Colors.transparent,
-                                    Colors.black,
-                                    Colors.black,
-                                  ],
-                                ).createShader(rect),
-                                // Ignore pointer drags on the collapsed preview so vertical chat
-                                // scrolling is never trapped while tapping expands full CoT!
-                                child: IgnorePointer(child: scrollViewport),
-                              ),
-                            ),
-                          )
-                        : scrollViewport,
-                  ),
-                  if (expanded) ...[
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 4,
-                      crossAxisAlignment: WrapCrossAlignment.center,
+                  // Editorial header bar
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(13, 10, 10, 8),
+                    child: Row(
                       children: [
-                        if (showTranslateBtn)
-                          GrassBagSpringTap(
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 7.5, vertical: 2.5),
+                          decoration: BoxDecoration(
+                            color: showingTranslation
+                                ? t.primary.withValues(alpha: t.isDark ? 0.20 : 0.12)
+                                : (t.isDark
+                                    ? Colors.white.withValues(alpha: 0.075)
+                                    : t.primary.withValues(alpha: 0.08)),
+                            borderRadius: BorderRadius.circular(99),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                showingTranslation
+                                    ? CupertinoIcons.globe
+                                    : CupertinoIcons.sparkles,
+                                size: 10.5,
+                                color: showingTranslation
+                                    ? t.primary
+                                    : (t.isDark ? t.primaryHi : t.primary),
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                showingTranslation ? '中文译文' : '思考详情',
+                                style: TextStyle(
+                                  fontSize: 10.8,
+                                  fontWeight: FontWeight.w600,
+                                  color: showingTranslation
+                                      ? t.primary
+                                      : (t.isDark ? t.primaryHi : t.primary),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        if (charCount > 0) ...[
+                          const SizedBox(width: 7),
+                          Text(
+                            '约 $charCount 字',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.text3,
+                            ),
+                          ),
+                        ],
+                        const Spacer(),
+                        if (showTranslateBtn) ...[
+                          _buildMiniGlassAction(
+                            t: t,
+                            icon: CupertinoIcons.globe,
+                            label: translating
+                                ? '翻译中'
+                                : (translated ? '原文' : '翻译'),
+                            color: t.primary,
+                            loading: translating,
                             enabled: !translating,
-                            onTap: translating ? () {} : widget.onToggleTranslate,
-                            pressedScale: 0.94,
-                            haptic: true,
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  if (translating)
-                                    GrassBagActivityIndicator(radius: 6, color: t.primary)
-                                  else
-                                    Icon(CupertinoIcons.globe, size: 13, color: t.primary),
-                                  const SizedBox(width: 5),
-                                  Text(
-                                    translating
-                                        ? '正在翻译…'
-                                        : (translated ? '查看原文' : '翻译思考过程'),
-                                    style: TextStyle(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: t.primary,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                            onTap: widget.onToggleTranslate,
+                          ),
+                          const SizedBox(width: 5),
+                        ],
+                        if (cleanBody.isNotEmpty)
+                          _buildMiniGlassAction(
+                            t: t,
+                            icon: _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                            label: _copied ? '已复制' : '复制',
+                            color: _copied ? t.ok : t.text2,
+                            onTap: () => _handleCopyThinking(cleanBody),
+                          ),
+                        if (charCount > 220 || '\n'.allMatches(cleanBody).length >= 7) ...[
+                          const SizedBox(width: 5),
+                          _buildMiniGlassAction(
+                            t: t,
+                            icon: CupertinoIcons.arrow_up_left_arrow_down_right,
+                            label: '全屏',
+                            color: t.primary,
+                            onTap: () => _openFullscreenThinking(
+                              context,
+                              cleanBody,
+                              showingTranslation,
                             ),
                           ),
-                        if (bodyText.trim().isNotEmpty)
-                          GrassBagSpringTap(
-                            onTap: () => _handleCopyThinking(bodyText),
-                            pressedScale: 0.94,
-                            haptic: true,
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    _copied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
-                                    size: 12.5,
-                                    color: _copied ? t.ok : t.text3,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    _copied ? '已复制' : '复制',
-                                    style: TextStyle(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: _copied ? t.ok : t.text3,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        if (bodyText.length > 240 || '\n'.allMatches(bodyText).length >= 8)
-                          GrassBagSpringTap(
-                            onTap: () => _openFullscreenThinking(context, bodyText, isNarration),
-                            pressedScale: 0.94,
-                            haptic: true,
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 6),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    CupertinoIcons.arrow_up_left_arrow_down_right,
-                                    size: 11.5,
-                                    color: t.primary,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    '全屏查看',
-                                    style: TextStyle(
-                                      fontSize: 11.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: t.primary,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
+                        ],
                       ],
+                    ),
+                  ),
+                  Divider(
+                    height: 0.6,
+                    thickness: 0.6,
+                    color: t.isDark
+                        ? Colors.white.withValues(alpha: 0.08)
+                        : t.sep.withValues(alpha: 0.65),
+                  ),
+                  // Structured thinking prose body with subtle left accent quote rail
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(13, 11, 14, 12),
+                    child: IntrinsicHeight(
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Container(
+                            width: 2.5,
+                            margin: const EdgeInsets.only(right: 11, top: 2, bottom: 2),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(99),
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: isLiveThinking
+                                    ? [
+                                        t.primary.withValues(alpha: 0.78),
+                                        t.primary.withValues(alpha: 0.18),
+                                      ]
+                                    : [
+                                        t.primary.withValues(alpha: t.isDark ? 0.42 : 0.34),
+                                        t.text3.withValues(alpha: 0.12),
+                                      ],
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: SelectionArea(
+                              contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                              key: ValueKey('think-body-${step.id}-$translated'),
+                              child: _ThinkingRichProse(
+                                text: displayBody,
+                                fontSize: 12.8,
+                                lineHeight: 1.66,
+                                bodyColor: t.text2,
+                                headingColor: t.text,
+                                mutedColor: t.text3,
+                                codeBg: t.isDark
+                                    ? Colors.white.withValues(alpha: 0.08)
+                                    : t.primary.withValues(alpha: 0.08),
+                                codeFg: t.isDark ? t.primaryHi : t.primary,
+                                accentColor: t.primary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (clipped.clipped) ...[
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(13, 0, 13, 11),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: GrassBagSpringTap(
+                              pressedScale: 0.97,
+                              haptic: true,
+                              onTap: () => setState(() => _inlineFullExpanded = true),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 11),
+                                decoration: BoxDecoration(
+                                  color: t.primary.withValues(alpha: t.isDark ? 0.14 : 0.08),
+                                  borderRadius: BorderRadius.circular(11),
+                                  border: Border.all(
+                                    color: t.primary.withValues(alpha: t.isDark ? 0.26 : 0.18),
+                                    width: 0.6,
+                                  ),
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.primary),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      '展开剩余思考（共 $charCount 字）',
+                                      style: TextStyle(
+                                        fontSize: 11.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ],
               ),
             );
+
             return Padding(
-              padding: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
+              padding: const EdgeInsets.only(left: 6, top: 4, bottom: 10),
               child: thinkSolid
-                  ? thinkBox
+                  ? cardSurface
                   : CustomPaint(
                       foregroundPainter: GrassBagFresnelRimPainter(
                         isDark: t.isDark,
-                        borderRadius: 15,
-                        accent: showLiveViewport ? t.primary : null,
+                        borderRadius: 18,
+                        accent: isLiveThinking ? t.primary : null,
                         innerWell: true,
                         frosted: thinkTier == GrassBagGlassTier.frosted,
                         paintTopSheen: false,
                         strokeWidth: 0.78,
                       ),
-                      child: thinkBox,
+                      child: cardSurface,
                     ),
             );
           },
@@ -4043,13 +4536,9 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       : BorderSide.none,
                 ),
               ),
-              child: AnimatedSize(
-                duration: GrassBagMotion.duration(context, const Duration(milliseconds: 210)),
-                curve: Curves.easeOutCubic,
-                alignment: Alignment.topCenter,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
                     if (_loading && _detail == null)
                     Row(
                       children: [
@@ -4114,21 +4603,25 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                         ],
                       ),
                       const SizedBox(height: 4),
-                      ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 170),
-                        child: SelectionArea(
+                      () {
+                        final diffClip = _clipInlinePreview(
+                          synthDiff.unified,
+                          maxLines: 14,
+                          maxChars: 1400,
+                        );
+                        final span = diffClip.clipped
+                            ? _highlightDiffSpan('${diffClip.text}\n…', isDark: t.isDark)
+                            : (synthDiffSpan ??
+                                _highlightDiffSpan(synthDiff.unified, isDark: t.isDark));
+                        return SelectionArea(
                           contextMenuBuilder: buildGrassBagSelectableContextMenu,
                           child: SingleChildScrollView(
-                            child: SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              child: Text.rich(
-                                synthDiffSpan ??
-                                    _highlightDiffSpan(synthDiff.unified, isDark: t.isDark),
-                              ),
-                            ),
+                            scrollDirection: Axis.horizontal,
+                            physics: const ClampingScrollPhysics(),
+                            child: Text.rich(span),
                           ),
-                        ),
-                      ),
+                        );
+                      }(),
                       const SizedBox(height: 8),
                     ] else if (argsText.isNotEmpty) ...[
                       Text(
@@ -4140,23 +4633,21 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                         ),
                       ),
                       const SizedBox(height: 4),
-                      ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 110),
-                        child: SingleChildScrollView(
-                          child: SelectionArea(
-                            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                            child: Text(
-                              argsText,
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 11,
-                                height: 1.42,
-                                color: t.isDark ? const Color(0xFF93C5FD) : const Color(0xFF1B56B5),
-                              ),
+                      () {
+                        final argsClip = _clipInlinePreview(argsText, maxLines: 8, maxChars: 720);
+                        return SelectionArea(
+                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                          child: Text(
+                            argsClip.clipped ? '${argsClip.text}\n…' : argsClip.text,
+                            style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11,
+                              height: 1.42,
+                              color: t.isDark ? const Color(0xFF93C5FD) : const Color(0xFF1B56B5),
                             ),
                           ),
-                        ),
-                      ),
+                        );
+                      }(),
                       const SizedBox(height: 8),
                     ],
                     Text(
@@ -4168,40 +4659,42 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       ),
                     ),
                     const SizedBox(height: 4),
-                    ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 220),
-                      child: SingleChildScrollView(
-                        child: SelectionArea(
-                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                          child: () {
-                            final memoOut = _resolveMemoizedOutput(
-                              effectiveOutput,
-                              isErr: isErr,
-                              isDark: t.isDark,
-                            );
-                            if (memoOut.jsonSpan != null) {
-                              return Text.rich(
-                                memoOut.jsonSpan!,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 11.5,
-                                  height: 1.48,
-                                  color: t.codeFg,
-                                ),
-                              );
-                            }
-                            return Text(
-                              memoOut.clean,
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 11.5,
-                                height: 1.48,
-                                color: isErr ? errInk : t.codeFg,
-                              ),
-                            );
-                          }(),
-                        ),
-                      ),
+                    SelectionArea(
+                      contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                      child: () {
+                        final memoOut = _resolveMemoizedOutput(
+                          effectiveOutput,
+                          isErr: isErr,
+                          isDark: t.isDark,
+                        );
+                        final outClip = _clipInlinePreview(
+                          memoOut.clean,
+                          maxLines: 16,
+                          maxChars: 1600,
+                        );
+                        if (!outClip.clipped && memoOut.jsonSpan != null) {
+                          return Text.rich(
+                            memoOut.jsonSpan!,
+                            style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11.5,
+                              height: 1.48,
+                              color: t.codeFg,
+                            ),
+                          );
+                        }
+                        return Text(
+                          outClip.clipped
+                              ? '${outClip.text}\n…（共 ${outClip.totalLines} 行，点击下方「全屏查看」阅读完整输出）'
+                              : outClip.text,
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11.5,
+                            height: 1.48,
+                            color: isErr ? errInk : t.codeFg,
+                          ),
+                        );
+                      }(),
                     ),
                     const SizedBox(height: 8),
                     Wrap(
@@ -4397,10 +4890,9 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                   ],
                 ],
               ),
-              ),
             );
             return Padding(
-              padding: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
+              padding: const EdgeInsets.only(left: 10, top: 2, bottom: 8),
               child: toolSolid
                   ? toolBox
                   : CustomPaint(
@@ -4794,9 +5286,12 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
 
 class _AssistantBody extends StatefulWidget {
   const _AssistantBody({
+    super.key,
     required this.turnId,
     required this.text,
     required this.isStreaming,
+    this.showFooter = true,
+    this.hasPriorProse = false,
     required this.deliverables,
     this.modifiedFiles = const [],
     this.subagentSteps = const [],
@@ -4819,6 +5314,8 @@ class _AssistantBody extends StatefulWidget {
   final String turnId;
   final String text;
   final bool isStreaming;
+  final bool showFooter;
+  final bool hasPriorProse;
   final List<Map<String, dynamic>> deliverables;
   final List<String> modifiedFiles;
   final List<ToolStep> subagentSteps;
@@ -7434,7 +7931,9 @@ class _AssistantBodyState extends State<_AssistantBody>
                 : buildGrassBagSelectableContextMenu,
             child: richBody,
           )
-        else if (!isTyping &&
+        else if (widget.showFooter &&
+            !widget.hasPriorProse &&
+            !isTyping &&
             widget.text.isEmpty &&
             widget.deliverables.isEmpty &&
             widget.completedToolCount > 0)
@@ -7595,7 +8094,7 @@ class _AssistantBodyState extends State<_AssistantBody>
         ],
         // Quiet minimalist bottom chrome (modified files + one-tap action pills) smoothly revealed
         // with SizeTransition + FadeTransition so completion NEVER causes a 1-frame layout pop!
-        if (!isTyping)
+        if (widget.showFooter && !isTyping)
           _ReplyActionStripReveal(
             animate: _animateActionStripEntrance,
             child: Column(

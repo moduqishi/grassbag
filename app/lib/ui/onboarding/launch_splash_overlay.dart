@@ -601,6 +601,73 @@ class GrassBagAppGate extends ConsumerStatefulWidget {
 
   final bool skipLaunchAnimation;
 
+  /// Pure readiness predicate shared by splash choreography and unit tests.
+  /// Ensures returning Android local-host launches complete container boot, DSH connection,
+  /// sessions list, and model/account hydration INSIDE the splash before revealing Home!
+  @visibleForTesting
+  static bool isStartupHydrationSettled(
+    GrassBagAppState s, {
+    bool? isAndroidOverride,
+    bool userStoppedLocalEngine = false,
+  }) {
+    final isAndroid = isAndroidOverride ?? GrassBagNativeBridge.instance.isAndroidNative;
+    final isLocalActive = s.hosts.isEmpty || s.activeHost.isLocal;
+    if (isAndroid && isLocalActive && !s.nativeStatusHydrated) {
+      return false;
+    }
+    if (s.connectionPhase == ConnectionPhase.connecting ||
+        s.connectionPhase == ConnectionPhase.reconnecting ||
+        s.connectionPhase == ConnectionPhase.bootstrapping) {
+      return false;
+    }
+    if (isLocalActive) {
+      final rt = s.nativeRuntimeStatus;
+      if (rt.engineState == 'starting') return false;
+      // On an initialized local container that wasn't explicitly stopped by the user,
+      // wait until the container actually boots AND connects (closes the race where splash
+      // exited while `prewarmInBackground` hadn't yet transitioned `stopped -> starting`!).
+      if (isAndroid &&
+          rt.initialized &&
+          !userStoppedLocalEngine &&
+          rt.engineState != 'error' &&
+          s.connectionPhase != ConnectionPhase.error) {
+        if (!rt.engineRunning) return false;
+        if (s.connectionPhase != ConnectionPhase.connected) return false;
+      }
+    }
+    if (s.hydratingDomains || s.loadingSessions) return false;
+    if (s.connectionPhase == ConnectionPhase.connected) {
+      // Wait until initial domain/model/auth hydration lands (prevents login/model card flash!)
+      if (s.dshNamespaces.isEmpty && s.modelGroups.isEmpty && !s.isAccountSignedIn) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// Computes the adaptive splash safety ceiling: generous 20s once Android confirms a
+  /// genuinely initialized/booting local container so startup finishes completely inside
+  /// the splash, and brisk 3.6s if native bridge hasn't responded or remote host is offline.
+  @visibleForTesting
+  static Duration computeMaxHoldDuration(
+    GrassBagAppState s, {
+    bool? isAndroidOverride,
+    bool userStoppedLocalEngine = false,
+  }) {
+    final isAndroid = isAndroidOverride ?? GrassBagNativeBridge.instance.isAndroidNative;
+    final isLocalActive = s.hosts.isEmpty || s.activeHost.isLocal;
+    final bootingLocalContainer = isAndroid &&
+        isLocalActive &&
+        s.nativeStatusHydrated &&
+        !userStoppedLocalEngine &&
+        (s.nativeRuntimeStatus.initialized ||
+            s.nativeRuntimeStatus.engineState == 'starting' ||
+            s.connectionPhase == ConnectionPhase.connecting);
+    return bootingLocalContainer
+        ? const Duration(seconds: 20)
+        : const Duration(milliseconds: 3600);
+  }
+
   @override
   ConsumerState<GrassBagAppGate> createState() => _GrassBagAppGateState();
 }
@@ -621,6 +688,7 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
   bool _exitingSplash = false;
   bool _logoAssembled = false;
   bool _allowManualSkip = false;
+  bool _extendedHoldForLocalBoot = false;
   Timer? _shellMountTimer;
   Timer? _skipUnlockTimer;
   Timer? _maxHoldTimer;
@@ -631,7 +699,7 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
     super.initState();
     _exitCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 360),
+      duration: const Duration(milliseconds: 320),
     )..addStatusListener((status) {
         if (status == AnimationStatus.completed && mounted && _exitingSplash) {
           final target = _pendingExitStage ?? _GateStage.ready;
@@ -659,24 +727,25 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
 
     _stage = _GateStage.splash;
     // CRITICAL COLD-START 120FPS OPTIMIZATION:
-    // On Android, `MainActivity.onCreate` ALREADY started booting the local Ubuntu + DSH engine
-    // on a native background thread at t=0ms!
+    // On Android, `GrassBagApplication.onCreate` ALREADY started booting the local Ubuntu + DSH
+    // engine on a native background thread BEFORE `MainActivity` & Flutter even started!
     // Render ONLY the pure-Canvas kinetic logo assembly on Frame 0 (zero GLSL shaders -> OS splash
-    // lifts immediately and all 1280ms of particle convergence + outline trace + liquid wave fill
+    // lifts immediately and all 1000ms of particle convergence + outline trace + liquid wave fill
     // play at rock-solid 120fps!). Once the logo locks in (`_onLogoAssembled`), mount `GrassBagShell`
-    // underneath to warm up Liquid Glass shaders while the assembled emblem & status pill hold cleanly!
+    // invisibly underneath to warm up Liquid Glass shaders while the splash holds cleanly until
+    // container + DSH + models + sessions are 100% ready!
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      // Allow impatient returning users to tap through after 1.15s once logo is nearly complete
-      // (never unlock manual skip during first-launch onboarding beat).
-      _skipUnlockTimer = Timer(const Duration(milliseconds: 1150), () {
+      // Allow impatient returning users to tap through after 2.2s if cold container boot is still
+      // running (never unlock manual skip during first-launch onboarding beat).
+      _skipUnlockTimer = Timer(const Duration(milliseconds: 2200), () {
         if (mounted && !_isOnboardingDecisionPending() && !_shouldShowOnboarding()) {
           setState(() => _allowManualSkip = true);
         }
       });
-      // Safety fallback: ensure shell mounts only for returning users, and hold splash gracefully
-      // up to 3.6s while container startup + model/DeepSeek auth hydration settle so Home NEVER flashes!
-      _shellMountTimer = Timer(const Duration(milliseconds: 1400), () {
+      // Safety fallback: ensure shell mounts invisibly under splash for returning users once
+      // the 1000ms logo animation finishes so Home layout & shaders are pre-warmed before exit!
+      _shellMountTimer = Timer(const Duration(milliseconds: 1120), () {
         if (mounted &&
             !_shellMounted &&
             !_isOnboardingDecisionPending() &&
@@ -684,9 +753,22 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
           setState(() => _shellMounted = true);
         }
       });
-      _maxHoldTimer = Timer(const Duration(milliseconds: 3600), () {
-        _beginSplashExit();
-      });
+      _armMaxHoldTimer(ref.read(appProvider));
+    });
+  }
+
+  void _armMaxHoldTimer(GrassBagAppState s) {
+    final ctrl = ref.read(appProvider.notifier);
+    final budget = GrassBagAppGate.computeMaxHoldDuration(
+      s,
+      userStoppedLocalEngine: ctrl.userStoppedLocalEngine,
+    );
+    final isExtended = budget.inSeconds >= 10;
+    if (_maxHoldTimer != null && _extendedHoldForLocalBoot == isExtended) return;
+    _extendedHoldForLocalBoot = isExtended;
+    _maxHoldTimer?.cancel();
+    _maxHoldTimer = Timer(budget, () {
+      _beginSplashExit();
     });
   }
 
@@ -717,53 +799,32 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
     return true;
   }
 
-  /// True once initial host startup, DSH namespaces, and DeepSeek auth/models have settled
-  /// enough to enter Home cleanly without flashing intermediate "connecting / configure model" cards.
-  bool _isStartupHydrationSettled(GrassBagAppState s) {
-    if (GrassBagNativeBridge.instance.isAndroidNative &&
-        s.activeHost.isLocal &&
-        !s.nativeStatusHydrated) {
-      return false;
-    }
-    if (s.connectionPhase == ConnectionPhase.connecting ||
-        s.connectionPhase == ConnectionPhase.reconnecting ||
-        s.connectionPhase == ConnectionPhase.bootstrapping) {
-      return false;
-    }
-    if (s.activeHost.isLocal && s.nativeRuntimeStatus.engineState == 'starting') return false;
-    if (s.hydratingDomains) return false;
-    if (s.connectionPhase == ConnectionPhase.connected) {
-      // Wait briefly until initial domain/model/auth hydration lands (prevents login-card flash!)
-      if (s.dshNamespaces.isEmpty && s.modelGroups.isEmpty && !s.isAccountSignedIn) {
-        return false;
-      }
-    }
-    return true;
-  }
+  bool _isStartupHydrationSettled(GrassBagAppState s) =>
+      GrassBagAppGate.isStartupHydrationSettled(
+        s,
+        userStoppedLocalEngine: ref.read(appProvider.notifier).userStoppedLocalEngine,
+      );
 
   void _onLogoAssembled() {
     if (!mounted || _stage != _GateStage.splash) return;
     _logoAssembled = true;
     // On first launch, mount OnboardingPage DIRECTLY under the splash (NEVER mount GrassBagShell!)
     // so the splash cross-dissolves seamlessly into Onboarding with ZERO home-screen flash!
-    // Note: `_beginSplashExit()` re-evaluates `_shouldShowOnboarding()` after the 220ms beat
-    // (total ~1.5s from launch), giving Android's parallel `refreshNativeStatus()` plenty of
-    // headroom to report `initialized == true` for upgrading users while never stalling if
-    // the native channel is unavailable (e.g., headless tests or OEM binder error).
     if (_shouldShowOnboarding()) {
       _dismissTimer?.cancel();
       _dismissTimer = Timer(const Duration(milliseconds: 220), _beginSplashExit);
       return;
     }
     // On subsequent launch, mount GrassBagShell underneath to warm up Liquid Glass shaders
-    // while holding the breathing emblem until container + model + DeepSeek auth settle!
+    // while holding the breathing emblem until container + DSH + models + sessions settle!
     if (!_shellMounted) {
       setState(() => _shellMounted = true);
     }
     final s = ref.read(appProvider);
+    _armMaxHoldTimer(s);
     if (_isStartupHydrationSettled(s)) {
       _dismissTimer?.cancel();
-      _dismissTimer = Timer(const Duration(milliseconds: 260), _beginSplashExit);
+      _dismissTimer = Timer(const Duration(milliseconds: 200), _beginSplashExit);
     }
   }
 
@@ -795,20 +856,27 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
 
   @override
   Widget build(BuildContext context) {
-    // Watch startup readiness while splash is visible so we dissolve right when engine + models + auth settle!
+    // Watch full startup readiness while splash is visible so we dissolve right when
+    // container + DSH + sessions + models + DeepSeek auth are 100% live!
     if (_stage == _GateStage.splash) {
-      ref.listen<(ConnectionPhase, String, bool, bool, bool)>(
+      ref.listen<(ConnectionPhase, String, bool, bool, bool, bool, bool, bool)>(
         appProvider.select(
           (s) => (
             s.connectionPhase,
             s.nativeRuntimeStatus.engineState,
+            s.nativeRuntimeStatus.initialized,
+            s.nativeRuntimeStatus.engineRunning,
             s.nativeStatusHydrated,
             s.hydratingDomains,
+            s.loadingSessions,
             s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn,
           ),
         ),
         (prev, next) {
-          if (!_logoAssembled || _exitingSplash) return;
+          if (_exitingSplash) return;
+          final currentState = ref.read(appProvider);
+          _armMaxHoldTimer(currentState);
+          if (!_logoAssembled) return;
           if (_shouldShowOnboarding()) {
             return;
           }
@@ -818,10 +886,9 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
           if (!_shellMounted) {
             setState(() {
               _shellMounted = true;
-              _allowManualSkip = true;
             });
           }
-          if (_isStartupHydrationSettled(ref.read(appProvider))) {
+          if (_isStartupHydrationSettled(currentState)) {
             _dismissTimer = Timer(const Duration(milliseconds: 180), _beginSplashExit);
           }
         },
@@ -911,9 +978,13 @@ class _GrassBagSplashLayer extends ConsumerWidget {
           hostName: s.activeHost.name,
           onboardingDone: s.onboardingCompleted,
           initialized: s.nativeRuntimeStatus.initialized,
+          engineRunning: s.nativeRuntimeStatus.engineRunning,
+          engineState: s.nativeRuntimeStatus.engineState,
           hasRemoteHosts: s.hosts.any((h) => !h.isLocal),
           progressPct: s.runtimeProgressPct,
+          loadingSessions: s.loadingSessions,
           hydrated: !s.hydratingDomains &&
+              !s.loadingSessions &&
               (s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn),
         ),
       ),
@@ -930,13 +1001,19 @@ class _GrassBagSplashLayer extends ConsumerWidget {
       statusText = slice.isLocal ? '本机核心与模型已就绪' : '已连接到 ${slice.hostName}';
       statusReady = true;
     } else if (slice.phase == ConnectionPhase.connected) {
-      statusText = '正在同步模型与账号状态…';
+      statusText = '正在同步模型与历史对话…';
       statusReady = false;
     } else if (slice.progressPct > 0 && slice.progressPct < 100) {
       statusText = '正在部署本机环境 ${slice.progressPct}%…';
       statusReady = false;
+    } else if (slice.isLocal && slice.engineRunning) {
+      statusText = '正在建立本机核心通道…';
+      statusReady = false;
+    } else if (slice.isLocal && (slice.engineState == 'starting' || slice.phase == ConnectionPhase.connecting)) {
+      statusText = '正在启动 Ubuntu 容器与 DSH 核心…';
+      statusReady = false;
     } else if (slice.phase == ConnectionPhase.connecting) {
-      statusText = slice.isLocal ? '正在唤醒本机容器与 DSH 核心…' : '正在连接 ${slice.hostName}…';
+      statusText = '正在连接 ${slice.hostName}…';
       statusReady = false;
     } else if (slice.phase == ConnectionPhase.reconnecting) {
       statusText = '正在重新连接 ${slice.hostName}…';
@@ -947,8 +1024,11 @@ class _GrassBagSplashLayer extends ConsumerWidget {
     } else if (slice.phase == ConnectionPhase.needsAuth) {
       statusText = '已连通 ${slice.hostName} · 待授权';
       statusReady = false;
-    } else if (slice.phase == ConnectionPhase.error) {
+    } else if (slice.phase == ConnectionPhase.error || slice.engineState == 'error') {
       statusText = '正在进入工作台（可稍后检查连接）…';
+      statusReady = false;
+    } else if (slice.isLocal && slice.initialized) {
+      statusText = '正在唤醒本机容器…';
       statusReady = false;
     } else {
       statusText = '正在准备你的工作台…';
@@ -986,7 +1066,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                     children: [
                       GrassBagAnimatedLogo(
                         size: 118,
-                        duration: const Duration(milliseconds: 1280),
+                        duration: const Duration(milliseconds: 1000),
                         paused: exiting,
                         onAssembled: onLogoAssembled,
                       ),
@@ -1093,7 +1173,7 @@ class _GrassBagSplashLayer extends ConsumerWidget {
                               innerWell: true,
                               padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 5),
                               child: Text(
-                                '轻点屏幕立即进入',
+                                '先进入主页（后台继续启动）',
                                 style: TextStyle(
                                   fontSize: 11.5,
                                   fontWeight: FontWeight.w500,

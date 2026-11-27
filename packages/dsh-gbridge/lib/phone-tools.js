@@ -1,5 +1,10 @@
 import { request as httpRequest } from 'node:http';
 import { existsSync } from 'node:fs';
+import {
+  imageExtensionForMediaType,
+  normalizeImageMediaType,
+  toCanonicalImageAttachmentRef,
+} from './session-image-repair.js';
 
 const PHONE_TOOL_DEFS = [
   {
@@ -139,6 +144,51 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
   const disposers = [];
   const activeTurnBySession = new Map();
   const phoneActiveSessions = new Set();
+  let keepaliveTimer = null;
+  let lastReportedActive = false;
+  let lastReportedTurns = 0;
+
+  const reportNativeKeepalive = (reason = '') => {
+    const activeTurns = activeTurnBySession.size;
+    let activeJobs = 0;
+    try {
+      const jobsSvc = ctx.get?.('jobs');
+      const list = typeof jobsSvc?.list === 'function' ? jobsSvc.list() : [];
+      if (Array.isArray(list)) {
+        for (const j of list) {
+          if (j && (j.status === 'running' || j.running === true)) activeJobs++;
+        }
+      }
+    } catch {}
+    const active = activeTurns > 0 || activeJobs > 0;
+    lastReportedActive = active;
+    lastReportedTurns = activeTurns;
+    callDaemon('/v1/keepalive', {
+      active,
+      activeTurns,
+      activeJobs,
+      ...(reason ? { reason } : {}),
+    }, undefined, 8_000).catch(() => {});
+  };
+
+  const ensureKeepaliveHeartbeat = () => {
+    if (activeTurnBySession.size > 0) {
+      if (!keepaliveTimer) {
+        keepaliveTimer = setInterval(() => {
+          if (activeTurnBySession.size > 0) {
+            reportNativeKeepalive('heartbeat');
+          } else {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+          }
+        }, 90_000);
+        keepaliveTimer.unref?.();
+      }
+    } else if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+  };
 
   const callDaemon = (path, payload, signal, timeoutMs = 195_000) => new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
@@ -237,16 +287,29 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     return true;
   };
 
-  // Track active turns & forward turn/end ONLY for sessions that actually used phone tools
-  // (or when sessionId is known) so unrelated title/background sessions NEVER wipe ALLOW_TURN!
+  // Track active turns process-wide so Android native GrassBagEngineService ALWAYS holds
+  // CPU WakeLock + low-latency WifiLock while ANY DSH conversation or phone-control turn runs
+  // (even when GrassBag is backgrounded over another app and Flutter's isolate is paused!).
+  // Still forward `/v1/turn-end` ONLY for sessions that used phone tools so ALLOW_TURN stays scoped.
   if (typeof ctx.on === 'function') {
     const off = ctx.on('session/event', (session, event) => {
       const sid = session?.id ?? null;
       if (event?.type === 'turn/start' && sid) {
         const tid = event?.data?.turnId ?? (event?.data?.turn !== undefined ? `turn-${event.data.turn}` : `seq-${event?.seq ?? Date.now()}`);
+        const prevCount = activeTurnBySession.size;
         activeTurnBySession.set(sid, String(tid));
+        if (prevCount === 0 || activeTurnBySession.size !== lastReportedTurns || !lastReportedActive) {
+          reportNativeKeepalive('turn_start');
+        }
+        ensureKeepaliveHeartbeat();
       } else if (event?.type === 'turn/end') {
+        const hadTurns = activeTurnBySession.size > 0;
+        if (sid) activeTurnBySession.delete(sid);
         notifyTurnEnd(sid, event?.data?.reason ?? 'completed');
+        if (hadTurns && (activeTurnBySession.size === 0 || activeTurnBySession.size !== lastReportedTurns)) {
+          reportNativeKeepalive('turn_end');
+        }
+        ensureKeepaliveHeartbeat();
       }
     });
     if (typeof off === 'function') disposers.push(off);
@@ -269,12 +332,30 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
           output: {
             schema: { type: 'object', additionalProperties: true },
             render: (_args, value) => {
-              if (value && typeof value === 'object' && typeof value.base64 === 'string' && value.mimeType) {
-                const { base64, ...meta } = value;
-                return [
-                  { type: 'text', text: JSON.stringify(meta) },
-                  { type: 'image', data: base64, mimeType: value.mimeType },
-                ];
+              if (value && typeof value === 'object') {
+                const attachment = toCanonicalImageAttachmentRef(value.image ?? value.attachment);
+                if (attachment) {
+                  const { image: _img, attachment: _att, base64: _b64, ...meta } = value;
+                  const summary = {
+                    ...meta,
+                    width: meta.width ?? attachment.width,
+                    height: meta.height ?? attachment.height,
+                    mediaType: attachment.mediaType,
+                    bytes: attachment.bytes,
+                  };
+                  return [
+                    { type: 'text', text: JSON.stringify(summary) },
+                    { type: 'image', attachment },
+                  ];
+                }
+                if (typeof value.base64 === 'string') {
+                  // Never emit an inline `{ type: 'image', data, mimeType }` block without a durable
+                  // `attachment` ref — `dsh-llm-pi-ai` and `dsh-llm-deepseek` crash when replaying it!
+                  const { base64: _b64, ...meta } = value;
+                  return [
+                    { type: 'text', text: JSON.stringify(meta) },
+                  ];
+                }
               }
               return [
                 { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? {}) },
@@ -296,7 +377,48 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
               caller: { sessionId, turnId },
               ...(permissionPreset ? { permissionPreset } : {}),
             };
-            return await callDaemon('/v1/tool', payload, execCtx?.signal);
+            const result = await callDaemon('/v1/tool', payload, execCtx?.signal);
+            if (result && typeof result === 'object' && typeof result.base64 === 'string' && result.base64.length > 0) {
+              const { base64, ...meta } = result;
+              const mediaType = normalizeImageMediaType(result.mimeType ?? result.mediaType);
+              const attachments = ctx.get?.('attachments');
+              if (attachments && typeof attachments.saveImage === 'function') {
+                try {
+                  const bytes = Buffer.from(base64, 'base64');
+                  if (bytes.length > 0) {
+                    const ext = imageExtensionForMediaType(mediaType);
+                    const ref = await attachments.saveImage({
+                      data: bytes,
+                      mediaType,
+                      name: `phone-screenshot-${Date.now()}.${ext}`,
+                    });
+                    const canonical = toCanonicalImageAttachmentRef(ref);
+                    if (canonical) {
+                      return {
+                        ...meta,
+                        mediaType: canonical.mediaType,
+                        width: canonical.width,
+                        height: canonical.height,
+                        bytes: canonical.bytes,
+                        image: canonical,
+                      };
+                    }
+                  }
+                } catch (err) {
+                  logger?.warn?.(`[gbridge] failed to persist ${def.name} screenshot via ctx.attachments.saveImage:`, err?.message || err);
+                  return {
+                    ...meta,
+                    imageError: err?.message || 'save_image_failed',
+                  };
+                }
+              }
+              logger?.warn?.(`[gbridge] ${def.name} omitted image block because ctx.attachments is unavailable`);
+              return {
+                ...meta,
+                imageError: 'attachments_service_unavailable',
+              };
+            }
+            return result;
           },
         });
         if (typeof off === 'function') disposers.push(off);
@@ -337,7 +459,16 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     get reason() { return registered > 0 ? 'ready' : 'tools-service-unavailable'; },
     notifyTurnEnd,
     dispose() {
-      activeTurnBySession.clear();
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+      }
+      if (lastReportedActive) {
+        activeTurnBySession.clear();
+        reportNativeKeepalive('dispose');
+      } else {
+        activeTurnBySession.clear();
+      }
       phoneActiveSessions.clear();
       for (const fn of disposers) {
         try { fn(); } catch {}

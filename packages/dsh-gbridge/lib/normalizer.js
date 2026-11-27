@@ -455,12 +455,13 @@ export class SessionNormalizer {
     const toolIndex = new Map();
     const toolStartTimes = new Map();
 
-    const promotePreToolNarration = (turn, seq) => {
+    const promoteIntermediateProse = (turn, seq) => {
       if (!turn || typeof turn.assistantText !== 'string') return;
       const trimmed = turn.assistantText.trim();
       if (!trimmed) return;
       turn.steps.push({
         kind: 'reasoning',
+        role: 'prose',
         id: `narration-${seq ?? 0}-${turn.steps.length}`,
         text: trimmed,
         collapsedPreview: previewLine(trimmed),
@@ -473,7 +474,7 @@ export class SessionNormalizer {
       if (typeof turn.assistantText === 'string' && turn.assistantText.trim().length > 0) return;
       for (let idx = turn.steps.length - 1; idx >= 0; idx -= 1) {
         const s = turn.steps[idx];
-        if (s && s.kind === 'reasoning' && typeof s.id === 'string' && s.id.startsWith('narration-') && s.text) {
+        if (s && s.kind === 'reasoning' && (s.role === 'prose' || (typeof s.id === 'string' && s.id.startsWith('narration-'))) && s.text) {
           turn.assistantText = s.text;
           turn.steps.splice(idx, 1);
           return;
@@ -583,7 +584,7 @@ export class SessionNormalizer {
 
       if (type === 'tool/call' || type === 'tool_call') {
         const turn = ensureTurn(ev.turnId, seq);
-        promotePreToolNarration(turn, seq);
+        promoteIntermediateProse(turn, seq);
         const callId = String(data?.callId || data?.id || `call-${seq}-${turn.steps.length}`);
         let parsedArgs = data?.arguments ?? data?.input ?? {};
         if (typeof parsedArgs === 'string') {
@@ -631,6 +632,7 @@ export class SessionNormalizer {
             if (b.type === 'reasoning' || b.type === 'thinking') {
               const rText = String(b.text ?? b.thinking ?? '');
               if (rText) {
+                promoteIntermediateProse(turn, seq);
                 turn.steps.push({
                   kind: 'reasoning',
                   id: b.id || `reason-${seq}-${turn.steps.length}`,
@@ -639,7 +641,7 @@ export class SessionNormalizer {
                 });
               }
             } else if (b.type === 'tool-call' || b.type === 'tool_use' || b.type === 'toolCall') {
-              promotePreToolNarration(turn, seq);
+              promoteIntermediateProse(turn, seq);
               const callId = String(b.id || b.callId || `call-${seq}-${turn.steps.length}`);
               let bArgs = b.arguments ?? b.input ?? {};
               if (typeof bArgs === 'string') {

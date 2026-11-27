@@ -108,6 +108,9 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onPause() {
+        // Reinforce foreground service + CPU/Wi-Fi locks BEFORE the Activity loses foreground
+        // importance so switching to other apps never freezes the DSH container or drops LLM sockets!
+        RuntimeController.onActivityBackgrounded(applicationContext)
         if (resumedActivityRef.get() === this) {
             resumedActivityRef = WeakReference(null)
         }

@@ -143,6 +143,26 @@ class PhoneControlDaemon(
                     return
                 }
                 when (req.path) {
+                    "/v1/keepalive" -> {
+                        val active = body.optBoolean("active", false)
+                        val activeTurns = body.optInt("activeTurns", if (active) 1 else 0)
+                        val activeJobs = body.optInt("activeJobs", 0)
+                        val reason = body.optCleanString("reason", "").ifBlank { null }
+                        GrassBagEngineService.updateNativeActiveWork(
+                            ctx = context,
+                            activeTurns = if (active) activeTurns.coerceAtLeast(1) else activeTurns,
+                            activeJobs = activeJobs,
+                            reason = reason
+                        )
+                        writeJson(
+                            out,
+                            200,
+                            JSONObject()
+                                .put("ok", true)
+                                .put("fgsActive", GrassBagEngineService.isServiceActive())
+                                .put("holdingWakeLock", GrassBagEngineService.isHoldingWakeLock())
+                        )
+                    }
                     "/v1/turn-end" -> {
                         val sid = body.optCleanString("sessionId").ifBlank { null }
                         val tid = body.optCleanString("turnId").ifBlank { null }

@@ -429,13 +429,14 @@ class VanillaDshNormalizer {
     final toolIndex = <String, Map<String, dynamic>>{};
     final toolStartTimes = <String, int>{};
 
-    void promotePreToolNarration(Map<String, dynamic> turn, int seq) {
+    void promoteIntermediateProse(Map<String, dynamic> turn, int seq) {
       final text = turn['assistantText'] as String? ?? '';
       final trimmed = text.trim();
       if (trimmed.isEmpty) return;
       final steps = turn['steps'] as List<Map<String, dynamic>>;
       steps.add({
         'kind': 'reasoning',
+        'role': 'prose',
         'id': 'narration-$seq-${steps.length}',
         'text': trimmed,
         'collapsedPreview': previewLine(trimmed),
@@ -452,7 +453,9 @@ class VanillaDshNormalizer {
         final s = steps[idx];
         final id = s['id']?.toString() ?? '';
         final stepText = s['text']?.toString() ?? '';
-        if (s['kind'] == 'reasoning' && id.startsWith('narration-') && stepText.isNotEmpty) {
+        if (s['kind'] == 'reasoning' &&
+            (s['role'] == 'prose' || id.startsWith('narration-')) &&
+            stepText.isNotEmpty) {
           turn['assistantText'] = stepText;
           steps.removeAt(idx);
           return;
@@ -596,7 +599,7 @@ class VanillaDshNormalizer {
 
       if (type == 'tool/call' || type == 'tool_call') {
         final turn = ensureTurn(ev['turnId']?.toString(), seq);
-        promotePreToolNarration(turn, seq);
+        promoteIntermediateProse(turn, seq);
         final steps = turn['steps'] as List<Map<String, dynamic>>;
         final callId =
             (data['callId'] ?? data['id'] ?? 'call-$seq-${steps.length}').toString();
@@ -654,6 +657,7 @@ class VanillaDshNormalizer {
             if (bType == 'reasoning' || bType == 'thinking') {
               final rText = (b['text'] ?? b['thinking'] ?? '').toString();
               if (rText.isNotEmpty) {
+                promoteIntermediateProse(turn, seq);
                 steps.add({
                   'kind': 'reasoning',
                   'id': (b['id'] ?? 'reason-$seq-${steps.length}').toString(),
@@ -662,7 +666,7 @@ class VanillaDshNormalizer {
                 });
               }
             } else if (bType == 'tool-call' || bType == 'tool_use' || bType == 'toolCall') {
-              promotePreToolNarration(turn, seq);
+              promoteIntermediateProse(turn, seq);
               final callId =
                   (b['id'] ?? b['callId'] ?? 'call-$seq-${steps.length}').toString();
               Object? bArgs = b['arguments'] ?? b['input'] ?? const <String, dynamic>{};

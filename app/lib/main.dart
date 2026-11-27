@@ -86,13 +86,15 @@ Future<void> main() async {
     GrassBagController.preloadedInitialHosts = preloadedHosts;
   }
 
-  // Warm up liquid_glass_widgets 1.19.0 Impeller shaders off the Frame-0 critical path
-  // so genuine iOS 27 optical glass renders smoothly on first appearance without startup jank.
+  // Defer Impeller GLSL shader warm-up slightly past Frame 0 so the pure-Canvas kinetic logo
+  // assembly plays at locked 120fps with zero GPU compilation hitch on cold launch!
   unawaited(
-    LiquidGlassWidgets.initialize(
-      warmUpMode: GlassWarmUpMode.auto,
-      enablePerformanceMonitor: false,
-    ),
+    Future<void>.delayed(const Duration(milliseconds: 240), () {
+      return LiquidGlassWidgets.initialize(
+        warmUpMode: GlassWarmUpMode.auto,
+        enablePerformanceMonitor: false,
+      );
+    }),
   );
 
   runApp(

@@ -15,6 +15,7 @@
 import dns from 'node:dns';
 import fs from 'node:fs';
 import * as nodeModule from 'node:module';
+import net from 'node:net';
 import os from 'node:os';
 import { basename as pathBasename, dirname as pathDirname, join as pathJoin, resolve as pathResolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,23 +23,79 @@ import { isMainThread } from 'node:worker_threads';
 
 const { syncBuiltinESMExports } = nodeModule;
 
+// 0. Android mobile dual-stack & TCP keep-alive hardening:
+// - Prefer IPv4 first so glibc `getaddrinfo()` never stalls on blackholed mobile/Wi-Fi AAAA routes.
+// - Enable Happy Eyeballs (`autoSelectFamily`) with a brisk 500ms fallback timeout.
+// - Enable 15s TCP keep-alive probes on outbound non-loopback sockets so mobile carrier NATs
+//   and Android OEM background firewalls (OriginOS / HyperOS / ColorOS) never silently reap
+//   long-lived DeepSeek reasoning/SSE connections while operating other apps!
+try {
+  dns.setDefaultResultOrder?.('ipv4first');
+} catch {}
+try {
+  net.setDefaultAutoSelectFamily?.(true);
+  net.setDefaultAutoSelectFamilyAttemptTimeout?.(500);
+} catch {}
+
+const isLocalAndroid = process.env.GBRIDGE_LOCAL_ANDROID === '1';
+
+if (isLocalAndroid && typeof net.Socket?.prototype?.connect === 'function') {
+  const origSocketConnect = net.Socket.prototype.connect;
+  net.Socket.prototype.connect = function grassbagKeepAliveConnect(...args) {
+    const first = args[0];
+    const isUnix =
+      typeof first === 'string' ||
+      (first && typeof first === 'object' && typeof first.path === 'string' && first.path.length > 0) ||
+      (Array.isArray(first) && first[0] && typeof first[0].path === 'string');
+    if (!isUnix) {
+      const host =
+        typeof first === 'object' && first !== null
+          ? (Array.isArray(first) ? first[0]?.host : first.host)
+          : (typeof args[1] === 'string' ? args[1] : undefined);
+      const isLoopback =
+        host === '127.0.0.1' || host === '::1' || host === 'localhost' || host === '::ffff:127.0.0.1';
+      if (!isLoopback) {
+        this.once('connect', () => {
+          try {
+            this.setKeepAlive(true, 15_000);
+            this.setNoDelay(true);
+          } catch {}
+        });
+      }
+    }
+    return Reflect.apply(origSocketConnect, this, args);
+  };
+}
+
 // Schedule V8 compile-cache flushes for long-running DSH daemons that never exit cleanly
 // (force-stop / kill bypasses Node's default exit-only compile-cache flush).
 let compileCacheFlushScheduled = false;
-function scheduleCompileCacheFlush(delaysMs = [1200, 6000]) {
+function flushCompileCacheNow() {
+  if (!isMainThread || !process.env.NODE_COMPILE_CACHE) return;
+  const flushFn = nodeModule.flushCompileCache ?? nodeModule.default?.flushCompileCache;
+  if (typeof flushFn === 'function') {
+    try { flushFn(); } catch {}
+  }
+}
+function scheduleCompileCacheFlush(delaysMs = [1200, 6000, 22000]) {
   if (compileCacheFlushScheduled || !isMainThread || !process.env.NODE_COMPILE_CACHE) return;
   const flushFn = nodeModule.flushCompileCache ?? nodeModule.default?.flushCompileCache;
   if (typeof flushFn !== 'function') return;
   compileCacheFlushScheduled = true;
   for (const ms of delaysMs) {
     const t = setTimeout(() => {
-      try {
-        flushFn();
-      } catch {
-        // Best-effort bytecode cache persistence.
-      }
+      flushCompileCacheNow();
     }, ms);
     t.unref?.();
+  }
+}
+if (isMainThread && process.env.NODE_COMPILE_CACHE) {
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    try {
+      process.prependListener(sig, () => {
+        flushCompileCacheNow();
+      });
+    } catch {}
   }
 }
 
@@ -79,8 +136,155 @@ function syncDnsFromResolvConf(force = false) {
 }
 syncDnsFromResolvConf(true);
 if (isMainThread) {
-  const dnsTimer = setInterval(() => syncDnsFromResolvConf(false), 6000);
+  const dnsTimer = setInterval(() => syncDnsFromResolvConf(false), 2500);
   dnsTimer.unref?.();
+}
+
+// 1b. Resilient `globalThis.fetch` wrapper on Android local runtime:
+// When GrassBag moves to the background (e.g. controlling another app via Accessibility or
+// user switching apps on OriginOS/HyperOS/ColorOS), OEM firewalls and NATs often drop or
+// half-close pooled undici keep-alive TLS sockets, causing `fetch()` to reject BEFORE headers
+// arrive (`UND_ERR_SOCKET` / `ECONNRESET` / `other side closed` -> `[TRANSPORT] DeepSeek Messages transport failed`).
+// Retrying pre-response socket failures on a FRESH connection (`connection: close`) with DNS
+// refresh transparently recovers without duplicating responses or corrupting streams.
+if (isLocalAndroid && typeof globalThis.fetch === 'function' && process.env.GBRIDGE_FETCH_RESILIENCE !== '0') {
+  const origFetch = globalThis.fetch.bind(globalThis);
+  const RETRYABLE_CODES = new Set([
+    'UND_ERR_SOCKET',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_CLOSED',
+    'UND_ERR_DESTROYED',
+    'ECONNRESET',
+    'EPIPE',
+    'ETIMEDOUT',
+    'EAI_AGAIN',
+    'ENOTFOUND',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    'ECONNABORTED',
+    'ECONNREFUSED',
+    'ERR_SOCKET_CLOSED',
+    'ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC',
+    'ERR_SSL_UNEXPECTED_EOF_WHILE_READING',
+  ]);
+
+  const extractUrlString = (input) => {
+    if (typeof input === 'string') return input;
+    if (input instanceof URL) return input.href;
+    if (input && typeof input === 'object' && typeof input.url === 'string') return input.url;
+    return '';
+  };
+
+  const isLoopbackUrl = (urlStr) => {
+    try {
+      const u = new URL(urlStr);
+      const h = u.hostname.toLowerCase();
+      return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+    } catch {
+      return false;
+    }
+  };
+
+  const isBodyReplayable = (input, init) => {
+    const body = init?.body;
+    if (body !== undefined && body !== null) {
+      if (
+        typeof body === 'string' ||
+        body instanceof ArrayBuffer ||
+        ArrayBuffer.isView(body) ||
+        body instanceof URLSearchParams ||
+        (typeof Blob !== 'undefined' && body instanceof Blob)
+      ) {
+        return true;
+      }
+      return false;
+    }
+    // If caller passed a Request object with a body stream, avoid replaying consumed Request.
+    if (input && typeof input === 'object' && !(input instanceof URL) && input.body !== undefined && input.body !== null) {
+      return false;
+    }
+    return true;
+  };
+
+  const isRetryableTransportError = (err) => {
+    if (!err || typeof err !== 'object') return false;
+    if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+    let cur = err;
+    for (let depth = 0; cur && depth < 5; depth++) {
+      const code = typeof cur.code === 'string' ? cur.code : '';
+      if (code && RETRYABLE_CODES.has(code)) return true;
+      const msg = typeof cur.message === 'string' ? cur.message.toLowerCase() : '';
+      if (
+        msg.includes('fetch failed') ||
+        msg.includes('other side closed') ||
+        msg.includes('socket hang up') ||
+        msg.includes('econnreset') ||
+        msg.includes('etimedout') ||
+        msg.includes('eai_again') ||
+        msg.includes('enotfound') ||
+        msg.includes('ehostunreach') ||
+        msg.includes('enetunreach') ||
+        msg.includes('connect timeout') ||
+        msg.includes('tls') ||
+        msg.includes('unexpected eof')
+      ) {
+        return true;
+      }
+      cur = cur.cause;
+    }
+    return false;
+  };
+
+  const sleepWithSignal = (ms, signal) => new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+
+  const withFreshConnectionHeader = (init) => {
+    const headers = new Headers(init?.headers || undefined);
+    // Force a clean non-pooled TCP/TLS handshake on retry so a poisoned undici pool slot is bypassed!
+    headers.set('connection', 'close');
+    return { ...(init || {}), headers };
+  };
+
+  globalThis.fetch = async function grassbagResilientFetch(input, init) {
+    const urlStr = extractUrlString(input);
+    const signal = init?.signal ?? (input && typeof input === 'object' ? input.signal : undefined);
+    const canRetry = Boolean(urlStr) && !isLoopbackUrl(urlStr) && isBodyReplayable(input, init);
+    const delaysMs = [350, 900, 1800];
+    let attempt = 0;
+    while (true) {
+      try {
+        const effectiveInit = attempt === 0 ? init : withFreshConnectionHeader(init);
+        return await origFetch(input, effectiveInit);
+      } catch (err) {
+        if (
+          !canRetry ||
+          attempt >= delaysMs.length ||
+          signal?.aborted ||
+          !isRetryableTransportError(err)
+        ) {
+          throw err;
+        }
+        syncDnsFromResolvConf(true);
+        const baseDelay = delaysMs[attempt++];
+        const jittered = Math.round(baseDelay * (0.85 + Math.random() * 0.3));
+        await sleepWithSignal(jittered, signal);
+      }
+    }
+  };
 }
 
 // 2. Patch fs.promises.rename, fs.rename & fs.renameSync to fall back cleanly & atomically on EXDEV across bind mounts.
@@ -195,6 +399,7 @@ if (isDshBoot && process.env.GBRIDGE_BOOT_CACHE !== '0') {
   try {
     const ROOTS = [
       '/opt/dsh-slots/',
+      '/opt/shims/',
       '/usr/local/lib/node_modules/',
       '/opt/node_modules/',
       '/node_modules/',
@@ -478,7 +683,9 @@ if (isDshBoot && process.env.GBRIDGE_BOOT_CACHE !== '0') {
             : String(chunk);
       if (text.includes('?token=') || text.includes('dsh web:')) {
         uninstallBootCache();
-        scheduleCompileCacheFlush([1200, 6000]);
+        scheduleCompileCacheFlush([1200, 6000, 22000]);
+      } else if (text.includes('UDS listener ready')) {
+        scheduleCompileCacheFlush([1200, 6000, 22000]);
       }
       return res;
     }

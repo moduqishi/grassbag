@@ -1002,9 +1002,13 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     private fun readPermissionsStatus(): Map<String, Any> {
         val ctx = activity.applicationContext
         val pm = ctx.getSystemService(Activity.POWER_SERVICE) as PowerManager
+        val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
         val batteryIgnored = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             pm.isIgnoringBatteryOptimizations(ctx.packageName)
         } else true
+        val backgroundRestricted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            runCatching { am?.isBackgroundRestricted == true }.getOrDefault(false)
+        } else false
         val overlayOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Settings.canDrawOverlays(ctx)
         } else true
@@ -1032,6 +1036,8 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             "overlayGranted" to overlayOk,
             "allFilesGranted" to storageOk,
             "batteryOptIgnored" to batteryIgnored,
+            "backgroundRestricted" to backgroundRestricted,
+            "engineServiceActive" to GrassBagEngineService.isServiceActive(),
             "notificationsGranted" to notificationsOk,
             "microphoneGranted" to microphoneOk,
             "shizukuInstalled" to shizukuInstalled,
@@ -1146,6 +1152,38 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS),
                 appDetails
             )
+            "oem_keepalive" -> buildList {
+                val brand = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase()
+                fun comp(pkg: String, cls: String) = Intent().setComponent(ComponentName(pkg, cls))
+                when {
+                    brand.contains("vivo") || brand.contains("iqoo") -> {
+                        add(comp("com.iqoo.powersaving", "com.iqoo.powersaving.PowerSavingManagerActivity"))
+                        add(comp("com.vivo.abe", "com.vivo.applicationbehaviorengine.ui.ExcessivePowerManagerActivity"))
+                        add(comp("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"))
+                        add(comp("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager"))
+                    }
+                    brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco") -> {
+                        add(comp("com.miui.powerkeeper", "com.miui.powerkeeper.ui.HiddenAppsConfigActivity")
+                            .putExtra("package_name", activity.packageName)
+                            .putExtra("package_label", "GrassBag"))
+                        add(comp("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"))
+                    }
+                    brand.contains("oppo") || brand.contains("realme") || brand.contains("oneplus") -> {
+                        add(comp("com.oplus.battery", "com.oplus.powermanager.fuelgaue.PowerConsumptionActivity"))
+                        add(comp("com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"))
+                        add(comp("com.oplus.safecenter", "com.oplus.safecenter.startupapp.StartupAppListActivity"))
+                    }
+                    brand.contains("huawei") || brand.contains("honor") -> {
+                        add(comp("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"))
+                        add(comp("com.hihonor.systemmanager", "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity"))
+                    }
+                    brand.contains("samsung") -> {
+                        add(comp("com.samsung.android.lool", "com.samsung.android.sm.battery.ui.BatteryActivity"))
+                    }
+                }
+                add(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkgUri))
+                add(appDetails)
+            }
             "notifications" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 listOf(
                     Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, activity.packageName),

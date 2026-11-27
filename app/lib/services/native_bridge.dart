@@ -326,6 +326,8 @@ class NativePermissionsStatus {
     this.overlayGranted = false,
     this.allFilesGranted = false,
     this.batteryOptIgnored = false,
+    this.backgroundRestricted = false,
+    this.engineServiceActive = false,
     this.notificationsGranted = true,
     this.microphoneGranted = false,
     this.shizukuInstalled = false,
@@ -341,6 +343,8 @@ class NativePermissionsStatus {
       overlayGranted: m['overlayGranted'] == true,
       allFilesGranted: m['allFilesGranted'] == true,
       batteryOptIgnored: m['batteryOptIgnored'] == true,
+      backgroundRestricted: m['backgroundRestricted'] == true,
+      engineServiceActive: m['engineServiceActive'] == true,
       notificationsGranted: m['notificationsGranted'] != false,
       microphoneGranted: m['microphoneGranted'] == true,
       shizukuInstalled: m['shizukuInstalled'] == true,
@@ -354,6 +358,8 @@ class NativePermissionsStatus {
   final bool overlayGranted;
   final bool allFilesGranted;
   final bool batteryOptIgnored;
+  final bool backgroundRestricted;
+  final bool engineServiceActive;
   final bool notificationsGranted;
   final bool microphoneGranted;
   final bool shizukuInstalled;
@@ -381,6 +387,8 @@ class NativePermissionsStatus {
         other.overlayGranted == overlayGranted &&
         other.allFilesGranted == allFilesGranted &&
         other.batteryOptIgnored == batteryOptIgnored &&
+        other.backgroundRestricted == backgroundRestricted &&
+        other.engineServiceActive == engineServiceActive &&
         other.notificationsGranted == notificationsGranted &&
         other.microphoneGranted == microphoneGranted &&
         other.shizukuInstalled == shizukuInstalled &&
@@ -395,6 +403,8 @@ class NativePermissionsStatus {
         overlayGranted,
         allFilesGranted,
         batteryOptIgnored,
+        backgroundRestricted,
+        engineServiceActive,
         notificationsGranted,
         microphoneGranted,
         shizukuInstalled,

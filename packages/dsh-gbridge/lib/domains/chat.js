@@ -70,7 +70,7 @@ function sanitizeSessionTitle(rawTitle, cwd) {
   return str.length > 72 ? `${str.slice(0, 71)}…` : str;
 }
 
-export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, normalizer }) {
+export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, normalizer, waitForLegacyImageRepair }) {
   // ---------------- Sessions ----------------
   router.get('/sessions', async (_req, res, { searchParams, peer }) => {
     const args = {};
@@ -344,6 +344,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
 
   // Unified send / steer / queue / interrupt
   router.post('/sessions/:id/messages', async (req, res, { params, peer }) => {
+    if (typeof waitForLegacyImageRepair === 'function') {
+      await waitForLegacyImageRepair(2000);
+    }
     // Allow inline base64 images up to 16 MiB so phone camera/screenshot attachments never hit HTTP 413!
     const body = await readJsonBody(req, Math.max(DEFAULT_MAX_UPLOAD_BYTES, 16 * 1024 * 1024));
     const mode = body.mode || 'auto'; // auto | steer | queue | interrupt
@@ -556,7 +559,11 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       const asstBlocks = [];
       for (const step of t.steps ?? []) {
         if ((step.kind === 'reasoning' || step.kind === 'thinking') && step.text) {
-          asstBlocks.push(`<details><summary>Thinking</summary>\n\n${step.text}\n</details>`);
+          if (step.role === 'prose' || (typeof step.id === 'string' && step.id.startsWith('narration-'))) {
+            asstBlocks.push(step.text);
+          } else {
+            asstBlocks.push(`<details><summary>Thinking</summary>\n\n${step.text}\n</details>`);
+          }
         } else if (step.kind === 'tool') {
           asstBlocks.push(`> Tool: \`${step.name || step.title || 'tool'}\` (${step.status || 'done'})${step.summary ? ` — ${step.summary}` : ''}`);
         } else if (step.kind === 'notice' && step.text) {

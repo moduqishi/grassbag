@@ -153,7 +153,10 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       // earlier turn, preserve the user's stashed draft instead of overwriting it with turn text!).
       final draftToFlush = _editingContextNotifier.value?.stashedDraft ?? _composerCtrl.text;
       ref.read(appProvider.notifier).setComposerDraftForActiveHost(draftToFlush);
-      if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+      if (state == AppLifecycleState.inactive) {
+        // Reinforce Android FGS + CPU/Wi-Fi keepalive while Activity is STILL foreground-eligible!
+        ref.read(appProvider.notifier).handleAppInactivating();
+      } else {
         ref.read(appProvider.notifier).handleAppPaused();
       }
     } else if (state == AppLifecycleState.resumed) {

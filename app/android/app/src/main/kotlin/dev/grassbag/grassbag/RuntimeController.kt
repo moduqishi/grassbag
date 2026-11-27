@@ -344,6 +344,8 @@ class RuntimeController private constructor(
     private val homeSizeRefreshing = AtomicBoolean(false)
     private val prewarmTriggered = AtomicBoolean(false)
     private val stopEpoch = AtomicInteger(0)
+    private val autoRestartLock = Any()
+    private val recentAutoRestartMs = LinkedList<Long>()
     private val networkCallbackRegistered = AtomicBoolean(false)
     private val lastNetworkNotifyMs = AtomicLong(0L)
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -374,6 +376,26 @@ class RuntimeController private constructor(
         )
     }
 
+    private fun tryReserveAutoRestartSlot(): Boolean = synchronized(autoRestartLock) {
+        val now = SystemClock.elapsedRealtime()
+        while (recentAutoRestartMs.isNotEmpty() && now - recentAutoRestartMs.first > 5 * 60 * 1000L) {
+            recentAutoRestartMs.removeFirst()
+        }
+        if (recentAutoRestartMs.size >= 3) {
+            return false
+        }
+        recentAutoRestartMs.addLast(now)
+        true
+    }
+
+    private fun nextAutoRestartBackoffMs(): Long = synchronized(autoRestartLock) {
+        when (recentAutoRestartMs.size) {
+            1 -> 600L
+            2 -> 1500L
+            else -> 3000L
+        }
+    }
+
     fun ensureForegroundServiceIfRunning() {
         worker.execute {
             runCatching {
@@ -387,6 +409,52 @@ class RuntimeController private constructor(
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Called synchronously from `MainActivity.onPause()` BEFORE the Activity loses foreground
+     * importance: ensures `GrassBagEngineService` is promoted while foreground-eligible AND holds
+     * CPU WakeLock + low-latency WifiLock so switching to other apps never freezes DSH or drops
+     * active DeepSeek HTTPS streams!
+     */
+    fun onActivityBackgrounded() {
+        val alive = isEngineAlive()
+        val starting = engineState == "starting"
+        val hasActiveWork = GrassBagEngineService.hasNativeActiveWork() ||
+            activeToolkitInstalls.get() > 0 ||
+            upgradeInProgress.get() ||
+            bootstrapRunning.get()
+        if (!alive && !starting && !hasActiveWork) return
+        if (hasActiveWork) {
+            val isPhone = SafetyGate.hasActiveTurn()
+            GrassBagEngineService.startOrUpdate(
+                ctx = ctx,
+                heading = if (isPhone) "GrassBag 正在操控手机" else "GrassBag 正在后台执行任务",
+                detail = if (isPhone) "操作执行中并保持网络稳定 · 可在悬浮岛随时暂停" else "保持后台 CPU 与网络通道畅通，防止切应用断连",
+                wakeLockMs = 15 * 60 * 1000L,
+                holdWifiLock = true
+            )
+        } else if (starting) {
+            GrassBagEngineService.startOrUpdate(
+                ctx = ctx,
+                heading = "GrassBag 正在启动本机引擎…",
+                detail = "后台持续启动中，完成后自动保活",
+                wakeLockMs = 3 * 60 * 1000L,
+                holdWifiLock = true
+            )
+        } else {
+            // Brief 120s grace WakeLock + WifiLock on app switches so copying content, OAuth sign-in,
+            // or immediate background handoffs never freeze the container or poison pooled sockets.
+            val ver = lastCapabilitiesDshVersion ?: readMeta().optString("dshVersion", "0.2.2-rc.5")
+            val exec = activeExecutorUsed ?: effectiveExecutorMode()
+            GrassBagEngineService.startOrUpdate(
+                ctx = ctx,
+                heading = "GrassBag 本机引擎运行中",
+                detail = "DSH $ver ($exec) · 后台保活中",
+                wakeLockMs = 120_000L,
+                holdWifiLock = true
+            )
         }
     }
 
@@ -586,6 +654,14 @@ class RuntimeController private constructor(
         if (etcPrepared && !force) return@synchronized
         runCatching {
             val etcDir = File(ubuntuRoot, "etc")
+            val etcStamp = File(etcDir, ".grassbag-etc-v2")
+            // Cold-start fast path: skip 15+ redundant config writes/chmod/group scans when container
+            // /etc was already configured; only refresh live Android DNS servers!
+            if (!force && etcStamp.isFile) {
+                refreshContainerDns()
+                etcPrepared = true
+                return@synchronized
+            }
             etcDir.mkdirs()
             val containerTmp = File(ubuntuRoot, "tmp").apply { mkdirs() }
             val containerVarTmp = File(ubuntuRoot, "var/tmp").apply { mkdirs() }
@@ -728,6 +804,7 @@ class RuntimeController private constructor(
                     groupFile.appendText(sb.toString())
                 }
             }
+            runCatching { File(etcDir, ".grassbag-etc-v2").writeText("ok") }
             etcPrepared = true
         }
         Unit
@@ -2440,6 +2517,7 @@ class RuntimeController private constructor(
             activeExecutorUsed = null
             engineState = nextState
             SafetyGate.endTurn()
+            GrassBagEngineService.clearNativeActiveWork()
             PhoneOverlayController.getInstance(ctx).dismissAll()
             runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
             if (!keepForegroundService) {
@@ -2735,10 +2813,20 @@ class RuntimeController private constructor(
                 return mapOf("ok" to false, "error" to "runtime_not_initialized", "status" to getStatus())
             }
 
-            // Adopt an already-healthy local DSH instance ONLY when a prior pid/socket exists
-            // (avoids cold HttpURLConnection/OkHttp classloading + ECONNREFUSED on clean cold launch).
+            // Adopt an already-healthy local DSH instance ONLY when a prior pid/socket exists AND
+            // any recorded PID is genuinely alive (avoids slow stale UDS + cold HttpURLConnection
+            // probes after an OEM background kill!).
             val existingCaps = if (pidFile.exists() || bridgeSocket.exists()) {
-                probeLocalCapabilities()
+                val recordedPid = runCatching {
+                    if (pidFile.isFile) pidFile.readText().trim().toIntOrNull() else null
+                }.getOrNull()
+                if (recordedPid != null && !isValidEnginePid(recordedPid)) {
+                    runCatching { pidFile.delete() }
+                    runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
+                    null
+                } else {
+                    probeLocalCapabilities()
+                }
             } else {
                 null
             }
@@ -2996,6 +3084,7 @@ class RuntimeController private constructor(
             val (pb, tag) = buildProotProcess(
                 listOf(
                     "/usr/local/bin/node",
+                    "--no-warnings",
                     "--import=/opt/shims/android-shim.mjs",
                     "/opt/dsh-slots/current/node_modules/@deepseek-ai/dsh/lib/bin.js",
                     "web",
@@ -3071,6 +3160,7 @@ class RuntimeController private constructor(
                 synchronized(engineLock) {
                     if (dshProcess === proc) {
                         SafetyGate.endTurn()
+                        GrassBagEngineService.clearNativeActiveWork()
                         PhoneOverlayController.getInstance(ctx).dismissAll()
                         dshProcess = null
                         runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
@@ -3082,12 +3172,37 @@ class RuntimeController private constructor(
                         if (engineState == "starting") {
                             lastEngineError = formattedErr
                         } else if (engineState != "stopped") {
-                            engineState = "error"
-                            lastEngineError = formattedErr
-                            if (activeToolkitInstalls.get() <= 0) {
-                                GrassBagEngineService.stop(ctx)
+                            val canAutoRecover = stopEpoch.get() == startEpoch &&
+                                !bootstrapRunning.get() &&
+                                !upgradeInProgress.get() &&
+                                tryReserveAutoRestartSlot()
+                            if (canAutoRecover) {
+                                engineState = "starting"
+                                lastEngineError = null
+                                appendLog("[runtime] unexpected DSH exit (code=$code); keeping FGS alive and auto-recovering...")
+                                GrassBagEngineService.startOrUpdate(
+                                    ctx,
+                                    "GrassBag 正在自动恢复本机引擎…",
+                                    "检测到后台进程中断，正在自动重启 DSH 核心",
+                                    wakeLockMs = 180_000L,
+                                    holdWifiLock = true
+                                )
+                                emit("engine_state", mapOf("state" to "starting", "exitCode" to code, "recovering" to true))
+                                val backoffMs = nextAutoRestartBackoffMs()
+                                worker.execute {
+                                    runCatching { Thread.sleep(backoffMs) }
+                                    if (stopEpoch.get() == startEpoch && !bootstrapRunning.get() && !upgradeInProgress.get()) {
+                                        startEngineSync()
+                                    }
+                                }
+                            } else {
+                                engineState = "error"
+                                lastEngineError = formattedErr
+                                if (activeToolkitInstalls.get() <= 0) {
+                                    GrassBagEngineService.stop(ctx)
+                                }
+                                emit("engine_state", mapOf("state" to engineState, "exitCode" to code, "error" to lastEngineError))
                             }
-                            emit("engine_state", mapOf("state" to engineState, "exitCode" to code, "error" to lastEngineError))
                         }
                     }
                 }
@@ -3138,7 +3253,7 @@ class RuntimeController private constructor(
                     readyViaUds = true
                 }
             }
-            if (probe.first == null && (dshWebUrl != null || (elapsed >= 4000L && nowMs - lastBlindTcpProbeAt >= 1000L))) {
+            if (probe.first == null && (dshWebUrl != null || (elapsed >= 2000L && nowMs - lastBlindTcpProbeAt >= 500L))) {
                 lastBlindTcpProbeAt = nowMs
                 probe = probeLocalCapabilitiesWithStatus()
             }
@@ -3178,7 +3293,7 @@ class RuntimeController private constructor(
                     ctx,
                     "GrassBag 本机引擎运行中",
                     "DSH $lastCapabilitiesDshVersion ($executorTag) · 后台保活中",
-                    releaseWakeLock = activeToolkitInstalls.get() <= 0
+                    releaseWakeLock = activeToolkitInstalls.get() <= 0 && !GrassBagEngineService.hasNativeActiveWork()
                 )
                 appendLog("[runtime] DSH READY in ${bootMs}ms! executor=$executorTag version=$lastCapabilitiesDshVersion endpoints=${caps.optInt("endpointsCount")} uds=${bridgeSocket.exists()} readyViaUds=$readyViaUds webUrl=${dshWebUrl != null} port=$LOCAL_DSH_PORT")
                 emit(
@@ -3197,7 +3312,7 @@ class RuntimeController private constructor(
                 )
                 return mapOf("ok" to true, "bootMs" to bootMs, "executorMode" to executorTag, "capabilities" to caps.toString(), "status" to getStatus())
             }
-            val waitMs = if (dshWebUrl != null || udsExists) 150L else if (elapsed < 10_000L) 250L else 420L
+            val waitMs = if (dshWebUrl != null || udsExists) 60L else if (elapsed < 8_000L) 120L else 220L
             synchronized(readinessSignal) {
                 runCatching { readinessSignal.wait(waitMs) }
             }
@@ -4249,6 +4364,10 @@ class RuntimeController private constructor(
 
         fun ensureForegroundServiceIfRunning(appContext: Context) {
             instance?.ensureForegroundServiceIfRunning()
+        }
+
+        fun onActivityBackgrounded(appContext: Context) {
+            instance?.onActivityBackgrounded()
         }
 
         /**

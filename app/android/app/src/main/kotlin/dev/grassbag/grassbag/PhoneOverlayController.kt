@@ -614,9 +614,14 @@ class PhoneOverlayController(private val appContext: Context) {
                 hudCurrentApp = appLabel
             }
             if (incrementStep && actionLabel.isNotBlank()) {
+                val entryIndex = if (isPreview) {
+                    (recentSteps.lastOrNull()?.index ?: 0) + 1
+                } else {
+                    nextStep.coerceAtLeast(1)
+                }
                 recentSteps.add(
                     StepEntry(
-                        index = nextStep,
+                        index = entryIndex,
                         tool = toolName,
                         action = actionLabel,
                         appLabel = hudCurrentApp,
@@ -1437,7 +1442,7 @@ class PhoneOverlayController(private val appContext: Context) {
         val container = FrameLayout(ctx).apply {
             clipChildren = false
             clipToPadding = false
-            setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 10))
+            setPadding(dp(ctx, 2), dp(ctx, 2), dp(ctx, 2), dp(ctx, 2))
         }
         // Never set FLAG_BLUR_BEHIND on raw WindowManager overlay windows: Android 12+ blurs
         // the entire underlying screen behind the window instead of just the HUD capsule!
@@ -1512,7 +1517,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 params.width = WindowManager.LayoutParams.WRAP_CONTENT
                 params.x = 0
                 params.y = (if (hudSavedY >= minY) hudSavedY else safeTopY).coerceIn(minY, maxY)
-                container.setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 10))
+                container.setPadding(dp(ctx, 2), dp(ctx, 2), dp(ctx, 2), dp(ctx, 2))
             }
             HudMode.EXPANDED -> {
                 val minY = safeTopY
@@ -1521,7 +1526,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 params.width = min(safeW - dp(ctx, 22), dp(ctx, 368)).coerceAtLeast(dp(ctx, 220))
                 params.x = 0
                 params.y = (if (hudSavedY >= minY) hudSavedY else safeTopY).coerceIn(minY, maxY)
-                container.setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 10))
+                container.setPadding(dp(ctx, 2), dp(ctx, 2), dp(ctx, 2), dp(ctx, 2))
             }
             HudMode.DOCKED_LEFT -> {
                 val minY = safeTopY + dp(ctx, 12)
@@ -1533,7 +1538,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 params.x = m.leftInset
                 params.y = (if (hudSavedY >= minY) hudSavedY else (m.height * 0.24f).toInt())
                     .coerceIn(minY, maxY)
-                container.setPadding(0, dp(ctx, 4), dp(ctx, 6), dp(ctx, 6))
+                container.setPadding(0, dp(ctx, 2), dp(ctx, 2), dp(ctx, 2))
             }
             HudMode.DOCKED_RIGHT -> {
                 val minY = safeTopY + dp(ctx, 12)
@@ -1544,7 +1549,7 @@ class PhoneOverlayController(private val appContext: Context) {
                 params.x = m.rightInset
                 params.y = (if (hudSavedY >= minY) hudSavedY else (m.height * 0.24f).toInt())
                     .coerceIn(minY, maxY)
-                container.setPadding(dp(ctx, 6), dp(ctx, 4), 0, dp(ctx, 6))
+                container.setPadding(dp(ctx, 2), dp(ctx, 2), 0, dp(ctx, 2))
             }
         }
         container.removeAllViews()
@@ -1614,7 +1619,10 @@ class PhoneOverlayController(private val appContext: Context) {
                 elevated = true,
                 hasBackdropBlur = false
             )
-            elevation = 16f * density
+            // Zero HWUI Material elevation: hardware elevation casts a solid gray shadow
+            // straight through translucent Liquid Glass and hard-clips at the overlay window edge!
+            elevation = 0f
+            outlineProvider = null
         }
 
         val logo = GrassBagOverlayLogoView(ctx, dark, accentPrimary, accentHi).apply {
@@ -1742,7 +1750,8 @@ class PhoneOverlayController(private val appContext: Context) {
             pill,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
             )
         )
 
@@ -1790,7 +1799,8 @@ class PhoneOverlayController(private val appContext: Context) {
                 elevated = true,
                 hasBackdropBlur = false
             )
-            elevation = 22f * density
+            elevation = 0f
+            outlineProvider = null
         }
 
         // Top drag handle bar
@@ -2091,7 +2101,8 @@ class PhoneOverlayController(private val appContext: Context) {
                 dockedEdge = if (dockedLeft) -1 else 1,
                 hasBackdropBlur = false
             )
-            elevation = 16f * density
+            elevation = 0f
+            outlineProvider = null
         }
 
         val logo = GrassBagOverlayLogoView(ctx, dark, accentPrimary, accentHi).apply {
@@ -2603,15 +2614,12 @@ class PhoneOverlayController(private val appContext: Context) {
         val safeW = (m.width - m.leftInset - m.rightInset).coerceAtLeast(dp(ctx, 240))
         val dark = isDarkPalette()
         val cardWidth = min(safeW - dp(ctx, 24), dp(ctx, 412))
-        // Keep the underlying target app 100% crisp & readable during confirmation so the user can
-        // verify the exact UI element before approving (NO FLAG_BLUR_BEHIND full-screen blur!).
-        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        // Keep the underlying target app 100% crisp, bright & readable during confirmation
+        // (NO FLAG_BLUR_BEHIND full-screen blur and NO FLAG_DIM_BEHIND gray screen veil!).
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-        if (!atTop) {
-            flags = flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND
-        }
         return WindowManager.LayoutParams(
             cardWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -2625,9 +2633,6 @@ class PhoneOverlayController(private val appContext: Context) {
                 } else {
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
                 }
-            }
-            if (!atTop) {
-                dimAmount = if (dark) 0.24f else 0.12f
             }
             if (atTop) {
                 gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
@@ -2672,7 +2677,7 @@ class PhoneOverlayController(private val appContext: Context) {
         val wrapper = FrameLayout(ctx).apply {
             clipChildren = false
             clipToPadding = false
-            setPadding(dp(ctx, 4), dp(ctx, 4), dp(ctx, 4), dp(ctx, 10))
+            setPadding(dp(ctx, 2), dp(ctx, 2), dp(ctx, 2), dp(ctx, 2))
         }
 
         val card = LinearLayout(ctx).apply {
@@ -2686,7 +2691,8 @@ class PhoneOverlayController(private val appContext: Context) {
                 elevated = true,
                 hasBackdropBlur = hasBackdropBlur
             )
-            elevation = 24f * density
+            elevation = 0f
+            outlineProvider = null
         }
 
         // Subtle iOS 26 floating-sheet grabber pill ONLY on draggable Handoff cards (never a dead affordance!)
@@ -3317,11 +3323,11 @@ class PhoneOverlayController(private val appContext: Context) {
                     if (uDark > 0.5) {
                         topCol = mix(float3(0.148, 0.165, 0.198), uAccent.rgb, 0.07);
                         botCol = mix(float3(0.082, 0.094, 0.118), uAccent.rgb, 0.04);
-                        baseAlpha = (uHasBlur > 0.5) ? 0.72 : ((uElevated > 0.5) ? 0.84 : 0.79);
+                        baseAlpha = (uHasBlur > 0.5) ? 0.72 : ((uElevated > 0.5) ? 0.91 : 0.87);
                     } else {
                         topCol = mix(float3(0.990, 0.992, 0.996), uAccent.rgb, 0.025);
                         botCol = mix(float3(0.935, 0.945, 0.960), uAccent.rgb, 0.055);
-                        baseAlpha = (uHasBlur > 0.5) ? 0.78 : ((uElevated > 0.5) ? 0.87 : 0.83);
+                        baseAlpha = (uHasBlur > 0.5) ? 0.78 : ((uElevated > 0.5) ? 0.93 : 0.90);
                     }
                     float3 rgb = mix(topCol, botCol, diag);
 
@@ -3481,27 +3487,27 @@ class PhoneOverlayController(private val appContext: Context) {
             val baseTop = if (dark) {
                 when {
                     hasBackdropBlur -> Color.parseColor("#C81F2530")
-                    elevated -> Color.parseColor("#D61E242E")
-                    else -> Color.parseColor("#CE191F29")
+                    elevated -> Color.parseColor("#E81E242E")
+                    else -> Color.parseColor("#DF191F29")
                 }
             } else {
                 when {
                     hasBackdropBlur -> Color.parseColor("#D4FCFEFF")
-                    elevated -> Color.parseColor("#E0FCFEFF")
-                    else -> Color.parseColor("#D8F7FAFD")
+                    elevated -> Color.parseColor("#EDFCFEFF")
+                    else -> Color.parseColor("#E5F7FAFD")
                 }
             }
             val baseBot = if (dark) {
                 when {
                     hasBackdropBlur -> Color.parseColor("#BE131820")
-                    elevated -> Color.parseColor("#CC141A24")
-                    else -> Color.parseColor("#C411161F")
+                    elevated -> Color.parseColor("#E0141A24")
+                    else -> Color.parseColor("#D811161F")
                 }
             } else {
                 when {
                     hasBackdropBlur -> Color.parseColor("#C6EEF3F8")
-                    elevated -> Color.parseColor("#D2EEF3F8")
-                    else -> Color.parseColor("#CAEAF0F6")
+                    elevated -> Color.parseColor("#E6EEF3F8")
+                    else -> Color.parseColor("#DCEAF0F6")
                 }
             }
             val topCol = ColorUtils.setAlphaComponent(
@@ -3656,9 +3662,13 @@ class PhoneOverlayController(private val appContext: Context) {
                     }
                     true
                 }.getOrDefault(false)
-                if (pathOk) return
+                if (pathOk) {
+                    outline.alpha = 0f
+                    return
+                }
             }
             outline.setRoundRect(bounds, rPx)
+            outline.alpha = 0f
         }
 
         override fun setVisible(visible: Boolean, restart: Boolean): Boolean {

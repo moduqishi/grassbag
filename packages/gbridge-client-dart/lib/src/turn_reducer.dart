@@ -163,6 +163,27 @@ class TurnStreamReducer {
 
   void _appendReasoningText(int idx, String? explicitId, String delta, int eventSeq) {
     if (_activeTextBuf != null) _flushTextBuffer(detach: true);
+    // If the assistant already emitted intermediate prose and is now starting a new thinking
+    // block, preserve that prose chronologically in `steps` before appending the new thinking!
+    final preCur = _turns[idx];
+    if (preCur.assistantText.trim().isNotEmpty) {
+      if (_activeReasonBuf != null) _flushReasonBuffer(detach: true);
+      final narr = preCur.assistantText.trim();
+      final promotedSteps = List<NormalizedStep>.of(preCur.steps)
+        ..add(ReasoningStep(
+          id: 'narration-$eventSeq-${preCur.steps.length}',
+          role: 'prose',
+          text: narr,
+          collapsedPreview: _previewLine(narr),
+        ));
+      _turns[idx] = preCur.copyWith(
+        status: 'streaming',
+        seqEnd: eventSeq > preCur.seqEnd ? eventSeq : preCur.seqEnd,
+        steps: List.unmodifiable(promotedSteps),
+        assistantText: '',
+      );
+      _cachedTurns = null;
+    }
     // Fast path: appending into the currently buffered reasoning step!
     if (_activeReasonBuf != null && _activeReasonTurnIdx == idx) {
       final cur = _turns[idx];
@@ -172,7 +193,7 @@ class TurnStreamReducer {
             ((explicitId != null && explicitId.isNotEmpty && step.id == explicitId) ||
                 ((explicitId == null || explicitId.isEmpty) &&
                     _activeReasonStepIdx == cur.steps.length - 1 &&
-                    !step.id.startsWith('narration-')))) {
+                    !step.isIntermediateProse))) {
           _activeReasonBuf!.write(delta);
           _activeReasonDirty = true;
           if (eventSeq > _activeReasonMaxSeq) _activeReasonMaxSeq = eventSeq;
@@ -192,7 +213,7 @@ class TurnStreamReducer {
       existingStepIdx = steps.lastIndexWhere((s) => s is ReasoningStep && s.id == explicitId);
     } else if (steps.isNotEmpty &&
         steps.last is ReasoningStep &&
-        !(steps.last as ReasoningStep).id.startsWith('narration-')) {
+        !(steps.last as ReasoningStep).isIntermediateProse) {
       existingStepIdx = steps.length - 1;
     }
     if (existingStepIdx >= 0) {
@@ -368,6 +389,7 @@ class TurnStreamReducer {
           final preview = narr.split('\n').first;
           steps.add(ReasoningStep(
             id: 'narration-$fallbackIdSeq-${steps.length}',
+            role: 'prose',
             text: narr,
             collapsedPreview: preview.length > 160 ? '${preview.substring(0, 159)}…' : preview,
           ));
@@ -513,9 +535,12 @@ class TurnStreamReducer {
                         t.status == 'interrupted' ||
                         t.status == 'error' ||
                         snapshotSettled;
-                    final mergedText = (!hasTerminal && prev.assistantText.length > t.assistantText.length)
-                        ? prev.assistantText
-                        : t.assistantText;
+                    final alreadyPromoted = _shouldClearPromotedNarration(prev, t);
+                    final mergedText = alreadyPromoted
+                        ? t.assistantText
+                        : ((!hasTerminal && prev.assistantText.length > t.assistantText.length)
+                            ? prev.assistantText
+                            : t.assistantText);
                     final mergedSteps = (!hasTerminal && prev.steps.length > enrichedSteps.length)
                         ? prev.steps
                         : enrichedSteps;
@@ -669,7 +694,7 @@ class TurnStreamReducer {
           if (finalText.trim().isEmpty) {
             for (var j = settled.length - 1; j >= 0; j--) {
               final s = settled[j];
-              if (s is ReasoningStep && s.id.startsWith('narration-') && s.text.trim().isNotEmpty) {
+              if (s is ReasoningStep && s.isIntermediateProse && s.text.trim().isNotEmpty) {
                 finalText = s.text;
                 settled.removeAt(j);
                 break;
@@ -780,7 +805,7 @@ class TurnStreamReducer {
         if (nextStatus != 'streaming' && nextAssistantText.trim().isEmpty) {
           for (var i = nextSteps.length - 1; i >= 0; i--) {
             final s = nextSteps[i];
-            if (s is ReasoningStep && s.id.startsWith('narration-') && s.text.trim().isNotEmpty) {
+            if (s is ReasoningStep && s.isIntermediateProse && s.text.trim().isNotEmpty) {
               nextAssistantText = s.text;
               nextSteps.removeAt(i);
               break;
@@ -985,6 +1010,7 @@ class TurnStreamReducer {
           final preview = narr.split('\n').first;
           steps.add(ReasoningStep(
             id: 'narration-$fallbackIdSeq-${steps.length}',
+            role: 'prose',
             text: narr,
             collapsedPreview: preview.length > 160 ? '${preview.substring(0, 159)}…' : preview,
           ));
@@ -1048,13 +1074,16 @@ class TurnStreamReducer {
         if (ri >= 0) {
           final prev = target[ri] as ReasoningStep;
           final keepId = prev.id.isNotEmpty ? prev.id : s.id;
+          final keepRole = s.role ?? prev.role;
           final keepDuration = s.durationMs ?? prev.durationMs;
           final keepTranslation = s.translatedText ?? prev.translatedText;
           target[ri] = (keepId != s.id ||
+                  keepRole != s.role ||
                   keepDuration != s.durationMs ||
                   keepTranslation != s.translatedText)
               ? ReasoningStep(
                   id: keepId,
+                  role: keepRole,
                   text: s.text,
                   collapsedPreview: s.collapsedPreview,
                   translatedText: keepTranslation,
@@ -1084,14 +1113,14 @@ class TurnStreamReducer {
   static int _findMatchingReasoningIndex(List<NormalizedStep> steps, ReasoningStep incoming) {
     final byId = steps.indexWhere((x) => x is ReasoningStep && x.id == incoming.id);
     if (byId >= 0) return byId;
-    final incIsNarration = incoming.id.startsWith('narration-');
+    final incIsNarration = incoming.isIntermediateProse;
     final incTrim = incoming.text.trim();
     // Pass 1: exact or prefix content match across the turn (handles persisted `assistant/message`
     // arriving AFTER `tool-call-delta` already appended a trailing ToolStep).
     if (incTrim.isNotEmpty) {
       for (int i = steps.length - 1; i >= 0; i--) {
         final s = steps[i];
-        if (s is ReasoningStep && s.id.startsWith('narration-') == incIsNarration) {
+        if (s is ReasoningStep && s.isIntermediateProse == incIsNarration) {
           final curTrim = s.text.trim();
           if (curTrim.isNotEmpty &&
               (curTrim == incTrim || incTrim.startsWith(curTrim) || curTrim.startsWith(incTrim))) {
@@ -1103,7 +1132,7 @@ class TurnStreamReducer {
     // Pass 2: fallback only against an empty trailing reasoning placeholder before any tool call.
     for (int i = steps.length - 1; i >= 0; i--) {
       final s = steps[i];
-      if (s is ReasoningStep && s.id.startsWith('narration-') == incIsNarration) {
+      if (s is ReasoningStep && s.isIntermediateProse == incIsNarration) {
         final curTrim = s.text.trim();
         if (curTrim.isEmpty || incTrim.isEmpty) return i;
         break;
@@ -1141,11 +1170,11 @@ class TurnStreamReducer {
   static bool _shouldClearPromotedNarration(NormalizedTurn cur, NormalizedTurn snap) {
     final promotedSteps = snap.steps
         .whereType<ReasoningStep>()
-        .where((s) => s.id.startsWith('narration-') && s.text.trim().isNotEmpty)
+        .where((s) => s.isIntermediateProse && s.text.trim().isNotEmpty)
         .toList(growable: false);
-    if (promotedSteps.isEmpty || snap.assistantText.isNotEmpty) return false;
+    if (promotedSteps.isEmpty) return false;
     final curTrim = cur.assistantText.trim();
-    if (curTrim.isEmpty) return true;
+    if (curTrim.isEmpty) return snap.assistantText.isEmpty;
     return promotedSteps.any((s) {
       final p = s.text.trim();
       return p == curTrim || p.startsWith(curTrim) || curTrim.startsWith(p);
@@ -1174,7 +1203,7 @@ class TurnStreamReducer {
           ? snap.status
           : (cur.isStreaming ? 'streaming' : snap.status);
       final nextAssistantText = promotedNarration
-          ? ''
+          ? snap.assistantText
           : (snap.assistantText.length >= cur.assistantText.length
               ? snap.assistantText
               : cur.assistantText);
@@ -1209,7 +1238,7 @@ class TurnStreamReducer {
             ? snap.status
             : 'streaming';
         final nextAssistantText = promotedNarration
-            ? ''
+            ? snap.assistantText
             : (snap.assistantText.isNotEmpty && snap.assistantText.length >= cur.assistantText.length
                 ? snap.assistantText
                 : cur.assistantText);
@@ -1411,6 +1440,7 @@ class TurnStreamReducer {
         }
       } else if (x is ReasoningStep && y is ReasoningStep) {
         if (x.id != y.id ||
+            x.role != y.role ||
             x.text.length != y.text.length ||
             x.text != y.text ||
             x.translatedText != y.translatedText ||
@@ -1483,14 +1513,17 @@ class TurnStreamReducer {
         if (matchIdx >= 0) {
           final prev = prevSteps[matchIdx] as ReasoningStep;
           final keepId = prev.id.isNotEmpty ? prev.id : s.id;
+          final keepRole = s.role ?? prev.role;
           final keepDuration = s.durationMs ?? prev.durationMs;
           final keepTranslation = s.translatedText ?? prev.translatedText;
           if (keepId != s.id ||
+              keepRole != s.role ||
               keepDuration != s.durationMs ||
               keepTranslation != s.translatedText) {
             out ??= List<NormalizedStep>.of(nextSteps);
             out[i] = ReasoningStep(
               id: keepId,
+              role: keepRole,
               text: s.text,
               collapsedPreview: s.collapsedPreview,
               translatedText: keepTranslation,

@@ -2383,6 +2383,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     return a == b;
   }
 
+  /// True only when the user explicitly tapped "停止本机引擎" in this session.
+  bool get userStoppedLocalEngine => _userStoppedLocalEngine;
+
   /// Live `/gbridge/v1` client when connected to a bridged or zero-plugin direct host.
   GbridgeClient? get liveClient => _liveClient;
 
@@ -2706,8 +2709,14 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
     List<ManagedHost>? restoredHosts;
     String? restoredActiveHostId;
+    final hasRemoteSavedHosts = savedHosts != null && savedHosts.any((raw) => raw['isLocal'] != true);
     if (GrassBagNativeBridge.instance.isAndroidNative) {
-      await _refreshDeviceLocalIps();
+      if (hasRemoteSavedHosts) {
+        await _refreshDeviceLocalIps();
+      } else {
+        // Never block local cold-start connection behind enumerating Android network interfaces!
+        unawaited(_refreshDeviceLocalIps());
+      }
     }
     if (savedHosts != null && savedHosts.isNotEmpty) {
       const legacyDemoAddresses = {'https://dsh.myhost.dev', 'http://192.168.1.24:3080'};
@@ -3062,6 +3071,76 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
+  void _applyPermissionsAndSafetySnapshot(
+    NativePermissionsStatus? perms,
+    Map<String, dynamic>? safety,
+  ) {
+    if (!mounted || (perms == null && safety == null)) return;
+    final nextPerms = perms ?? state.nativePermissions;
+    final nextAccess = perms?.accessibilityEnabled ?? state.phoneAccessibility;
+    final nextOverlay = perms?.overlayGranted ?? state.phoneOverlay;
+    final nextShizuku = perms?.shizukuInstalled ?? state.phoneShizuku;
+    final nextConfirmRisk = safety?['confirmHighRisk'] is bool
+        ? safety!['confirmHighRisk'] as bool
+        : state.phoneConfirmHighRisk;
+    final nextAutoReturn = safety?['autoReturnOnComplete'] is bool
+        ? safety!['autoReturnOnComplete'] as bool
+        : state.phoneAutoReturn;
+    final nextEdgeAurora = safety?['showEdgeAurora'] is bool
+        ? safety!['showEdgeAurora'] as bool
+        : state.phoneShowEdgeAurora;
+    final nextGestureFx = safety?['showGestureFx'] is bool
+        ? safety!['showGestureFx'] as bool
+        : state.phoneShowGestureFx;
+    final nextPaused = safety?['paused'] is bool ? safety!['paused'] as bool : state.phoneLivePaused;
+    final nextEmergency = safety?['emergencyStopped'] == true;
+    final nextPolicy = safety?['policy']?.toString() ?? state.safetyPolicy;
+    final rawAudit = safety?['audit'];
+    final auditList = rawAudit is List
+        ? rawAudit
+            .whereType<Map<Object?, Object?>>()
+            .map((m) => m.map((k, v) => MapEntry(k.toString(), v)))
+            .toList(growable: false)
+        : state.safetyAudit;
+    final auditChanged = !_deepEquals(auditList, state.safetyAudit);
+    final nativePhoneBusy =
+        safety?['activeTurnLocked'] == true || safety?['hudVisible'] == true;
+    final shouldClearStalePhoneLive =
+        safety != null && !nativePhoneBusy && state.phoneLiveActive && !state.isStreaming;
+    if (nextPerms != state.nativePermissions ||
+        nextAccess != state.phoneAccessibility ||
+        nextOverlay != state.phoneOverlay ||
+        nextShizuku != state.phoneShizuku ||
+        nextConfirmRisk != state.phoneConfirmHighRisk ||
+        nextAutoReturn != state.phoneAutoReturn ||
+        nextEdgeAurora != state.phoneShowEdgeAurora ||
+        nextGestureFx != state.phoneShowGestureFx ||
+        nextPaused != state.phoneLivePaused ||
+        nextEmergency != state.emergencyStopped ||
+        nextPolicy != state.safetyPolicy ||
+        shouldClearStalePhoneLive ||
+        auditChanged) {
+      state = state.copyWith(
+        nativePermissions: nextPerms,
+        phoneAccessibility: nextAccess,
+        phoneOverlay: nextOverlay,
+        phoneShizuku: nextShizuku,
+        phoneConfirmHighRisk: nextConfirmRisk,
+        phoneAutoReturn: nextAutoReturn,
+        phoneShowEdgeAurora: nextEdgeAurora,
+        phoneShowGestureFx: nextGestureFx,
+        phoneLiveActive: shouldClearStalePhoneLive ? false : state.phoneLiveActive,
+        phoneLivePaused: shouldClearStalePhoneLive ? false : nextPaused,
+        phoneLiveAction: shouldClearStalePhoneLive ? '' : state.phoneLiveAction,
+        phoneLiveApp: shouldClearStalePhoneLive ? '' : state.phoneLiveApp,
+        phoneLiveSteps: shouldClearStalePhoneLive ? 0 : state.phoneLiveSteps,
+        emergencyStopped: nextEmergency,
+        safetyPolicy: nextPolicy,
+        safetyAudit: auditChanged ? auditList : state.safetyAudit,
+      );
+    }
+  }
+
   /// Fast, non-blocking refresh of Android permission & SafetyGate status ONLY.
   /// Never waits for container/runtime I/O and is never cancelled by host-switch generations,
   /// guaranteeing Accessibility / Overlay / Storage toggles reflect instantaneously on return!
@@ -3076,72 +3155,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         native.getSafetyStatus(),
       ]);
       if (!mounted) return;
-      final perms = res[0] as NativePermissionsStatus?;
-      final safety = res[1] as Map<String, dynamic>?;
-      if (perms == null && safety == null) return;
-      final nextPerms = perms ?? state.nativePermissions;
-      final nextAccess = perms?.accessibilityEnabled ?? state.phoneAccessibility;
-      final nextOverlay = perms?.overlayGranted ?? state.phoneOverlay;
-      final nextShizuku = perms?.shizukuInstalled ?? state.phoneShizuku;
-      final nextConfirmRisk = safety?['confirmHighRisk'] is bool
-          ? safety!['confirmHighRisk'] as bool
-          : state.phoneConfirmHighRisk;
-      final nextAutoReturn = safety?['autoReturnOnComplete'] is bool
-          ? safety!['autoReturnOnComplete'] as bool
-          : state.phoneAutoReturn;
-      final nextEdgeAurora = safety?['showEdgeAurora'] is bool
-          ? safety!['showEdgeAurora'] as bool
-          : state.phoneShowEdgeAurora;
-      final nextGestureFx = safety?['showGestureFx'] is bool
-          ? safety!['showGestureFx'] as bool
-          : state.phoneShowGestureFx;
-      final nextPaused = safety?['paused'] is bool ? safety!['paused'] as bool : state.phoneLivePaused;
-      final nextEmergency = safety?['emergencyStopped'] == true;
-      final nextPolicy = safety?['policy']?.toString() ?? state.safetyPolicy;
-      final rawAudit = safety?['audit'];
-      final auditList = rawAudit is List
-          ? rawAudit
-              .whereType<Map<Object?, Object?>>()
-              .map((m) => m.map((k, v) => MapEntry(k.toString(), v)))
-              .toList(growable: false)
-          : state.safetyAudit;
-      final auditChanged = !_deepEquals(auditList, state.safetyAudit);
-      final nativePhoneBusy =
-          safety?['activeTurnLocked'] == true || safety?['hudVisible'] == true;
-      final shouldClearStalePhoneLive =
-          safety != null && !nativePhoneBusy && state.phoneLiveActive && !state.isStreaming;
-      if (nextPerms != state.nativePermissions ||
-          nextAccess != state.phoneAccessibility ||
-          nextOverlay != state.phoneOverlay ||
-          nextShizuku != state.phoneShizuku ||
-          nextConfirmRisk != state.phoneConfirmHighRisk ||
-          nextAutoReturn != state.phoneAutoReturn ||
-          nextEdgeAurora != state.phoneShowEdgeAurora ||
-          nextGestureFx != state.phoneShowGestureFx ||
-          nextPaused != state.phoneLivePaused ||
-          nextEmergency != state.emergencyStopped ||
-          nextPolicy != state.safetyPolicy ||
-          shouldClearStalePhoneLive ||
-          auditChanged) {
-        state = state.copyWith(
-          nativePermissions: nextPerms,
-          phoneAccessibility: nextAccess,
-          phoneOverlay: nextOverlay,
-          phoneShizuku: nextShizuku,
-          phoneConfirmHighRisk: nextConfirmRisk,
-          phoneAutoReturn: nextAutoReturn,
-          phoneShowEdgeAurora: nextEdgeAurora,
-          phoneShowGestureFx: nextGestureFx,
-          phoneLiveActive: shouldClearStalePhoneLive ? false : state.phoneLiveActive,
-          phoneLivePaused: shouldClearStalePhoneLive ? false : nextPaused,
-          phoneLiveAction: shouldClearStalePhoneLive ? '' : state.phoneLiveAction,
-          phoneLiveApp: shouldClearStalePhoneLive ? '' : state.phoneLiveApp,
-          phoneLiveSteps: shouldClearStalePhoneLive ? 0 : state.phoneLiveSteps,
-          emergencyStopped: nextEmergency,
-          safetyPolicy: nextPolicy,
-          safetyAudit: auditChanged ? auditList : state.safetyAudit,
-        );
-      }
+      _applyPermissionsAndSafetySnapshot(
+        res[0] as NativePermissionsStatus?,
+        res[1] as Map<String, dynamic>?,
+      );
     }();
     _inFlightPermissionsRefresh = fut;
     fut.whenComplete(() {
@@ -3150,6 +3167,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
     });
     return fut;
+  }
+
+  /// Called on `AppLifecycleState.inactive` while the Activity is STILL foreground-eligible on
+  /// Android 12–16, ensuring `GrassBagEngineService` and CPU/Wi-Fi locks are promoted BEFORE
+  /// Android drops process importance on app switch.
+  void handleAppInactivating() {
+    _flushHostContextsNow();
+    if (_persistPrefsTimer != null) _persistPrefs(immediate: true);
+    if (_persistHostsTimer != null) _persistHosts(immediate: true);
+    if (GrassBagNativeBridge.instance.isAndroidNative) {
+      _syncAndroidKeepalive(force: true);
+    }
   }
 
   /// Records background entry timestamp, flushes pending drafts/prefs, and immediately reinforces
@@ -3388,15 +3417,24 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   Future<void> _refreshNativeStatusImpl({int? connectGen, bool skipAutoConnect = false}) async {
     final seq = ++_nativeStatusSeq;
     final native = GrassBagNativeBridge.instance;
-    final nativeRes = await Future.wait<Object?>([
-      native.getRuntimeStatus(),
+    // Kick off permissions + safety in parallel off the critical local-engine connect path so
+    // cold-start local UDS connection never waits behind 6+ Android Binder permission IPCs!
+    final permsAndSafetyFuture = Future.wait<Object?>([
       native.getPermissionsStatus(),
       native.getSafetyStatus(),
     ]);
-    final rt = nativeRes[0] as NativeRuntimeStatus?;
-    final perms = nativeRes[1] as NativePermissionsStatus?;
-    final safety = nativeRes[2] as Map<String, dynamic>?;
+    final rt = await native.getRuntimeStatus();
     if (!mounted || seq != _nativeStatusSeq) return;
+    // Apply permissions & safety asynchronously as soon as their IPCs settle (or immediately if already done).
+    unawaited(
+      permsAndSafetyFuture.then((extraRes) {
+        if (!mounted || seq != _nativeStatusSeq) return;
+        _applyPermissionsAndSafetySnapshot(
+          extraRes[0] as NativePermissionsStatus?,
+          extraRes[1] as Map<String, dynamic>?,
+        );
+      }),
+    );
     if (connectGen != null && connectGen != _hostConnectGen) return;
     final shouldAutoConnect = !skipAutoConnect || _pendingAutoConnectRequested;
     if (shouldAutoConnect) {
@@ -3440,62 +3478,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       ];
     }
 
-    final rawAudit = safety?['audit'];
-    final auditList = rawAudit is List
-        ? rawAudit
-            .whereType<Map<Object?, Object?>>()
-            .map((m) => m.map((k, v) => MapEntry(k.toString(), v)))
-            .toList(growable: false)
-        : state.safetyAudit;
-
     final nextRt = rt ?? state.nativeRuntimeStatus;
-    final nextPerms = perms ?? state.nativePermissions;
-    final nextAccess = perms?.accessibilityEnabled ?? state.phoneAccessibility;
-    final nextOverlay = perms?.overlayGranted ?? state.phoneOverlay;
-    final nextShizuku = perms?.shizukuInstalled ?? state.phoneShizuku;
-    final nextConfirmRisk = safety?['confirmHighRisk'] is bool
-        ? safety!['confirmHighRisk'] as bool
-        : state.phoneConfirmHighRisk;
-    final nextAutoReturn = safety?['autoReturnOnComplete'] is bool
-        ? safety!['autoReturnOnComplete'] as bool
-        : state.phoneAutoReturn;
-    final nextEdgeAurora = safety?['showEdgeAurora'] is bool
-        ? safety!['showEdgeAurora'] as bool
-        : state.phoneShowEdgeAurora;
-    final nextGestureFx = safety?['showGestureFx'] is bool
-        ? safety!['showGestureFx'] as bool
-        : state.phoneShowGestureFx;
-    final nextPaused = safety?['paused'] is bool ? safety!['paused'] as bool : state.phoneLivePaused;
-    final nextEmergency = safety?['emergencyStopped'] == true;
-    final nextPolicy = safety?['policy']?.toString() ?? state.safetyPolicy;
-    final nativePhoneBusy =
-        safety?['activeTurnLocked'] == true || safety?['hudVisible'] == true;
-    final shouldClearStalePhoneLive =
-        safety != null && !nativePhoneBusy && state.phoneLiveActive && !state.isStreaming;
-
     final hostsChanged = !listEquals(nextHosts, state.hosts);
     final toolkitsChanged = nextToolkits.length != state.containerToolkits.length ||
         Iterable<int>.generate(nextToolkits.length).any(
           (i) => nextToolkits[i].installed != state.containerToolkits[i].installed,
         );
-    final auditChanged = !_deepEquals(auditList, state.safetyAudit);
     final nativeChanged = !state.nativeStatusHydrated ||
         hostsChanged ||
         toolkitsChanged ||
-        nextRt != state.nativeRuntimeStatus ||
-        nextPerms != state.nativePermissions ||
-        nextAccess != state.phoneAccessibility ||
-        nextOverlay != state.phoneOverlay ||
-        nextShizuku != state.phoneShizuku ||
-        nextConfirmRisk != state.phoneConfirmHighRisk ||
-        nextAutoReturn != state.phoneAutoReturn ||
-        nextEdgeAurora != state.phoneShowEdgeAurora ||
-        nextGestureFx != state.phoneShowGestureFx ||
-        nextPaused != state.phoneLivePaused ||
-        nextEmergency != state.emergencyStopped ||
-        nextPolicy != state.safetyPolicy ||
-        shouldClearStalePhoneLive ||
-        auditChanged;
+        nextRt != state.nativeRuntimeStatus;
 
     if (nativeChanged) {
       state = state.copyWith(
@@ -3503,22 +3495,6 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         hosts: hostsChanged ? nextHosts : state.hosts,
         containerToolkits: toolkitsChanged ? nextToolkits : state.containerToolkits,
         nativeRuntimeStatus: nextRt,
-        nativePermissions: nextPerms,
-        phoneAccessibility: nextAccess,
-        phoneOverlay: nextOverlay,
-        phoneShizuku: nextShizuku,
-        phoneConfirmHighRisk: nextConfirmRisk,
-        phoneAutoReturn: nextAutoReturn,
-        phoneShowEdgeAurora: nextEdgeAurora,
-        phoneShowGestureFx: nextGestureFx,
-        phoneLiveActive: shouldClearStalePhoneLive ? false : state.phoneLiveActive,
-        phoneLivePaused: shouldClearStalePhoneLive ? false : nextPaused,
-        phoneLiveAction: shouldClearStalePhoneLive ? '' : state.phoneLiveAction,
-        phoneLiveApp: shouldClearStalePhoneLive ? '' : state.phoneLiveApp,
-        phoneLiveSteps: shouldClearStalePhoneLive ? 0 : state.phoneLiveSteps,
-        emergencyStopped: nextEmergency,
-        safetyPolicy: nextPolicy,
-        safetyAudit: auditChanged ? auditList : state.safetyAudit,
       );
     }
 
@@ -6322,8 +6298,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         if (t.userMessage != null) {
           md.writeln('## 用户\n${t.userMessage!.text}\n');
         }
-        if (t.assistantText.isNotEmpty) {
-          md.writeln('## 助手\n${t.assistantText}\n');
+        final fullProse = t.combinedAssistantProse;
+        if (fullProse.isNotEmpty) {
+          md.writeln('## 助手\n$fullProse\n');
         }
       }
       content = md.toString();
@@ -13232,10 +13209,25 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _domainRetryTimer?.cancel();
     _domainRetryTimer = null;
     try {
-      // Stage 0 (Instant Fast Path): ONLY fetch sessions + workspaces first and commit immediately!
-      // Never block the sidebar chat list behind slow model/schema/plugin/market endpoints.
+      // Launch Stage 0 (sessions + workspaces) AND Stage 1 (models, schema, presets, permissions, account)
+      // CONCURRENTLY so startup cuts a full serial round-trip while Stage 0 still commits first!
       var sessionsFailed = false;
       var workspacesFailed = false;
+      final hydrateModelGen = _modelSelectionGen;
+      final hydratePresetGen = _presetSelectionGen;
+      final hydratePermissionGen = _permissionSelectionGen;
+      var modelsFailed = false;
+      final stage1Future = Future.wait([
+        client.getSettingsSchema().catchError((_) => const <String, dynamic>{}),
+        client.getSettingsManifest().catchError((_) => const <String, dynamic>{}),
+        client.listPresets().catchError((_) => const <String, dynamic>{}),
+        client.getModels().catchError((_) {
+          modelsFailed = true;
+          return const <String, dynamic>{};
+        }),
+        client.getPermissionsCatalog().catchError((_) => const <String, dynamic>{}),
+        client.getAccount().catchError((_) => const <String, dynamic>{}),
+      ]);
       final fastResults = await Future.wait([
         client.listSessions(includeArchived: true).catchError((_) {
           sessionsFailed = true;
@@ -13347,22 +13339,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         });
       }
 
-      // Stage 1 (Core engine config, models, presets, permissions, account)
-      final hydrateModelGen = _modelSelectionGen;
-      final hydratePresetGen = _presetSelectionGen;
-      final hydratePermissionGen = _permissionSelectionGen;
-      var modelsFailed = false;
-      final coreResults = await Future.wait([
-        client.getSettingsSchema().catchError((_) => const <String, dynamic>{}),
-        client.getSettingsManifest().catchError((_) => const <String, dynamic>{}),
-        client.listPresets().catchError((_) => const <String, dynamic>{}),
-        client.getModels().catchError((_) {
-          modelsFailed = true;
-          return const <String, dynamic>{};
-        }),
-        client.getPermissionsCatalog().catchError((_) => const <String, dynamic>{}),
-        client.getAccount().catchError((_) => const <String, dynamic>{}),
-      ]);
+      // Stage 1 (Core engine config, models, presets, permissions, account — already running in parallel!)
+      final coreResults = await stage1Future;
       if (!mounted || !identical(_liveClient, client) || myHydrateGen != _hydrationGen) return;
 
       final schemaResp = coreResults[0];

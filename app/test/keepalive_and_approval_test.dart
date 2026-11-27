@@ -6,6 +6,7 @@ import 'package:grassbag/services/native_bridge.dart';
 import 'package:grassbag/state/app_state.dart';
 import 'package:grassbag/theme/grassbag_theme.dart';
 import 'package:grassbag/ui/common/grassbag_sheets.dart';
+import 'package:grassbag/ui/onboarding/launch_splash_overlay.dart';
 
 const _runningJob1 = BackgroundJobRecord(
   id: 'job-1',
@@ -137,6 +138,130 @@ void main() {
       );
       expect(plan.managedByBootstrap, isTrue);
       expect(plan.shouldRun, isTrue);
+    });
+  });
+
+  group('GrassBagAppGate startup readiness & adaptive splash hold', () {
+    test('holds splash until initialized Android local container finishes booting, connecting, and hydrating', () {
+      const unhydrated = GrassBagAppState(
+        nativeStatusHydrated: false,
+        nativeRuntimeStatus: NativeRuntimeStatus(initialized: true, engineState: 'stopped'),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(unhydrated, isAndroidOverride: true),
+        isFalse,
+      );
+      // Unhydrated native channel stays on safe 3.6s fallback budget so broken binder never hangs 20s
+      expect(
+        GrassBagAppGate.computeMaxHoldDuration(unhydrated, isAndroidOverride: true),
+        const Duration(milliseconds: 3600),
+      );
+
+      // Even before `prewarmInBackground` flips `stopped -> starting`, splash MUST stay up & extend to 20s!
+      const prewarmRace = GrassBagAppState(
+        nativeStatusHydrated: true,
+        connectionPhase: ConnectionPhase.disconnected,
+        nativeRuntimeStatus: NativeRuntimeStatus(
+          initialized: true,
+          engineState: 'stopped',
+          engineRunning: false,
+        ),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(prewarmRace, isAndroidOverride: true),
+        isFalse,
+      );
+      expect(
+        GrassBagAppGate.computeMaxHoldDuration(prewarmRace, isAndroidOverride: true),
+        const Duration(seconds: 20),
+      );
+
+      // Container starting -> still holds splash
+      const starting = GrassBagAppState(
+        nativeStatusHydrated: true,
+        connectionPhase: ConnectionPhase.connecting,
+        loadingSessions: true,
+        nativeRuntimeStatus: NativeRuntimeStatus(
+          initialized: true,
+          engineState: 'starting',
+          engineRunning: false,
+        ),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(starting, isAndroidOverride: true),
+        isFalse,
+      );
+
+      // Connected but still hydrating domains/sessions -> still holds splash
+      const connectingHydrating = GrassBagAppState(
+        nativeStatusHydrated: true,
+        connectionPhase: ConnectionPhase.connected,
+        hydratingDomains: true,
+        loadingSessions: false,
+        nativeRuntimeStatus: NativeRuntimeStatus(
+          initialized: true,
+          engineState: 'running',
+          engineRunning: true,
+        ),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(connectingHydrating, isAndroidOverride: true),
+        isFalse,
+      );
+
+      // Engine running + connected + sessions & models hydrated -> settles IMMEDIATELY!
+      const fullyReady = GrassBagAppState(
+        nativeStatusHydrated: true,
+        connectionPhase: ConnectionPhase.connected,
+        hydratingDomains: false,
+        loadingSessions: false,
+        modelGroups: [
+          ModelCatalogGroup(
+            id: 'deepseek-account',
+            name: 'DeepSeek',
+            models: [
+              ModelCatalogEntry(
+                id: 'deepseek-chat',
+                name: 'DeepSeek Chat',
+                providerId: 'deepseek-account',
+                providerName: 'DeepSeek',
+              ),
+            ],
+          ),
+        ],
+        nativeRuntimeStatus: NativeRuntimeStatus(
+          initialized: true,
+          engineState: 'running',
+          engineRunning: true,
+        ),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(fullyReady, isAndroidOverride: true),
+        isTrue,
+      );
+
+      // Explicit user stop or engine error settles gracefully so user is never trapped on splash
+      const engineError = GrassBagAppState(
+        nativeStatusHydrated: true,
+        connectionPhase: ConnectionPhase.error,
+        nativeRuntimeStatus: NativeRuntimeStatus(
+          initialized: true,
+          engineState: 'error',
+          engineRunning: false,
+        ),
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(engineError, isAndroidOverride: true),
+        isTrue,
+      );
+      expect(
+        GrassBagAppGate.isStartupHydrationSettled(
+          prewarmRace,
+          isAndroidOverride: true,
+          userStoppedLocalEngine: true,
+        ),
+        isTrue,
+      );
     });
   });
 

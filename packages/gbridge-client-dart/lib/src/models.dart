@@ -519,6 +519,7 @@ class ReasoningStep extends NormalizedStep {
     required this.id,
     required this.text,
     required this.collapsedPreview,
+    this.role,
     this.translatedText,
     this.durationMs,
   });
@@ -530,6 +531,7 @@ class ReasoningStep extends NormalizedStep {
       text: text,
       collapsedPreview: json['collapsedPreview']?.toString() ??
           (text.isEmpty ? '' : text.split('\n').first),
+      role: json['role']?.toString(),
       translatedText: json['translatedText']?.toString(),
       durationMs: (json['durationMs'] as num?)?.toInt(),
     );
@@ -538,12 +540,18 @@ class ReasoningStep extends NormalizedStep {
   final String id;
   final String text;
   final String collapsedPreview;
+  final String? role;
   final String? translatedText;
   final int? durationMs;
+
+  /// Whether this step is an intermediate assistant prose message emitted between
+  /// thinking/tool steps rather than internal chain-of-thought reasoning.
+  bool get isIntermediateProse => role == 'prose' || id.startsWith('narration-');
 
   ReasoningStep copyWith({
     String? text,
     String? collapsedPreview,
+    String? role,
     String? translatedText,
     int? durationMs,
   }) {
@@ -551,6 +559,7 @@ class ReasoningStep extends NormalizedStep {
       id: id,
       text: text ?? this.text,
       collapsedPreview: collapsedPreview ?? this.collapsedPreview,
+      role: role ?? this.role,
       translatedText: translatedText ?? this.translatedText,
       durationMs: durationMs ?? this.durationMs,
     );
@@ -562,6 +571,7 @@ class ReasoningStep extends NormalizedStep {
         'id': id,
         'text': text,
         'collapsedPreview': collapsedPreview,
+        if (role != null) 'role': role,
         if (translatedText != null) 'translatedText': translatedText,
         if (durationMs != null) 'durationMs': durationMs,
       };
@@ -800,6 +810,21 @@ class NormalizedTurn {
       status == 'error' ||
       (errorMessage != null && errorMessage!.isNotEmpty) ||
       steps.any((s) => s is NoticeStep && s.level == 'error');
+
+  /// All visible assistant prose across the turn in chronological order
+  /// (intermediate prose segments emitted between tool/thinking steps + final `assistantText`).
+  String get combinedAssistantProse {
+    final parts = <String>[];
+    for (final s in steps) {
+      if (s is ReasoningStep && s.isIntermediateProse && s.text.trim().isNotEmpty) {
+        parts.add(s.text.trim());
+      }
+    }
+    if (assistantText.trim().isNotEmpty) {
+      parts.add(assistantText.trim());
+    }
+    return parts.join('\n\n');
+  }
 
   NormalizedTurn copyWith({
     String? stableKey,

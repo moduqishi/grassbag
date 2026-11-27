@@ -22,6 +22,7 @@ import { SessionNormalizer } from './normalizer.js';
 import { StreamHub } from './stream-hub.js';
 import { SduiRegistry } from './sdui.js';
 import { mountPhoneTools } from './phone-tools.js';
+import { repairLegacyInlineImageSessions } from './session-image-repair.js';
 import { buildQrPathData, encodeQrMatrix } from './qr-svg.js';
 import { renderPairingDashboardHtml } from './pairing-ui.js';
 import { detectDshVersion, registerMetaDomain } from './domains/meta.js';
@@ -604,6 +605,22 @@ export function createGbridgeCore(ctx, options = {}) {
   const normalizer = new SessionNormalizer();
   const hub = new StreamHub({ bootId, gateway, normalizer, logger });
   const sdui = new SduiRegistry();
+  let legacyRepairPromise = null;
+  const waitForLegacyImageRepair = async (timeoutMs = 2000) => {
+    if (!legacyRepairPromise) return;
+    let timer;
+    try {
+      await Promise.race([
+        legacyRepairPromise.catch(() => {}),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   if (process.env.GBRIDGE_TOKEN) latchedAndroidEnv.token = process.env.GBRIDGE_TOKEN;
   if (process.env.GBRIDGE_PHONE_TOKEN) latchedAndroidEnv.phoneToken = process.env.GBRIDGE_PHONE_TOKEN;
@@ -637,7 +654,7 @@ export function createGbridgeCore(ctx, options = {}) {
   let pairingController = options.pairingController ?? null;
 
   const router = new Router();
-  const deps = { ctx, gateway, hub, normalizer, sdui, bridgeVersion: PKG_VERSION, bootId, phoneState, isLocalAndroid };
+  const deps = { ctx, gateway, hub, normalizer, sdui, bridgeVersion: PKG_VERSION, bootId, phoneState, isLocalAndroid, waitForLegacyImageRepair };
 
   registerIsolated('meta', () => registerMetaDomain(router, deps), logger);
   registerIsolated('chat', () => registerChatAndInteractionsDomain(router, deps), logger);
@@ -789,6 +806,7 @@ export function createGbridgeCore(ctx, options = {}) {
     phoneState,
     router,
     setPairingController(ctrl) { pairingController = ctrl; },
+    setLegacyImageRepairPromise(p) { legacyRepairPromise = p; },
     handleHttp,
     handleUpgrade,
     dispose,
@@ -1247,6 +1265,21 @@ export function apply(ctx, config = {}) {
   }, 'gbridge: core lifecycle');
 
   if (typeof ctx.inject === 'function') {
+    // Automatically migrate any historical session logs containing legacy inline `{ type: 'image', data }`
+    // tool results (from older `phone_screenshot` calls) into durable `ctx.attachments` refs so poisoned
+    // sessions recover cleanly on boot without crashing `dsh-llm-pi-ai` / `dsh-llm-deepseek`.
+    let legacyImageRepairTriggered = false;
+    ctx.inject(['attachments'], (attCtx) => {
+      if (legacyImageRepairTriggered) return;
+      legacyImageRepairTriggered = true;
+      const attachments = attCtx.attachments ?? attCtx.get?.('attachments');
+      const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
+      const repairPromise = repairLegacyInlineImageSessions({ dshHome, attachments, logger }).catch((err) => {
+        logger?.warn?.('[gbridge] legacy inline image session scan failed:', err?.message || err);
+      });
+      core.setLegacyImageRepairPromise(repairPromise);
+    });
+
     // Start host event pump once typertGateway is mounted.
     ctx.inject(['typertGateway'], () => {
       core.hub.startHostEventPump();

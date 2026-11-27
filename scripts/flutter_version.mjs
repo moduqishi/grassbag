@@ -90,16 +90,16 @@ export function prepareStableVersion(currentVersion, baselineVersion, tag) {
   const baselineVersionName = formatVersionName(baselineVersion);
   const highestKnownBuild = Math.max(currentVersion.build, baselineVersion.build);
 
-  if (currentVersionName === versionName) {
+  if (baselineVersionName === versionName) {
     return {
-      ...currentVersion,
+      ...baselineVersion,
       build: highestKnownBuild,
     };
   }
 
-  if (baselineVersionName === versionName) {
+  if (currentVersionName === versionName && currentVersion.build >= baselineVersion.build) {
     return {
-      ...baselineVersion,
+      ...currentVersion,
       build: highestKnownBuild,
     };
   }

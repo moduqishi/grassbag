@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import { ignoreCleanupError } from './diagnostics.js';
 
 const ZSTD_MAGIC = 0xFD2FB528;
 
@@ -303,7 +304,7 @@ export async function repairSessionFile(filePath, { attachments, logger } = {}) 
     writeFileSync(tmpPath, outBytes);
     renameSync(tmpPath, filePath);
   } catch (err) {
-    try { unlinkSync(tmpPath); } catch {}
+    try { unlinkSync(tmpPath); } catch (cleanupErr) { ignoreCleanupError(cleanupErr); }
     throw err;
   }
 

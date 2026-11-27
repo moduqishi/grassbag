@@ -162,6 +162,10 @@ void main() {
 
   test('Remote connect preserves minted cookie for single-use token and never marks 401 :3081 as bridged',
       () async {
+    final prevHttpOverrides = HttpOverrides.current;
+    HttpOverrides.global = null;
+    addTearDown(() => HttpOverrides.global = prevHttpOverrides);
+
     var tokenRedeemCount = 0;
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));
@@ -221,13 +225,63 @@ void main() {
     addTearDown(container.dispose);
     final ctrl = container.read(appProvider.notifier);
 
-    // 1) Diagnose with single-use token on non-loopback IP alias? Use 127.0.0.1 won't pass selfDevice check;
-    //    test diagnoseRemoteHost + connectRemoteInput directly via a non-self IP? Wait: 127.0.0.1 is loopback,
-    //    so verify selfDevice detection on loopback AND verify Desktop :3081 401 + cookie persistence directly!
-    final loopbackDiag = await ctrl.diagnoseRemoteHost('http://127.0.0.1:${server.port}/?token=one-time-tok-2026');
+    // 1) Production guard rejects loopback 127.0.0.1 as selfDevice before test override is enabled
+    final loopbackDiag =
+        await ctrl.diagnoseRemoteHost('http://127.0.0.1:${server.port}/?token=one-time-tok-2026');
     expect(loopbackDiag.kind, RemoteDiagnosisKind.selfDevice);
+    expect(tokenRedeemCount, 0);
 
-    // 2) Verify updateHostToken clears stale cookie & updates DHCP address when given a full URL
+    // 2) Enable test loopback hook and genuinely exercise single-use token -> cookie exchange!
+    GrassBagController.allowLoopbackRemoteForTest = true;
+    addTearDown(() => GrassBagController.allowLoopbackRemoteForTest = false);
+
+    final outcome = await ctrl.connectRemoteInput(
+      'http://127.0.0.1:${server.port}/?token=one-time-tok-2026',
+      name: 'Loopback Vanilla Host',
+    );
+    expect(tokenRedeemCount, 1, reason: 'Single-use launch token must only be exchanged once');
+    expect(outcome.connected, isTrue);
+    expect(outcome.diagnosis.kind, RemoteDiagnosisKind.readyDirect);
+    expect(outcome.diagnosis.capturedCookie, contains('dsh-auth-once=v1.freshcookie'));
+    expect(outcome.host, isNotNull);
+    expect(outcome.host!.hasSavedCookie, isTrue);
+
+    // 3) Spin up a mock Desktop LAN Bridge returning HTTP 401 on /gbridge/v1/capabilities
+    //    and verify diagnoseRemoteHost / connectRemoteInput NEVER marks 401 as bridged or online!
+    final bridge401Server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => bridge401Server.close(force: true));
+    bridge401Server.listen((req) async {
+      if (req.uri.path == '/plugins/events') {
+        req.response.statusCode = 200;
+        req.response.headers.set('content-type', 'text/event-stream; charset=utf-8');
+        req.response.write(
+          'data: ${jsonEncode({"graph": {"release": {"version": "0.2.2-rc.5"}}, "surface": "desktop", "hasGbridge": true, "requiresAuth": true})}\n\n',
+        );
+        await req.response.close();
+        return;
+      }
+      req.response.statusCode = 401;
+      req.response.headers.contentType = ContentType.json;
+      req.response.write(jsonEncode({
+        'error': {'code': 'gbridge/unauthorized', 'message': 'invalid token'},
+      }));
+      await req.response.close();
+    });
+
+    final diag401 = await ctrl.diagnoseRemoteHost(
+      'http://127.0.0.1:${bridge401Server.port}/?token=wrong-token',
+    );
+    expect(diag401.kind, RemoteDiagnosisKind.needsAuth);
+    final outcome401 = await ctrl.connectRemoteInput(
+      'http://127.0.0.1:${bridge401Server.port}/?token=wrong-token',
+      saveIfNeedsAuth: true,
+    );
+    expect(outcome401.connected, isFalse);
+    expect(outcome401.host, isNotNull);
+    expect(outcome401.host!.bridged, isFalse);
+    expect(outcome401.host!.online, isFalse);
+
+    // 4) Verify updateHostToken clears stale cookie & updates DHCP address when given a full URL
     final added = ctrl.addRemoteHost(
       'http://192.168.10.10:3080',
       name: 'Office Mac',
@@ -248,7 +302,7 @@ void main() {
     expect(updated.token, 'fresh_dhcp_tok');
     expect(updated.hasSavedCookie, isFalse);
 
-    // 3) Verify ManagedHost.isDesktopLanBridge detection
+    // 5) Verify ManagedHost.isDesktopLanBridge detection
     final bridgeHost = ManagedHost(
       id: 'rem-bridge',
       isLocal: false,

@@ -80,7 +80,9 @@ export function applyLoopbackCors(req, res) {
   if (hostHeader) {
     try {
       sameHost = new URL(origin).host.toLowerCase() === hostHeader;
-    } catch {}
+    } catch (_invalidOrigin) {
+      sameHost = false;
+    }
   }
   if (sameHost) {
     res.setHeader('access-control-allow-credentials', 'true');
@@ -313,7 +315,9 @@ export function admitRequest(req, { mode, ctx, bearerToken, lanPort } = {}) {
   let queryToken = null;
   try {
     queryToken = new URL(req.url || '/', 'http://gbridge.local').searchParams.get('token');
-  } catch {}
+  } catch (_malformedUrl) {
+    queryToken = null;
+  }
   const reqToken = parseBearerToken(req) ?? queryToken;
   const resolveConnPeer = (conn) => {
     if (conn?.browserPeer && !conn.browserPeer.signal?.aborted) return conn.browserPeer;

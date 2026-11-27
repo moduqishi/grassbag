@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'sha256_util.dart';
+
 class AppUpdateHttpResponse {
   const AppUpdateHttpResponse({required this.statusCode, required this.body});
   final int statusCode;
@@ -72,6 +74,7 @@ Future<String> downloadAppUpdateApk(
   void Function(int receivedBytes, int totalBytes)? onProgress,
   bool Function()? isCancelled,
   int? expectedSizeBytes,
+  String? expectedSha256,
   void Function(void Function() abort)? onAbortReady,
 }) async {
   final destFile = File(destinationPath);
@@ -161,6 +164,8 @@ Future<String> downloadAppUpdateApk(
     }
     var receivedBytes = 0;
     var bytesSinceFlush = 0;
+    final cleanExpectedSha = expectedSha256?.trim().toLowerCase() ?? '';
+    final sha256 = cleanExpectedSha.isNotEmpty ? StreamingSha256() : null;
     sink = partFile.openWrite();
     onProgress?.call(0, totalBytes);
 
@@ -172,6 +177,7 @@ Future<String> downloadAppUpdateApk(
       if (receivedBytes > maxApkBytes) {
         throw HttpException('APK 下载体积超过 512 MB 安全上限', uri: currentUri);
       }
+      sha256?.add(chunk);
       sink.add(chunk);
       bytesSinceFlush += chunk.length;
       if (bytesSinceFlush >= 1024 * 1024) {
@@ -198,6 +204,15 @@ Future<String> downloadAppUpdateApk(
         'APK 文件大小校验失败（实际 $receivedBytes 字节，预期 $expectedSizeBytes 字节）',
         uri: downloadUri,
       );
+    }
+    if (sha256 != null && cleanExpectedSha.isNotEmpty) {
+      final actualSha = sha256.digestHex();
+      if (actualSha != cleanExpectedSha) {
+        throw HttpException(
+          'APK SHA-256 完整性校验失败，已拦截潜在篡改文件，正在切换备用源',
+          uri: downloadUri,
+        );
+      }
     }
     // Verify APK ZIP local file header magic (`PK\x03\x04`) before replacing installed cache!
     final raf = await partFile.open(mode: FileMode.read);

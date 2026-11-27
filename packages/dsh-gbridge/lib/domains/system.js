@@ -1,5 +1,6 @@
 import { GbridgeError, readJsonBody, sendJson } from '../http-util.js';
 import { detectDshVersion } from './meta.js';
+import { logSuppressed } from '../diagnostics.js';
 
 const DEFAULT_CREDENTIAL_REFS = [
   'DEEPSEEK_API_KEY',
@@ -160,7 +161,9 @@ export function registerSystemDomain(router, { ctx, gateway }) {
             }
             if (authorized) break;
           }
-        } catch {}
+        } catch (err) {
+          logSuppressed(ctx?.logger, 'system', err, { detail: `settings/describe failed while verifying apiKeyEnv=${envRef}` });
+        }
       }
       if (!authorized && requestedNormUrl) {
         throw new GbridgeError(
@@ -180,7 +183,9 @@ export function registerSystemDomain(router, { ctx, gateway }) {
           if (typeof secret === 'string' && secret.trim()) {
             requestObj = { ...requestObj, apiKey: secret.trim() };
           }
-        } catch {}
+        } catch (err) {
+          logSuppressed(ctx?.logger, 'system', err, { detail: `credential lookup failed for ${envRef}` });
+        }
       }
     }
     const result = await gateway.call('llm/discoverModels', {
@@ -220,7 +225,9 @@ export function registerSystemDomain(router, { ctx, gateway }) {
             addValidRef(val?.apiKeyEnv);
           }
         }
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'system', err, { level: 'debug', detail: 'settings/describe failed while collecting credential refs' });
+      }
     }
     const allRefs = [...refSet];
     let credentials;
@@ -487,7 +494,9 @@ export function registerSystemDomain(router, { ctx, gateway }) {
           }, { peer });
           sendJson(res, 200, { v: 1, result });
           return;
-        } catch {}
+        } catch (err) {
+          logSuppressed(ctx?.logger, 'system', err, { detail: 'pluginMarket/search failed, falling back to npm registry' });
+        }
       }
     }
 

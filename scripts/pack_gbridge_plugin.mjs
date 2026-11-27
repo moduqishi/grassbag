@@ -14,10 +14,14 @@ export const REQUIRED_TARBALL_ENTRIES = [
   'package/icon.svg',
   'package/lib/index.js',
   'package/lib/client.js',
+  'package/lib/content-contract.js',
+  'package/lib/diagnostics.js',
   'package/lib/qr-svg.js',
   'package/lib/pairing-ui.js',
   'package/locale/zh.json',
   'package/locale/en.json',
+  'package/test/dsh-contract-roundtrip.test.mjs',
+  'package/test/reliability-audit.test.mjs',
 ];
 
 function parseArgs(argv) {
@@ -66,7 +70,7 @@ export function packGbridgePlugin({
       }
     }
     for (const entry of entries) {
-      if (entry.startsWith('package/test/') || entry.includes('.DS_Store')) {
+      if (entry.includes('.DS_Store') || entry.includes('node_modules/')) {
         throw new Error(`dsh-gbridge.tgz contains disallowed file: ${entry}`);
       }
     }

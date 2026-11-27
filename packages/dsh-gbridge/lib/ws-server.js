@@ -140,17 +140,21 @@ export class GbridgeWsConnection extends EventEmitter {
         const killer = setTimeout(() => {
           try {
             if (!sock.destroyed) sock.destroy();
-          } catch {}
+          } catch (_alreadyDestroyed) {
+            // Best-effort socket destroy after WS close frame timeout.
+          }
         }, 1000);
         killer.unref?.();
       }
-    } catch {}
+    } catch (_closeWriteErr) {
+      // Best-effort WS close frame write on closing socket.
+    }
     this._markClosed(validCode, reason);
   }
 
   terminate() {
     this._markClosed(1006, 'terminated');
-    try { this.socket.destroy(); } catch {}
+    try { this.socket.destroy(); } catch (_destroyErr) { /* best-effort terminate */ }
   }
 
   _markClosed(code, reason) {
@@ -321,8 +325,8 @@ export function rejectUpgrade(socket, status, reason = 'Forbidden') {
       'Content-Length: 0\r\n' +
       'Cache-Control: no-store\r\n\r\n'
     );
-  } catch {
-    try { socket.destroy(); } catch {}
+  } catch (_endErr) {
+    try { socket.destroy(); } catch (_destroyErr) { /* best-effort rejectUpgrade teardown */ }
   }
 }
 
@@ -348,8 +352,8 @@ export function upgradeWebSocket(req, socket, head, meta = {}) {
       'Connection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
-  } catch {
-    try { socket.destroy(); } catch {}
+  } catch (_writeErr) {
+    try { socket.destroy(); } catch (_destroyErr) { /* best-effort handshake teardown */ }
     return null;
   }
   return new GbridgeWsConnection(socket, head, meta);

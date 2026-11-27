@@ -134,14 +134,18 @@ SHIMS_SHA="$(sha256_file "$SHIMS_TAR")"
 SHIMS_BYTES="$(file_bytes "$SHIMS_TAR")"
 echo "[GrassBag Runtime] shims.gbag: $SHIMS_BYTES bytes"
 
-# 2. Always package tiny APK-coupled dsh-gbridge zero-patch bridge (~102 KB)
+# 2. Always package tiny APK-coupled dsh-gbridge zero-patch bridge (~130 KB, including self-tests)
 BRIDGE_STAGE="$WORK_DIR/dsh-gbridge"
 mkdir -p "$BRIDGE_STAGE"
 cp -R "$ROOT_DIR/packages/dsh-gbridge/package.json" \
       "$ROOT_DIR/packages/dsh-gbridge/lib" \
+      "$ROOT_DIR/packages/dsh-gbridge/test" \
       "$ROOT_DIR/packages/dsh-gbridge/locale" \
       "$ROOT_DIR/packages/dsh-gbridge/icon.svg" \
       "$BRIDGE_STAGE/"
+if [[ -f "$ROOT_DIR/packages/gbridge-protocol/schema/gbridge-v1.schema.json" ]]; then
+  cp "$ROOT_DIR/packages/gbridge-protocol/schema/gbridge-v1.schema.json" "$BRIDGE_STAGE/gbridge-v1.schema.json"
+fi
 cat > "$BRIDGE_STAGE/cordis.patch.yml" <<'EOF'
 - insert:
   - name: /opt/dsh-slots/current/dsh-gbridge/lib/index.js

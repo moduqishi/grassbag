@@ -209,6 +209,7 @@ void main() {
           onProgress,
           isCancelled,
           expectedSizeBytes,
+          expectedSha256,
           onAbortReady,
         }) async {
           tried.add(uri.toString());

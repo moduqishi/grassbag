@@ -50,6 +50,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Enforce immutable runtime tag (never overwrite published assets)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ github.repository }}
+          RUNTIME_TAG: ${{ inputs.runtime_tag }}
+        run: |
+          if [[ -z "${RUNTIME_TAG}" || ! "${RUNTIME_TAG}" =~ ^runtime-[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::无效的运行时标签 '${RUNTIME_TAG}'，请使用不可变版本标识（例如 runtime-arm64-r3）。"
+            exit 1
+          fi
+          if gh release view "${RUNTIME_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            echo "::error::运行时资产发行版 ${RUNTIME_TAG} 已存在。精简版 APK 通过 runtime-lock.json 锁定该标签的体积与 SHA-256，严禁覆盖既有资产；请递增为新标签（如 runtime-arm64-r3）并同步更新 runtime/runtime-lock.json。"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${RUNTIME_TAG}" >/dev/null 2>&1; then
+            echo "::error::Git 标签 ${RUNTIME_TAG} 已存在，禁止覆盖不可变运行时标签；请使用新版本号标签。"
+            exit 1
+          fi
+
       - name: Reclaim unused runner disk space
         run: bash scripts/free_runner_disk.sh
 
@@ -110,25 +129,15 @@ jobs:
           EOF
 
           if gh release view "${RUNTIME_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
-            gh release edit "${RUNTIME_TAG}" \
-              --repo "${RELEASE_REPO}" \
-              --title "GrassBag Android Runtime (${RUNTIME_TAG})" \
-              --notes-file "${NOTES}" \
-              --latest=false
-            gh release upload "${RUNTIME_TAG}" \
-              "${OUT_DIR}/base-arm64.gbag" \
-              "${OUT_DIR}/engine-init.gbag" \
-              "${OUT_DIR}/runtime-manifest.json" \
-              "${OUT_DIR}/SHA256SUMS.txt" \
-              --repo "${RELEASE_REPO}" --clobber
-          else
-            gh release create "${RUNTIME_TAG}" \
-              "${OUT_DIR}/base-arm64.gbag" \
-              "${OUT_DIR}/engine-init.gbag" \
-              "${OUT_DIR}/runtime-manifest.json" \
-              "${OUT_DIR}/SHA256SUMS.txt" \
-              --repo "${RELEASE_REPO}" \
-              --title "GrassBag Android Runtime (${RUNTIME_TAG})" \
-              --notes-file "${NOTES}" \
-              --latest=false
+            echo "::error::运行时资产发行版 ${RUNTIME_TAG} 已在构建期间发布，拒绝覆盖既有不可变资产。"
+            exit 1
           fi
+          gh release create "${RUNTIME_TAG}" \
+            "${OUT_DIR}/base-arm64.gbag" \
+            "${OUT_DIR}/engine-init.gbag" \
+            "${OUT_DIR}/runtime-manifest.json" \
+            "${OUT_DIR}/SHA256SUMS.txt" \
+            --repo "${RELEASE_REPO}" \
+            --title "GrassBag Android Runtime (${RUNTIME_TAG})" \
+            --notes-file "${NOTES}" \
+            --latest=false

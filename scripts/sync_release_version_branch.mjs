@@ -3,6 +3,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
+import { parseVersionLine } from './flutter_version.mjs';
+
 function parseArgs(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -99,6 +101,15 @@ function main() {
     }
 
     const targetPath = path.resolve(tempDir, targetFile);
+    const nextVersion = parseVersionLine(fs.readFileSync(sourcePath, 'utf8'));
+    if (fs.existsSync(targetPath)) {
+      const existingVersion = parseVersionLine(fs.readFileSync(targetPath, 'utf8'));
+      if (nextVersion.build < existingVersion.build) {
+        throw new Error(
+          `Refusing to regress ${branch} build number from ${existingVersion.build} to ${nextVersion.build}.`,
+        );
+      }
+    }
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.copyFileSync(sourcePath, targetPath);
 

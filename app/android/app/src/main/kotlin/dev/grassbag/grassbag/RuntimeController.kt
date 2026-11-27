@@ -343,6 +343,7 @@ class RuntimeController private constructor(
 
     private val homeSizeRefreshing = AtomicBoolean(false)
     private val prewarmTriggered = AtomicBoolean(false)
+    private val autoRecoverPending = AtomicBoolean(false)
     private val stopEpoch = AtomicInteger(0)
     private val autoRestartLock = Any()
     private val recentAutoRestartMs = LinkedList<Long>()
@@ -363,6 +364,78 @@ class RuntimeController private constructor(
 
     fun removeListener(listener: (String, Map<String, Any?>) -> Unit) {
         listeners.remove(listener)
+    }
+
+    fun ownsForegroundService(): Boolean =
+        bootstrapRunning.get() ||
+            upgradeInProgress.get() ||
+            activeToolkitInstalls.get() > 0 ||
+            autoRecoverPending.get() ||
+            engineState == "starting" ||
+            isEngineAlive()
+
+    fun cancelLocalSessionsAsync(sessionIds: List<String>) {
+        val unique = sessionIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (unique.isEmpty()) return
+        worker.execute {
+            for (sid in unique) {
+                cancelLocalSessionSync(sid)
+            }
+        }
+    }
+
+    private fun cancelLocalSessionSync(sessionId: String): Boolean {
+        val encoded = runCatching { java.net.URLEncoder.encode(sessionId, "UTF-8") }.getOrDefault(sessionId)
+        val path = "/gbridge/v1/sessions/$encoded/cancel"
+        if (bridgeSocket.exists()) {
+            val udsOk = runCatching {
+                val sock = LocalSocket(LocalSocket.SOCKET_STREAM)
+                try {
+                    sock.connect(LocalSocketAddress(bridgeSocket.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+                    sock.soTimeout = 2500
+                    val body = "{}"
+                    val req = "POST $path HTTP/1.1\r\n" +
+                        "Host: localhost\r\n" +
+                        "Authorization: Bearer $bridgeToken\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Content-Length: ${body.length}\r\n" +
+                        "Connection: close\r\n\r\n$body"
+                    sock.outputStream.write(req.toByteArray(Charsets.UTF_8))
+                    sock.outputStream.flush()
+                    val buf = ByteArray(256)
+                    val n = sock.inputStream.read(buf)
+                    val firstLine = if (n > 0) String(buf, 0, n, Charsets.UTF_8).substringBefore("\r\n") else ""
+                    val code = firstLine.split(' ').getOrNull(1)?.toIntOrNull() ?: -1
+                    code in 200..299
+                } finally {
+                    runCatching { sock.close() }
+                }
+            }.getOrDefault(false)
+            if (udsOk) {
+                appendLog("[runtime] emergency-stop cancelled local session $sessionId via UDS")
+                return true
+            }
+        }
+        val httpOk = runCatching {
+            val conn = (URL("http://127.0.0.1:$LOCAL_DSH_PORT$path").openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 800
+                readTimeout = 2000
+                doOutput = true
+                setRequestProperty("Authorization", "Bearer $bridgeToken")
+                setRequestProperty("Content-Type", "application/json")
+            }
+            try {
+                conn.outputStream.use { it.write("{}".toByteArray(Charsets.UTF_8)) }
+                conn.responseCode in 200..299
+            } finally {
+                conn.disconnect()
+            }
+        }.getOrDefault(false)
+        if (httpOk) {
+            appendLog("[runtime] emergency-stop cancelled local session $sessionId via HTTP")
+        }
+        return httpOk
     }
 
     fun currentEngineStateEvent(): Map<String, Any?> {
@@ -466,6 +539,9 @@ class RuntimeController private constructor(
 
     init {
         SafetyGate.init(ctx)
+        SafetyGate.addEmergencyStopListener { sessionIds ->
+            cancelLocalSessionsAsync(sessionIds)
+        }
         prepareLayout()
         registerNetworkDnsWatcher()
         bridgeToken = vault.getSecret("local_bridge_token")
@@ -2478,6 +2554,7 @@ class RuntimeController private constructor(
         nextState: String = "stopped"
     ) {
         if (cancelStartup) {
+            autoRecoverPending.set(false)
             stopEpoch.incrementAndGet()
             synchronized(readinessSignal) { readinessSignal.notifyAll() }
             val inFlightLatch = synchronized(engineLock) { activeStartupLatch }
@@ -3177,6 +3254,7 @@ class RuntimeController private constructor(
                                 !upgradeInProgress.get() &&
                                 tryReserveAutoRestartSlot()
                             if (canAutoRecover) {
+                                autoRecoverPending.set(true)
                                 engineState = "starting"
                                 lastEngineError = null
                                 appendLog("[runtime] unexpected DSH exit (code=$code); keeping FGS alive and auto-recovering...")
@@ -3190,9 +3268,13 @@ class RuntimeController private constructor(
                                 emit("engine_state", mapOf("state" to "starting", "exitCode" to code, "recovering" to true))
                                 val backoffMs = nextAutoRestartBackoffMs()
                                 worker.execute {
-                                    runCatching { Thread.sleep(backoffMs) }
-                                    if (stopEpoch.get() == startEpoch && !bootstrapRunning.get() && !upgradeInProgress.get()) {
-                                        startEngineSync()
+                                    try {
+                                        runCatching { Thread.sleep(backoffMs) }
+                                        if (stopEpoch.get() == startEpoch && !bootstrapRunning.get() && !upgradeInProgress.get()) {
+                                            startEngineSync()
+                                        }
+                                    } finally {
+                                        autoRecoverPending.set(false)
                                     }
                                 }
                             } else {

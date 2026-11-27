@@ -192,20 +192,24 @@ cd packages/gbridge-client-dart && dart pub get && dart analyze && dart test
 cd app && flutter pub get && flutter analyze && flutter test
 ```
 
-### 3. 本地构建完整离线 ARM64 Release APK
+### 3. 本地构建完整离线 / 精简版 ARM64 Release APK
 
 <details>
-<summary><b>展开查看离线运行时打包与 Release 签名说明</b></summary>
+<summary><b>展开查看运行时打包模式与 Release 签名说明</b></summary>
 <br />
 
-Git 仓库不提交 >100 MB 的二进制容器镜像。首次本地构建 Android APK 前，运行一次 `--fetch` 自动拉取并封装离线运行时：
+Git 仓库不提交 >100 MB 的二进制容器镜像。本地构建 Android APK 前，可按需选择**完整离线包**或**精简按需下载包**：
 
 ```bash
-# 自动下载 Ubuntu 24.04.5 ARM64、Node 24.22.3 ARM64 与原版 @deepseek-ai/dsh，
-# 生成 app/android/app/src/main/assets/runtime/*.gbag 与 runtime-manifest.json
-bash runtime/scripts/build-runtime-bundle.sh --fetch
+# 方案 A（完整离线 APK）：下载并内置 Ubuntu 24.04.5 ARM64、Node 24.22.3 ARM64 与 @deepseek-ai/dsh，
+# 生成完整离线 base-arm64.gbag + engine-init.gbag（首次启用本机模式零下载）
+bash runtime/scripts/build-runtime-bundle.sh --full --fetch
 
-# 构建 ARM64 Release APK（本地无 keystore 时自动回退 Debug 签名）
+# 方案 B（精简 APK，与 GitHub Actions 正式发布一致）：仅封装 ~260 KB 桥接/垫片覆盖包与远端校验清单，
+# 首次启用本机模式时按需断点续传下载 ~188 MiB 并校验 SHA-256
+bash runtime/scripts/build-runtime-bundle.sh --thin
+
+# 构建 ARM64 Release APK（本地无 keystore 时回退 Debug 签名；CI 正式发版强制要求 Release 签名）
 cd app && flutter build apk --release --target-platform android-arm64
 ```
 

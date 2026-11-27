@@ -1,15 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildCapabilities } from '../lib/domains/meta.js';
 import { SduiRegistry } from '../lib/sdui.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = resolve(HERE, '../../gbridge-protocol/schema/gbridge-v1.schema.json');
+const SCHEMA_CANDIDATES = [
+  resolve(HERE, '../../gbridge-protocol/schema/gbridge-v1.schema.json'),
+  resolve(HERE, '../gbridge-v1.schema.json'),
+];
+const SCHEMA_PATH = SCHEMA_CANDIDATES.find((p) => existsSync(p)) ?? null;
 
-test('capabilities response matches gbridge-v1.schema.json required fields and enums', () => {
+test('capabilities response matches gbridge-v1.schema.json required fields and enums', (t) => {
+  if (!SCHEMA_PATH) {
+    t.skip('gbridge-v1.schema.json not bundled in standalone runtime install');
+    return;
+  }
   const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
   const capDef = schema.$defs.CapabilitiesResponse;
   const mockGateway = {
@@ -38,7 +46,11 @@ test('capabilities response matches gbridge-v1.schema.json required fields and e
   }
 });
 
-test('SDUI node types stay within gbridge-v1.schema.json allowed enum', async () => {
+test('SDUI node types stay within gbridge-v1.schema.json allowed enum', async (t) => {
+  if (!SCHEMA_PATH) {
+    t.skip('gbridge-v1.schema.json not bundled in standalone runtime install');
+    return;
+  }
   const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
   const allowedTypes = new Set(schema.$defs.SduiNode.properties.type.enum);
   const sdui = new SduiRegistry();

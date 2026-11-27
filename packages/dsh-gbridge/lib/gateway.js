@@ -1,4 +1,5 @@
 import { GbridgeError, isPlainObject } from './http-util.js';
+import { ignoreCleanupError, logSuppressed } from './diagnostics.js';
 
 /**
  * Thin, resilient zero-patch adapter around DSH's official Cordis services
@@ -26,7 +27,7 @@ export class GatewayAdapter {
     }
     if (typeof connection?.createPeer === 'function') {
       if (!this._ownerPeerScope || this._ownerPeerScope.peer?.signal?.aborted) {
-        try { this._ownerPeerScope?.dispose?.(); } catch {}
+        try { this._ownerPeerScope?.dispose?.(); } catch (err) { ignoreCleanupError(err); }
         this._ownerPeerScope = connection.createPeer({ principal: { kind: 'owner' } });
       }
       return this._ownerPeerScope.peer ?? this._ownerPeerScope;
@@ -35,7 +36,7 @@ export class GatewayAdapter {
   }
 
   dispose() {
-    try { this._ownerPeerScope?.dispose?.(); } catch {}
+    try { this._ownerPeerScope?.dispose?.(); } catch (err) { ignoreCleanupError(err); }
     this._ownerPeerScope = null;
   }
 
@@ -74,13 +75,17 @@ export class GatewayAdapter {
           if (item?.namespace && item?.method) set.add(`${item.namespace}/${item.method}`);
         }
       }
-    } catch {}
+    } catch (err) {
+      logSuppressed(this.ctx?.logger, 'gateway', err, { level: 'debug', detail: 'typert.local.list() failed' });
+    }
     try {
       const gw = this.gateway;
       if (gw && typeof gw.collectSrcClaims === 'function') {
         for (const ep of gw.collectSrcClaims()) set.add(ep);
       }
-    } catch {}
+    } catch (err) {
+      logSuppressed(this.ctx?.logger, 'gateway', err, { level: 'debug', detail: 'gateway.collectSrcClaims() failed' });
+    }
     return [...set].sort();
   }
 
@@ -94,7 +99,9 @@ export class GatewayAdapter {
     let descriptor;
     try {
       descriptor = this.typert?.local?.get?.(endpoint);
-    } catch {}
+    } catch (err) {
+      logSuppressed(this.ctx?.logger, 'gateway', err, { level: 'debug', detail: `descriptor lookup failed for ${endpoint}` });
+    }
     if (!descriptor || !Array.isArray(descriptor.parameters)) {
       return clean;
     }

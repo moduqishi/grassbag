@@ -18,6 +18,7 @@
     "locale/*.json",
     "cordis.patch.yml",
     "lib/**/*.js",
+    "test/*.test.mjs",
     "README.md"
   ],
   "dsh": {

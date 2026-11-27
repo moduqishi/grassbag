@@ -25,6 +25,7 @@ Future<String> downloadAppUpdateApk(
   void Function(int receivedBytes, int totalBytes)? onProgress,
   bool Function()? isCancelled,
   int? expectedSizeBytes,
+  String? expectedSha256,
   void Function(void Function() abort)? onAbortReady,
 }) async {
   throw UnsupportedError('APK file download unavailable on this platform');

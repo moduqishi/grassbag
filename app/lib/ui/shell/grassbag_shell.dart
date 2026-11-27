@@ -97,6 +97,9 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
 
   bool _userScrolledAway = false;
   bool _userDraggingList = false;
+  bool _selectionAutoScrolling = false;
+  String _chatSelectedPlainText = '';
+  final ValueNotifier<bool> _hasActiveChatSelectionNotifier = ValueNotifier<bool>(false);
   bool _isProgrammaticScroll = false;
   bool _drawerEdgeDragDismissed = false;
   int _programmaticScrollGen = 0;
@@ -186,6 +189,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     _composerHeightNotifier.dispose();
     _topBannerStackHeight.dispose();
     _drawerOpenForBackNotifier.dispose();
+    _hasActiveChatSelectionNotifier.dispose();
     _drawerCtrl.dispose();
     super.dispose();
   }
@@ -233,9 +237,12 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     }
 
     final pos = _scrollCtrl.position;
-    // Never fight the user while they are actively touching, dragging, or flinging the list,
-    // and never fight an active programmatic `animateTo()` glide!
-    if (_userDraggingList || _scrollCtrl.isUserDrivenScroll || _isProgrammaticScroll) {
+    // Never fight the user while they are actively touching, dragging, flinging, or
+    // edge-selecting the list, and never fight an active programmatic `animateTo()` glide!
+    if (_userDraggingList ||
+        _selectionAutoScrolling ||
+        _scrollCtrl.isUserDrivenScroll ||
+        _isProgrammaticScroll) {
       return;
     }
     final gap = pos.maxScrollExtent - pos.pixels;
@@ -1725,6 +1732,24 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               },
               onUserUpwardWheel: () {
                 if (!_userScrolledAway) {
+                  _userScrolledAway = true;
+                  _stopStreamScrollFollower();
+                }
+              },
+              onSelectionChanged: (plainText) {
+                _chatSelectedPlainText = plainText;
+                final hasSel = plainText.isNotEmpty;
+                if (_hasActiveChatSelectionNotifier.value != hasSel) {
+                  _hasActiveChatSelectionNotifier.value = hasSel;
+                }
+              },
+              hasActiveSelectionNotifier: _hasActiveChatSelectionNotifier,
+              getSelectedPlainText: () => _chatSelectedPlainText,
+              onSelectionAutoScrollActiveChanged: (active) {
+                _selectionAutoScrolling = active;
+              },
+              onSelectionAutoScrollStep: (deltaPx) {
+                if (deltaPx < -0.5) {
                   _userScrolledAway = true;
                   _stopStreamScrollFollower();
                 }
@@ -3744,6 +3769,11 @@ class _ChatCanvasArea extends ConsumerWidget {
     required this.topBannerHeightNotifier,
     required this.onEffectiveTopPadChanged,
     required this.onUserUpwardWheel,
+    required this.onSelectionChanged,
+    required this.hasActiveSelectionNotifier,
+    required this.getSelectedPlainText,
+    required this.onSelectionAutoScrollActiveChanged,
+    required this.onSelectionAutoScrollStep,
     required this.screenH,
     required this.topPad,
     required this.baseComposerBottom,
@@ -3773,6 +3803,11 @@ class _ChatCanvasArea extends ConsumerWidget {
   final ValueListenable<double> topBannerHeightNotifier;
   final ValueChanged<double> onEffectiveTopPadChanged;
   final VoidCallback onUserUpwardWheel;
+  final ValueChanged<String> onSelectionChanged;
+  final ValueListenable<bool> hasActiveSelectionNotifier;
+  final String Function() getSelectedPlainText;
+  final ValueChanged<bool> onSelectionAutoScrollActiveChanged;
+  final ValueChanged<double> onSelectionAutoScrollStep;
   final double screenH;
   final double topPad;
   final double baseComposerBottom;
@@ -3825,46 +3860,48 @@ class _ChatCanvasArea extends ConsumerWidget {
     final showActiveList = !showLoading && !showError && !showEmpty && !showEmptySelectedSession;
 
     Widget buildLoadOlderHeader() {
-      return SizedBox(
+      return SelectionContainer.disabled(
         key: const ValueKey('load-older-header'),
-        height: 44,
-        child: Align(
-          alignment: Alignment.topCenter,
-          child: GrassBagSpringTap(
-            onTap: () {
-              if (!slice.loadingOlderTurns) {
-                onLoadOlderTurns();
-              }
-            },
-            pressedScale: 0.95,
-            haptic: true,
-            child: GrassBagFresnelGlassSurface(
-              isPill: true,
-              elevated: true,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (slice.loadingOlderTurns) ...[
-                    GrassBagActivityIndicator(radius: 6.5, color: t.primary),
-                    const SizedBox(width: 7),
-                    Text(
-                      '正在加载更早消息…',
-                      style: TextStyle(fontSize: 12, color: t.text2),
-                    ),
-                  ] else ...[
-                    Icon(CupertinoIcons.clock, size: 13, color: t.primary),
-                    const SizedBox(width: 6),
-                    Text(
-                      '加载更早消息',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: t.primary,
+        child: SizedBox(
+          height: 44,
+          child: Align(
+            alignment: Alignment.topCenter,
+            child: GrassBagSpringTap(
+              onTap: () {
+                if (!slice.loadingOlderTurns) {
+                  onLoadOlderTurns();
+                }
+              },
+              pressedScale: 0.95,
+              haptic: true,
+              child: GrassBagFresnelGlassSurface(
+                isPill: true,
+                elevated: true,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (slice.loadingOlderTurns) ...[
+                      GrassBagActivityIndicator(radius: 6.5, color: t.primary),
+                      const SizedBox(width: 7),
+                      Text(
+                        '正在加载更早消息…',
+                        style: TextStyle(fontSize: 12, color: t.text2),
                       ),
-                    ),
+                    ] else ...[
+                      Icon(CupertinoIcons.clock, size: 13, color: t.primary),
+                      const SizedBox(width: 6),
+                      Text(
+                        '加载更早消息',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: t.primary,
+                        ),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
@@ -3880,20 +3917,23 @@ class _ChatCanvasArea extends ConsumerWidget {
       final anchorKey = turn != null
           ? turnItemKeys.putIfAbsent(turn.turnId, () => GlobalKey(debugLabel: 'turn-${turn.turnId}'))
           : null;
-      return _TurnListItem(
+      return GrassBagSelectionKeepAlive(
         key: ValueKey(scopedKey),
-        index: index,
-        scopePrefix: '${slice.activeHostId}:${slice.sessionRenderGen}',
-        activeSessionId: slice.activeSessionId,
-        animatedTurnIds: animatedTurnIds,
-        anchorKey: anchorKey,
-        highlighted: turn != null && turn.turnId == highlightedTurnId,
-        onOpenTerminal: onOpenTerminal,
-        onPrefillPrompt: onPrefillPrompt,
-        onQuoteExcerpt: onQuoteExcerpt,
-        onEditTurn: onEditTurn,
-        onOpenModelSettings: onOpenModelSettings,
-        onOpenHostSettings: onOpenHostSettings,
+        keepAliveListenable: hasActiveSelectionNotifier,
+        child: _TurnListItem(
+          index: index,
+          scopePrefix: '${slice.activeHostId}:${slice.sessionRenderGen}',
+          activeSessionId: slice.activeSessionId,
+          animatedTurnIds: animatedTurnIds,
+          anchorKey: anchorKey,
+          highlighted: turn != null && turn.turnId == highlightedTurnId,
+          onOpenTerminal: onOpenTerminal,
+          onPrefillPrompt: onPrefillPrompt,
+          onQuoteExcerpt: onQuoteExcerpt,
+          onEditTurn: onEditTurn,
+          onOpenModelSettings: onOpenModelSettings,
+          onOpenHostSettings: onOpenHostSettings,
+        ),
       );
     }
 
@@ -3947,9 +3987,34 @@ class _ChatCanvasArea extends ConsumerWidget {
                       defaultTargetPlatform == TargetPlatform.macOS ||
                       defaultTargetPlatform == TargetPlatform.windows ||
                       defaultTargetPlatform == TargetPlatform.linux;
-                  return CupertinoScrollbar(
-                    controller: scrollCtrl,
-                    child: CustomScrollView(
+                  // Single unified SelectionArea OUTSIDE CustomScrollView so Flutter mounts
+                  // `_ScrollableSelectionHandler` + our edge-inset auto-scroller: dragging
+                  // handles (or long-press-dragging) toward the floating header or composer
+                  // smoothly auto-scrolls the conversation and selects beyond the viewport!
+                  final viewRef = View.maybeOf(ctx);
+                  return SelectionArea(
+                    onSelectionChanged: (content) {
+                      onSelectionChanged(content?.plainText ?? '');
+                    },
+                    contextMenuBuilder: buildGrassBagSelectableContextMenuWithQuote(
+                      onQuoteSelectedText: onQuoteExcerpt,
+                      getSelectedText: getSelectedPlainText,
+                    ),
+                    child: GrassBagSelectionAutoScrollScope(
+                      scrollController: scrollCtrl,
+                      topEdgeInset: listTopPad,
+                      resolveBottomEdgeInset: () {
+                        final kbInset = viewRef != null && viewRef.devicePixelRatio > 0
+                            ? viewRef.viewInsets.bottom / viewRef.devicePixelRatio
+                            : 0.0;
+                        final bottomGap = math.max(baseComposerBottom, kbInset + 8.0);
+                        return bottomGap + composerHeightNotifier.value;
+                      },
+                      onAutoScrollActiveChanged: onSelectionAutoScrollActiveChanged,
+                      onAutoScrollStep: onSelectionAutoScrollStep,
+                      child: CupertinoScrollbar(
+                        controller: scrollCtrl,
+                        child: CustomScrollView(
                     controller: scrollCtrl,
                     center: _centerSliverKey,
                     cacheExtent: 1400,
@@ -4015,25 +4080,27 @@ class _ChatCanvasArea extends ConsumerWidget {
                               if (prepended == 0) {
                                 return buildLoadOlderHeader();
                               }
-                              return SizedBox(
+                              return SelectionContainer.disabled(
                                 key: const ValueKey('older-history-divider'),
-                                height: 44,
-                                child: Center(
-                                  child: Padding(
-                                    padding: const EdgeInsets.only(bottom: 10),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
-                                        Padding(
-                                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                                          child: Text(
-                                            '以上为更早消息',
-                                            style: TextStyle(fontSize: 11, color: t.text3),
+                                child: SizedBox(
+                                  height: 44,
+                                  child: Center(
+                                    child: Padding(
+                                      padding: const EdgeInsets.only(bottom: 10),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                          Padding(
+                                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                                            child: Text(
+                                              '以上为更早消息',
+                                              style: TextStyle(fontSize: 11, color: t.text3),
+                                            ),
                                           ),
-                                        ),
-                                        SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
-                                      ],
+                                          SizedBox(width: 24, child: Divider(height: 0.6, color: t.sep)),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -4053,6 +4120,8 @@ class _ChatCanvasArea extends ConsumerWidget {
                         ),
                       ),
                     ],
+                  ),
+                  ),
                   ),
                   );
                 },
@@ -4263,7 +4332,6 @@ class _ChatCanvasArea extends ConsumerWidget {
 /// completed turns keep the exact same object identity -> ZERO rebuilds during live streaming!
 class _TurnListItem extends ConsumerWidget {
   const _TurnListItem({
-    super.key,
     required this.index,
     required this.scopePrefix,
     required this.activeSessionId,

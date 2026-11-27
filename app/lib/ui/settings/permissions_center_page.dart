@@ -30,9 +30,11 @@ class PermissionsCenterPage extends ConsumerWidget {
             Positioned.fill(
               child: RefreshIndicator.adaptive(
                 edgeOffset: topPad + 86,
-                onRefresh: () => ref
-                    .read(appProvider.notifier)
-                    .refreshNativeStatus(skipAutoConnect: true, forceFresh: true),
+                onRefresh: () => ref.read(appProvider.notifier).refreshNativeStatus(
+                      skipAutoConnect: true,
+                      forceFresh: true,
+                      awaitPermissions: true,
+                    ),
                 child: SingleChildScrollView(
                   physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
                   padding: EdgeInsets.fromLTRB(16, topPad + 86, 16, 40 + botPad),
@@ -61,8 +63,17 @@ class PermissionsCenterPage extends ConsumerWidget {
                   useOwnLayer: false,
                   onTap: () async {
                     final ctrl = ref.read(appProvider.notifier);
-                    await ctrl.refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
-                    ctrl.showToast('已刷新系统权限状态', tone: ToastTone.info);
+                    await ctrl.refreshNativeStatus(
+                      skipAutoConnect: true,
+                      forceFresh: true,
+                      awaitPermissions: true,
+                    );
+                    if (!context.mounted) return;
+                    final permsOk = ctrl.lastPermissionsRefreshSucceeded;
+                    ctrl.showToast(
+                      permsOk ? '已刷新系统权限与安全状态' : '部分系统权限或安全状态查询失败，已保留原状态',
+                      tone: permsOk ? ToastTone.info : ToastTone.warn,
+                    );
                   },
                 ),
               ),

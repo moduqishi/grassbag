@@ -29,6 +29,7 @@ import { detectDshVersion, registerMetaDomain } from './domains/meta.js';
 import { registerChatAndInteractionsDomain } from './domains/chat.js';
 import { registerWorkspaceDomain } from './domains/workspace.js';
 import { registerSystemDomain } from './domains/system.js';
+import { ignoreCleanupError, logSuppressed } from './diagnostics.js';
 
 export const name = 'gbridge';
 export const PREFIX = '/gbridge/v1';
@@ -51,8 +52,10 @@ const latchedAndroidEnv = (() => {
       const parsed = JSON.parse(raw);
       if (typeof parsed?.token === 'string' && parsed.token.trim()) token = parsed.token.trim();
       if (typeof parsed?.phoneToken === 'string' && parsed.phoneToken.trim()) phoneToken = parsed.phoneToken.trim();
-    } catch {}
-    try { unlinkSync(secretsFile); } catch {}
+    } catch (err) {
+      logSuppressed(console, 'boot', err, { detail: 'failed to read GBRIDGE_SECRETS_FILE' });
+    }
+    try { unlinkSync(secretsFile); } catch (err) { ignoreCleanupError(err); }
     delete process.env.GBRIDGE_SECRETS_FILE;
   }
   return {
@@ -116,7 +119,9 @@ function persistRotatedLanToken() {
   try {
     mkdirSync(dshHome, { recursive: true, mode: 0o700 });
     writeFileSync(tokenFile, `${fresh}\n`, { mode: 0o600 });
-  } catch {}
+  } catch (err) {
+    logSuppressed(console, 'lan-auth', err, { detail: 'failed to persist rotated LAN token' });
+  }
   return fresh;
 }
 
@@ -150,7 +155,9 @@ export function listReachableNetworkInterfaces() {
         }
       }
     }
-  } catch {}
+  } catch (err) {
+    logSuppressed(console, 'network', err, { detail: 'networkInterfaces() enumeration failed' });
+  }
   const combined = [...lan, ...tailscale, ...other];
   return combined.map((item, idx) => ({ ...item, recommended: idx === 0 }));
 }
@@ -165,7 +172,9 @@ function inspectWebServerBinding(ctx) {
       const u = new URL(ws.url);
       if (!host) host = u.hostname;
       if (!port && u.port) port = Number(u.port);
-    } catch {}
+    } catch (err) {
+      logSuppressed(ctx?.logger, 'webserver', err, { level: 'debug', detail: 'failed to parse webServer.url' });
+    }
   }
   if ((!host || !port) && typeof ws?.server?.address === 'function') {
     try {
@@ -174,7 +183,9 @@ function inspectWebServerBinding(ctx) {
         if (!host) host = addr.address;
         if (!port) port = addr.port;
       }
-    } catch {}
+    } catch (err) {
+      logSuppressed(ctx?.logger, 'webserver', err, { level: 'debug', detail: 'webServer.server.address() probe failed' });
+    }
   }
   const loopback = isLoopbackHost(host);
   const allowsRemote = Boolean(conn?.allowsRemoteAuthorities);
@@ -212,7 +223,7 @@ function scheduleLanTeardown(listenKey, expectedGen, { immediate = false } = {})
     };
     const guard = setTimeout(finish, 800);
     guard.unref?.();
-    try { srv.closeAllConnections?.(); } catch {}
+    try { srv.closeAllConnections?.(); } catch (err) { ignoreCleanupError(err); }
     try {
       srv.close(() => {
         clearTimeout(guard);
@@ -318,8 +329,8 @@ export function startLanBridgeListener(core, {
       clearTimeout(existing.closeTimer);
       existing.closeTimer = null;
     }
-    try { existing.server?.closeAllConnections?.(); } catch {}
-    try { existing.server?.close?.(); } catch {}
+    try { existing.server?.closeAllConnections?.(); } catch (err) { ignoreCleanupError(err); }
+    try { existing.server?.close?.(); } catch (err) { ignoreCleanupError(err); }
     activeLanListeners.delete(listenKey);
   }
 
@@ -401,7 +412,7 @@ export function startLanBridgeListener(core, {
           let submitted = '';
           const ct = String(req.headers['content-type'] || '').toLowerCase();
           if (ct.includes('application/json')) {
-            try { submitted = String(JSON.parse(rawBody)?.token || '').trim(); } catch {}
+            try { submitted = String(JSON.parse(rawBody)?.token || '').trim(); } catch (_invalidLoginJson) { submitted = ''; }
           } else {
             submitted = String(new URLSearchParams(rawBody).get('token') || '').trim();
           }
@@ -540,8 +551,8 @@ export function startLanBridgeListener(core, {
       server.removeListener('error', onError);
       if (entry.disposed) {
         if (activeLanListeners.get(listenKey) === entry) activeLanListeners.delete(listenKey);
-        try { server.closeAllConnections?.(); } catch {}
-        try { server.close(); } catch {}
+        try { server.closeAllConnections?.(); } catch (err) { ignoreCleanupError(err); }
+        try { server.close(); } catch (err) { ignoreCleanupError(err); }
         resolveReady({ host, port: null, error: 'disposed' });
         return;
       }
@@ -643,10 +654,23 @@ export function createGbridgeCore(ctx, options = {}) {
     socketPath: capturedPhoneSocket,
     token: capturedPhoneToken,
     logger,
+    onContractViolation: (violation) => {
+      normalizer.recordContractViolation(null, violation);
+    },
   });
+  if (typeof phoneState.notifyTurnStart === 'function') {
+    hub.setOnTurnStarted(({ sessionId, turnId }) => {
+      phoneState.notifyTurnStart(sessionId, turnId);
+    });
+  }
   if (typeof phoneState.notifyTurnEnd === 'function') {
     hub.setOnTurnCompleted(({ sessionId, reason }) => {
       phoneState.notifyTurnEnd(sessionId, reason);
+    });
+  }
+  if (typeof phoneState.notifyJobState === 'function') {
+    hub.setOnJobStateChanged(({ jobId, status }) => {
+      phoneState.notifyJobState(jobId, status);
     });
   }
 
@@ -709,8 +733,8 @@ export function createGbridgeCore(ctx, options = {}) {
     if (deferStop || deferredDisposePrev) {
       res.once('finish', () => {
         const t = setTimeout(() => {
-          try { if (deferStop) pairingController.stopLanIfDisabled?.(true); } catch {}
-          try { deferredDisposePrev?.(); } catch {}
+          try { if (deferStop) pairingController.stopLanIfDisabled?.(true); } catch (err) { logSuppressed(logger, 'pairing', err, { detail: 'deferred stopLanIfDisabled failed' }); }
+          try { deferredDisposePrev?.(); } catch (err) { ignoreCleanupError(err); }
         }, 150);
         t.unref?.();
       });
@@ -723,7 +747,9 @@ export function createGbridgeCore(ctx, options = {}) {
     try {
       mkdirSync(dirname(capturedPidFile), { recursive: true, mode: 0o700 });
       writeFileSync(capturedPidFile, `${process.pid}\n`, { mode: 0o600 });
-    } catch {}
+    } catch (err) {
+      logSuppressed(logger, 'boot', err, { detail: `failed to write pid file ${capturedPidFile}` });
+    }
   }
   if (capturedUnixSocket) {
     // Prevent child agent shell / MCP / npm processes inside Android containers from inheriting privileged tokens.
@@ -790,7 +816,7 @@ export function createGbridgeCore(ctx, options = {}) {
     phoneState.dispose();
     gateway.dispose?.();
     if (capturedPidFile && pidFileGenCounter === myPidGen) {
-      try { unlinkSync(capturedPidFile); } catch {}
+      try { unlinkSync(capturedPidFile); } catch (err) { ignoreCleanupError(err); }
     }
   };
 
@@ -820,16 +846,16 @@ function scheduleUdsTeardown(socketPath, expectedGen) {
     const cur = activeUdsListeners.get(socketPath);
     if (!cur || cur.gen !== expectedGen) return;
     activeUdsListeners.delete(socketPath);
-    try { cur.server?.closeAllConnections?.(); } catch {}
+    try { cur.server?.closeAllConnections?.(); } catch (err) { ignoreCleanupError(err); }
     try {
       cur.server?.close(() => {
         if (!activeUdsListeners.has(socketPath)) {
-          try { unlinkSync(socketPath); } catch {}
+          try { unlinkSync(socketPath); } catch (err) { ignoreCleanupError(err); }
         }
       });
-    } catch {
+    } catch (_closeErr) {
       if (!activeUdsListeners.has(socketPath)) {
-        try { unlinkSync(socketPath); } catch {}
+        try { unlinkSync(socketPath); } catch (err) { ignoreCleanupError(err); }
       }
     }
   };
@@ -867,11 +893,11 @@ function startUdsListener(core, socketPath, bearerToken, logger) {
 
   try {
     mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
-    try { chmodSync(dirname(socketPath), 0o700); } catch {}
+    try { chmodSync(dirname(socketPath), 0o700); } catch (err) { logSuppressed(logger, 'uds', err, { level: 'debug', detail: 'chmod 0700 on UDS parent dir failed' }); }
   } catch (err) {
     logger?.warn?.('[gbridge] failed to create UDS parent dir:', err?.message || err);
   }
-  try { unlinkSync(socketPath); } catch {}
+  try { unlinkSync(socketPath); } catch (err) { ignoreCleanupError(err); }
 
   const server = createServer((req, res) => {
     if (entry.core?.hub?._disposed) {
@@ -966,7 +992,9 @@ export function createPairingController(ctx, core, config = {}) {
         const t = new URL(authed).searchParams.get('token');
         if (t && t.trim()) return t.trim();
       }
-    } catch {}
+    } catch (err) {
+      logSuppressed(logger, 'pairing', err, { level: 'debug', detail: 'failed to extract shared web token' });
+    }
     return null;
   };
 
@@ -987,21 +1015,21 @@ export function createPairingController(ctx, core, config = {}) {
 
   const stopLan = (immediate = true) => runLanOp(async () => {
     lanWanted = false;
-    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch {}
+    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch (err) { logSuppressed(logger, 'pairing', err, { detail: 'disconnectByMode(lan) failed on stopLan' }); }
     const prev = lanHandle;
     lanHandle = null;
     if (prev) {
-      try { await prev.dispose({ immediate }); } catch {}
+      try { await prev.dispose({ immediate }); } catch (err) { ignoreCleanupError(err); }
     }
   });
 
   const stopLanIfDisabled = (immediate = true) => runLanOp(async () => {
     if (lanWanted || disposed) return;
-    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch {}
+    try { core.hub.disconnectByMode('lan', 4001, 'lan bridge stopped'); } catch (err) { logSuppressed(logger, 'pairing', err, { detail: 'disconnectByMode(lan) failed on stopLanIfDisabled' }); }
     const prev = lanHandle;
     lanHandle = null;
     if (prev) {
-      try { await prev.dispose({ immediate }); } catch {}
+      try { await prev.dispose({ immediate }); } catch (err) { ignoreCleanupError(err); }
     }
   });
 
@@ -1015,11 +1043,11 @@ export function createPairingController(ctx, core, config = {}) {
     const canDeferPrev = Boolean(deferPrevDispose && prev && prevPort && prevPort !== preferredPort);
     lanHandle = null;
     if (prev && !canDeferPrev) {
-      try { await prev.dispose({ immediate: true }); } catch {}
+      try { await prev.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
     }
     if (disposed) {
       if (canDeferPrev) {
-        try { await prev.dispose({ immediate: true }); } catch {}
+        try { await prev.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
       }
       return;
     }
@@ -1034,9 +1062,9 @@ export function createPairingController(ctx, core, config = {}) {
       getPairingSnapshot: () => getSnapshot(),
     });
     if (disposed) {
-      try { await nextHandle.dispose({ immediate: true }); } catch {}
+      try { await nextHandle.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
       if (canDeferPrev) {
-        try { await prev.dispose({ immediate: true }); } catch {}
+        try { await prev.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
       }
       return;
     }
@@ -1045,15 +1073,15 @@ export function createPairingController(ctx, core, config = {}) {
     if (canDeferPrev) {
       if (typeof onDeferredDispose === 'function') {
         onDeferredDispose(() => {
-          try { prev.dispose({ immediate: true }); } catch {}
+          try { prev.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
         });
       } else {
-        try { await prev.dispose({ immediate: true }); } catch {}
+        try { await prev.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
       }
     }
     if (disposed) {
       lanHandle = null;
-      try { await nextHandle.dispose({ immediate: true }); } catch {}
+      try { await nextHandle.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
     }
   });
 
@@ -1088,7 +1116,9 @@ export function createPairingController(ctx, core, config = {}) {
             if (oldestKey !== undefined) qrCache.delete(oldestKey);
           }
           qrCache.set(qrUrl, qr);
-        } catch {}
+        } catch (err) {
+          logSuppressed(logger, 'pairing', err, { detail: 'QR code generation failed for pairing endpoint' });
+        }
       }
       return {
         iface: item.iface,
@@ -1173,7 +1203,7 @@ export function createPairingController(ctx, core, config = {}) {
       lanToken = persistRotatedLanToken();
       if (lanHandle) lanHandle.setToken(lanToken);
       // Immediately revoke active LAN WebSocket sessions so rotated-out devices must re-authorize.
-      try { core.hub.disconnectByMode('lan', 4001, 'token rotated'); } catch {}
+      try { core.hub.disconnectByMode('lan', 4001, 'token rotated'); } catch (err) { logSuppressed(logger, 'pairing', err, { detail: 'disconnectByMode(lan) failed on token rotation' }); }
       return getSnapshot();
     }
     if (action === 'setLanEnabled') {
@@ -1232,7 +1262,7 @@ export function createPairingController(ctx, core, config = {}) {
       disposed = true;
       lanWanted = false;
       if (lanHandle) {
-        try { lanHandle.dispose({ immediate: false }); } catch {}
+        try { lanHandle.dispose({ immediate: false }); } catch (err) { ignoreCleanupError(err); }
         lanHandle = null;
       }
     },
@@ -1378,7 +1408,9 @@ export function apply(ctx, config = {}) {
               return { message: lines.join('\n') };
             },
           }), 'gbridge: /grassbag command');
-        } catch {}
+        } catch (err) {
+          logSuppressed(logger, 'commands', err, { detail: 'failed to register /grassbag slash command' });
+        }
       }
     });
   }

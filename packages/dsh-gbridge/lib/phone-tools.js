@@ -5,6 +5,8 @@ import {
   normalizeImageMediaType,
   toCanonicalImageAttachmentRef,
 } from './session-image-repair.js';
+import { sanitizeToolContentBlocks, validateToolContentBlock } from './content-contract.js';
+import { ignoreCleanupError, logSuppressed } from './diagnostics.js';
 
 const PHONE_TOOL_DEFS = [
   {
@@ -126,6 +128,59 @@ const PHONE_TOOL_DEFS = [
 ];
 
 /**
+ * Render and strictly contract-validate a phone tool's structured execution result into
+ * canonical DSH content blocks (`text` / durable `image` attachment ref).
+ * Exported so unit & round-trip tests can verify fail-closed payload validation directly.
+ */
+export function renderPhoneToolOutput(toolName, value, { logger, onViolation } = {}) {
+  let candidateBlocks;
+  if (value && typeof value === 'object') {
+    const rawAttachment = value.image ?? value.attachment;
+    const attachment = toCanonicalImageAttachmentRef(rawAttachment);
+    if (attachment) {
+      const { image: _img, attachment: _att, base64: _b64, ...meta } = value;
+      const summary = {
+        ...meta,
+        width: meta.width ?? attachment.width,
+        height: meta.height ?? attachment.height,
+        mediaType: attachment.mediaType,
+        bytes: attachment.bytes,
+      };
+      candidateBlocks = [
+        { type: 'text', text: JSON.stringify(summary) },
+        { type: 'image', attachment },
+      ];
+    } else if (rawAttachment && typeof rawAttachment === 'object') {
+      // Malformed attachment object without valid attachmentId — let contract guard log & block cleanly.
+      const { image: _img, attachment: _att, base64: _b64, ...meta } = value;
+      candidateBlocks = [
+        { type: 'text', text: JSON.stringify(meta) },
+        { type: 'image', attachment: rawAttachment },
+      ];
+    } else if (typeof value.base64 === 'string') {
+      // Never emit an inline `{ type: 'image', data, mimeType }` block without a durable
+      // `attachment` ref — `dsh-llm-pi-ai` and `dsh-llm-deepseek` crash when replaying it!
+      const { base64: _b64, ...meta } = value;
+      logger?.warn?.(
+        `[gbridge:phone-tools] ${toolName} stripped unpersisted inline base64 payload before DSH render`,
+      );
+      candidateBlocks = [
+        { type: 'text', text: JSON.stringify(meta) },
+      ];
+    } else {
+      candidateBlocks = [
+        { type: 'text', text: JSON.stringify(value) },
+      ];
+    }
+  } else {
+    candidateBlocks = [
+      { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? {}) },
+    ];
+  }
+  return sanitizeToolContentBlocks(toolName, candidateBlocks, { logger, onViolation });
+}
+
+/**
  * Zero-patch native Phone Control tool bridge for Android local hosts.
  * Activates ONLY when GBRIDGE_PHONE_SOCKET and GBRIDGE_PHONE_TOKEN are provided.
  *
@@ -133,7 +188,7 @@ const PHONE_TOOL_DEFS = [
  * (`PhoneOverlayController`), so phone control works reliably outside GrassBag in BOTH
  * `workspace-write` and `danger-full-access` modes with zero DSH approval deadlock!
  */
-export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
+export function mountPhoneTools(ctx, { socketPath, token, logger, onContractViolation } = {}) {
   if (!socketPath || !token) {
     return { active: false, registered: 0, reason: 'not-android-host', dispose: () => {} };
   }
@@ -143,44 +198,80 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
 
   const disposers = [];
   const activeTurnBySession = new Map();
+  const trackedActiveJobs = new Set();
   const phoneActiveSessions = new Set();
   let keepaliveTimer = null;
   let lastReportedActive = false;
   let lastReportedTurns = 0;
+  let lastReportedJobs = 0;
 
-  const reportNativeKeepalive = (reason = '') => {
-    const activeTurns = activeTurnBySession.size;
-    let activeJobs = 0;
+  const isTerminalJobStatus = (rawStatus) => {
+    const s = String(rawStatus || '').trim().toLowerCase();
+    return s === 'completed' ||
+      s === 'done' ||
+      s === 'finished' ||
+      s === 'success' ||
+      s === 'succeeded' ||
+      s === 'failed' ||
+      s === 'error' ||
+      s === 'killed' ||
+      s === 'exited' ||
+      s === 'stopped' ||
+      s === 'cancelled' ||
+      s === 'canceled' ||
+      s === 'aborted';
+  };
+
+  const isRunningJobStatus = (rawStatus) => {
+    const s = String(rawStatus || '').trim().toLowerCase();
+    return s === 'running' || s === 'starting' || s === 'queued' || s === 'pending' || s === 'active';
+  };
+
+  const countActiveJobs = () => {
+    const activeIds = new Set(trackedActiveJobs);
     try {
       const jobsSvc = ctx.get?.('jobs');
       const list = typeof jobsSvc?.list === 'function' ? jobsSvc.list() : [];
       if (Array.isArray(list)) {
+        const seenFromService = new Set();
         for (const j of list) {
-          if (j && (j.status === 'running' || j.running === true)) activeJobs++;
+          if (!j || typeof j !== 'object') continue;
+          const jid = String(j.id ?? j.jobId ?? '');
+          const status = j.status ?? j.state ?? (j.running === true ? 'running' : '');
+          if (jid) seenFromService.add(jid);
+          if (j.running === true || isRunningJobStatus(status)) {
+            if (jid) {
+              activeIds.add(jid);
+              trackedActiveJobs.add(jid);
+            } else {
+              activeIds.add(`__anon_${activeIds.size}`);
+            }
+          } else if (jid && isTerminalJobStatus(status)) {
+            activeIds.delete(jid);
+            trackedActiveJobs.delete(jid);
+          }
+        }
+        // Reconcile any tracked job IDs removed from the live service registry as finished.
+        if (typeof jobsSvc?.list === 'function' && seenFromService.size > 0) {
+          for (const tracked of [...trackedActiveJobs]) {
+            if (!seenFromService.has(tracked)) {
+              trackedActiveJobs.delete(tracked);
+              activeIds.delete(tracked);
+            }
+          }
         }
       }
-    } catch {}
-    const active = activeTurns > 0 || activeJobs > 0;
-    lastReportedActive = active;
-    lastReportedTurns = activeTurns;
-    callDaemon('/v1/keepalive', {
-      active,
-      activeTurns,
-      activeJobs,
-      ...(reason ? { reason } : {}),
-    }, undefined, 8_000).catch(() => {});
+    } catch (err) {
+      logSuppressed(logger, 'phone-tools', err, { level: 'debug', detail: 'jobs.list() probe failed during keepalive' });
+    }
+    return activeIds.size;
   };
 
-  const ensureKeepaliveHeartbeat = () => {
-    if (activeTurnBySession.size > 0) {
+  const ensureKeepaliveHeartbeat = (activeCount) => {
+    if (activeCount > 0) {
       if (!keepaliveTimer) {
         keepaliveTimer = setInterval(() => {
-          if (activeTurnBySession.size > 0) {
-            reportNativeKeepalive('heartbeat');
-          } else {
-            clearInterval(keepaliveTimer);
-            keepaliveTimer = null;
-          }
+          syncKeepaliveState('heartbeat', { force: true });
         }, 90_000);
         keepaliveTimer.unref?.();
       }
@@ -188,6 +279,29 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
+  };
+
+  const syncKeepaliveState = (reason = '', { force = false } = {}) => {
+    const activeTurns = activeTurnBySession.size;
+    const activeJobs = countActiveJobs();
+    const active = activeTurns > 0 || activeJobs > 0;
+    const changed = active !== lastReportedActive ||
+      activeTurns !== lastReportedTurns ||
+      activeJobs !== lastReportedJobs;
+    ensureKeepaliveHeartbeat(activeTurns + activeJobs);
+    if (!force && !changed) return false;
+    // On heartbeat ticks when nothing is active anymore, still emit once if previously active to release locks.
+    if (!active && !lastReportedActive && !changed) return false;
+    lastReportedActive = active;
+    lastReportedTurns = activeTurns;
+    lastReportedJobs = activeJobs;
+    callDaemon('/v1/keepalive', {
+      active,
+      activeTurns,
+      activeJobs,
+      ...(reason ? { reason } : {}),
+    }, undefined, 8_000).catch(() => {});
+    return true;
   };
 
   const callDaemon = (path, payload, signal, timeoutMs = 195_000) => new Promise((resolve, reject) => {
@@ -249,7 +363,9 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
         const def = permPresets.getDefaultPreset();
         if (typeof def === 'string' && def.trim()) return def.trim();
       }
-    } catch {}
+    } catch (err) {
+      logSuppressed(logger, 'phone-tools', err, { level: 'debug', detail: 'permission preset resolution failed' });
+    }
     return null;
   };
 
@@ -273,46 +389,101 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     return tag;
   };
 
-  const notifyTurnEnd = (sessionId, reason = 'completed', summary = '') => {
+  const notifyTurnStart = (sessionId, turnId = null) => {
     const sid = sessionId ? String(sessionId) : null;
-    if (sid) activeTurnBySession.delete(sid);
-    const shouldNotify = sid ? phoneActiveSessions.delete(sid) : phoneActiveSessions.size > 0;
-    if (!sid && shouldNotify) phoneActiveSessions.clear();
-    if (!shouldNotify) return false;
-    callDaemon('/v1/turn-end', {
-      sessionId: sid,
-      reason: normalizeTurnEndReason(reason),
-      ...(summary ? { summary: String(summary).slice(0, 120) } : {}),
-    }, undefined, 10_000).catch(() => {});
+    if (!sid) return false;
+    activeTurnBySession.set(sid, String(turnId || `turn-${Date.now()}`));
+    syncKeepaliveState('turn_start');
     return true;
   };
 
-  // Track active turns process-wide so Android native GrassBagEngineService ALWAYS holds
-  // CPU WakeLock + low-latency WifiLock while ANY DSH conversation or phone-control turn runs
-  // (even when GrassBag is backgrounded over another app and Flutter's isolate is paused!).
-  // Still forward `/v1/turn-end` ONLY for sessions that used phone tools so ALLOW_TURN stays scoped.
+  const notifyTurnEnd = (sessionId, reason = 'completed', summary = '') => {
+    const sid = sessionId ? String(sessionId) : null;
+    if (sid) {
+      activeTurnBySession.delete(sid);
+    } else {
+      activeTurnBySession.clear();
+    }
+    const shouldNotifyPhone = sid ? phoneActiveSessions.delete(sid) : phoneActiveSessions.size > 0;
+    if (!sid && shouldNotifyPhone) phoneActiveSessions.clear();
+    if (shouldNotifyPhone) {
+      callDaemon('/v1/turn-end', {
+        sessionId: sid,
+        reason: normalizeTurnEndReason(reason),
+        ...(summary ? { summary: String(summary).slice(0, 120) } : {}),
+      }, undefined, 10_000).catch(() => {});
+    }
+    // Always reconcile native keepalive state on EVERY turn-end path (including fallback
+    // `session.status === false` callbacks) so CPU/Wi-Fi locks never remain stuck until stale timeout!
+    syncKeepaliveState('turn_end');
+    return shouldNotifyPhone;
+  };
+
+  const notifyJobState = (jobId, status, reason = '') => {
+    const jid = jobId ? String(jobId).trim() : '';
+    const rawStatus = typeof status === 'string' ? status.trim().toLowerCase() : '';
+    if (jid) {
+      if (isTerminalJobStatus(rawStatus)) {
+        trackedActiveJobs.delete(jid);
+      } else if (isRunningJobStatus(rawStatus) || rawStatus === '') {
+        trackedActiveJobs.add(jid);
+      }
+    }
+    const tag = reason || (isTerminalJobStatus(rawStatus) ? 'job_end' : 'job_start');
+    return syncKeepaliveState(tag);
+  };
+
+  // Track active turns & standalone background jobs process-wide through ONE unified keepalive
+  // state updater so Android native GrassBagEngineService ALWAYS holds CPU/Wi-Fi locks while ANY
+  // DSH turn or background job runs, and ALWAYS releases locks cleanly the moment work finishes!
   if (typeof ctx.on === 'function') {
-    const off = ctx.on('session/event', (session, event) => {
+    const offSession = ctx.on('session/event', (session, event) => {
       const sid = session?.id ?? null;
       if (event?.type === 'turn/start' && sid) {
         const tid = event?.data?.turnId ?? (event?.data?.turn !== undefined ? `turn-${event.data.turn}` : `seq-${event?.seq ?? Date.now()}`);
-        const prevCount = activeTurnBySession.size;
-        activeTurnBySession.set(sid, String(tid));
-        if (prevCount === 0 || activeTurnBySession.size !== lastReportedTurns || !lastReportedActive) {
-          reportNativeKeepalive('turn_start');
-        }
-        ensureKeepaliveHeartbeat();
+        notifyTurnStart(sid, tid);
       } else if (event?.type === 'turn/end') {
-        const hadTurns = activeTurnBySession.size > 0;
-        if (sid) activeTurnBySession.delete(sid);
         notifyTurnEnd(sid, event?.data?.reason ?? 'completed');
-        if (hadTurns && (activeTurnBySession.size === 0 || activeTurnBySession.size !== lastReportedTurns)) {
-          reportNativeKeepalive('turn_end');
-        }
-        ensureKeepaliveHeartbeat();
       }
     });
-    if (typeof off === 'function') disposers.push(off);
+    if (typeof offSession === 'function') disposers.push(offSession);
+
+    const handleJobEvent = (defaultStatus) => (payloadOrId, maybeJob) => {
+      const obj = (maybeJob && typeof maybeJob === 'object')
+        ? maybeJob
+        : ((payloadOrId && typeof payloadOrId === 'object') ? payloadOrId : null);
+      const jobObj = obj?.job && typeof obj.job === 'object' ? obj.job : obj;
+      const jid = jobObj?.id ?? jobObj?.jobId ?? (typeof payloadOrId === 'string' ? payloadOrId : null);
+      const status = jobObj?.status ?? jobObj?.state ?? obj?.status ?? obj?.state ?? defaultStatus;
+      notifyJobState(jid, status);
+    };
+
+    const jobEvents = [
+      ['job/start', 'running'],
+      ['job/started', 'running'],
+      ['job/created', 'running'],
+      ['job/updated', ''],
+      ['job/state', ''],
+      ['job/event', ''],
+      ['job/complete', 'completed'],
+      ['job/completed', 'completed'],
+      ['job/end', 'completed'],
+      ['job/exit', 'exited'],
+      ['job/exited', 'exited'],
+      ['job/fail', 'failed'],
+      ['job/failed', 'failed'],
+      ['job/kill', 'killed'],
+      ['job/killed', 'killed'],
+      ['jobs/changed', ''],
+    ];
+    for (const [evName, defStatus] of jobEvents) {
+      try {
+        const offJob = ctx.on(evName, handleJobEvent(defStatus));
+        if (typeof offJob === 'function') disposers.push(offJob);
+      } catch (err) {
+        logSuppressed(logger, 'phone-tools', err, { level: 'debug', detail: `ctx.on(${evName}) skipped` });
+      }
+    }
   }
 
   let registered = 0;
@@ -331,36 +502,10 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
           },
           output: {
             schema: { type: 'object', additionalProperties: true },
-            render: (_args, value) => {
-              if (value && typeof value === 'object') {
-                const attachment = toCanonicalImageAttachmentRef(value.image ?? value.attachment);
-                if (attachment) {
-                  const { image: _img, attachment: _att, base64: _b64, ...meta } = value;
-                  const summary = {
-                    ...meta,
-                    width: meta.width ?? attachment.width,
-                    height: meta.height ?? attachment.height,
-                    mediaType: attachment.mediaType,
-                    bytes: attachment.bytes,
-                  };
-                  return [
-                    { type: 'text', text: JSON.stringify(summary) },
-                    { type: 'image', attachment },
-                  ];
-                }
-                if (typeof value.base64 === 'string') {
-                  // Never emit an inline `{ type: 'image', data, mimeType }` block without a durable
-                  // `attachment` ref — `dsh-llm-pi-ai` and `dsh-llm-deepseek` crash when replaying it!
-                  const { base64: _b64, ...meta } = value;
-                  return [
-                    { type: 'text', text: JSON.stringify(meta) },
-                  ];
-                }
-              }
-              return [
-                { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value ?? {}) },
-              ];
-            },
+            render: (_args, value) => renderPhoneToolOutput(def.name, value, {
+              logger,
+              onViolation: onContractViolation,
+            }),
           },
           async execute(args, execCtx) {
             const sessionId = execCtx?.agent?.session?.id ?? execCtx?.session?.id ?? null;
@@ -393,16 +538,24 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
                       name: `phone-screenshot-${Date.now()}.${ext}`,
                     });
                     const canonical = toCanonicalImageAttachmentRef(ref);
-                    if (canonical) {
+                    const check = canonical ? validateToolContentBlock({ type: 'image', attachment: canonical }) : null;
+                    if (canonical && check?.ok) {
                       return {
                         ...meta,
-                        mediaType: canonical.mediaType,
-                        width: canonical.width,
-                        height: canonical.height,
-                        bytes: canonical.bytes,
-                        image: canonical,
+                        mediaType: check.normalized.attachment.mediaType,
+                        width: check.normalized.attachment.width,
+                        height: check.normalized.attachment.height,
+                        bytes: check.normalized.attachment.bytes,
+                        image: check.normalized.attachment,
                       };
                     }
+                    logger?.warn?.(
+                      `[gbridge:phone-tools] ${def.name} saveImage returned invalid attachment ref: ${check?.detail || 'missing attachmentId'}`,
+                    );
+                    return {
+                      ...meta,
+                      imageError: check?.reason || 'invalid_attachment_ref',
+                    };
                   }
                 } catch (err) {
                   logger?.warn?.(`[gbridge] failed to persist ${def.name} screenshot via ctx.attachments.saveImage:`, err?.message || err);
@@ -442,7 +595,7 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
           const added = disposers.splice(before);
           return () => {
             for (const fn of added) {
-              try { fn(); } catch {}
+              try { fn(); } catch (err) { ignoreCleanupError(err); }
             }
             registered = Math.max(0, registered - added.length);
           };
@@ -457,21 +610,31 @@ export function mountPhoneTools(ctx, { socketPath, token, logger } = {}) {
     get active() { return registered > 0; },
     get registered() { return registered; },
     get reason() { return registered > 0 ? 'ready' : 'tools-service-unavailable'; },
+    notifyTurnStart,
     notifyTurnEnd,
+    notifyJobState,
+    syncKeepalive: syncKeepaliveState,
     dispose() {
       if (keepaliveTimer) {
         clearInterval(keepaliveTimer);
         keepaliveTimer = null;
       }
+      activeTurnBySession.clear();
+      trackedActiveJobs.clear();
       if (lastReportedActive) {
-        activeTurnBySession.clear();
-        reportNativeKeepalive('dispose');
-      } else {
-        activeTurnBySession.clear();
+        lastReportedActive = false;
+        lastReportedTurns = 0;
+        lastReportedJobs = 0;
+        callDaemon('/v1/keepalive', {
+          active: false,
+          activeTurns: 0,
+          activeJobs: 0,
+          reason: 'dispose',
+        }, undefined, 8_000).catch(() => {});
       }
       phoneActiveSessions.clear();
       for (const fn of disposers) {
-        try { fn(); } catch {}
+        try { fn(); } catch (err) { ignoreCleanupError(err); }
       }
     },
   };

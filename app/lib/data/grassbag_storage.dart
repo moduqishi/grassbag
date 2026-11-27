@@ -13,6 +13,7 @@ class GrassBagStorage {
   static const _kHostsKey = 'grassbag_saved_hosts_v2';
   static const _kDomainKey = 'grassbag_domain_cache_v2';
   static const _kHostContextsKey = 'grassbag_host_contexts_v1';
+  static const _kWebSecretsKey = 'grassbag_web_secrets_v1';
 
   SharedPreferences? _cachedPrefs;
 
@@ -114,5 +115,59 @@ class GrassBagStorage {
     try {
       await p.setString(_kHostContextsKey, jsonEncode(contexts));
     } catch (_) {}
+  }
+
+  Future<Map<String, String>> _loadWebSecretsMap() async {
+    final p = await _prefs();
+    final raw = p?.getString(_kWebSecretsKey);
+    if (raw == null || raw.isEmpty) return <String, String>{};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return <String, String>{};
+      final out = <String, String>{};
+      for (final entry in decoded.entries) {
+        final v = entry.value?.toString();
+        if (v != null && v.isNotEmpty) {
+          out[entry.key.toString()] = v;
+        }
+      }
+      return out;
+    } catch (_) {
+      return <String, String>{};
+    }
+  }
+
+  Future<String?> loadWebSecret(String key) async {
+    final map = await _loadWebSecretsMap();
+    return map[key];
+  }
+
+  Future<void> saveWebSecret(String key, String value) async {
+    final p = await _prefs();
+    if (p == null) return;
+    try {
+      final map = await _loadWebSecretsMap();
+      map[key] = value;
+      await p.setString(_kWebSecretsKey, jsonEncode(map));
+    } catch (_) {}
+  }
+
+  Future<void> deleteWebSecret(String key) async {
+    final p = await _prefs();
+    if (p == null) return;
+    try {
+      final map = await _loadWebSecretsMap();
+      if (map.remove(key) != null) {
+        if (map.isEmpty) {
+          await p.remove(_kWebSecretsKey);
+        } else {
+          await p.setString(_kWebSecretsKey, jsonEncode(map));
+        }
+      }
+    } catch (_) {}
+  }
+
+  void resetCacheForTest() {
+    _cachedPrefs = null;
   }
 }

@@ -1080,17 +1080,26 @@ test('v35 regression: StreamHub ascending coalesced seq, slow-consumer 1013 disc
   };
   hub.clients.set(client.id, client);
 
-  // Interleave s-a (seq 1), s-b (seq 2), s-a (seq 3 -> coalesced onto s-a with latest seq 3)
+  // Interleave s-a (seq 1), s-b (seq 2), s-a (seq 3), s-a (seq 4):
+  // Only contiguous same-channel deltas coalesce (3+4); non-contiguous seq 1 flushes BEFORE seq 2
+  // so every frame arrives in strictly ascending seq order with zero gaps on resume!
   hub.publish('session:s-a', 'turn.delta', { turnId: 'ta', chunk: { kind: 'text', delta: 'A1' } }, { isDelta: true });
   hub.publish('session:s-b', 'turn.delta', { turnId: 'tb', chunk: { kind: 'text', delta: 'B1' } }, { isDelta: true });
   hub.publish('session:s-a', 'turn.delta', { turnId: 'ta', chunk: { kind: 'text', delta: 'A2' } }, { isDelta: true });
+  hub.publish('session:s-a', 'turn.delta', { turnId: 'ta', chunk: { kind: 'text', delta: 'A3' } }, { isDelta: true });
   hub._flushClientDeltas(client);
 
-  assert.equal(sentFrames.length, 2);
-  assert.ok(sentFrames[0].seq < sentFrames[1].seq, `expected strictly ascending seq, got ${sentFrames.map((f) => f.seq)}`);
-  assert.equal(sentFrames[0].channel, 'session:s-b');
-  assert.equal(sentFrames[1].channel, 'session:s-a');
-  assert.deepEqual(sentFrames[1].data.chunks.map((c) => c.delta), ['A1', 'A2']);
+  assert.equal(sentFrames.length, 3);
+  assert.ok(
+    sentFrames[0].seq < sentFrames[1].seq && sentFrames[1].seq < sentFrames[2].seq,
+    `expected strictly ascending seq, got ${sentFrames.map((f) => f.seq)}`,
+  );
+  assert.equal(sentFrames[0].channel, 'session:s-a');
+  assert.equal(sentFrames[0].data.chunk.delta, 'A1');
+  assert.equal(sentFrames[1].channel, 'session:s-b');
+  assert.equal(sentFrames[1].data.chunk.delta, 'B1');
+  assert.equal(sentFrames[2].channel, 'session:s-a');
+  assert.deepEqual(sentFrames[2].data.chunks.map((c) => c.delta), ['A2', 'A3']);
 
   // 2. Slow consumer with > 8 MiB socket write buffer is disconnected cleanly (1013) instead of OOM/silent drop
   fakeWs.socket.writableLength = 9 * 1024 * 1024;

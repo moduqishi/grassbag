@@ -19,6 +19,44 @@ class VanillaDshNormalizer {
       LinkedHashMap<String, ({Map<String, dynamic> record, int bytes})>();
   int _toolOutputBytes = 0;
   final Map<String, _SessionStreamStat> _turnStats = <String, _SessionStreamStat>{};
+  final Map<String, _TurnFailureContext> _sessionFailureContexts =
+      <String, _TurnFailureContext>{};
+
+  _TurnFailureContext _ensureFailureContext(String sessionId) {
+    return _sessionFailureContexts.putIfAbsent(sessionId, _TurnFailureContext.new);
+  }
+
+  static const _forbiddenInlineImageKeys = <String>[
+    'data',
+    'base64',
+    'mimeType',
+    'source',
+    'image',
+  ];
+
+  static List<Map<String, dynamic>> _findMalformedContentBlocks(List<dynamic> blocks) {
+    final findings = <Map<String, dynamic>>[];
+    for (final raw in blocks) {
+      if (raw is! Map) continue;
+      final b = _asStringMap(raw);
+      if (b['type'] != 'image') continue;
+      final att = b['attachment'];
+      final attMap = att is Map ? _asStringMap(att) : null;
+      final attId = attMap?['attachmentId'];
+      final hasValidId = attId is String && attId.trim().isNotEmpty;
+      final forbidden = _forbiddenInlineImageKeys.where((k) => b[k] != null).toList();
+      if (!hasValidId || forbidden.isNotEmpty) {
+        findings.add({
+          'blockType': 'image',
+          'blockKeys': b.keys.toList(growable: false),
+          'reason': forbidden.isNotEmpty
+              ? 'inline_provider_image_block_forbidden'
+              : (attMap == null ? 'missing_image_attachment' : 'missing_attachment_id'),
+        });
+      }
+    }
+    return findings;
+  }
 
   static final RegExp _secretQuickTrigger = RegExp(
     r'(?:sk-|gh[pousr]_|github_pat_|AKIA|AIza|-----BEGIN )',
@@ -277,12 +315,30 @@ class VanillaDshNormalizer {
     return '';
   }
 
+  static ({String title, String summary}) _extractUpstreamPresentation(Object? presentation) {
+    if (presentation is! Map) return (title: '', summary: '');
+    final p = _asStringMap(presentation);
+    final record = p['record'] is Map ? _asStringMap(p['record'] as Map) : null;
+    final rawTitle = p['title'] ?? p['label'] ?? record?['title'] ?? record?['label'];
+    final rawSummary =
+        p['summary'] ?? p['caption'] ?? p['subtitle'] ?? record?['summary'] ?? record?['caption'];
+    return (
+      title: (rawTitle is String && rawTitle.trim().isNotEmpty)
+          ? previewLine(rawTitle, maxChars: 120)
+          : '',
+      summary: (rawSummary is String && rawSummary.trim().isNotEmpty)
+          ? previewLine(rawSummary, maxChars: 220)
+          : '',
+    );
+  }
+
   static ({String title, String summary, bool hasFullOutput}) summarizeTool(
     Object? name,
     Object? args, [
     Object? output,
     Map<String, dynamic>? preParsedOut,
     bool hasPreParsedOut = false,
+    Object? presentation,
   ]) {
     final tool = (name?.toString().isNotEmpty == true) ? name.toString() : 'tool';
     final parsedOut = hasPreParsedOut ? preParsedOut : _tryParseJsonObject(output);
@@ -292,25 +348,31 @@ class VanillaDshNormalizer {
         : output is String
             ? output
             : (hasOutput ? _safeJsonPreview(output, 400) : '');
-    final target = _extractToolTarget(tool, args, parsedOut);
-    final title = target.isNotEmpty ? '$tool · $target' : tool;
-    final summary = _summarizeHumanToolOutput(tool, outStr, parsedOut);
+    final upstream = _extractUpstreamPresentation(presentation ?? parsedOut?['presentation']);
+    final target = upstream.title.isNotEmpty ? '' : _extractToolTarget(tool, args, parsedOut);
+    final title = upstream.title.isNotEmpty
+        ? upstream.title
+        : (target.isNotEmpty ? '$tool · $target' : tool);
+    final summary = upstream.summary.isNotEmpty
+        ? upstream.summary
+        : _summarizeHumanToolOutput(tool, outStr, parsedOut);
     return (title: title, summary: summary, hasFullOutput: hasOutput);
   }
 
   static ({String? code, String message})? extractFailureInfo(
     Object? reason, [
     Map<String, dynamic> data = const <String, dynamic>{},
+    _TurnFailureContext? context,
   ]) {
+    ({String? code, String message})? base;
     if (reason is Map) {
       final kind = (reason['kind'] ?? reason['status'] ?? '').toString();
       if (kind == 'error') {
         final err = reason['error'] is Map ? reason['error'] as Map : reason;
         final code = err['code'] is String ? err['code'] as String : null;
         final msg = _formatErrorObject(err);
-        return (code: code, message: msg.isNotEmpty ? msg : '执行过程中发生未知错误');
-      }
-      if (kind == 'aborted') {
+        base = (code: code, message: msg.isNotEmpty ? msg : '执行过程中发生未知错误');
+      } else if (kind == 'aborted') {
         final inner = reason['reason'] is Map ? reason['reason'] as Map : null;
         if (inner != null &&
             inner['kind'] == 'hook' &&
@@ -324,28 +386,71 @@ class VanillaDshNormalizer {
           );
         }
         return null;
-      }
-      if (kind == 'interrupted') {
+      } else if (kind == 'interrupted') {
         return (code: 'INTERRUPTED', message: 'DSH 进程在本轮回复完成前意外退出。');
       }
     }
-    if (reason == 'error') {
+    if (base == null && reason == 'error') {
       final err = data['error'];
       final code = (err is Map && err['code'] is String)
           ? err['code'] as String
           : (data['code'] is String ? data['code'] as String : null);
       final msg = _formatErrorObject(err ?? data);
-      return (code: code, message: msg.isNotEmpty ? msg : '执行过程中发生错误');
+      base = (code: code, message: msg.isNotEmpty ? msg : '执行过程中发生错误');
     }
-    if (data['error'] != null) {
+    if (base == null && data['error'] != null) {
       final err = data['error'];
       final code = (err is Map && err['code'] is String)
           ? err['code'] as String
           : (data['code'] is String ? data['code'] as String : null);
       final msg = _formatErrorObject(err);
-      return (code: code, message: msg.isNotEmpty ? msg : err.toString());
+      base = (code: code, message: msg.isNotEmpty ? msg : err.toString());
     }
-    return null;
+    if (base == null) return null;
+    return _enrichFailureInfo(base, context);
+  }
+
+  static ({String? code, String message}) _enrichFailureInfo(
+    ({String? code, String message}) fail,
+    _TurnFailureContext? context,
+  ) {
+    if (context == null) return fail;
+    final codeUpper = (fail.code ?? '').toUpperCase();
+    final isOpaque = codeUpper.isEmpty || codeUpper == 'UNKNOWN' || codeUpper == 'INTERNAL_ERROR';
+    final mentionsAttachment = RegExp(
+      r'''attachmentid|attachment\b|reading ['"]attachment''',
+      caseSensitive: false,
+    ).hasMatch(fail.message);
+    final extras = <String>[];
+    if (context.malformedBlocks.isNotEmpty && (isOpaque || mentionsAttachment)) {
+      final latest = context.malformedBlocks.last;
+      final blockType = latest['blockType']?.toString() ?? 'unknown';
+      final keys = (latest['blockKeys'] is List)
+          ? (latest['blockKeys'] as List).map((e) => e.toString()).join(',')
+          : '';
+      final toolLabel = (latest['toolName']?.toString().isNotEmpty == true)
+          ? latest['toolName'].toString()
+          : (context.lastToolName.isNotEmpty ? context.lastToolName : 'tool');
+      final reason = latest['reason']?.toString() ?? 'invalid_content_block';
+      final hint = (reason == 'inline_provider_image_block_forbidden' ||
+              reason == 'missing_image_attachment' ||
+              reason == 'missing_attachment_id')
+          ? '缺少 attachment.attachmentId'
+          : reason;
+      final diag = '检测到工具 $toolLabel 返回了异常内容块 {type:"$blockType", keys:[$keys]}（$hint）';
+      if (!fail.message.contains(toolLabel) || !fail.message.contains('异常内容块')) {
+        extras.add(diag);
+      }
+    } else if (mentionsAttachment && context.lastToolName.isNotEmpty) {
+      final diag = '疑似工具 ${context.lastToolName} 返回了未入库的图像块（缺少 attachment.attachmentId）';
+      if (!fail.message.contains(context.lastToolName)) extras.add(diag);
+    } else if (isOpaque &&
+        context.lastToolName.isNotEmpty &&
+        !fail.message.contains(context.lastToolName)) {
+      extras.add('最近调用工具: ${context.lastToolName}');
+    }
+    if (extras.isEmpty) return fail;
+    return (code: fail.code, message: '${fail.message} · ${extras.join(' · ')}');
   }
 
   void cacheToolOutput(String sessionId, String callId, Map<String, dynamic> record) {
@@ -428,6 +533,26 @@ class VanillaDshNormalizer {
     Map<String, dynamic>? current;
     final toolIndex = <String, Map<String, dynamic>>{};
     final toolStartTimes = <String, int>{};
+    final turnDiagnostics = Expando<_TurnFailureContext>();
+    _TurnFailureContext getTurnDiag(Map<String, dynamic> turn) {
+      var d = turnDiagnostics[turn];
+      if (d == null) {
+        d = _TurnFailureContext();
+        turnDiagnostics[turn] = d;
+      }
+      return d;
+    }
+
+    _TurnFailureContext mergedFailureContext(Map<String, dynamic> turn) {
+      final local = getTurnDiag(turn);
+      final live = incremental && sessionId.isNotEmpty ? _sessionFailureContexts[sessionId] : null;
+      final out = _TurnFailureContext();
+      out.lastToolName = local.lastToolName.isNotEmpty ? local.lastToolName : (live?.lastToolName ?? '');
+      out.malformedBlocks.addAll(
+        local.malformedBlocks.isNotEmpty ? local.malformedBlocks : (live?.malformedBlocks ?? const []),
+      );
+      return out;
+    }
 
     void promoteIntermediateProse(Map<String, dynamic> turn, int seq) {
       final text = turn['assistantText'] as String? ?? '';
@@ -609,7 +734,12 @@ class VanillaDshNormalizer {
             parsedArgs = jsonDecode(parsedArgs);
           } catch (_) {}
         }
-        final sum = summarizeTool(data['name'], parsedArgs);
+        final toolName = (data['name'] ?? 'tool').toString();
+        getTurnDiag(turn).lastToolName = toolName;
+        if (incremental && sessionId.isNotEmpty) {
+          _ensureFailureContext(sessionId).lastToolName = toolName;
+        }
+        final sum = summarizeTool(toolName, parsedArgs, null, null, false, data['presentation']);
         if (ev['time'] is num && !toolStartTimes.containsKey(callId)) {
           toolStartTimes[callId] = (ev['time'] as num).toInt();
         }
@@ -617,7 +747,7 @@ class VanillaDshNormalizer {
           final step = <String, dynamic>{
             'kind': 'tool',
             'callId': callId,
-            'name': (data['name'] ?? 'tool').toString(),
+            'name': toolName,
             'title': sum.title,
             'status': 'running',
             'summary': sum.summary,
@@ -628,7 +758,7 @@ class VanillaDshNormalizer {
         }
         cacheToolOutput(sessionId, callId, {
           'callId': callId,
-          'name': (data['name'] ?? 'tool').toString(),
+          'name': toolName,
           'args': parsedArgs,
           'output': null,
           'status': 'running',
@@ -675,7 +805,12 @@ class VanillaDshNormalizer {
                   bArgs = jsonDecode(bArgs);
                 } catch (_) {}
               }
-              final sum = summarizeTool(b['name'], bArgs);
+              final bToolName = (b['name'] ?? 'tool').toString();
+              getTurnDiag(turn).lastToolName = bToolName;
+              if (incremental && sessionId.isNotEmpty) {
+                _ensureFailureContext(sessionId).lastToolName = bToolName;
+              }
+              final sum = summarizeTool(bToolName, bArgs, null, null, false, b['presentation']);
               if (ev['time'] is num && !toolStartTimes.containsKey(callId)) {
                 toolStartTimes[callId] = (ev['time'] as num).toInt();
               }
@@ -764,7 +899,29 @@ class VanillaDshNormalizer {
             prev?['name']?.toString() ??
             (msg['name'] ?? data['name'] ?? 'tool').toString();
         final effectiveArgs = prev?['args'] ?? data['arguments'] ?? const <String, dynamic>{};
-        final sum = summarizeTool(toolName, effectiveArgs, output, parsedOut, true);
+        final diag = getTurnDiag(turn);
+        diag.lastToolName = toolName;
+        if (incremental && sessionId.isNotEmpty) {
+          _ensureFailureContext(sessionId).lastToolName = toolName;
+        }
+        if (rawOut is List) {
+          final malformed = _findMalformedContentBlocks(rawOut);
+          for (final bad in malformed) {
+            final entry = <String, dynamic>{...bad, 'toolName': toolName};
+            diag.malformedBlocks.add(entry);
+            if (incremental && sessionId.isNotEmpty) {
+              _ensureFailureContext(sessionId).malformedBlocks.add(entry);
+            }
+          }
+        }
+        final sum = summarizeTool(
+          toolName,
+          effectiveArgs,
+          output,
+          parsedOut,
+          true,
+          data['presentation'] ?? msg['presentation'],
+        );
         final effectiveHasFull =
             sum.hasFullOutput || (isError && output.toString().trim().isNotEmpty);
         if (existing != null) {
@@ -827,7 +984,7 @@ class VanillaDshNormalizer {
           type == 'step/error' ||
           type == 'assistant/error') {
         final turn = ensureTurn(ev['turnId']?.toString(), seq);
-        final fail = extractFailureInfo('error', data);
+        final fail = extractFailureInfo('error', data, mergedFailureContext(turn));
         if (fail != null) {
           turn['status'] = 'error';
           turn['errorMessage'] = fail.message;
@@ -847,7 +1004,7 @@ class VanillaDshNormalizer {
         final reason = rawReason is Map
             ? (rawReason['kind'] ?? rawReason['status'])?.toString()
             : (rawReason ?? data['status'])?.toString();
-        final fail = extractFailureInfo(rawReason, data);
+        final fail = extractFailureInfo(rawReason, data, mergedFailureContext(turn));
         final rawTurnErr = data['error'];
         final hasTruthyTurnErr = rawTurnErr != null &&
             rawTurnErr != false &&
@@ -998,6 +1155,7 @@ class VanillaDshNormalizer {
 
   void clearSessionStat(String sessionId) {
     _turnStats.remove(sessionId);
+    _sessionFailureContexts.remove(sessionId);
   }
 
   static void _accumulateUsage(Map<String, dynamic> turn, Map<String, dynamic> msgUsage) {
@@ -1072,11 +1230,38 @@ class VanillaDshNormalizer {
     if (err is! Map) return err.toString();
     final parts = <String>[];
     final main = err['message'] ?? err['reason'] ?? err['detail'] ?? err['summary'] ?? err['error'];
-    if (main is String && main.trim().isNotEmpty) parts.add(main.trim());
+    final rawName = err['name'];
+    final errName = (rawName is String && rawName.trim().isNotEmpty && rawName.trim() != 'Error')
+        ? rawName.trim()
+        : '';
+    if (main is String && main.trim().isNotEmpty) {
+      final trimmed = main.trim();
+      parts.add(errName.isNotEmpty && !trimmed.startsWith(errName) ? '$errName: $trimmed' : trimmed);
+    } else if (errName.isNotEmpty) {
+      parts.add(errName);
+    }
     if (err['reason'] is String &&
         (err['reason'] as String).trim().isNotEmpty &&
-        !parts.contains((err['reason'] as String).trim())) {
+        !parts.any((p) => p.contains((err['reason'] as String).trim()))) {
       parts.add((err['reason'] as String).trim());
+    }
+    final details = err['details'] is Map ? err['details'] as Map : null;
+    final toolName = err['toolName'] ?? err['tool'] ?? details?['toolName'] ?? details?['tool'];
+    if (toolName is String && toolName.trim().isNotEmpty && !parts.any((p) => p.contains(toolName.trim()))) {
+      parts.add('工具: ${toolName.trim()}');
+    }
+    final shape = details?['shape'] is Map ? details!['shape'] as Map : null;
+    final blockType = err['blockType'] ?? details?['blockType'] ?? shape?['type'];
+    final blockKeys = err['blockKeys'] ?? details?['blockKeys'] ?? shape?['keys'];
+    if (blockType is String && blockType.trim().isNotEmpty) {
+      final shapeDesc = (blockKeys is List && blockKeys.isNotEmpty)
+          ? '{type:"${blockType.trim()}", keys:[${blockKeys.join(',')}]}'
+          : '{type:"${blockType.trim()}"}';
+      if (!parts.any((p) => p.contains(shapeDesc))) parts.add('块形状: $shapeDesc');
+    }
+    final endpoint = err['endpoint'] ?? details?['endpoint'];
+    if (endpoint is String && endpoint.trim().isNotEmpty && !parts.any((p) => p.contains(endpoint.trim()))) {
+      parts.add('接口: ${endpoint.trim()}');
     }
     if (err['status'] is num && !parts.any((p) => p.contains('${err['status']}'))) {
       parts.add('HTTP ${err['status']}');
@@ -1085,8 +1270,31 @@ class VanillaDshNormalizer {
       final c = _formatErrorObject(err['cause']);
       if (c.isNotEmpty && !parts.contains(c)) parts.add('原因: $c');
     }
+    final codeUpper = (err['code']?.toString() ?? '').toUpperCase();
+    if ((codeUpper.isEmpty || codeUpper == 'UNKNOWN') && err['stack'] is String) {
+      final frame = _extractTopStackFrame(err['stack'] as String);
+      if (frame.isNotEmpty && !parts.any((p) => p.contains(frame))) {
+        parts.add('位置: $frame');
+      }
+    }
     if (parts.isNotEmpty) return parts.join(' · ');
     return _safeJsonPreview(err, 400);
+  }
+
+  static String _extractTopStackFrame(String stack) {
+    final lines = stack.split('\n');
+    for (var i = 1; i < lines.length; i++) {
+      final line = lines[i].trim();
+      if (!line.startsWith('at ')) continue;
+      if (line.contains('node:internal/') || line.contains('(node:')) continue;
+      final m = RegExp(r'([A-Za-z0-9@._-]+/[A-Za-z0-9@._/-]+:\d+)(?::\d+)?').firstMatch(line);
+      if (m != null) {
+        final segs = m.group(1)!.split('/');
+        return segs.length > 3 ? segs.sublist(segs.length - 3).join('/') : m.group(1)!;
+      }
+      return line.length > 93 ? line.substring(3, 93) : line.substring(3);
+    }
+    return '';
   }
 
   static String _safeJsonPreview(Object? val, int max) {
@@ -1098,6 +1306,11 @@ class VanillaDshNormalizer {
       return s.length > max ? s.substring(0, max) : s;
     }
   }
+}
+
+class _TurnFailureContext {
+  String lastToolName = '';
+  final List<Map<String, dynamic>> malformedBlocks = <Map<String, dynamic>>[];
 }
 
 class _SessionStreamStat {

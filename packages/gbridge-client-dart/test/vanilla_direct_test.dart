@@ -1551,6 +1551,118 @@ void main() {
       final probe = await client.bootstrap.probeHost();
       expect(probe, isA<HostProbeNeedsAuth>());
     });
+
+    test('VanillaDshNormalizer enriches UNKNOWN errors with malformed block shape & prefers upstream presentation', () {
+      final normalizer = VanillaDshNormalizer();
+      final turns = normalizer.normalizeEvents('sess-diag-1', [
+        {'seq': 1, 'type': 'turn/start', 'data': {'turnId': 'turn-9'}},
+        {
+          'seq': 2,
+          'type': 'tool/call',
+          'data': {
+            'callId': 'c-pres',
+            'name': 'read',
+            'arguments': {'file_path': '/a.js'},
+            'presentation': {'title': 'Read src/a.js', 'summary': 'Upstream summary'},
+          },
+        },
+        {
+          'seq': 3,
+          'type': 'tool/result',
+          'data': {
+            'callId': 'c-shot',
+            'name': 'phone_screenshot',
+            'message': {
+              'role': 'tool',
+              'toolCallId': 'c-shot',
+              'content': [
+                {'type': 'text', 'text': '{"ok":true}'},
+                {'type': 'image', 'data': 'AAAA', 'mimeType': 'image/jpeg'},
+              ],
+            },
+          },
+        },
+        {
+          'seq': 4,
+          'type': 'turn/end',
+          'data': {
+            'turnId': 'turn-9',
+            'reason': {
+              'kind': 'error',
+              'error': {
+                'code': 'UNKNOWN',
+                'name': 'TypeError',
+                'message': "Cannot read properties of undefined (reading 'attachmentId')",
+                'stack':
+                    "TypeError: Cannot read properties of undefined (reading 'attachmentId')\n"
+                    '    at collectImageRefs (/opt/dsh-slots/current/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js:1266:45)',
+              },
+            },
+          },
+        },
+      ]);
+
+      expect(turns, hasLength(1));
+      final steps = turns.first['steps'] as List<Map<String, dynamic>>;
+      expect(steps.first['title'], 'Read src/a.js');
+      expect(steps.first['summary'], 'Upstream summary');
+      expect(turns.first['status'], 'error');
+      expect(turns.first['errorCode'], 'UNKNOWN');
+      final errMsg = turns.first['errorMessage'] as String;
+      expect(errMsg, contains('phone_screenshot'));
+      expect(errMsg, contains('{type:"image", keys:[type,data,mimeType]}'));
+      expect(errMsg, contains('缺少 attachment.attachmentId'));
+      expect(errMsg, contains('dsh-llm-pi-ai/lib/index.js:1266'));
+    });
+
+    test('VanillaDshMuxEngine surfaces top-level status and exitCode on job.event from nested raw.job', () async {
+      final serverMsgCtrl = StreamController<String>.broadcast();
+      final sentFrames = <Map<String, dynamic>>[];
+      final doneComp = Completer<void>();
+
+      final mux = VanillaDshMuxEngine(
+        normalizer: VanillaDshNormalizer(),
+        autoReconnect: false,
+        openSocket: (_) async => _FakeRawWs(serverMsgCtrl.stream, sentFrames, doneComp),
+      );
+      addTearDown(() async {
+        await mux.dispose();
+        await serverMsgCtrl.close();
+      });
+
+      final events = <StreamFrame>[];
+      final sub = mux.frames.listen(events.add);
+      addTearDown(sub.cancel);
+
+      final connectFuture = mux.connect();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final eventsOpen = sentFrames.firstWhere((m) => m['endpoint'] == r'$events');
+      serverMsgCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': eventsOpen['streamId'],
+        'value': {'type': 'ready', 'clientId': 'c-job'},
+      }));
+      await connectFuture;
+
+      mux.subscribe('job:s1:job-77');
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      final jobOpen = sentFrames.firstWhere((m) => m['endpoint'] == 'job/follow');
+
+      serverMsgCtrl.add(jsonEncode({
+        'type': 'item',
+        'streamId': jobOpen['streamId'],
+        'value': {
+          'type': 'state',
+          'job': {'id': 'job-77', 'status': 'completed', 'exitCode': 0},
+        },
+      }));
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+
+      final jobFrame = events.firstWhere((f) => f.type == 'job.event');
+      expect(jobFrame.dataMap?['jobId'], 'job-77');
+      expect(jobFrame.dataMap?['status'], 'completed');
+      expect(jobFrame.dataMap?['exitCode'], 0);
+    });
   });
 }
 

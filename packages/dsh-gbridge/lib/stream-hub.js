@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isPlainObject } from './http-util.js';
 import { extractFailureInfo } from './normalizer.js';
+import { ignoreCleanupError, logSuppressed } from './diagnostics.js';
 
 const DEFAULT_REPLAY_CAPACITY = 2000;
 const DEFAULT_REPLAY_MAX_BYTES = 4 * 1024 * 1024;
@@ -135,15 +136,27 @@ export class StreamHub {
     this._eventsClientId = null;
     this._eventsPeer = null;
     this._eventsReconnectTimer = null;
+    this._onTurnStarted = null;
     this._onTurnCompleted = null;
+    this._onJobStateChanged = null;
     this._disposed = false;
     this._heartbeatTimer = setInterval(() => this._sendHeartbeats(), HEARTBEAT_MS);
     this._heartbeatTimer.unref?.();
   }
 
+  /** Register an internal observer notified whenever a session begins a turn/run. */
+  setOnTurnStarted(fn) {
+    this._onTurnStarted = typeof fn === 'function' ? fn : null;
+  }
+
   /** Register an internal observer notified whenever a session finishes a turn/run. */
   setOnTurnCompleted(fn) {
     this._onTurnCompleted = typeof fn === 'function' ? fn : null;
+  }
+
+  /** Register an internal observer notified whenever a background job reports running/terminal state. */
+  setOnJobStateChanged(fn) {
+    this._onJobStateChanged = typeof fn === 'function' ? fn : null;
   }
 
   _scheduleHostEventReconnect(delayMs) {
@@ -260,6 +273,11 @@ export class StreamHub {
         const statusSid = args[0] != null ? String(args[0]) : null;
         if (statusSid && args[1] === true) {
           this._clearPendingTurnEndTimer(statusSid);
+          try {
+            this._onTurnStarted?.({ sessionId: statusSid, turnId: this.activeTurns.get(statusSid) ?? null });
+          } catch (err) {
+            logSuppressed(this.logger, 'stream-hub', err, { detail: `onTurnStarted failed for ${statusSid}` });
+          }
         } else if (statusSid && args[1] === false) {
           this._clearPendingTurnEndTimer(statusSid);
           // Defer fallback turn-end notification briefly so the authoritative `turn/end` event
@@ -267,7 +285,11 @@ export class StreamHub {
           const fallbackTimer = setTimeout(() => {
             this.pendingTurnEndTimers.delete(statusSid);
             if (this._disposed) return;
-            try { this._onTurnCompleted?.({ sessionId: statusSid, reason: 'completed' }); } catch {}
+            try {
+              this._onTurnCompleted?.({ sessionId: statusSid, reason: 'completed' });
+            } catch (err) {
+              logSuppressed(this.logger, 'stream-hub', err, { detail: `fallback onTurnCompleted failed for ${statusSid}` });
+            }
           }, 250);
           fallbackTimer.unref?.();
           this.pendingTurnEndTimers.set(statusSid, fallbackTimer);
@@ -541,8 +563,8 @@ export class StreamHub {
       if (buffered > HARD_CLIENT_BUFFER_BYTES || (isDelta && buffered > MAX_CLIENT_BUFFER_BYTES)) {
         // Disconnect congested slow consumer cleanly so it reconnects & resyncs instead of
         // silently corrupting streaming text/terminal output or growing write buffers unboundedly!
-        try { client.ws.close(1013, 'slow consumer'); } catch {}
-        try { client.ws.terminate?.(); } catch {}
+        try { client.ws.close(1013, 'slow consumer'); } catch (err) { ignoreCleanupError(err); }
+        try { client.ws.terminate?.(); } catch (err) { ignoreCleanupError(err); }
         this._detachClient(client);
         continue;
       }
@@ -559,7 +581,7 @@ export class StreamHub {
   /** Attach an upgraded WebSocket connection to the hub. */
   attachClient(ws, { peer, mode = 'webServer' } = {}) {
     if (this._disposed) {
-      try { ws.close(1001, 'gbridge reloading'); } catch {}
+      try { ws.close(1001, 'gbridge reloading'); } catch (err) { ignoreCleanupError(err); }
       return null;
     }
     const connId = randomUUID();
@@ -612,7 +634,7 @@ export class StreamHub {
       if (client.mode !== mode) continue;
       closedCount++;
       this._detachClient(client);
-      try { client.ws.close(code, reason); } catch {}
+      try { client.ws.close(code, reason); } catch (err) { ignoreCleanupError(err); }
     }
     return closedCount;
   }
@@ -956,10 +978,29 @@ export class StreamHub {
       } else {
         chunk = typeof item === 'string' ? item : String(item?.chunk ?? item?.data ?? '');
       }
+      const extractedStatus = extractJobStatusFromItem(item);
+      const extractedExitCode = item?.exitCode ?? item?.job?.exitCode ?? item?.info?.exitCode ?? null;
       if (chunk) {
+        try {
+          this._onJobStateChanged?.({ jobId: targetId, status: extractedStatus || 'running' });
+        } catch (err) {
+          logSuppressed(this.logger, 'stream-hub', err, { detail: `onJobStateChanged failed for ${targetId}` });
+        }
         this.publish(channel, 'job.output', { jobId: targetId, chunk }, { isDelta: true });
       } else {
-        this.publish(channel, 'job.event', { jobId: targetId, raw: item });
+        if (extractedStatus) {
+          try {
+            this._onJobStateChanged?.({ jobId: targetId, status: extractedStatus });
+          } catch (err) {
+            logSuppressed(this.logger, 'stream-hub', err, { detail: `onJobStateChanged failed for ${targetId}` });
+          }
+        }
+        this.publish(channel, 'job.event', {
+          jobId: targetId,
+          ...(extractedStatus ? { status: extractedStatus } : {}),
+          ...(extractedExitCode !== null && extractedExitCode !== undefined ? { exitCode: extractedExitCode } : {}),
+          raw: item,
+        });
       }
       return;
     }
@@ -1033,6 +1074,11 @@ export class StreamHub {
         const turnId = ev.data?.turnId ||
           (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : (ev.id || `turn-${ev.seq ?? Date.now()}`));
         this.activeTurns.set(targetId, turnId);
+        try {
+          this._onTurnStarted?.({ sessionId: targetId, turnId });
+        } catch (err) {
+          logSuppressed(this.logger, 'stream-hub', err, { detail: `onTurnStarted failed for ${targetId}` });
+        }
         this.publish(channel, 'turn.start', {
           sessionId: targetId,
           turnId,
@@ -1045,15 +1091,18 @@ export class StreamHub {
         this._clearPendingTurnEndTimer(targetId);
         const turnId = ev.data?.turnId || (ev.data?.turn !== undefined ? `turn-${ev.data.turn}` : this.activeTurns.get(targetId));
         this.activeTurns.delete(targetId);
+        const failCtx = this.normalizer?.getSessionFailureContext?.(targetId) ?? null;
         this.normalizer?.clearSessionStat(targetId);
-        const fail = extractFailureInfo(ev.data?.reason, ev.data ?? ev);
+        const fail = extractFailureInfo(ev.data?.reason, ev.data ?? ev, failCtx);
         try {
           this._onTurnCompleted?.({
             sessionId: targetId,
             turnId,
             reason: normalizeTurnEndReasonTag(ev.data?.reason, Boolean(fail)),
           });
-        } catch {}
+        } catch (err) {
+          logSuppressed(this.logger, 'stream-hub', err, { detail: `onTurnCompleted failed for ${targetId}` });
+        }
         this.publish(channel, 'turn.completed', {
           sessionId: targetId,
           ...(turnId ? { turnId } : {}),
@@ -1093,15 +1142,18 @@ export class StreamHub {
       const evData = item?.event?.data ?? item?.data ?? item;
       const turnId = evData?.turnId || (evData?.turn !== undefined ? `turn-${evData.turn}` : this.activeTurns.get(targetId));
       this.activeTurns.delete(targetId);
+      const failCtx = this.normalizer?.getSessionFailureContext?.(targetId) ?? null;
       this.normalizer?.clearSessionStat(targetId);
-      const fail = extractFailureInfo(evData?.reason, evData);
+      const fail = extractFailureInfo(evData?.reason, evData, failCtx);
       try {
         this._onTurnCompleted?.({
           sessionId: targetId,
           turnId,
           reason: normalizeTurnEndReasonTag(evData?.reason, Boolean(fail)),
         });
-      } catch {}
+      } catch (err) {
+        logSuppressed(this.logger, 'stream-hub', err, { detail: `onTurnCompleted failed for ${targetId}` });
+      }
       this.publish(channel, 'turn.completed', {
         sessionId: targetId,
         ...(turnId ? { turnId } : {}),
@@ -1148,18 +1200,21 @@ export class StreamHub {
 
   _enqueueDelta(client, frame) {
     const key = `${frame.channel}:${frame.type}`;
+    // Only coalesce contiguous deltas belonging to the exact same (channel, type)!
+    // Flushing before switching keys guarantees strictly monotonic seq delivery on the wire so
+    // a client disconnecting after receiving seq N can NEVER miss an earlier seq < N on resume.
+    if (client.pendingDeltas.size > 0 && !client.pendingDeltas.has(key)) {
+      this._flushClientDeltas(client);
+    }
     const existing = client.pendingDeltas.get(key);
     const chunkBytes = estimateDeltaBytes(frame.data);
     if (!existing) {
       client.pendingDeltas.set(key, { ...frame, batch: [frame.data] });
     } else {
-      // Re-insert so Map iteration order stays strictly ascending by latest `seq`!
-      client.pendingDeltas.delete(key);
       existing.seq = frame.seq;
       existing.ts = frame.ts;
       existing.batch.push(frame.data);
       existing.data = frame.data;
-      client.pendingDeltas.set(key, existing);
     }
     client.pendingDeltaBytes = (client.pendingDeltaBytes || 0) + chunkBytes;
     if (client.pendingDeltaBytes >= 512 * 1024) {
@@ -1275,6 +1330,24 @@ export class StreamHub {
     }
     this.clients.clear();
   }
+}
+
+function extractJobStatusFromItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const raw = item.status ??
+    item.state ??
+    item.job?.status ??
+    item.job?.state ??
+    item.info?.status ??
+    item.info?.state ??
+    item.data?.status ??
+    item.data?.state ??
+    item.data?.job?.status ??
+    item.data?.job?.state ??
+    null;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed || null;
 }
 
 function sanitizeInteraction(item) {

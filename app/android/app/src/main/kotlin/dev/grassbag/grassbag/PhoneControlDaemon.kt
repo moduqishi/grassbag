@@ -145,12 +145,13 @@ class PhoneControlDaemon(
                 when (req.path) {
                     "/v1/keepalive" -> {
                         val active = body.optBoolean("active", false)
-                        val activeTurns = body.optInt("activeTurns", if (active) 1 else 0)
-                        val activeJobs = body.optInt("activeJobs", 0)
+                        val rawTurns = body.optInt("activeTurns", if (active) 1 else 0).coerceAtLeast(0)
+                        val activeJobs = body.optInt("activeJobs", 0).coerceAtLeast(0)
+                        val resolvedTurns = if (active && rawTurns == 0 && activeJobs == 0) 1 else rawTurns
                         val reason = body.optCleanString("reason", "").ifBlank { null }
                         GrassBagEngineService.updateNativeActiveWork(
                             ctx = context,
-                            activeTurns = if (active) activeTurns.coerceAtLeast(1) else activeTurns,
+                            activeTurns = resolvedTurns,
                             activeJobs = activeJobs,
                             reason = reason
                         )
@@ -368,7 +369,7 @@ class PhoneControlDaemon(
                     appLabel = resolvedApp,
                     toolName = tool
                 )
-                emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
+                emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay, sessionId)
                 return null
             }
             is SafetyGate.ActionVerdict.NeedConfirm -> {
@@ -391,7 +392,7 @@ class PhoneControlDaemon(
                             appLabel = resolvedApp,
                             toolName = tool
                         )
-                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
+                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay, sessionId)
                         null
                     }
                     PhoneOverlayController.ConfirmDecision.ALLOW_TURN -> {
@@ -401,7 +402,7 @@ class PhoneControlDaemon(
                             appLabel = resolvedApp,
                             toolName = tool
                         )
-                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay)
+                        emitStepTelemetry(tool, hudActionLabel, resolvedApp, overlay, sessionId)
                         null
                     }
                     PhoneOverlayController.ConfirmDecision.DENY -> {
@@ -445,12 +446,14 @@ class PhoneControlDaemon(
         tool: String,
         actionLabel: String,
         appLabel: String?,
-        overlay: PhoneOverlayController
+        overlay: PhoneOverlayController,
+        sessionId: String? = null
     ) {
         onEvent(
             "phone_step_event",
             mapOf(
                 "active" to true,
+                "sessionId" to (sessionId ?: ""),
                 "tool" to tool,
                 "action" to actionLabel,
                 "appLabel" to (appLabel ?: ""),

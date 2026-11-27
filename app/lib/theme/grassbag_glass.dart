@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show ValueListenable, kIsWeb;
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
@@ -5334,13 +5336,470 @@ Widget buildGrassBagEditableContextMenu(
   );
 }
 
+/// Joins an ancestor [SelectionArea] when already mounted inside one (e.g. the unified
+/// chat [CustomScrollView] selection area), or mounts a local [SelectionArea] when
+/// rendered standalone (e.g. isolated sheets or unit tests).
+///
+/// Avoiding nested [SelectionArea]s inside a scrollable is critical in Flutter: only a
+/// [Scrollable] *descendant* of [SelectionArea] mounts `_ScrollableSelectionHandler`
+/// and supports continuous cross-viewport edge auto-scrolling.
+class GrassBagSelectableScope extends StatelessWidget {
+  const GrassBagSelectableScope({
+    super.key,
+    required this.child,
+    this.onSelectionChanged,
+    this.contextMenuBuilder = buildGrassBagSelectableContextMenu,
+  });
+
+  final Widget child;
+  final ValueChanged<SelectedContent?>? onSelectionChanged;
+  final SelectableRegionContextMenuBuilder contextMenuBuilder;
+
+  @override
+  Widget build(BuildContext context) {
+    if (SelectionContainer.maybeOf(context) != null) {
+      return child;
+    }
+    return SelectionArea(
+      onSelectionChanged: onSelectionChanged,
+      contextMenuBuilder: contextMenuBuilder,
+      child: child,
+    );
+  }
+}
+
+/// Edge-inset-aware auto-scroller placed *inside* a [SelectionArea] and *outside* a
+/// vertical [ScrollView] (`CustomScrollView`, `ListView`, `SingleChildScrollView`).
+///
+/// Flutter's built-in `EdgeDraggingAutoScroller` only triggers when the dragged selection
+/// edge moves strictly *outside* the scroll view's raw `RenderBox` bounds — which is
+/// unreachable on edge-to-edge screens where floating Liquid Glass top headers and bottom
+/// composer bars overlap the scroll view, and does not auto-scroll during mobile
+/// long-press-drag (`continuous: false`).
+///
+/// This scope accounts for [topEdgeInset] / [bottomEdgeInset] (or dynamic resolvers) plus
+/// a smooth [hotZoneExtent] inside the visible reading band, scrolls smoothly at
+/// frame-rate-independent velocity, prevents blind overshoot behind floating bars while
+/// scrolling, and supports BOTH teardrop handle dragging and long-press-and-drag.
+class GrassBagSelectionAutoScrollScope extends StatefulWidget {
+  const GrassBagSelectionAutoScrollScope({
+    super.key,
+    required this.scrollController,
+    required this.child,
+    this.topEdgeInset = 0.0,
+    this.bottomEdgeInset = 0.0,
+    this.resolveTopEdgeInset,
+    this.resolveBottomEdgeInset,
+    this.hotZoneExtent = 56.0,
+    this.onAutoScrollActiveChanged,
+    this.onAutoScrollStep,
+  });
+
+  final ScrollController scrollController;
+  final Widget child;
+  final double topEdgeInset;
+  final double bottomEdgeInset;
+  final double Function()? resolveTopEdgeInset;
+  final double Function()? resolveBottomEdgeInset;
+  final double hotZoneExtent;
+  final ValueChanged<bool>? onAutoScrollActiveChanged;
+  final ValueChanged<double>? onAutoScrollStep;
+
+  @override
+  State<GrassBagSelectionAutoScrollScope> createState() =>
+      _GrassBagSelectionAutoScrollScopeState();
+}
+
+class _GrassBagSelectionAutoScrollScopeState
+    extends State<GrassBagSelectionAutoScrollScope>
+    with SingleTickerProviderStateMixin {
+  late final _EdgeInsetAutoScrollSelectionDelegate _delegate;
+  late final Ticker _autoScrollTicker;
+  Duration? _lastTickElapsed;
+
+  @override
+  void initState() {
+    super.initState();
+    _autoScrollTicker = createTicker(_onAutoScrollTick);
+    _delegate = _EdgeInsetAutoScrollSelectionDelegate(
+      scrollController: widget.scrollController,
+      getScopeContext: () => mounted ? context : null,
+      getTopEdgeInset: () => widget.resolveTopEdgeInset?.call() ?? widget.topEdgeInset,
+      getBottomEdgeInset: () =>
+          widget.resolveBottomEdgeInset?.call() ?? widget.bottomEdgeInset,
+      hotZoneExtent: widget.hotZoneExtent,
+      onStartTicker: _ensureTickerRunning,
+      onStopTicker: _stopTicker,
+      onAutoScrollActiveChanged: widget.onAutoScrollActiveChanged,
+      onAutoScrollStep: widget.onAutoScrollStep,
+    );
+  }
+
+  void _ensureTickerRunning() {
+    if (!mounted || _autoScrollTicker.isActive) return;
+    _lastTickElapsed = null;
+    _autoScrollTicker.start();
+  }
+
+  void _stopTicker() {
+    if (_autoScrollTicker.isActive) {
+      _autoScrollTicker.stop();
+    }
+    _lastTickElapsed = null;
+  }
+
+  void _onAutoScrollTick(Duration elapsed) {
+    if (!mounted) {
+      _stopTicker();
+      return;
+    }
+    final prev = _lastTickElapsed;
+    _lastTickElapsed = elapsed;
+    final dtSec = prev == null
+        ? 0.016
+        : ((elapsed - prev).inMicroseconds / 1000000.0).clamp(0.004, 0.034);
+    _delegate.stepAutoScroll(dtSec);
+  }
+
+  @override
+  void didUpdateWidget(covariant GrassBagSelectionAutoScrollScope oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _delegate.scrollController = widget.scrollController;
+    _delegate.getTopEdgeInset =
+        () => widget.resolveTopEdgeInset?.call() ?? widget.topEdgeInset;
+    _delegate.getBottomEdgeInset =
+        () => widget.resolveBottomEdgeInset?.call() ?? widget.bottomEdgeInset;
+    _delegate.hotZoneExtent = widget.hotZoneExtent;
+    _delegate.onAutoScrollActiveChanged = widget.onAutoScrollActiveChanged;
+    _delegate.onAutoScrollStep = widget.onAutoScrollStep;
+  }
+
+  @override
+  void dispose() {
+    _stopTicker();
+    _autoScrollTicker.dispose();
+    _delegate.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final registrar = SelectionContainer.maybeOf(context);
+    if (registrar == null) {
+      return widget.child;
+    }
+    return SelectionContainer(
+      registrar: registrar,
+      delegate: _delegate,
+      child: widget.child,
+    );
+  }
+}
+
+class _EdgeInsetAutoScrollSelectionDelegate
+    extends MultiSelectableSelectionContainerDelegate {
+  _EdgeInsetAutoScrollSelectionDelegate({
+    required this.scrollController,
+    required this.getScopeContext,
+    required this.getTopEdgeInset,
+    required this.getBottomEdgeInset,
+    required this.hotZoneExtent,
+    required this.onStartTicker,
+    required this.onStopTicker,
+    this.onAutoScrollActiveChanged,
+    this.onAutoScrollStep,
+  }) {
+    GestureBinding.instance.pointerRouter.addGlobalRoute(_handleGlobalPointerEvent);
+  }
+
+  ScrollController scrollController;
+  final BuildContext? Function() getScopeContext;
+  double Function() getTopEdgeInset;
+  double Function() getBottomEdgeInset;
+  double hotZoneExtent;
+  final VoidCallback onStartTicker;
+  final VoidCallback onStopTicker;
+  ValueChanged<bool>? onAutoScrollActiveChanged;
+  ValueChanged<double>? onAutoScrollStep;
+
+  final Set<int> _activePointers = <int>{};
+  SelectionEdgeUpdateEvent? _lastHotEdgeEvent;
+  double _currentVelocityPxPerSec = 0.0;
+  int _edgeGeneration = 0;
+  bool _postFrameEdgeSyncScheduled = false;
+  bool _autoScrollActive = false;
+  bool _disposed = false;
+
+  void _setAutoScrollActive(bool next) {
+    if (_autoScrollActive == next) return;
+    _autoScrollActive = next;
+    onAutoScrollActiveChanged?.call(next);
+  }
+
+  void _stopAutoScroll() {
+    _currentVelocityPxPerSec = 0.0;
+    _lastHotEdgeEvent = null;
+    _postFrameEdgeSyncScheduled = false;
+    onStopTicker();
+    _setAutoScrollActive(false);
+  }
+
+  void _handleGlobalPointerEvent(PointerEvent event) {
+    if (_disposed) return;
+    if (event is PointerDownEvent) {
+      _activePointers.add(event.pointer);
+    } else if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _activePointers.remove(event.pointer);
+      if (_activePointers.isEmpty) {
+        _stopAutoScroll();
+      }
+    }
+  }
+
+  void stepAutoScroll(double dtSec) {
+    if (_disposed || _activePointers.isEmpty || _currentVelocityPxPerSec == 0.0) {
+      _stopAutoScroll();
+      return;
+    }
+    final ScrollPosition? pos =
+        (scrollController.hasClients && scrollController.positions.length == 1)
+            ? scrollController.position
+            : null;
+    if (pos == null) {
+      _stopAutoScroll();
+      return;
+    }
+    final oldPixels = pos.pixels;
+    final nextPixels = (oldPixels + _currentVelocityPxPerSec * dtSec)
+        .clamp(pos.minScrollExtent, pos.maxScrollExtent);
+    final delta = nextPixels - oldPixels;
+    if (delta.abs() <= 0.05) {
+      // Reached min/max scroll extent: run one final unclamped edge update and stop!
+      final finalEvent = _lastHotEdgeEvent;
+      _stopAutoScroll();
+      if (finalEvent != null) {
+        super.handleSelectionEdgeUpdate(finalEvent);
+      }
+      return;
+    }
+    pos.jumpTo(nextPixels);
+    onAutoScrollStep?.call(delta);
+
+    // After layout catches up to the new scroll offset, ensure selection extends onto newly
+    // visible lines even for `continuous: false` gestures (Android long-press + drag down).
+    final expectedGen = _edgeGeneration;
+    if (!_postFrameEdgeSyncScheduled) {
+      _postFrameEdgeSyncScheduled = true;
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        _postFrameEdgeSyncScheduled = false;
+        if (_disposed || _activePointers.isEmpty) return;
+        // If `SelectableRegion` already dispatched its own continuous edge update this frame,
+        // skip duplicate dispatch.
+        if (_edgeGeneration != expectedGen) return;
+        final pending = _lastHotEdgeEvent;
+        if (pending != null) {
+          handleSelectionEdgeUpdate(pending);
+        }
+      });
+    }
+  }
+
+  @override
+  void ensureChildUpdated(Selectable selectable) {
+    // Child Scrollable's `_ScrollableSelectionContainerDelegate` already maintains
+    // scroll-relative edge offsets and updates its own selectables on scroll.
+  }
+
+  @override
+  SelectionResult handleClearSelection(ClearSelectionEvent event) {
+    _stopAutoScroll();
+    return super.handleClearSelection(event);
+  }
+
+  @override
+  SelectionResult handleSelectionEdgeUpdate(SelectionEdgeUpdateEvent event) {
+    _edgeGeneration++;
+
+    final scopeCtx = getScopeContext();
+    final renderObj = scopeCtx?.findRenderObject();
+    final RenderBox? box =
+        (renderObj is RenderBox && renderObj.hasSize) ? renderObj : null;
+    final ScrollPosition? pos =
+        (scrollController.hasClients && scrollController.positions.length == 1)
+            ? scrollController.position
+            : null;
+
+    double velocityPxPerSec = 0.0;
+    SelectionEdgeUpdateEvent effectiveEvent = event;
+
+    if (box != null && pos != null) {
+      final topLeft = box.localToGlobal(Offset.zero);
+      final viewportTop = topLeft.dy;
+      final viewportBottom = topLeft.dy + box.size.height;
+      final topInset = getTopEdgeInset().clamp(0.0, math.max(0.0, box.size.height * 0.45));
+      final bottomInset =
+          getBottomEdgeInset().clamp(0.0, math.max(0.0, box.size.height * 0.45));
+      final visibleTop = math.min(viewportBottom - 48.0, viewportTop + topInset);
+      final visibleBottom = math.max(visibleTop + 48.0, viewportBottom - bottomInset);
+      final effectiveHotZone =
+          math.min(hotZoneExtent, math.max(20.0, (visibleBottom - visibleTop) * 0.22));
+
+      final canScrollDown = pos.pixels < pos.maxScrollExtent - 0.5;
+      final canScrollUp = pos.pixels > pos.minScrollExtent + 0.5;
+      final dy = event.globalPosition.dy;
+
+      final bottomDepth = dy - (visibleBottom - effectiveHotZone);
+      final topDepth = (visibleTop + effectiveHotZone) - dy;
+
+      if (bottomDepth > 0 && canScrollDown) {
+        final t = (bottomDepth / (effectiveHotZone * 1.65)).clamp(0.0, 1.0);
+        velocityPxPerSec = 140.0 + 820.0 * t * t;
+        if (dy > visibleBottom) {
+          final clampedPos = Offset(event.globalPosition.dx, visibleBottom - 4.0);
+          effectiveEvent = event.type == SelectionEventType.endEdgeUpdate
+              ? SelectionEdgeUpdateEvent.forEnd(
+                  globalPosition: clampedPos,
+                  granularity: event.granularity,
+                )
+              : SelectionEdgeUpdateEvent.forStart(
+                  globalPosition: clampedPos,
+                  granularity: event.granularity,
+                );
+        }
+      } else if (topDepth > 0 && canScrollUp) {
+        final t = (topDepth / (effectiveHotZone * 1.65)).clamp(0.0, 1.0);
+        velocityPxPerSec = -(140.0 + 820.0 * t * t);
+        if (dy < visibleTop) {
+          final clampedPos = Offset(event.globalPosition.dx, visibleTop + 4.0);
+          effectiveEvent = event.type == SelectionEventType.endEdgeUpdate
+              ? SelectionEdgeUpdateEvent.forEnd(
+                  globalPosition: clampedPos,
+                  granularity: event.granularity,
+                )
+              : SelectionEdgeUpdateEvent.forStart(
+                  globalPosition: clampedPos,
+                  granularity: event.granularity,
+                );
+        }
+      }
+    }
+
+    final result = super.handleSelectionEdgeUpdate(effectiveEvent);
+    if (result == SelectionResult.pending) {
+      // A nested scrollable (or Flutter's native outer edge scroller) is already scrolling.
+      _currentVelocityPxPerSec = 0.0;
+      _lastHotEdgeEvent = null;
+      onStopTicker();
+      return result;
+    }
+
+    if (velocityPxPerSec != 0.0 && pos != null) {
+      _currentVelocityPxPerSec = velocityPxPerSec;
+      _lastHotEdgeEvent = event;
+      _setAutoScrollActive(true);
+      onStartTicker();
+      return SelectionResult.pending;
+    }
+
+    _stopAutoScroll();
+    return result;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _stopAutoScroll();
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(_handleGlobalPointerEvent);
+    super.dispose();
+  }
+}
+
+/// Keeps a virtualized list item (`SliverList.builder` / `ListView.builder`) alive while
+/// [keepAliveListenable] is `true` (e.g. while an active text selection is in progress),
+/// preventing `SliverList.builder` from disposing the selection's start/end item when the
+/// user auto-scrolls multiple screens away (which would otherwise truncate copied text
+/// and trip Flutter's `startGlyphHeight` null crash).
+///
+/// Unlike wrapping each item in a `SelectionListener` / nested `SelectionContainer`, this
+/// adds ZERO intermediate selection containers inside the scrollable and immediately
+/// releases keep-alive as soon as the selection clears.
+class GrassBagSelectionKeepAlive extends StatefulWidget {
+  const GrassBagSelectionKeepAlive({
+    super.key,
+    required this.keepAliveListenable,
+    required this.child,
+  });
+
+  final ValueListenable<bool> keepAliveListenable;
+  final Widget child;
+
+  @override
+  State<GrassBagSelectionKeepAlive> createState() => _GrassBagSelectionKeepAliveState();
+}
+
+class _GrassBagSelectionKeepAliveState extends State<GrassBagSelectionKeepAlive>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => widget.keepAliveListenable.value;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.keepAliveListenable.addListener(_onKeepAliveChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant GrassBagSelectionKeepAlive oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.keepAliveListenable != widget.keepAliveListenable) {
+      oldWidget.keepAliveListenable.removeListener(_onKeepAliveChanged);
+      widget.keepAliveListenable.addListener(_onKeepAliveChanged);
+      updateKeepAlive();
+    }
+  }
+
+  void _onKeepAliveChanged() {
+    if (!mounted) return;
+    updateKeepAlive();
+  }
+
+  @override
+  void dispose() {
+    widget.keepAliveListenable.removeListener(_onKeepAliveChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.child;
+  }
+}
+
+/// Safely reads [SelectableRegionState.contextMenuAnchors], falling back cleanly if a
+/// virtualized list ever evicted one selection endpoint (`startSelectionPoint == null`),
+/// which otherwise throws a null-check error in Flutter's `SelectableRegionState.startGlyphHeight`.
+TextSelectionToolbarAnchors _safeSelectableContextMenuAnchors(
+  BuildContext context,
+  SelectableRegionState state,
+) {
+  try {
+    return state.contextMenuAnchors;
+  } catch (_) {
+    final size = MediaQuery.sizeOf(context);
+    final pad = MediaQuery.paddingOf(context);
+    final fallback = Offset(size.width * 0.5, pad.top + 96.0);
+    return TextSelectionToolbarAnchors(primaryAnchor: fallback);
+  }
+}
+
 /// Floating Apple iOS 26 Liquid Glass horizontal text selection toolbar for `SelectionArea`.
 Widget buildGrassBagSelectableContextMenu(
   BuildContext context,
   SelectableRegionState selectableRegionState,
 ) {
   return _GrassBagGlassSelectionToolbar(
-    anchors: selectableRegionState.contextMenuAnchors,
+    anchors: _safeSelectableContextMenuAnchors(context, selectableRegionState),
     buttonItems: selectableRegionState.contextMenuButtonItems,
   );
 }
@@ -5391,7 +5850,7 @@ Widget Function(BuildContext, SelectableRegionState)
     final insertIdx = baseItems.isNotEmpty ? 1 : 0;
     baseItems.insert(insertIdx, quoteItem);
     return _GrassBagGlassSelectionToolbar(
-      anchors: selectableRegionState.contextMenuAnchors,
+      anchors: _safeSelectableContextMenuAnchors(context, selectableRegionState),
       buttonItems: baseItems,
     );
   };

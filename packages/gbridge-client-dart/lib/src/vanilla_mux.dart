@@ -884,7 +884,30 @@ class VanillaDshMuxEngine {
       if (chunk.isNotEmpty) {
         _publish(channel, 'job.output', {'jobId': targetId, 'chunk': chunk}, op: 'delta');
       } else {
-        _publish(channel, 'job.event', {'jobId': targetId, 'raw': rawItem});
+        final jobMap = item?['job'] is Map ? item!['job'] as Map : null;
+        final infoMap = item?['info'] is Map ? item!['info'] as Map : null;
+        final dataMap = item?['data'] is Map ? item!['data'] as Map : null;
+        final nestedJob = dataMap?['job'] is Map ? dataMap!['job'] as Map : null;
+        final extractedStatus = (item?['status'] ??
+                item?['state'] ??
+                jobMap?['status'] ??
+                jobMap?['state'] ??
+                infoMap?['status'] ??
+                infoMap?['state'] ??
+                dataMap?['status'] ??
+                dataMap?['state'] ??
+                nestedJob?['status'] ??
+                nestedJob?['state'])
+            ?.toString()
+            .trim();
+        final extractedExitCode =
+            item?['exitCode'] ?? jobMap?['exitCode'] ?? infoMap?['exitCode'] ?? dataMap?['exitCode'];
+        _publish(channel, 'job.event', {
+          'jobId': targetId,
+          if (extractedStatus != null && extractedStatus.isNotEmpty) 'status': extractedStatus,
+          if (extractedExitCode != null) 'exitCode': extractedExitCode,
+          'raw': rawItem,
+        });
       }
       return;
     }

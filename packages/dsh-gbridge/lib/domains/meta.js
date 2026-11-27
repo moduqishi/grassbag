@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { GbridgeError, readJsonBody, sendJson } from '../http-util.js';
+import { logSuppressed } from '../diagnostics.js';
 
 const TICKET_TTL_MS = 60_000;
 let cachedDiscoveredDshVersion = null;
@@ -21,7 +22,9 @@ export function detectDshVersion(ctx) {
             cachedDiscoveredDshVersion = pkg.version;
             return pkg.version;
           }
-        } catch {}
+        } catch (_missingPkg) {
+          // Candidate relative package.json path not present in this layout.
+        }
       }
     }
     const loader = ctx.get?.('loader');
@@ -33,7 +36,9 @@ export function detectDshVersion(ctx) {
         return ver;
       }
     }
-  } catch {}
+  } catch (err) {
+    logSuppressed(ctx?.logger, 'meta', err, { level: 'debug', detail: 'detectDshVersion failed' });
+  }
   return 'unknown';
 }
 
@@ -276,7 +281,9 @@ export function registerMetaDomain(router, { ctx, gateway, hub, sdui, bridgeVers
         if (!parsed.username && !parsed.password && parsed.pathname === '/' && effectiveParsedHost === candWithDefault) {
           baseUrl = `${parsed.protocol}//${parsed.host}`;
         }
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'meta', err, { level: 'debug', detail: 'rejected invalid candidateHost for web-ticket' });
+      }
     }
     if (!baseUrl) {
       if (typeof webServer.getOrigin === 'function') {
@@ -298,7 +305,9 @@ export function registerMetaDomain(router, { ctx, gateway, hub, sdui, bridgeVers
         const u = new URL(authenticatedUrl);
         u.hash = `/sessions/${encodeURIComponent(sessionId)}`;
         authenticatedUrl = u.toString();
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'meta', err, { level: 'warn', detail: 'failed to append session hash to web-ticket URL' });
+      }
     }
 
     const ticket = randomBytes(24).toString('base64url');

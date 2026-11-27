@@ -779,6 +779,7 @@ class GrassBagAppState {
     this.loadingSessions = false,
     this.searchingSessions = false,
     this.hydratingDomains = false,
+    this.initialDomainsHydrated = false,
     this.nativeStatusHydrated = false,
     this.activeSessionId,
     this.turns = const [],
@@ -939,6 +940,7 @@ class GrassBagAppState {
   final bool loadingSessions;
   final bool searchingSessions;
   final bool hydratingDomains;
+  final bool initialDomainsHydrated;
   final bool nativeStatusHydrated;
   final String? activeSessionId;
   final List<NormalizedTurn> turns;
@@ -1471,6 +1473,7 @@ class GrassBagAppState {
     bool? loadingSessions,
     bool? searchingSessions,
     bool? hydratingDomains,
+    bool? initialDomainsHydrated,
     bool? nativeStatusHydrated,
     String? activeSessionId,
     bool clearActiveSession = false,
@@ -1650,6 +1653,7 @@ class GrassBagAppState {
       loadingSessions: loadingSessions ?? this.loadingSessions,
       searchingSessions: searchingSessions ?? this.searchingSessions,
       hydratingDomains: hydratingDomains ?? this.hydratingDomains,
+      initialDomainsHydrated: initialDomainsHydrated ?? this.initialDomainsHydrated,
       nativeStatusHydrated: nativeStatusHydrated ?? this.nativeStatusHydrated,
       activeSessionId: clearActiveSession ? null : (activeSessionId ?? this.activeSessionId),
       turns: turns ?? this.turns,
@@ -1897,6 +1901,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   static const int _maxAttachmentCacheBytes = 24 * 1024 * 1024;
   final Map<String, Future<void>> _inFlightBundleSyncs = {};
   bool _wasRecentlyBackgrounded = false;
+  String? _activePhoneSessionId;
+
+  /// Test-only switch permitting loopback `127.0.0.1` servers in `diagnoseRemoteHost` /
+  /// `connectRemoteInput` unit tests (always `false` in production).
+  @visibleForTesting
+  static bool allowLoopbackRemoteForTest = false;
 
   void _stashQueuedMessagesForScope(String hostId, String? sessionId) {
     final key = _attachmentsScopeKey(hostId, sessionId);
@@ -2151,7 +2161,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   String _lastKeepaliveSig = '';
   bool _keepaliveServiceStarted = false;
   int _cachedRunningSessionsCount = 0;
-  Future<void>? _inFlightPermissionsRefresh;
+  Future<bool>? _inFlightPermissionsRefresh;
+  bool _lastPermissionsRefreshSucceeded = true;
+  bool get lastPermissionsRefreshSucceeded => _lastPermissionsRefreshSucceeded;
   Future<void>? _inFlightNativeStatus;
   int _nativeStatusSeq = 0;
   int _dshUpdateCheckSeq = 0;
@@ -2188,7 +2200,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     GrassBagAppState s, {
     required int runningSessionsCount,
   }) {
-    if (s.nativeRuntimeStatus.bootstrapActive) {
+    if (s.nativeRuntimeStatus.bootstrapActive ||
+        s.nativeRuntimeStatus.engineState == 'starting') {
       return (
         managedByBootstrap: true,
         shouldRun: true,
@@ -2282,6 +2295,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         prev.activeQuestion != next.activeQuestion ||
         prev.activeCordisRequest != next.activeCordisRequest ||
         prev.appUpdateDownloading != next.appUpdateDownloading ||
+        prev.nativeRuntimeStatus.engineState != next.nativeRuntimeStatus.engineState ||
         prev.nativeRuntimeStatus.engineRunning != next.nativeRuntimeStatus.engineRunning ||
         prev.nativeRuntimeStatus.bootstrapActive != next.nativeRuntimeStatus.bootstrapActive ||
         prev.activeHostId != next.activeHostId ||
@@ -2403,6 +2417,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool? isAndroidOverride,
     Set<String>? deviceIpsOverride,
   }) {
+    if (allowLoopbackRemoteForTest && isLoopbackHost(uri.host)) {
+      return null;
+    }
     final isAndroid = isAndroidOverride ?? GrassBagNativeBridge.instance.isAndroidNative;
     final ips = deviceIpsOverride ?? _deviceLocalIps;
     final localUri = Uri.tryParse(state.localHost.address);
@@ -2975,6 +2992,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             );
             showToast(displayReason, tone: ToastTone.warn);
           } else if (evt.type == 'phone_step_event') {
+            final stepSid = evt.data['sessionId']?.toString().trim() ?? '';
+            if (stepSid.isNotEmpty) _activePhoneSessionId = stepSid;
             final isPaused = evt.data['paused'] == true;
             state = state.copyWith(
               phoneLiveActive: evt.data['active'] != false,
@@ -2991,6 +3010,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
               phoneHandoffReason: isPaused ? state.phoneHandoffReason : '',
             );
           } else if (evt.type == 'phone_turn_end') {
+            final endedSid = evt.data['sessionId']?.toString().trim() ?? '';
+            if (endedSid.isEmpty || endedSid == _activePhoneSessionId) {
+              _activePhoneSessionId = null;
+            }
             final steps = (evt.data['stepsCount'] as num?)?.toInt() ?? state.phoneLiveSteps;
             final autoReturned = evt.data['autoReturn'] == true;
             state = state.copyWith(
@@ -3011,15 +3034,17 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
               );
             }
           } else if (evt.type == 'phone_emergency_stop') {
+            final targetSids = _extractEmergencyStopSessionIds(evt.data);
+            _activePhoneSessionId = null;
             state = state.copyWith(
               emergencyStopped: true,
               phoneLiveActive: false,
               phoneLivePaused: false,
               phoneHandoffReason: '',
             );
-            cancelStreaming(announce: false);
+            _cancelSpecificLocalSessions(targetSids, announce: false);
             unawaited(refreshNativeStatus(skipAutoConnect: true));
-            showToast('已急停手机操控并终止当前任务', tone: ToastTone.warn);
+            showToast('已急停手机操控并终止对应操控任务', tone: ToastTone.warn);
           }
         });
       } catch (_) {
@@ -3093,7 +3118,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         ? safety!['showGestureFx'] as bool
         : state.phoneShowGestureFx;
     final nextPaused = safety?['paused'] is bool ? safety!['paused'] as bool : state.phoneLivePaused;
-    final nextEmergency = safety?['emergencyStopped'] == true;
+    final nextEmergency = safety?['emergencyStopped'] is bool
+        ? safety!['emergencyStopped'] as bool
+        : state.emergencyStopped;
     final nextPolicy = safety?['policy']?.toString() ?? state.safetyPolicy;
     final rawAudit = safety?['audit'];
     final auditList = rawAudit is List
@@ -3141,12 +3168,22 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
+  @visibleForTesting
+  void applyPermissionsAndSafetySnapshotForTest(
+    NativePermissionsStatus? perms,
+    Map<String, dynamic>? safety,
+  ) =>
+      _applyPermissionsAndSafetySnapshot(perms, safety);
+
   /// Fast, non-blocking refresh of Android permission & SafetyGate status ONLY.
   /// Never waits for container/runtime I/O and is never cancelled by host-switch generations,
   /// guaranteeing Accessibility / Overlay / Storage toggles reflect instantaneously on return!
-  Future<void> refreshPermissionsOnly() {
+  Future<bool> refreshPermissionsOnly() {
     final native = GrassBagNativeBridge.instance;
-    if (!native.isAndroidNative) return Future<void>.value();
+    if (!native.isAndroidNative) {
+      _lastPermissionsRefreshSucceeded = true;
+      return Future<bool>.value(true);
+    }
     final existing = _inFlightPermissionsRefresh;
     if (existing != null) return existing;
     final fut = () async {
@@ -3154,11 +3191,13 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         native.getPermissionsStatus(),
         native.getSafetyStatus(),
       ]);
-      if (!mounted) return;
-      _applyPermissionsAndSafetySnapshot(
-        res[0] as NativePermissionsStatus?,
-        res[1] as Map<String, dynamic>?,
-      );
+      final perms = res[0] as NativePermissionsStatus?;
+      final safety = res[1] as Map<String, dynamic>?;
+      final ok = perms != null && safety != null;
+      _lastPermissionsRefreshSucceeded = ok;
+      if (!mounted) return ok;
+      _applyPermissionsAndSafetySnapshot(perms, safety);
+      return ok;
     }();
     _inFlightPermissionsRefresh = fut;
     fut.whenComplete(() {
@@ -3394,16 +3433,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     int? connectGen,
     bool skipAutoConnect = false,
     bool forceFresh = false,
+    bool awaitPermissions = false,
   }) {
     if (!skipAutoConnect) {
       _pendingAutoConnectRequested = true;
     }
-    if (_inFlightNativeStatus != null && skipAutoConnect && !forceFresh) {
+    if (_inFlightNativeStatus != null && skipAutoConnect && !forceFresh && !awaitPermissions) {
       return _inFlightNativeStatus!;
     }
     final fut = _refreshNativeStatusImpl(
       connectGen: connectGen,
       skipAutoConnect: skipAutoConnect,
+      awaitPermissions: awaitPermissions,
     );
     _inFlightNativeStatus = fut;
     fut.whenComplete(() {
@@ -3414,7 +3455,11 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     return fut;
   }
 
-  Future<void> _refreshNativeStatusImpl({int? connectGen, bool skipAutoConnect = false}) async {
+  Future<void> _refreshNativeStatusImpl({
+    int? connectGen,
+    bool skipAutoConnect = false,
+    bool awaitPermissions = false,
+  }) async {
     final seq = ++_nativeStatusSeq;
     final native = GrassBagNativeBridge.instance;
     // Kick off permissions + safety in parallel off the critical local-engine connect path so
@@ -3425,16 +3470,27 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     ]);
     final rt = await native.getRuntimeStatus();
     if (!mounted || seq != _nativeStatusSeq) return;
-    // Apply permissions & safety asynchronously as soon as their IPCs settle (or immediately if already done).
-    unawaited(
-      permsAndSafetyFuture.then((extraRes) {
-        if (!mounted || seq != _nativeStatusSeq) return;
-        _applyPermissionsAndSafetySnapshot(
-          extraRes[0] as NativePermissionsStatus?,
-          extraRes[1] as Map<String, dynamic>?,
-        );
-      }),
-    );
+    if (awaitPermissions) {
+      final extraRes = await permsAndSafetyFuture;
+      final perms = extraRes[0] as NativePermissionsStatus?;
+      final safety = extraRes[1] as Map<String, dynamic>?;
+      _lastPermissionsRefreshSucceeded =
+          !native.isAndroidNative || (perms != null && safety != null);
+      if (!mounted || seq != _nativeStatusSeq) return;
+      _applyPermissionsAndSafetySnapshot(perms, safety);
+    } else {
+      // Apply permissions & safety asynchronously as soon as their IPCs settle (or immediately if already done).
+      unawaited(
+        permsAndSafetyFuture.then((extraRes) {
+          final perms = extraRes[0] as NativePermissionsStatus?;
+          final safety = extraRes[1] as Map<String, dynamic>?;
+          _lastPermissionsRefreshSucceeded =
+              !native.isAndroidNative || (perms != null && safety != null);
+          if (!mounted || seq != _nativeStatusSeq) return;
+          _applyPermissionsAndSafetySnapshot(perms, safety);
+        }),
+      );
+    }
     if (connectGen != null && connectGen != _hostConnectGen) return;
     final shouldAutoConnect = !skipAutoConnect || _pendingAutoConnectRequested;
     if (shouldAutoConnect) {
@@ -3994,6 +4050,17 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         rawDetail: trimmed,
       );
     }
+    if (combined.contains('attachmentid') ||
+        combined.contains('未入库的图像块') ||
+        combined.contains('异常内容块') ||
+        combined.contains('inline_provider_image_block')) {
+      return (
+        title: '工具返回了不兼容的图片块',
+        guidance: '会话历史或工具结果包含未按 DSH 规范入库的图片块（缺少 attachmentId）。重启本地引擎后会自动修复旧会话，或开启新对话继续。',
+        actionKind: 'retry',
+        rawDetail: trimmed,
+      );
+    }
     if (combined.contains('interrupted')) {
       return (
         title: '引擎意外中断',
@@ -4186,8 +4253,19 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     _saveCurrentHostContext();
   }
 
-  String _attachmentsScopeKey(String hostId, String? sessionId) =>
-      '$hostId::${(sessionId == null || sessionId.isEmpty) ? '__new__' : sessionId}';
+  String _attachmentsScopeKey(String hostId, String? sessionId, {String? originOverride}) {
+    final origin = (originOverride ?? _hostOriginKey(hostId)).trim().toLowerCase();
+    final scope = (sessionId == null || sessionId.isEmpty) ? '__new__' : sessionId;
+    return '$hostId::$origin::$scope';
+  }
+
+  void _purgeHostAttachmentCaches(String hostId, {String? onlyOrigin}) {
+    final prefix = (onlyOrigin != null && onlyOrigin.isNotEmpty)
+        ? '$hostId::${onlyOrigin.trim().toLowerCase()}::'
+        : '$hostId::';
+    _sessionAttachmentsMemory.removeWhere((k, _) => k.startsWith(prefix));
+    _sessionQueuedMemory.removeWhere((k, _) => k.startsWith(prefix));
+  }
 
   static const int _maxPendingAttachmentsCount = 10;
   static const int _maxSingleAttachmentBytes = 8 * 1024 * 1024;
@@ -11917,13 +11995,18 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     String hostId, {
     bool awaitConnect = false,
     bool savePreviousContext = true,
+    bool preserveActiveDrafts = true,
     bool announce = true,
   }) async {
     final target = state.hosts.where((h) => h.id == hostId).firstOrNull;
     if (target == null) return;
-    // Save outgoing host's session/workspace/filter context & attachments BEFORE wiping state.
-    if (state.activeHostId != hostId) {
-      _stashPendingAttachmentsForScope(state.activeHostId, state.activeSessionId);
+    final isSameHostReconnect = state.activeHostId == hostId;
+    final prevActiveSessionId = state.activeSessionId;
+    // Save outgoing host's session/workspace/filter context & attachments BEFORE wiping state,
+    // including same-host reconnects (e.g. token refresh / config tweak) when origin stayed intact!
+    if (preserveActiveDrafts && (!isSameHostReconnect || state.pendingAttachments.isNotEmpty || prevActiveSessionId != null)) {
+      _stashPendingAttachmentsForScope(state.activeHostId, prevActiveSessionId);
+      _stashQueuedMessagesForScope(state.activeHostId, prevActiveSessionId);
       if (savePreviousContext) {
         _saveCurrentHostContext(hostIdOverride: state.activeHostId);
       }
@@ -11965,6 +12048,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           ? state.hosts
           : [for (final h in state.hosts) h.id == hostId ? effectiveTarget : h],
       clearActiveSession: true,
+      clearParentSession: true,
       sidebarWorkspaceFilter: restoredFilter,
       clearSidebarWorkspaceFilter: restoredFilter == null,
       clearPendingApproval: true,
@@ -12002,6 +12086,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       sessions: const [],
       loadingSessions: true,
       hydratingDomains: true,
+      initialDomainsHydrated: false,
       workspaces: const [],
       turns: const [],
       turnFeedback: const {},
@@ -12011,7 +12096,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       expandedTurnProcessIds: const {},
       collapsedTurnProcessIds: const {},
       expandedStepIds: const {},
-      pendingAttachments: _restorePendingAttachmentsForScope(hostId, null),
+      pendingAttachments: _restorePendingAttachmentsForScope(
+        hostId,
+        (isSameHostReconnect && preserveActiveDrafts) ? prevActiveSessionId : null,
+      ),
       workspaceFiles: const [],
       workspaceCurrentPath: '',
       workspaceDiffs: const [],
@@ -12873,6 +12961,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       connectionPhase: ConnectionPhase.connecting,
       loadingSessions: true,
       hydratingDomains: true,
+      initialDomainsHydrated: false,
       hosts: [
         for (final h in state.hosts)
           h.id == hostId
@@ -13658,7 +13747,10 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       final keepHydratingUntilRetry = needsModelWarmupRetry && !skipAutoDefaultSync;
 
       // Commit Stage 1 immediately (models, permissions, namespaces, account ready!)
-      state = next.copyWith(hydratingDomains: keepHydratingUntilRetry);
+      state = next.copyWith(
+        hydratingDomains: keepHydratingUntilRetry,
+        initialDomainsHydrated: !keepHydratingUntilRetry,
+      );
 
       // Stage 2 (extensions, plugins, providers, automation, speech)
       final stage2InteractionSeq = _interactionMutationSeq;
@@ -14907,7 +14999,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           }
         }
       } else if (type == 'job.event') {
-        final status = (data['status'] ?? data['state'])?.toString();
+        final status = extractJobEventStatus(data);
         if (status != null && status.isNotEmpty) {
           state = state.copyWith(
             jobs: [
@@ -14916,7 +15008,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             ],
           );
         }
-        if (status == 'completed' || status == 'failed' || status == 'killed' || status == 'exited') {
+        if (isTerminalJobStatus(status)) {
           unawaited(refreshJobs(silent: true));
         }
       }
@@ -15287,9 +15379,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       extractedToken = parsed.token;
       nextAddr = parsed.address;
     }
+    final oldOrigin = _hostOriginKey(hostId);
     final originChanged = nextAddr.toLowerCase() != target.address.toLowerCase();
-    if (originChanged && _hostContexts.remove(hostId) != null) {
-      _persistHostContexts(immediate: true);
+    if (originChanged) {
+      if (_hostContexts.remove(hostId) != null) {
+        _persistHostContexts(immediate: true);
+      }
+      _purgeHostAttachmentCaches(hostId, onlyOrigin: oldOrigin);
+    } else if (state.activeHostId == hostId && state.pendingAttachments.isNotEmpty) {
+      _stashPendingAttachmentsForScope(hostId, state.activeSessionId);
+      _stashQueuedMessagesForScope(hostId, state.activeSessionId);
     }
     final hasExtractedToken = extractedToken != null && extractedToken.isNotEmpty;
     final shouldClearToken = originChanged && !hasExtractedToken;
@@ -15320,7 +15419,11 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
     showToast('已更新主机「${updated.name}」配置');
     if (state.activeHostId == hostId) {
-      await switchHost(hostId);
+      await switchHost(
+        hostId,
+        savePreviousContext: !originChanged,
+        preserveActiveDrafts: !originChanged,
+      );
     } else {
       unawaited(_probeHostOnly(updated));
     }
@@ -15354,9 +15457,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         nextAddr = parsedFromLine.address;
       }
     }
-    if (nextAddr.toLowerCase() != target.address.toLowerCase() &&
-        _hostContexts.remove(hostId) != null) {
-      _persistHostContexts(immediate: true);
+    final oldOrigin = _hostOriginKey(hostId);
+    final originChanged = nextAddr.toLowerCase() != target.address.toLowerCase();
+    if (originChanged) {
+      if (_hostContexts.remove(hostId) != null) {
+        _persistHostContexts(immediate: true);
+      }
+      _purgeHostAttachmentCaches(hostId, onlyOrigin: oldOrigin);
+    } else if (state.activeHostId == hostId && state.pendingAttachments.isNotEmpty) {
+      _stashPendingAttachmentsForScope(hostId, state.activeSessionId);
+      _stashQueuedMessagesForScope(hostId, state.activeSessionId);
     }
     final updated = target.copyWith(
       address: nextAddr,
@@ -15380,7 +15490,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (state.activeHostId == hostId) {
       _liveClient?.transport.setCookieHeader(null);
       showToast('已更新访问令牌，正在重新连接 ${updated.name}…', tone: ToastTone.info);
-      await switchHost(hostId, awaitConnect: awaitConnect);
+      await switchHost(
+        hostId,
+        awaitConnect: awaitConnect,
+        savePreviousContext: !originChanged,
+        preserveActiveDrafts: !originChanged,
+      );
     } else if (awaitConnect) {
       showToast('已更新 ${updated.name} 的访问令牌，正在验证…', tone: ToastTone.info);
       await _probeHostOnly(updated);
@@ -15784,9 +15899,104 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     showToast('SafetyGate 策略：$label');
   }
 
+  @visibleForTesting
+  static String? extractJobEventStatus(Map<String, dynamic> data) {
+    String? pick(Object? raw) {
+      if (raw is! String) return null;
+      final t = raw.trim();
+      return t.isEmpty ? null : t;
+    }
+
+    String? fromMap(Object? obj) {
+      if (obj is! Map) return null;
+      return pick(obj['status']) ??
+          pick(obj['state']) ??
+          fromMap(obj['job']) ??
+          fromMap(obj['info']) ??
+          fromMap(obj['data']);
+    }
+
+    return pick(data['status']) ??
+        pick(data['state']) ??
+        fromMap(data['job']) ??
+        fromMap(data['raw']) ??
+        fromMap(data['info']);
+  }
+
+  @visibleForTesting
+  static bool isTerminalJobStatus(String? status) {
+    final s = status?.trim().toLowerCase() ?? '';
+    return s == 'completed' ||
+        s == 'done' ||
+        s == 'finished' ||
+        s == 'success' ||
+        s == 'succeeded' ||
+        s == 'failed' ||
+        s == 'error' ||
+        s == 'killed' ||
+        s == 'exited' ||
+        s == 'stopped' ||
+        s == 'cancelled' ||
+        s == 'canceled' ||
+        s == 'aborted';
+  }
+
+  static List<String> _extractEmergencyStopSessionIds(Map<String, dynamic> data) {
+    final out = <String>{};
+    final list = data['sessionIds'];
+    if (list is List) {
+      for (final item in list) {
+        final s = item?.toString().trim() ?? '';
+        if (s.isNotEmpty) out.add(s);
+      }
+    }
+    final single = data['sessionId']?.toString().trim() ?? '';
+    if (single.isNotEmpty) out.add(single);
+    return out.toList(growable: false);
+  }
+
+  /// Cancels ONLY the exact local session(s) that were controlling the phone when emergency stop
+  /// fired, never cancelling an unrelated session or remote host the user switched to mid-run.
+  void _cancelSpecificLocalSessions(
+    List<String> targetSessionIds, {
+    required bool announce,
+    bool allowActiveLocalFallback = false,
+  }) {
+    final unique = <String>{
+      for (final s in targetSessionIds)
+        if (s.trim().isNotEmpty) s.trim(),
+    };
+    if (!state.activeHost.isLocal) {
+      // Native RuntimeController already cancels local DSH sessions directly over UDS;
+      // NEVER touch the currently selected remote host's active chat!
+      return;
+    }
+    final activeSid = state.activeSessionId;
+    if (unique.isEmpty) {
+      if (allowActiveLocalFallback && activeSid != null) {
+        cancelStreaming(announce: announce);
+      }
+      return;
+    }
+    if (activeSid != null && unique.contains(activeSid)) {
+      cancelStreaming(announce: announce);
+    }
+    final client = _liveClient;
+    if (client != null) {
+      for (final sid in unique) {
+        if (sid == activeSid || sid.startsWith('pending-session-')) continue;
+        unawaited(
+          client.cancelSession(sid).timeout(const Duration(seconds: 3)).catchError((_) => <String, dynamic>{}),
+        );
+      }
+    }
+  }
+
   Future<void> triggerEmergencyStop({bool cancelChatIfIdle = false}) async {
     final wasPhoneActive = state.phoneLiveActive;
-    await GrassBagNativeBridge.instance.triggerEmergencyStop();
+    final trackedPhoneSid = _activePhoneSessionId;
+    final nativeStoppedIds = await GrassBagNativeBridge.instance.triggerEmergencyStop();
+    _activePhoneSessionId = null;
     state = state.copyWith(
       emergencyStopped: true,
       phoneLiveActive: false,
@@ -15796,13 +16006,22 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       phoneLiveApp: '',
       phoneLiveSteps: 0,
     );
-    if (wasPhoneActive || cancelChatIfIdle) {
+    final combinedTargetIds = <String>[
+      ...nativeStoppedIds,
+      if (nativeStoppedIds.isEmpty && trackedPhoneSid != null && trackedPhoneSid.isNotEmpty)
+        trackedPhoneSid,
+    ];
+    if (combinedTargetIds.isNotEmpty) {
+      _cancelSpecificLocalSessions(combinedTargetIds, announce: false);
+    } else if (cancelChatIfIdle && state.activeHost.isLocal) {
+      cancelStreaming(announce: false);
+    } else if (wasPhoneActive && state.activeHost.isLocal && !GrassBagNativeBridge.instance.isAndroidNative) {
       cancelStreaming(announce: false);
     }
     await refreshNativeStatus();
     showToast(
-      wasPhoneActive
-          ? '已触发紧急急停，所有操控与生成已立即中止'
+      wasPhoneActive || combinedTargetIds.isNotEmpty
+          ? '已触发紧急急停，对应手机操控任务已立即中止'
           : '已开启手机操控急停锁定（所有屏幕自动化已拦截）',
       tone: ToastTone.warn,
     );
@@ -16028,11 +16247,26 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return;
     }
 
+    String? expectedSha256;
+    try {
+      expectedSha256 = await _appUpdateService.resolveExpectedApkSha256(
+        release,
+        customMirrorUrl: customMirror.isNotEmpty ? customMirror : null,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      state = state.copyWith(appUpdateError: '获取发布校验信息失败：$e');
+      showToast('无法校验安装包 SHA-256 摘要，已中止自动安装', tone: ToastTone.warn);
+      return;
+    }
+    if (!mounted) return;
+
     if (state.appUpdateDownloading || _startingAppUpdateDownload) return;
     _startingAppUpdateDownload = true;
     String? updatesDir;
     try {
-      // Reuse already-downloaded APK ONLY when it matches the exact target release versionKey!
+      // Reuse already-downloaded APK ONLY when it matches the exact target release versionKey
+      // AND passes native SHA-256 + packageName + signing certificate verification!
       if (forceRedownload && state.appUpdateLocalApkPath != null) {
         state = state.copyWith(clearAppUpdateLocalApkPath: true);
       }
@@ -16041,17 +16275,20 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           existingPath != null &&
           existingPath.isNotEmpty &&
           existingPath.endsWith('grassbag-$safeKey.apk')) {
-        final installRes = await GrassBagNativeBridge.instance.installApk(existingPath);
+        final installRes = await GrassBagNativeBridge.instance.installApk(
+          existingPath,
+          expectedSha256: expectedSha256,
+        );
         if (!mounted) return;
         if (installRes == 'started') {
-          showToast('已拉起系统安装器', tone: ToastTone.ok);
+          showToast('已通过完整性与签名校验，正在拉起系统安装器', tone: ToastTone.ok);
           return;
         }
         if (installRes == 'permission_required') {
           showToast('请先开启「允许安装未知来源应用」，返回后点击立即安装', tone: ToastTone.warn);
           return;
         }
-        // File may have been evicted from cache: fall through to fresh download.
+        // File evicted or failed integrity/signature check: clear cache and re-download cleanly.
         state = state.copyWith(clearAppUpdateLocalApkPath: true);
       }
       updatesDir = await GrassBagNativeBridge.instance.getUpdatesCacheDir();
@@ -16082,6 +16319,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         downloadUrl: downloadUrl,
         destinationPath: destPath,
         expectedSizeBytes: release.apkSizeBytes,
+        expectedSha256: expectedSha256,
         customMirrorUrl: customMirror.isNotEmpty ? customMirror : null,
         onSourceChanged: (sourceLabel) {
           if (!mounted) return;
@@ -16123,12 +16361,30 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         appUpdateLocalApkPath: stillMatchesLatest ? savedPath : null,
         clearAppUpdateLocalApkPath: !stillMatchesLatest,
       );
-      final installRes = await GrassBagNativeBridge.instance.installApk(savedPath);
+      final installRes = await GrassBagNativeBridge.instance.installApk(
+        savedPath,
+        expectedSha256: expectedSha256,
+      );
       if (!mounted) return;
       if (installRes == 'started') {
-        showToast('安装包已就绪，正在拉起系统安装器', tone: ToastTone.ok);
+        showToast('安装包已通过校验，正在拉起系统安装器', tone: ToastTone.ok);
       } else if (installRes == 'permission_required') {
         showToast('已跳转系统授权页：请允许 GrassBag 安装应用后返回继续安装', tone: ToastTone.warn);
+      } else if (installRes == 'error:sha256_mismatch' ||
+          installRes == 'error:package_name_mismatch' ||
+          installRes == 'error:signature_mismatch' ||
+          installRes == 'error:invalid_apk_archive') {
+        state = state.copyWith(
+          clearAppUpdateLocalApkPath: true,
+          appUpdateError: '安装包安全校验失败（$installRes），已拒绝安装并删除异常文件',
+        );
+        final msg = switch (installRes) {
+          'error:sha256_mismatch' => '安装包 SHA-256 校验失败，已删除异常文件',
+          'error:package_name_mismatch' => '安装包应用包名不匹配，已拒绝安装',
+          'error:signature_mismatch' => '安装包签名与当前正式版不一致，无法安全覆盖升级',
+          _ => '安装包结构损坏，已删除，请重新下载',
+        };
+        showToast(msg, tone: ToastTone.warn);
       } else {
         showToast('拉起安装器失败，已为你保留安装包，可尝试重新下载或前往 Release 页面安装', tone: ToastTone.warn);
       }

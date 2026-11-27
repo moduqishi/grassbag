@@ -24,7 +24,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: android-release-${{ github.ref }}
+  group: android-release
   cancel-in-progress: false
 
 env:
@@ -235,14 +235,22 @@ jobs:
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          if [[ -n "${ANDROID_KEYSTORE_BASE64}" ]]; then
-            echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
-            echo "require_release_signing=true" >> "$GITHUB_OUTPUT"
-            echo "已解码 Release 签名密钥：${ANDROID_KEYSTORE_PATH}"
-          else
-            echo "require_release_signing=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，将临时使用 Debug 签名构建 APK。"
+          missing=()
+          [[ -z "${ANDROID_KEYSTORE_BASE64}" ]] && missing+=("ANDROID_KEYSTORE_BASE64")
+          [[ -z "${ANDROID_STORE_PASSWORD}" ]] && missing+=("ANDROID_STORE_PASSWORD")
+          [[ -z "${ANDROID_KEY_ALIAS}" ]] && missing+=("ANDROID_KEY_ALIAS")
+          [[ -z "${ANDROID_KEY_PASSWORD}" ]] && missing+=("ANDROID_KEY_PASSWORD")
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::正式发版缺少 Android Release 签名密钥 Secrets：${missing[*]}。已终止发布，禁止回退 Debug 签名以免破坏已有正式版的覆盖升级兼容性。"
+            exit 1
           fi
+          echo "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
+          if [[ ! -s "${ANDROID_KEYSTORE_PATH}" ]]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 解码结果为空，无法签名正式版 APK。"
+            exit 1
+          fi
+          echo "require_release_signing=true" >> "$GITHUB_OUTPUT"
+          echo "已解码 Release 签名密钥：${ANDROID_KEYSTORE_PATH}"
 
       - name: Install Flutter dependencies & verify version wiring
         run: |

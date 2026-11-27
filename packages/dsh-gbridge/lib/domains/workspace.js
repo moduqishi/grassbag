@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { GbridgeError, readJsonBody, sendBinary, sendJson } from '../http-util.js';
+import { logSuppressed } from '../diagnostics.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -58,7 +59,9 @@ function safeRealpath(p) {
       try {
         const realAncestor = realpathSync(cur);
         return join(realAncestor, ...trailing);
-      } catch {}
+      } catch (_ancestorMissing) {
+        // Keep walking up until an existing ancestor directory is found.
+      }
     }
   }
 }
@@ -153,7 +156,9 @@ export async function ensureExplicitWorkspaceForPath(ctx, gateway, dirPath, { ti
         title: created.title,
         sessionIds: Array.isArray(created.sessionIds) ? [...created.sessionIds] : [],
       });
-    } catch {}
+    } catch (err) {
+      logSuppressed(ctx?.logger, 'workspace', err, { detail: `workspaceRegistry.create failed for ${canonical}` });
+    }
   }
 
   if (gateway?.has('workspace/create')) {
@@ -163,7 +168,9 @@ export async function ensureExplicitWorkspaceForPath(ctx, gateway, dirPath, { ti
         ...(title ? { title } : {}),
       }, { peer });
       return normalizeExplicitWorkspace(created?.workspace ?? created);
-    } catch {}
+    } catch (err) {
+      logSuppressed(ctx?.logger, 'workspace', err, { detail: `workspace/create RPC failed for ${canonical}` });
+    }
   }
   return null;
 }
@@ -324,7 +331,9 @@ async function fallbackGitDiff(dirPath, scope = 'uncommitted') {
         combinedDiffOut = [stagedPart, unstagedPart].filter(Boolean).join('\n');
       }
     }
-  } catch {}
+  } catch (_gitDiffErr) {
+    // Fallback to status-only file entries when git diff exits non-zero (e.g. unborn repo/timeout).
+  }
   const diffByFile = splitUnifiedGitDiffByFile(combinedDiffOut);
 
   const files = [];
@@ -379,7 +388,9 @@ async function fallbackGitDiff(dirPath, scope = 'uncommitted') {
             patch = `@@ -0,0 +1,${textLines.length} @@\n${preview.join('\n')}`;
           }
         }
-      } catch {}
+      } catch (_untrackedReadErr) {
+        // Untracked file removed or unreadable mid-diff; emit status metadata without inline patch.
+      }
     } else {
       const diffOut = diffByFile.get(filePath) ?? (previousPath ? diffByFile.get(previousPath) : '') ?? '';
       if (/Binary files .* differ/.test(diffOut)) {
@@ -435,7 +446,9 @@ function resolveDefaultTimeZone(body) {
   try {
     const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone;
     if (resolved && resolved.includes('/')) return resolved;
-  } catch {}
+  } catch (_intlErr) {
+    // Minimal ICU build without host TZ database; fall back to UTC.
+  }
   return 'UTC';
 }
 
@@ -483,7 +496,7 @@ function resolveScheduleTarget(body) {
   return { kind: 'new_once' };
 }
 
-export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid = false }) {
+export function registerWorkspaceDomain(router, { ctx, gateway, phoneState = null, isLocalAndroid = false }) {
   const MAX_TRACKED_ENTRIES = 512;
   const terminalSessionMap = new Map();
   const jobSessionMap = new Map();
@@ -595,7 +608,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
       try {
         await gateway.call('workspace/rename', { workspaceId: norm.workspaceId, title: reqTitle }, { peer });
         norm = { ...norm, title: reqTitle, name: reqTitle };
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'workspace', err, { detail: `workspace/rename failed for ${norm.workspaceId}` });
+      }
     }
 
     // Optionally attach matching ungrouped sessions so they immediately appear grouped in Official WebUI!
@@ -615,7 +630,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
             try {
               await entity.attachSession(String(sid));
               attachedCount += 1;
-            } catch {}
+            } catch (err) {
+              logSuppressed(ctx?.logger, 'workspace', err, { level: 'debug', detail: `attachSession(${sid}) failed` });
+            }
           }
         }
       }
@@ -652,7 +669,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
           try {
             await entity.attachSession(sid);
             attachedCount += 1;
-          } catch {}
+          } catch (err) {
+            logSuppressed(ctx?.logger, 'workspace', err, { level: 'debug', detail: `organize attachSession(${sid}) failed` });
+          }
         }
       }
     }
@@ -793,7 +812,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
         }, { peer });
         sendJson(res, 201, { v: 1, path: fullTarget, result });
         return;
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'workspace', err, { detail: `directoryPicker/createDirectory failed for ${fullTarget}, falling back to mkdirSync` });
+      }
     }
     mkdirSync(fullTarget, { recursive: true });
     sendJson(res, 201, { v: 1, path: fullTarget, created: true });
@@ -977,7 +998,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
           sendJson(res, 200, { v: 1, changes: { ...diff, source: 'forge-local-diff', files } });
           return;
         }
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'workspace', err, { level: 'debug', detail: `forgePanel/localDiff failed for ${sid}, falling back to git CLI` });
+      }
     }
 
     if (dirPath && existsSync(dirPath)) {
@@ -1067,7 +1090,9 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
         const shells = await gateway.call('terminal/shells', { agentId }, { peer });
         sendJson(res, 200, { v: 1, shells });
         return;
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'workspace', err, { level: 'debug', detail: 'terminal/shells RPC failed, falling back to local shell probe' });
+      }
     }
     const candidates = [process.env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'].filter(Boolean);
     const unique = [...new Set(candidates)].filter((p) => existsSync(p));
@@ -1240,6 +1265,7 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
         jobId: params.id,
       },
     }, { peer });
+    phoneState?.notifyJobState?.(params.id, 'killed', 'job_killed');
     sendJson(res, 200, { v: 1, result });
   }, { domain: 'jobs' });
 

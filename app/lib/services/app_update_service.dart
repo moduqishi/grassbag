@@ -162,6 +162,8 @@ class AppReleaseInfo {
     this.apkName,
     this.apkDownloadUrl,
     this.apkSizeBytes,
+    this.checksumsDownloadUrl,
+    this.apkSha256,
   });
 
   final String tagName;
@@ -175,6 +177,8 @@ class AppReleaseInfo {
   final String? apkName;
   final String? apkDownloadUrl;
   final int? apkSizeBytes;
+  final String? checksumsDownloadUrl;
+  final String? apkSha256;
 
   String get versionKey =>
       (buildNumber != null && buildNumber! > 0) ? '$versionName+$buildNumber' : versionName;
@@ -219,6 +223,7 @@ class AppReleaseInfo {
     String? apkName;
     String? apkDownloadUrl;
     int? apkSizeBytes;
+    String? checksumsDownloadUrl;
 
     final assets = json['assets'];
     if (assets is List) {
@@ -229,6 +234,13 @@ class AppReleaseInfo {
         final map = Map<String, dynamic>.from(item);
         final name = map['name']?.toString() ?? '';
         final lower = name.toLowerCase();
+        if (lower == 'sha256sums.txt' || lower == 'sha256sums') {
+          final rawSumUrl = map['browser_download_url']?.toString().trim() ?? '';
+          if (rawSumUrl.isNotEmpty) {
+            checksumsDownloadUrl = rawSumUrl;
+          }
+          continue;
+        }
         if (!lower.endsWith('.apk')) continue;
         fallback ??= map;
         if (lower.contains('arm64') || lower.contains('grassbag')) {
@@ -244,7 +256,23 @@ class AppReleaseInfo {
         apkDownloadUrl = rawApkUrl.isNotEmpty ? rawApkUrl : null;
         apkSizeBytes = (chosen['size'] as num?)?.toInt();
       }
+      // Continue scanning assets in case SHA256SUMS.txt appeared after the preferred arm64 APK.
+      if (checksumsDownloadUrl == null) {
+        for (final item in assets) {
+          if (item is! Map) continue;
+          final name = item['name']?.toString().trim().toLowerCase() ?? '';
+          if (name == 'sha256sums.txt' || name == 'sha256sums') {
+            final rawSumUrl = item['browser_download_url']?.toString().trim() ?? '';
+            if (rawSumUrl.isNotEmpty) {
+              checksumsDownloadUrl = rawSumUrl;
+              break;
+            }
+          }
+        }
+      }
     }
+
+    final apkSha256 = extractApkSha256FromReleaseBody(body, apkName: apkName);
 
     var buildNumber = parsedTag?.buildNumber;
     if (buildNumber == null && apkName != null) {
@@ -268,6 +296,8 @@ class AppReleaseInfo {
       apkName: apkName,
       apkDownloadUrl: apkDownloadUrl,
       apkSizeBytes: apkSizeBytes,
+      checksumsDownloadUrl: checksumsDownloadUrl,
+      apkSha256: apkSha256,
     );
   }
 
@@ -280,12 +310,69 @@ class AppReleaseInfo {
         other.buildNumber == buildNumber &&
         other.apkDownloadUrl == apkDownloadUrl &&
         other.apkSizeBytes == apkSizeBytes &&
+        other.checksumsDownloadUrl == checksumsDownloadUrl &&
+        other.apkSha256 == apkSha256 &&
         other.body == body;
   }
 
   @override
-  int get hashCode =>
-      Object.hash(tagName, versionName, buildNumber, apkDownloadUrl, apkSizeBytes, body);
+  int get hashCode => Object.hash(
+        tagName,
+        versionName,
+        buildNumber,
+        apkDownloadUrl,
+        apkSizeBytes,
+        checksumsDownloadUrl,
+        apkSha256,
+        body,
+      );
+}
+
+final RegExp _kSha256HexRegex = RegExp(r'^[0-9a-fA-F]{64}$');
+
+/// Parses a standard `sha256sum` manifest (`<64-hex>  <filename>`) for [assetName].
+String? parseSha256SumsForAsset(String content, String? assetName) {
+  final target = assetName?.trim() ?? '';
+  String? singleApkFallback;
+  var apkEntryCount = 0;
+  for (final rawLine in content.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (line.isEmpty || line.startsWith('#')) continue;
+    final match = RegExp(r'^([0-9a-fA-F]{64})\s+\*?(.+)$').firstMatch(line);
+    if (match == null) continue;
+    final digest = match.group(1)!.toLowerCase();
+    final rawFile = match.group(2)!.trim();
+    final baseName = rawFile.split(RegExp(r'[/\\]')).last;
+    if (target.isNotEmpty && (rawFile == target || baseName == target)) {
+      return digest;
+    }
+    if (baseName.toLowerCase().endsWith('.apk')) {
+      apkEntryCount++;
+      singleApkFallback = digest;
+    }
+  }
+  if (target.isEmpty && apkEntryCount == 1) {
+    return singleApkFallback;
+  }
+  return null;
+}
+
+/// Extracts an optional 64-hex APK SHA-256 embedded in release notes as a secondary cross-check.
+String? extractApkSha256FromReleaseBody(String body, {String? apkName}) {
+  if (body.isEmpty) return null;
+  final fromSums = parseSha256SumsForAsset(body, apkName);
+  if (fromSums != null) return fromSums;
+  final target = apkName?.trim() ?? '';
+  for (final rawLine in body.split(RegExp(r'\r?\n'))) {
+    final lower = rawLine.toLowerCase();
+    final mentionsApk = (target.isNotEmpty && rawLine.contains(target)) ||
+        lower.contains('.apk') ||
+        lower.contains('apk sha');
+    if (!mentionsApk) continue;
+    final m = RegExp(r'\b([0-9a-fA-F]{64})\b').firstMatch(rawLine);
+    if (m != null) return m.group(1)!.toLowerCase();
+  }
+  return null;
 }
 
 bool isRemoteReleaseNewer({
@@ -437,12 +524,45 @@ typedef AppUpdateFetcher = Future<AppUpdateHttpResponse> Function(
   Duration timeout,
 });
 
+/// Builds candidate URIs for fetching trusted release checksums (`SHA256SUMS.txt`):
+/// ALWAYS prioritizes direct official GitHub first before falling back to mirrors so
+/// an untrusted mirror cannot spoof both the APK and its checksum manifest simultaneously.
+List<Uri> buildAppUpdateTrustedChecksumCandidateUris(
+  String rawChecksumUrl, {
+  String? customMirrorUrl,
+}) {
+  final cleanTarget = rawChecksumUrl.trim();
+  final seen = <String>{};
+  final out = <Uri>[];
+  void addUrl(String u) {
+    final trimmed = u.trim();
+    if (trimmed.isEmpty || !seen.add(trimmed)) return;
+    final parsed = Uri.tryParse(trimmed);
+    if (parsed != null && parsed.hasScheme && parsed.host.isNotEmpty) {
+      out.add(parsed);
+    }
+  }
+
+  addUrl(cleanTarget);
+  if (_isGitHubUrl(cleanTarget)) {
+    final custom = customMirrorUrl?.trim() ?? '';
+    if (custom.isNotEmpty && _looksLikeGitHubProxyPrefix(custom)) {
+      addUrl(_prefixWithMirror(custom, cleanTarget));
+    }
+    for (final prefix in kAppUpdateDownloadMirrorPrefixes) {
+      addUrl(_prefixWithMirror(prefix, cleanTarget));
+    }
+  }
+  return out;
+}
+
 typedef AppUpdateApkDownloader = Future<String> Function(
   Uri uri,
   String destinationPath, {
   void Function(int receivedBytes, int totalBytes)? onProgress,
   bool Function()? isCancelled,
   int? expectedSizeBytes,
+  String? expectedSha256,
   void Function(void Function() abort)? onAbortReady,
 });
 
@@ -623,12 +743,62 @@ class AppUpdateService {
     );
   }
 
+  /// Fetches and verifies the trusted SHA-256 digest for [release]'s APK from `SHA256SUMS.txt`
+  /// (prioritizing direct GitHub first) and cross-checks against any digest embedded in release notes.
+  Future<String?> resolveExpectedApkSha256(
+    AppReleaseInfo release, {
+    Duration timeout = const Duration(seconds: 12),
+    String? customMirrorUrl,
+  }) async {
+    final bodyDigest = release.apkSha256?.trim().toLowerCase();
+    final validBodyDigest =
+        (bodyDigest != null && _kSha256HexRegex.hasMatch(bodyDigest)) ? bodyDigest : null;
+    final sumsUrl = release.checksumsDownloadUrl?.trim() ?? '';
+    if (sumsUrl.isEmpty) {
+      return validBodyDigest;
+    }
+
+    final candidates = buildAppUpdateTrustedChecksumCandidateUris(
+      sumsUrl,
+      customMirrorUrl: customMirrorUrl,
+    );
+    Object? lastError;
+    for (final candidate in candidates) {
+      try {
+        final resp = await _fetcher(candidate, timeout: timeout);
+        if (resp.statusCode != 200) {
+          lastError = StateError('SHA256SUMS HTTP ${resp.statusCode}');
+          continue;
+        }
+        final parsed = parseSha256SumsForAsset(resp.body, release.apkName);
+        if (parsed == null) {
+          lastError = const FormatException('SHA256SUMS.txt 中未找到对应 APK 的 SHA-256 校验值');
+          continue;
+        }
+        if (validBodyDigest != null && validBodyDigest != parsed) {
+          throw const FormatException('发布校验清单与版本说明中的 APK SHA-256 不一致，已中止更新');
+        }
+        return parsed;
+      } catch (e) {
+        if (e is FormatException && e.message.contains('不一致')) {
+          rethrow;
+        }
+        lastError = e;
+      }
+    }
+    if (validBodyDigest != null) {
+      return validBodyDigest;
+    }
+    throw Exception('无法获取可信 APK SHA-256 校验清单：${_friendlyNetworkError(lastError ?? '网络异常')}');
+  }
+
   Future<String> downloadApk({
     required String downloadUrl,
     required String destinationPath,
     void Function(int receivedBytes, int totalBytes)? onProgress,
     bool Function()? isCancelled,
     int? expectedSizeBytes,
+    String? expectedSha256,
     void Function(void Function() abort)? onAbortReady,
     String? customMirrorUrl,
     void Function(String sourceLabel)? onSourceChanged,
@@ -654,6 +824,7 @@ class AppUpdateService {
           onProgress: onProgress,
           isCancelled: isCancelled,
           expectedSizeBytes: expectedSizeBytes,
+          expectedSha256: expectedSha256,
           onAbortReady: onAbortReady,
         );
       } on AppUpdateDownloadCancelledException {

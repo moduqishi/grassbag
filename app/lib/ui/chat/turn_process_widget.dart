@@ -746,8 +746,9 @@ class TurnView extends ConsumerWidget {
         ),
         if (showCancelledRow) ...[
           const SizedBox(height: 12),
-          Consumer(
-            builder: (_, ref, __) {
+          SelectionContainer.disabled(
+            child: Consumer(
+              builder: (_, ref, __) {
               final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
               return Wrap(
                 spacing: 8,
@@ -858,6 +859,7 @@ class TurnView extends ConsumerWidget {
                 ],
               );
             },
+          ),
           ),
         ],
         if (turn.assistantText.isNotEmpty ||
@@ -1360,7 +1362,7 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  SelectionArea(
+                  GrassBagSelectableScope(
                     onSelectionChanged: (content) {
                       _selectedPlainText = content?.plainText ?? '';
                     },
@@ -1372,7 +1374,8 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                         : buildGrassBagSelectableContextMenu,
                     child: bubble,
                   ),
-                  Padding(
+                  SelectionContainer.disabled(
+                    child: Padding(
                     padding: const EdgeInsets.only(top: 4, right: 4),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -1505,6 +1508,7 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                         ),
                       ],
                     ),
+                  ),
                   ),
                 ],
               ),
@@ -3165,23 +3169,19 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
               padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
               child: ConstrainedBox(
                 constraints: BoxConstraints(maxHeight: maxH),
-                child: SingleChildScrollView(
-                  physics: const BouncingScrollPhysics(),
-                  child: SelectionArea(
-                    contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                    child: _ThinkingRichProse(
-                      text: text,
-                      fontSize: 13.5,
-                      lineHeight: 1.7,
-                      bodyColor: st.text2,
-                      headingColor: st.text,
-                      mutedColor: st.text3,
-                      codeBg: st.isDark
-                          ? Colors.white.withValues(alpha: 0.08)
-                          : st.primary.withValues(alpha: 0.08),
-                      codeFg: st.isDark ? st.primaryHi : st.primary,
-                      accentColor: st.primary,
-                    ),
+                child: _AutoScrollSelectableTextSheetBody(
+                  child: _ThinkingRichProse(
+                    text: text,
+                    fontSize: 13.5,
+                    lineHeight: 1.7,
+                    bodyColor: st.text2,
+                    headingColor: st.text,
+                    mutedColor: st.text3,
+                    codeBg: st.isDark
+                        ? Colors.white.withValues(alpha: 0.08)
+                        : st.primary.withValues(alpha: 0.08),
+                    codeFg: st.isDark ? st.primaryHi : st.primary,
+                    accentColor: st.primary,
                   ),
                 ),
               ),
@@ -3566,7 +3566,8 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   // Editorial header bar
-                  Padding(
+                  SelectionContainer.disabled(
+                    child: Padding(
                     padding: const EdgeInsets.fromLTRB(13, 10, 10, 8),
                     child: Row(
                       children: [
@@ -3657,6 +3658,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                       ],
                     ),
                   ),
+                  ),
                   Divider(
                     height: 0.6,
                     thickness: 0.6,
@@ -3692,7 +3694,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                             ),
                           ),
                           Expanded(
-                            child: SelectionArea(
+                            child: GrassBagSelectableScope(
                               contextMenuBuilder: buildGrassBagSelectableContextMenu,
                               key: ValueKey('think-body-${step.id}-$translated'),
                               child: _ThinkingRichProse(
@@ -3715,44 +3717,46 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                     ),
                   ),
                   if (clipped.clipped) ...[
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(13, 0, 13, 11),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: GrassBagSpringTap(
-                              pressedScale: 0.97,
-                              haptic: true,
-                              onTap: () => setState(() => _inlineFullExpanded = true),
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 11),
-                                decoration: BoxDecoration(
-                                  color: t.primary.withValues(alpha: t.isDark ? 0.14 : 0.08),
-                                  borderRadius: BorderRadius.circular(11),
-                                  border: Border.all(
-                                    color: t.primary.withValues(alpha: t.isDark ? 0.26 : 0.18),
-                                    width: 0.6,
-                                  ),
-                                ),
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.primary),
-                                    const SizedBox(width: 5),
-                                    Text(
-                                      '展开剩余思考（共 $charCount 字）',
-                                      style: TextStyle(
-                                        fontSize: 11.5,
-                                        fontWeight: FontWeight.w600,
-                                        color: t.primary,
-                                      ),
+                    SelectionContainer.disabled(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(13, 0, 13, 11),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: GrassBagSpringTap(
+                                pressedScale: 0.97,
+                                haptic: true,
+                                onTap: () => setState(() => _inlineFullExpanded = true),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 11),
+                                  decoration: BoxDecoration(
+                                    color: t.primary.withValues(alpha: t.isDark ? 0.14 : 0.08),
+                                    borderRadius: BorderRadius.circular(11),
+                                    border: Border.all(
+                                      color: t.primary.withValues(alpha: t.isDark ? 0.26 : 0.18),
+                                      width: 0.6,
                                     ),
-                                  ],
+                                  ),
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.primary),
+                                      const SizedBox(width: 5),
+                                      Text(
+                                        '展开剩余思考（共 $charCount 字）',
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: t.primary,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ],
@@ -4276,17 +4280,18 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        GrassBagSpringTap(
-          pressedScale: 0.985,
-          haptic: true,
-          onTap: () {
-            widget.onToggleExpand();
-            if (!expanded) {
-              _ensureLoaded();
-            }
-          },
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
+        SelectionContainer.disabled(
+          child: GrassBagSpringTap(
+            pressedScale: 0.985,
+            haptic: true,
+            onTap: () {
+              widget.onToggleExpand();
+              if (!expanded) {
+                _ensureLoaded();
+              }
+            },
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -4469,6 +4474,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
             ),
           ),
         ),
+        ),
         // Inline expandable tool parameters + real execution output panel (formatted lazily ONLY when expanded!)
         _SmoothDisclosure(
           expanded: expanded,
@@ -4553,7 +4559,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                     )
                   else ...[
                     if (cmdText.isNotEmpty) ...[
-                      SelectionArea(
+                      GrassBagSelectableScope(
                         contextMenuBuilder: buildGrassBagSelectableContextMenu,
                         child: Text(
                           '\$ $cmdText',
@@ -4568,39 +4574,41 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       ),
                       const SizedBox(height: 7),
                     ] else if (synthDiff != null) ...[
-                      Row(
-                        children: [
-                          Text(
-                            '改动预览',
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                              color: mutedInk,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          if (synthDiff.added > 0)
+                      SelectionContainer.disabled(
+                        child: Row(
+                          children: [
                             Text(
-                              '+${synthDiff.added}',
+                              '改动预览',
                               style: TextStyle(
-                                fontFamily: 'monospace',
                                 fontSize: 10.5,
                                 fontWeight: FontWeight.w600,
-                                color: okInk,
+                                color: mutedInk,
                               ),
                             ),
-                          if (synthDiff.added > 0 && synthDiff.removed > 0) const SizedBox(width: 5),
-                          if (synthDiff.removed > 0)
-                            Text(
-                              '-${synthDiff.removed}',
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 10.5,
-                                fontWeight: FontWeight.w600,
-                                color: errInk,
+                            const SizedBox(width: 8),
+                            if (synthDiff.added > 0)
+                              Text(
+                                '+${synthDiff.added}',
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: okInk,
+                                ),
                               ),
-                            ),
-                        ],
+                            if (synthDiff.added > 0 && synthDiff.removed > 0) const SizedBox(width: 5),
+                            if (synthDiff.removed > 0)
+                              Text(
+                                '-${synthDiff.removed}',
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: errInk,
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
                       const SizedBox(height: 4),
                       () {
@@ -4613,7 +4621,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                             ? _highlightDiffSpan('${diffClip.text}\n…', isDark: t.isDark)
                             : (synthDiffSpan ??
                                 _highlightDiffSpan(synthDiff.unified, isDark: t.isDark));
-                        return SelectionArea(
+                        return GrassBagSelectableScope(
                           contextMenuBuilder: buildGrassBagSelectableContextMenu,
                           child: SingleChildScrollView(
                             scrollDirection: Axis.horizontal,
@@ -4624,18 +4632,20 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       }(),
                       const SizedBox(height: 8),
                     ] else if (argsText.isNotEmpty) ...[
-                      Text(
-                        '调用参数 (${step.name})',
-                        style: TextStyle(
-                          fontSize: 10.5,
-                          fontWeight: FontWeight.w600,
-                          color: mutedInk,
+                      SelectionContainer.disabled(
+                        child: Text(
+                          '调用参数 (${step.name})',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w600,
+                            color: mutedInk,
+                          ),
                         ),
                       ),
                       const SizedBox(height: 4),
                       () {
                         final argsClip = _clipInlinePreview(argsText, maxLines: 8, maxChars: 720);
-                        return SelectionArea(
+                        return GrassBagSelectableScope(
                           contextMenuBuilder: buildGrassBagSelectableContextMenu,
                           child: Text(
                             argsClip.clipped ? '${argsClip.text}\n…' : argsClip.text,
@@ -4650,16 +4660,18 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       }(),
                       const SizedBox(height: 8),
                     ],
-                    Text(
-                      isErr ? '错误输出' : '执行结果',
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.w600,
-                        color: isErr ? errInk : mutedInk,
+                    SelectionContainer.disabled(
+                      child: Text(
+                        isErr ? '错误输出' : '执行结果',
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600,
+                          color: isErr ? errInk : mutedInk,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 4),
-                    SelectionArea(
+                    GrassBagSelectableScope(
                       contextMenuBuilder: buildGrassBagSelectableContextMenu,
                       child: () {
                         final memoOut = _resolveMemoizedOutput(
@@ -5020,57 +5032,59 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              Icon(CupertinoIcons.exclamationmark_triangle_fill, size: 16, color: t.err),
-              const SizedBox(width: 7),
-              Expanded(
-                child: Text(
-                  classified.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                    color: t.err,
-                  ),
-                ),
-              ),
-              if (hasInspectableDetail)
-                GrassBagSpringTap(
-                  onTap: () => setState(() => _showTechDetail = !_showTechDetail),
-                  pressedScale: 0.94,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _showTechDetail ? '收起详情' : '技术详情',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                            color: t.err.withValues(alpha: 0.85),
-                          ),
-                        ),
-                        const SizedBox(width: 3),
-                        AnimatedRotation(
-                          turns: _showTechDetail ? 0.5 : 0.0,
-                          duration: const Duration(milliseconds: 180),
-                          child: Icon(
-                            CupertinoIcons.chevron_down,
-                            size: 11,
-                            color: t.err.withValues(alpha: 0.85),
-                          ),
-                        ),
-                      ],
+          SelectionContainer.disabled(
+            child: Row(
+              children: [
+                Icon(CupertinoIcons.exclamationmark_triangle_fill, size: 16, color: t.err),
+                const SizedBox(width: 7),
+                Expanded(
+                  child: Text(
+                    classified.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: t.err,
                     ),
                   ),
                 ),
-            ],
+                if (hasInspectableDetail)
+                  GrassBagSpringTap(
+                    onTap: () => setState(() => _showTechDetail = !_showTechDetail),
+                    pressedScale: 0.94,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _showTechDetail ? '收起详情' : '技术详情',
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: t.err.withValues(alpha: 0.85),
+                            ),
+                          ),
+                          const SizedBox(width: 3),
+                          AnimatedRotation(
+                            turns: _showTechDetail ? 0.5 : 0.0,
+                            duration: const Duration(milliseconds: 180),
+                            child: Icon(
+                              CupertinoIcons.chevron_down,
+                              size: 11,
+                              color: t.err.withValues(alpha: 0.85),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
           ),
           const SizedBox(height: 6),
-          SelectionArea(
+          GrassBagSelectableScope(
             contextMenuBuilder: buildGrassBagSelectableContextMenu,
             child: Text(
               primaryBody,
@@ -5119,10 +5133,10 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                     width: 0.6,
                   ),
                 ),
-                child: SingleChildScrollView(
-                  physics: const BouncingScrollPhysics(),
-                  child: SelectionArea(
-                    contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                child: GrassBagSelectableScope(
+                  contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                  child: SingleChildScrollView(
+                    physics: const BouncingScrollPhysics(),
                     child: Text(
                       copyPayload,
                       style: TextStyle(
@@ -5138,8 +5152,9 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
             ),
           ),
           const SizedBox(height: 12),
-          Consumer(
-            builder: (_, ref, __) {
+          SelectionContainer.disabled(
+            child: Consumer(
+              builder: (_, ref, __) {
               final errSlice = ref.watch(
                 appProvider.select(
                   (s) => (
@@ -5264,6 +5279,7 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                 ],
               );
             },
+          ),
           ),
         ],
       ),
@@ -7919,7 +7935,7 @@ class _AssistantBodyState extends State<_AssistantBody>
         // Keep mounted whenever typing with non-empty source text so Frame 0 never collapses
         // if the first character is temporarily stripped syntax (e.g. leading `**`).
         if (_settledLen > 0 || displayTail.isNotEmpty || (isTyping && widget.text.isNotEmpty))
-          SelectionArea(
+          GrassBagSelectableScope(
             onSelectionChanged: (content) {
               _selectedPlainText = content?.plainText ?? '';
             },
@@ -7937,95 +7953,99 @@ class _AssistantBodyState extends State<_AssistantBody>
             widget.text.isEmpty &&
             widget.deliverables.isEmpty &&
             widget.completedToolCount > 0)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 4),
-            child: Row(
-              children: [
-                Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: t.ok),
-                const SizedBox(width: 6),
-                Text(
-                  '已完成 ${widget.completedToolCount} 项操作',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.text2),
-                ),
-              ],
+          SelectionContainer.disabled(
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: Row(
+                children: [
+                  Icon(CupertinoIcons.checkmark_circle_fill, size: 14, color: t.ok),
+                  const SizedBox(width: 6),
+                  Text(
+                    '已完成 ${widget.completedToolCount} 项操作',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: t.text2),
+                  ),
+                ],
+              ),
             ),
           ),
         for (final item in widget.deliverables) ...[
           const SizedBox(height: 14),
-          GrassBagSpringTap(
-            pressedScale: 0.975,
-            enablePointerGlow: false,
-            haptic: true,
-            onTap: () => widget.onDeliverableTap(item),
-            child: GrassBagCard(
-              borderRadius: 22,
-              interactive: true,
-              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
-              child: Row(
-                children: [
-                  GrassBagSquircleIcon(
-                    icon: CupertinoIcons.doc_text_fill,
-                    color: t.ok,
-                    size: 38,
-                    iconSize: 18,
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          (item['name'] ?? '产物').toString(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: -0.2,
-                            color: t.text,
-                          ),
-                        ),
-                        const SizedBox(height: 1.5),
-                        Text(
-                          () {
-                            final note = (item['note'] ?? '生成产物').toString().trim();
-                            final size = (item['size'] ?? '').toString().trim();
-                            return size.isEmpty ? note : '$note · $size';
-                          }(),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                            color: t.text3,
-                          ),
-                        ),
-                      ],
+          SelectionContainer.disabled(
+            child: GrassBagSpringTap(
+              pressedScale: 0.975,
+              enablePointerGlow: false,
+              haptic: true,
+              onTap: () => widget.onDeliverableTap(item),
+              child: GrassBagCard(
+                borderRadius: 22,
+                interactive: true,
+                padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+                child: Row(
+                  children: [
+                    GrassBagSquircleIcon(
+                      icon: CupertinoIcons.doc_text_fill,
+                      color: t.ok,
+                      size: 38,
+                      iconSize: 18,
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  GrassBagFresnelGlassSurface(
-                    isPill: true,
-                    innerWell: true,
-                    tintColor: t.primarySoft,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          '预览',
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: t.primary,
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            (item['name'] ?? '产物').toString(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: -0.2,
+                              color: t.text,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 2),
-                        Icon(CupertinoIcons.chevron_right, size: 11.5, color: t.primary),
-                      ],
+                          const SizedBox(height: 1.5),
+                          Text(
+                            () {
+                              final note = (item['note'] ?? '生成产物').toString().trim();
+                              final size = (item['size'] ?? '').toString().trim();
+                              return size.isEmpty ? note : '$note · $size';
+                            }(),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.text3,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 8),
+                    GrassBagFresnelGlassSurface(
+                      isPill: true,
+                      innerWell: true,
+                      tintColor: t.primarySoft,
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '预览',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: t.primary,
+                            ),
+                          ),
+                          const SizedBox(width: 2),
+                          Icon(CupertinoIcons.chevron_right, size: 11.5, color: t.primary),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -8095,9 +8115,10 @@ class _AssistantBodyState extends State<_AssistantBody>
         // Quiet minimalist bottom chrome (modified files + one-tap action pills) smoothly revealed
         // with SizeTransition + FadeTransition so completion NEVER causes a 1-frame layout pop!
         if (widget.showFooter && !isTyping)
-          _ReplyActionStripReveal(
-            animate: _animateActionStripEntrance,
-            child: Column(
+          SelectionContainer.disabled(
+            child: _ReplyActionStripReveal(
+              animate: _animateActionStripEntrance,
+              child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -8346,7 +8367,45 @@ class _AssistantBodyState extends State<_AssistantBody>
               ],
             ),
           ),
+          ),
       ],
+    );
+  }
+}
+
+class _AutoScrollSelectableTextSheetBody extends StatefulWidget {
+  const _AutoScrollSelectableTextSheetBody({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_AutoScrollSelectableTextSheetBody> createState() =>
+      _AutoScrollSelectableTextSheetBodyState();
+}
+
+class _AutoScrollSelectableTextSheetBodyState
+    extends State<_AutoScrollSelectableTextSheetBody> {
+  final ScrollController _ctrl = ScrollController();
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SelectionArea(
+      contextMenuBuilder: buildGrassBagSelectableContextMenu,
+      child: GrassBagSelectionAutoScrollScope(
+        scrollController: _ctrl,
+        hotZoneExtent: 40.0,
+        child: SingleChildScrollView(
+          controller: _ctrl,
+          physics: const BouncingScrollPhysics(),
+          child: widget.child,
+        ),
+      ),
     );
   }
 }

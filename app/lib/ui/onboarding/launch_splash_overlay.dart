@@ -637,12 +637,25 @@ class GrassBagAppGate extends ConsumerStatefulWidget {
     }
     if (s.hydratingDomains || s.loadingSessions) return false;
     if (s.connectionPhase == ConnectionPhase.connected) {
-      // Wait until initial domain/model/auth hydration lands (prevents login/model card flash!)
-      if (s.dshNamespaces.isEmpty && s.modelGroups.isEmpty && !s.isAccountSignedIn) {
+      // Wait until initial domain/model/auth hydration finishes at least once; once hydration
+      // settles, genuinely empty models/account/namespaces are treated as a valid ready state!
+      final hydratedOnce = s.initialDomainsHydrated ||
+          s.dshNamespaces.isNotEmpty ||
+          s.modelGroups.isNotEmpty ||
+          s.isAccountSignedIn;
+      if (!hydratedOnce) {
         return false;
       }
     }
     return true;
+  }
+
+  /// Computes remaining hold time against a monotonic splash elapsed clock so switching
+  /// between fast (3.6s) and local-boot (20s) wait tiers NEVER resets the timer from zero.
+  @visibleForTesting
+  static Duration computeRemainingHoldDuration(Duration budget, Duration elapsed) {
+    final remaining = budget - elapsed;
+    return remaining.isNegative ? Duration.zero : remaining;
   }
 
   /// Computes the adaptive splash safety ceiling: generous 20s once Android confirms a
@@ -689,6 +702,8 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
   bool _logoAssembled = false;
   bool _allowManualSkip = false;
   bool _extendedHoldForLocalBoot = false;
+  int _splashElapsedMs = 0;
+  Timer? _splashElapsedTimer;
   Timer? _shellMountTimer;
   Timer? _skipUnlockTimer;
   Timer? _maxHoldTimer;
@@ -753,6 +768,14 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
           setState(() => _shellMounted = true);
         }
       });
+      _splashElapsedTimer ??= Timer.periodic(const Duration(milliseconds: 200), (_) {
+        if (!mounted || _stage != _GateStage.splash || _exitingSplash) {
+          _splashElapsedTimer?.cancel();
+          _splashElapsedTimer = null;
+          return;
+        }
+        _splashElapsedMs += 200;
+      });
       _armMaxHoldTimer(ref.read(appProvider));
     });
   }
@@ -767,13 +790,23 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
     if (_maxHoldTimer != null && _extendedHoldForLocalBoot == isExtended) return;
     _extendedHoldForLocalBoot = isExtended;
     _maxHoldTimer?.cancel();
-    _maxHoldTimer = Timer(budget, () {
+    final remaining = GrassBagAppGate.computeRemainingHoldDuration(
+      budget,
+      Duration(milliseconds: _splashElapsedMs),
+    );
+    if (remaining == Duration.zero) {
+      _maxHoldTimer = null;
+      _beginSplashExit();
+      return;
+    }
+    _maxHoldTimer = Timer(remaining, () {
       _beginSplashExit();
     });
   }
 
   @override
   void dispose() {
+    _splashElapsedTimer?.cancel();
     _shellMountTimer?.cancel();
     _skipUnlockTimer?.cancel();
     _maxHoldTimer?.cancel();
@@ -830,6 +863,8 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
 
   void _beginSplashExit() {
     if (!mounted || _stage != _GateStage.splash || _exitingSplash) return;
+    _splashElapsedTimer?.cancel();
+    _splashElapsedTimer = null;
     _shellMountTimer?.cancel();
     _skipUnlockTimer?.cancel();
     _maxHoldTimer?.cancel();
@@ -869,7 +904,10 @@ class _GrassBagAppGateState extends ConsumerState<GrassBagAppGate>
             s.nativeStatusHydrated,
             s.hydratingDomains,
             s.loadingSessions,
-            s.dshNamespaces.isNotEmpty || s.modelGroups.isNotEmpty || s.isAccountSignedIn,
+            s.initialDomainsHydrated ||
+                s.dshNamespaces.isNotEmpty ||
+                s.modelGroups.isNotEmpty ||
+                s.isAccountSignedIn,
           ),
         ),
         (prev, next) {

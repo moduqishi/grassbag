@@ -8,6 +8,7 @@ import {
   sendJson,
 } from '../http-util.js';
 import { ensureExplicitWorkspaceForPath, readWorkspaceRegistrySnapshot } from './workspace.js';
+import { logSuppressed } from '../diagnostics.js';
 
 function usesAddressEnvelope(gateway, endpoint) {
   try {
@@ -849,7 +850,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
             }
           }
         }
-      } catch {}
+      } catch (err) {
+        logSuppressed(ctx?.logger, 'chat', err, { level: 'debug', detail: `attachment metadata lookup failed for ${params.id}` });
+      }
     }
     const callArgs = usesReqEnvelope
       ? { request: { sessionId, attachment: attachmentObj } }

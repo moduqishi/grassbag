@@ -4,6 +4,9 @@
  * `session-format` changes, and detects secret ranges for UI masking.
  */
 
+import { findMalformedContentBlocks } from './content-contract.js';
+import { extractTopStackFrame } from './diagnostics.js';
+
 const SECRET_QUICK_TRIGGER = /(?:sk-|gh[pousr]_|github_pat_|AKIA|AIza|-----BEGIN )/;
 
 const SECRET_PATTERNS = [
@@ -234,7 +237,18 @@ function summarizeHumanToolOutput(tool, outStr, parsedOut) {
   return '';
 }
 
-export function summarizeTool(name, args, output, preParsedOut = undefined) {
+function extractUpstreamPresentation(presentation) {
+  if (!presentation || typeof presentation !== 'object') return { title: '', summary: '' };
+  const record = presentation.record && typeof presentation.record === 'object' ? presentation.record : null;
+  const rawTitle = presentation.title ?? presentation.label ?? record?.title ?? record?.label;
+  const rawSummary = presentation.summary ?? presentation.caption ?? presentation.subtitle ?? record?.summary ?? record?.caption;
+  return {
+    title: typeof rawTitle === 'string' && rawTitle.trim() ? previewLine(rawTitle, 120) : '',
+    summary: typeof rawSummary === 'string' && rawSummary.trim() ? previewLine(rawSummary, 220) : '',
+  };
+}
+
+export function summarizeTool(name, args, output, preParsedOut = undefined, presentation = null) {
   const tool = String(name || 'tool');
   const parsedOut = preParsedOut !== undefined ? preParsedOut : tryParseJsonObject(output);
   const hasOutput = typeof output === 'string'
@@ -247,26 +261,30 @@ export function summarizeTool(name, args, output, preParsedOut = undefined) {
       : hasOutput
         ? safeJsonPreview(output, 400)
         : '';
-  const target = extractToolTarget(tool, args, parsedOut);
-  const title = target ? `${tool} · ${target}` : tool;
-  const summary = summarizeHumanToolOutput(tool, outStr, parsedOut);
+  // Prefer upstream DSH tool presentation metadata when available to minimize shadow-rendering drift.
+  const upstream = extractUpstreamPresentation(presentation ?? parsedOut?.presentation);
+  const target = upstream.title ? '' : extractToolTarget(tool, args, parsedOut);
+  const title = upstream.title || (target ? `${tool} · ${target}` : tool);
+  const summary = upstream.summary || summarizeHumanToolOutput(tool, outStr, parsedOut);
   return { title, summary, hasFullOutput: hasOutput };
 }
 
 /**
  * Extract structured human-readable error info matching `@deepseek-ai/dsh-client-ui-chat`
  * (`endFailure` + `displayFailure`) across DSH v0.1.x & v0.2.x event shapes.
+ * When DSH collapses an unexpected exception to `[UNKNOWN]`, enriches the message with
+ * concrete tool name, malformed content-block shape, endpoint, and stack location.
  */
-export function extractFailureInfo(reason, data = {}) {
+export function extractFailureInfo(reason, data = {}, context = null) {
+  let base = null;
   if (reason && typeof reason === 'object') {
     const kind = String(reason.kind || reason.status || '');
     if (kind === 'error') {
       const err = reason.error && typeof reason.error === 'object' ? reason.error : reason;
       const code = typeof err.code === 'string' ? err.code : undefined;
       const msg = formatErrorObject(err);
-      return { code, message: msg || '执行过程中发生未知错误' };
-    }
-    if (kind === 'aborted') {
+      base = { code, message: msg || '执行过程中发生未知错误' };
+    } else if (kind === 'aborted') {
       const inner = reason.reason && typeof reason.reason === 'object' ? reason.reason : null;
       if (inner?.kind === 'hook' && inner?.reason === 'deepseek-account/signed-out') {
         return { code: 'ACCOUNT_SIGNED_OUT', message: 'DeepSeek 账号已退出登录，当前回复已中止。' };
@@ -275,25 +293,63 @@ export function extractFailureInfo(reason, data = {}) {
         return { code: inner.code ? String(inner.code) : 'ABORTED', message: String(inner.message) };
       }
       return null;
-    }
-    if (kind === 'interrupted') {
+    } else if (kind === 'interrupted') {
       return { code: 'INTERRUPTED', message: 'DSH 进程在本轮回复完成前意外退出。' };
     }
   }
-  if (typeof reason === 'string' && reason === 'error') {
+  if (!base && typeof reason === 'string' && reason === 'error') {
     const err = data?.error;
-    return {
+    base = {
       code: typeof err?.code === 'string' ? err.code : (typeof data?.code === 'string' ? data.code : undefined),
       message: formatErrorObject(err ?? data) || '执行过程中发生错误',
     };
   }
-  if (data?.error) {
-    return {
+  if (!base && data?.error) {
+    base = {
       code: typeof data.error?.code === 'string' ? data.error.code : (typeof data.code === 'string' ? data.code : undefined),
       message: formatErrorObject(data.error) || String(data.error),
     };
   }
-  return null;
+  if (!base) return null;
+  return enrichFailureInfo(base, context);
+}
+
+function enrichFailureInfo(fail, context) {
+  if (!fail || !context || typeof context !== 'object') return fail;
+  const codeUpper = String(fail.code || '').toUpperCase();
+  const isOpaque = !codeUpper || codeUpper === 'UNKNOWN' || codeUpper === 'INTERNAL_ERROR';
+  const mentionsAttachment = /attachmentid|attachment\b|reading ['"]attachment/i.test(fail.message);
+  const malformed = Array.isArray(context.malformedBlocks) ? context.malformedBlocks : [];
+  const lastTool = typeof context.lastToolName === 'string' && context.lastToolName.trim()
+    ? context.lastToolName.trim()
+    : '';
+  const extras = [];
+
+  if (malformed.length > 0 && (isOpaque || mentionsAttachment)) {
+    const latest = malformed[malformed.length - 1];
+    const shapeStr = `{type:"${latest.blockType || 'unknown'}", keys:[${(latest.blockKeys || []).join(',')}]}`;
+    const toolLabel = latest.toolName || lastTool || 'tool';
+    const hint = latest.reason === 'inline_provider_image_block_forbidden' || latest.reason === 'missing_image_attachment' || latest.reason === 'missing_attachment_id'
+      ? '缺少 attachment.attachmentId'
+      : latest.reason;
+    const diag = `检测到工具 ${toolLabel} 返回了异常内容块 ${shapeStr}（${hint}）`;
+    if (!fail.message.includes(toolLabel) || !fail.message.includes('异常内容块')) {
+      extras.push(diag);
+    }
+  } else if (mentionsAttachment && lastTool) {
+    const diag = `疑似工具 ${lastTool} 返回了未入库的图像块（缺少 attachment.attachmentId）`;
+    if (!fail.message.includes(lastTool)) extras.push(diag);
+  } else if (isOpaque && lastTool && !fail.message.includes(lastTool)) {
+    extras.push(`最近调用工具: ${lastTool}`);
+  }
+
+  if (extras.length === 0) return fail;
+  return {
+    ...fail,
+    message: `${fail.message} · ${extras.join(' · ')}`,
+    ...(malformed.length > 0 ? { malformedBlock: malformed[malformed.length - 1] } : {}),
+    ...(lastTool ? { toolName: lastTool } : {}),
+  };
 }
 
 function formatErrorObject(err, depth = 0, seen = new Set()) {
@@ -304,9 +360,32 @@ function formatErrorObject(err, depth = 0, seen = new Set()) {
   seen.add(err);
   const parts = [];
   const main = err.message ?? err.reason ?? err.detail ?? err.summary ?? err.error;
-  if (typeof main === 'string' && main.trim()) parts.push(main.trim());
-  if (typeof err.reason === 'string' && err.reason.trim() && !parts.includes(err.reason.trim())) {
+  const errName = typeof err.name === 'string' && err.name && err.name !== 'Error' ? err.name.trim() : '';
+  if (typeof main === 'string' && main.trim()) {
+    const trimmed = main.trim();
+    parts.push(errName && !trimmed.startsWith(errName) ? `${errName}: ${trimmed}` : trimmed);
+  } else if (errName) {
+    parts.push(errName);
+  }
+  if (typeof err.reason === 'string' && err.reason.trim() && !parts.some((p) => p.includes(err.reason.trim()))) {
     parts.push(err.reason.trim());
+  }
+  const details = err.details && typeof err.details === 'object' ? err.details : null;
+  const toolName = err.toolName ?? err.tool ?? details?.toolName ?? details?.tool;
+  if (typeof toolName === 'string' && toolName.trim() && !parts.some((p) => p.includes(toolName.trim()))) {
+    parts.push(`工具: ${toolName.trim()}`);
+  }
+  const blockType = err.blockType ?? details?.blockType ?? details?.shape?.type;
+  const blockKeys = err.blockKeys ?? details?.blockKeys ?? details?.shape?.keys;
+  if (typeof blockType === 'string' && blockType.trim()) {
+    const shapeDesc = Array.isArray(blockKeys) && blockKeys.length > 0
+      ? `{type:"${blockType.trim()}", keys:[${blockKeys.join(',')}]}`
+      : `{type:"${blockType.trim()}"}`;
+    if (!parts.some((p) => p.includes(shapeDesc))) parts.push(`块形状: ${shapeDesc}`);
+  }
+  const endpoint = err.endpoint ?? details?.endpoint;
+  if (typeof endpoint === 'string' && endpoint.trim() && !parts.some((p) => p.includes(endpoint.trim()))) {
+    parts.push(`接口: ${endpoint.trim()}`);
   }
   if (typeof err.status === 'number' && !parts.some((p) => p.includes(String(err.status)))) {
     parts.push(`HTTP ${err.status}`);
@@ -314,6 +393,13 @@ function formatErrorObject(err, depth = 0, seen = new Set()) {
   if (err.cause) {
     const c = formatErrorObject(err.cause, depth + 1, seen);
     if (c && !parts.includes(c)) parts.push(`原因: ${c}`);
+  }
+  const codeUpper = String(err.code || '').toUpperCase();
+  if ((codeUpper === 'UNKNOWN' || !codeUpper) && typeof err.stack === 'string') {
+    const frame = extractTopStackFrame(err.stack);
+    if (frame && !parts.some((p) => p.includes(frame))) {
+      parts.push(`位置: ${frame}`);
+    }
   }
   if (parts.length > 0) return parts.join(' · ');
   return safeJsonPreview(err, 400);
@@ -341,6 +427,38 @@ export class SessionNormalizer {
     this.toolOutputs = new Map(); // `${sessionId}:${callId}` -> { record, bytes }
     this.toolOutputBytes = 0;
     this.turnStats = new Map(); // sessionId -> { startedAt, outputChars, phase, target }
+    this.sessionFailureContexts = new Map(); // sessionId -> { lastToolName, malformedBlocks: [] }
+  }
+
+  _ensureFailureContext(sessionId) {
+    if (!sessionId) return null;
+    let ctx = this.sessionFailureContexts.get(sessionId);
+    if (!ctx) {
+      ctx = { lastToolName: '', malformedBlocks: [] };
+      this.sessionFailureContexts.set(sessionId, ctx);
+    }
+    return ctx;
+  }
+
+  recordContractViolation(sessionId, violation) {
+    const ctx = this._ensureFailureContext(sessionId || '_global');
+    if (!ctx || !violation) return;
+    if (violation.toolName) ctx.lastToolName = String(violation.toolName);
+    ctx.malformedBlocks.push({
+      toolName: String(violation.toolName || ctx.lastToolName || 'tool'),
+      blockType: String(violation.shape?.type ?? violation.blockType ?? 'unknown'),
+      blockKeys: Array.isArray(violation.shape?.keys)
+        ? violation.shape.keys
+        : (Array.isArray(violation.blockKeys) ? violation.blockKeys : []),
+      reason: String(violation.reason || 'invalid_content_block'),
+    });
+    if (ctx.malformedBlocks.length > 8) ctx.malformedBlocks.shift();
+  }
+
+  getSessionFailureContext(sessionId) {
+    return (sessionId ? this.sessionFailureContexts.get(sessionId) : null)
+      ?? this.sessionFailureContexts.get('_global')
+      ?? null;
   }
 
   cacheToolOutput(sessionId, callId, record) {
@@ -388,7 +506,9 @@ export class SessionNormalizer {
           };
           jsonLen = normalizedRecord.output.length;
         }
-      } catch {}
+      } catch (_jsonErr) {
+        // Non-JSON-serializable or circular tool output: retain conservative byte estimate.
+      }
       bytes = Math.max(256, jsonLen * 2);
     }
     if (normalizedRecord && normalizedRecord.args != null) {
@@ -415,7 +535,9 @@ export class SessionNormalizer {
             };
             argsLen = normalizedRecord.args.length;
           }
-        } catch {}
+        } catch (_jsonErr) {
+          // Non-JSON-serializable tool args: keep default size estimate.
+        }
       }
       bytes += argsLen * 2;
     }
@@ -454,6 +576,25 @@ export class SessionNormalizer {
     let current = null;
     const toolIndex = new Map();
     const toolStartTimes = new Map();
+    const turnDiagnostics = new WeakMap();
+    const getTurnDiag = (turn) => {
+      let diag = turnDiagnostics.get(turn);
+      if (!diag) {
+        diag = { lastToolName: '', malformedBlocks: [] };
+        turnDiagnostics.set(turn, diag);
+      }
+      return diag;
+    };
+    const mergedFailureContext = (turn) => {
+      const local = getTurnDiag(turn);
+      const live = incremental ? this.getSessionFailureContext(sessionId) : null;
+      return {
+        lastToolName: local.lastToolName || live?.lastToolName || '',
+        malformedBlocks: local.malformedBlocks.length > 0
+          ? local.malformedBlocks
+          : (live?.malformedBlocks ?? []),
+      };
+    };
 
     const promoteIntermediateProse = (turn, seq) => {
       if (!turn || typeof turn.assistantText !== 'string') return;
@@ -588,9 +729,12 @@ export class SessionNormalizer {
         const callId = String(data?.callId || data?.id || `call-${seq}-${turn.steps.length}`);
         let parsedArgs = data?.arguments ?? data?.input ?? {};
         if (typeof parsedArgs === 'string') {
-          try { parsedArgs = JSON.parse(parsedArgs); } catch {}
+          try { parsedArgs = JSON.parse(parsedArgs); } catch (_invalidJsonArgs) { /* keep raw string args */ }
         }
-        const { title, summary } = summarizeTool(data?.name, parsedArgs);
+        const toolName = String(data?.name || 'tool');
+        getTurnDiag(turn).lastToolName = toolName;
+        if (incremental && sessionId) this._ensureFailureContext(sessionId).lastToolName = toolName;
+        const { title, summary } = summarizeTool(toolName, parsedArgs, undefined, undefined, data?.presentation);
         const existing = toolIndex.get(callId);
         if (typeof ev.time === 'number' && !toolStartTimes.has(callId)) {
           toolStartTimes.set(callId, ev.time);
@@ -599,7 +743,7 @@ export class SessionNormalizer {
           const step = {
             kind: 'tool',
             callId,
-            name: String(data?.name || 'tool'),
+            name: toolName,
             title,
             status: 'running',
             summary,
@@ -610,7 +754,7 @@ export class SessionNormalizer {
         }
         this.cacheToolOutput(sessionId, callId, {
           callId,
-          name: String(data?.name || 'tool'),
+          name: toolName,
           args: parsedArgs,
           output: null,
           status: 'running',
@@ -645,9 +789,12 @@ export class SessionNormalizer {
               const callId = String(b.id || b.callId || `call-${seq}-${turn.steps.length}`);
               let bArgs = b.arguments ?? b.input ?? {};
               if (typeof bArgs === 'string') {
-                try { bArgs = JSON.parse(bArgs); } catch {}
+                try { bArgs = JSON.parse(bArgs); } catch (_invalidJsonArgs) { /* keep raw string args */ }
               }
-              const { title, summary } = summarizeTool(b.name, bArgs);
+              const bToolName = String(b.name || 'tool');
+              getTurnDiag(turn).lastToolName = bToolName;
+              if (incremental && sessionId) this._ensureFailureContext(sessionId).lastToolName = bToolName;
+              const { title, summary } = summarizeTool(bToolName, bArgs, undefined, undefined, b.presentation);
               if (typeof ev.time === 'number' && !toolStartTimes.has(callId)) {
                 toolStartTimes.set(callId, ev.time);
               }
@@ -744,7 +891,29 @@ export class SessionNormalizer {
         const existing = toolIndex.get(callId);
         const toolName = existing?.name || prev?.name || String(msg?.name || data?.name || 'tool');
         const effectiveArgs = prev?.args ?? data?.arguments ?? {};
-        const { title, summary, hasFullOutput } = summarizeTool(toolName, effectiveArgs, output, parsedOut);
+        const diag = getTurnDiag(turn);
+        diag.lastToolName = toolName;
+        if (incremental && sessionId) this._ensureFailureContext(sessionId).lastToolName = toolName;
+        if (Array.isArray(rawOut)) {
+          const malformed = findMalformedContentBlocks(rawOut);
+          for (const bad of malformed) {
+            const entry = {
+              toolName,
+              blockType: bad.shape.type,
+              blockKeys: bad.shape.keys,
+              reason: bad.reason,
+            };
+            diag.malformedBlocks.push(entry);
+            if (incremental && sessionId) this.recordContractViolation(sessionId, entry);
+          }
+        }
+        const { title, summary, hasFullOutput } = summarizeTool(
+          toolName,
+          effectiveArgs,
+          output,
+          parsedOut,
+          data?.presentation ?? msg?.presentation,
+        );
         const effectiveHasFull = hasFullOutput || (isError && String(output || '').trim().length > 0);
         if (existing) {
           existing.status = isError ? 'error' : 'ok';
@@ -799,7 +968,7 @@ export class SessionNormalizer {
 
       if (type === 'error' || type === 'turn/error' || type === 'step/error' || type === 'assistant/error') {
         const turn = ensureTurn(ev.turnId, seq);
-        const fail = extractFailureInfo('error', data);
+        const fail = extractFailureInfo('error', data, mergedFailureContext(turn));
         if (fail) {
           turn.status = 'error';
           turn.errorMessage = fail.message;
@@ -818,7 +987,7 @@ export class SessionNormalizer {
         const reason = typeof data?.reason === 'object' && data?.reason !== null
           ? (data.reason.kind || data.reason.status)
           : (data?.reason || data?.status);
-        const fail = extractFailureInfo(data?.reason, data);
+        const fail = extractFailureInfo(data?.reason, data, mergedFailureContext(turn));
         turn.status = reason === 'cancelled' || (reason === 'aborted' && !fail)
           ? 'cancelled'
           : (reason === 'error' || reason === 'interrupted' || Boolean(fail) || Boolean(data?.error))
@@ -923,6 +1092,7 @@ export class SessionNormalizer {
 
   clearSessionStat(sessionId) {
     this.turnStats.delete(sessionId);
+    this.sessionFailureContexts.delete(sessionId);
   }
 }
 

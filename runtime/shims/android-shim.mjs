@@ -252,8 +252,20 @@ if (isLocalAndroid && typeof globalThis.fetch === 'function' && process.env.GBRI
     signal?.addEventListener?.('abort', onAbort, { once: true });
   });
 
-  const withFreshConnectionHeader = (init) => {
-    const headers = new Headers(init?.headers || undefined);
+  const SAFE_RETRY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+  const extractMethod = (input, init) => {
+    const raw = init?.method ?? (input && typeof input === 'object' && !(input instanceof URL) ? input.method : undefined) ?? 'GET';
+    return String(raw).trim().toUpperCase() || 'GET';
+  };
+
+  const withFreshConnectionHeader = (input, init) => {
+    // Follow the Fetch spec: when `init.headers` is omitted for `fetch(Request)`, preserve all
+    // headers carried on the original Request object instead of replacing them with an empty set.
+    const sourceHeaders = init?.headers !== undefined
+      ? init.headers
+      : (input && typeof input === 'object' && !(input instanceof URL) ? input.headers : undefined);
+    const headers = new Headers(sourceHeaders || undefined);
     // Force a clean non-pooled TCP/TLS handshake on retry so a poisoned undici pool slot is bypassed!
     headers.set('connection', 'close');
     return { ...(init || {}), headers };
@@ -261,15 +273,28 @@ if (isLocalAndroid && typeof globalThis.fetch === 'function' && process.env.GBRI
 
   globalThis.fetch = async function grassbagResilientFetch(input, init) {
     const urlStr = extractUrlString(input);
+    const method = extractMethod(input, init);
     const signal = init?.signal ?? (input && typeof input === 'object' ? input.signal : undefined);
-    const canRetry = Boolean(urlStr) && !isLoopbackUrl(urlStr) && isBodyReplayable(input, init);
+    // Strictly restrict automatic transport retries to RFC-safe read-only methods (GET/HEAD/OPTIONS)
+    // so non-idempotent POST/PATCH/DELETE calls (e.g. LLM completions or mutations) are NEVER
+    // duplicated after the server may have already accepted the first attempt.
+    const canRetry =
+      Boolean(urlStr) &&
+      !isLoopbackUrl(urlStr) &&
+      SAFE_RETRY_METHODS.has(method) &&
+      isBodyReplayable(input, init);
     const delaysMs = [350, 900, 1800];
     let attempt = 0;
     while (true) {
       try {
-        const effectiveInit = attempt === 0 ? init : withFreshConnectionHeader(init);
+        const effectiveInit = attempt === 0 ? init : withFreshConnectionHeader(input, init);
         return await origFetch(input, effectiveInit);
       } catch (err) {
+        if (isRetryableTransportError(err)) {
+          // Even for non-retryable methods (POST), refresh DNS immediately after a transport fault
+          // so the caller's own next request uses up-to-date resolvers after a Wi-Fi/5G handoff.
+          syncDnsFromResolvConf(true);
+        }
         if (
           !canRetry ||
           attempt >= delaysMs.length ||
@@ -278,7 +303,6 @@ if (isLocalAndroid && typeof globalThis.fetch === 'function' && process.env.GBRI
         ) {
           throw err;
         }
-        syncDnsFromResolvConf(true);
         const baseDelay = delaysMs[attempt++];
         const jittered = Math.round(baseDelay * (0.85 + Math.random() * 0.3));
         await sleepWithSignal(jittered, signal);

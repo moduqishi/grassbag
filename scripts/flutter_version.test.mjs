@@ -55,6 +55,14 @@ test('prepareStableVersion keeps build number monotonic across release-version b
   // Explicit major/minor jump increments from baseline build
   const manualMinor = prepareStableVersion(mainVer, branchVer, 'v0.2.0');
   assert.deepEqual(manualMinor, { major: 0, minor: 2, patch: 0, build: 6 });
+
+  // Tag matching stale main pubspec version while baseline is ahead MUST still increment build
+  const staleMainTag = prepareStableVersion(mainVer, branchVer, 'v0.1.0');
+  assert.deepEqual(staleMainTag, { major: 0, minor: 1, patch: 0, build: 6 });
+
+  // Serialized releases advance baseline between runs so distinct tags never share versionCode
+  const secondTagAfterSync = prepareStableVersion(mainVer, manualMinor, 'v0.2.1');
+  assert.deepEqual(secondTagAfterSync, { major: 0, minor: 2, patch: 1, build: 7 });
 });
 
 test('parseAndroidMetadata extracts versionCode and versionName', () => {

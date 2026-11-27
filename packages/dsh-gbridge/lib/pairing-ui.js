@@ -188,7 +188,9 @@ async function copyTextSafe(text) {
     try {
       await navigator.clipboard.writeText(text);
       return true;
-    } catch {}
+    } catch (_clipboardErr) {
+      // Non-HTTPS LAN origin may block navigator.clipboard; fall through to execCommand('copy').
+    }
   }
   try {
     const ta = document.createElement('textarea');

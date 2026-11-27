@@ -62,6 +62,7 @@ object SafetyGate {
     private val policy = AtomicReference(PolicyTier.ASK)
     private val syncedChatPermissionPreset = AtomicReference("workspace-write")
     private val activeTurnsBySession = ConcurrentHashMap<String, Long>()
+    private val activeSessionIds = ConcurrentHashMap<String, Long>()
     private val sessionTurnGrants = ConcurrentHashMap<String, Long>()
     private val emergencyStopped = AtomicBoolean(false)
     private val paused = AtomicBoolean(false)
@@ -72,7 +73,7 @@ object SafetyGate {
     private val auditLog = CopyOnWriteArrayList<AuditRecord>()
     private val auditLock = Any()
     private val turnPolicyLock = Any()
-    private val emergencyStopListeners = CopyOnWriteArraySet<() -> Unit>()
+    private val emergencyStopListeners = CopyOnWriteArraySet<(List<String>) -> Unit>()
     private val pauseListeners = CopyOnWriteArraySet<(Boolean) -> Unit>()
 
     private val interactiveWriteTools = setOf(
@@ -166,11 +167,11 @@ object SafetyGate {
         }
     }
 
-    fun addEmergencyStopListener(listener: () -> Unit) {
+    fun addEmergencyStopListener(listener: (List<String>) -> Unit) {
         emergencyStopListeners.add(listener)
     }
 
-    fun removeEmergencyStopListener(listener: () -> Unit) {
+    fun removeEmergencyStopListener(listener: (List<String>) -> Unit) {
         emergencyStopListeners.remove(listener)
     }
 
@@ -187,6 +188,7 @@ object SafetyGate {
             val now = System.currentTimeMillis()
             val hadActive = activeTurnsBySession.isNotEmpty()
             activeTurnsBySession.entries.removeIf { now - it.value > TURN_WATCHDOG_MS }
+            activeSessionIds.entries.removeIf { now - it.value > TURN_WATCHDOG_MS }
             sessionTurnGrants.entries.removeIf { now - it.value > TURN_WATCHDOG_MS }
             // Only revert ALLOW_TURN -> ASK when an active turn expired OR the idle policy grant itself timed out.
             // Never wipe a freshly selected ALLOW_TURN policy while the user is still in Settings before starting a turn!
@@ -295,8 +297,13 @@ object SafetyGate {
 
     fun beginTurn(turnId: String?, sessionId: String? = null) {
         synchronized(turnPolicyLock) {
+            val now = System.currentTimeMillis()
             val key = sessionKey(sessionId, turnId)
-            activeTurnsBySession[key] = System.currentTimeMillis()
+            activeTurnsBySession[key] = now
+            val cleanSid = sessionId?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+            if (cleanSid != null) {
+                activeSessionIds[cleanSid] = now
+            }
         }
     }
 
@@ -306,6 +313,10 @@ object SafetyGate {
             val now = System.currentTimeMillis()
             activeTurnsBySession[key] = now
             sessionTurnGrants[key] = now
+            val cleanSid = sessionId?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+            if (cleanSid != null) {
+                activeSessionIds[cleanSid] = now
+            }
         }
         record("confirm", key, true, "user_granted_turn_allow")
     }
@@ -330,6 +341,7 @@ object SafetyGate {
                 var anyRemoved = false
                 if (key != null) {
                     anyRemoved = (activeTurnsBySession.remove(key) != null) || anyRemoved
+                    anyRemoved = (activeSessionIds.remove(key) != null) || anyRemoved
                     anyRemoved = (sessionTurnGrants.remove(key) != null) || anyRemoved
                 }
                 if (tKey != null && tKey != key) {
@@ -338,8 +350,9 @@ object SafetyGate {
                 }
                 anyRemoved
             } else {
-                val hadAny = activeTurnsBySession.isNotEmpty() || sessionTurnGrants.isNotEmpty()
+                val hadAny = activeTurnsBySession.isNotEmpty() || activeSessionIds.isNotEmpty() || sessionTurnGrants.isNotEmpty()
                 activeTurnsBySession.clear()
+                activeSessionIds.clear()
                 sessionTurnGrants.clear()
                 hadAny
             }
@@ -383,16 +396,29 @@ object SafetyGate {
 
     fun hasActiveTurn(): Boolean = isTurnLockedNow()
 
-    fun triggerEmergencyStop() {
+    fun activePhoneSessionIds(): List<String> = synchronized(turnPolicyLock) {
+        pruneExpiredTurns()
+        activeSessionIds.keys.toList().sorted()
+    }
+
+    fun triggerEmergencyStop(): List<String> {
         emergencyStopped.set(true)
         setPaused(false)
-        activeTurnsBySession.clear()
-        sessionTurnGrants.clear()
-        policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
-        record("emergency_stop", "all", false, "user_triggered_stop")
-        for (l in emergencyStopListeners) {
-            runCatching { l() }
+        val affectedSessionIds = synchronized(turnPolicyLock) {
+            pruneExpiredTurns()
+            val captured = activeSessionIds.keys.toList().sorted()
+            activeTurnsBySession.clear()
+            activeSessionIds.clear()
+            sessionTurnGrants.clear()
+            allowTurnSetAtMs = 0L
+            policy.compareAndSet(PolicyTier.ALLOW_TURN, PolicyTier.ASK)
+            captured
         }
+        record("emergency_stop", affectedSessionIds.joinToString(",").ifEmpty { "all" }, false, "user_triggered_stop")
+        for (l in emergencyStopListeners) {
+            runCatching { l(affectedSessionIds) }
+        }
+        return affectedSessionIds
     }
 
     fun resetEmergencyStop() {

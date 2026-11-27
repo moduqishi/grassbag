@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import '../data/grassbag_storage.dart';
+
 @immutable
 class NativeRuntimeStatus {
   const NativeRuntimeStatus({
@@ -693,16 +695,34 @@ class GrassBagNativeBridge {
     await _safeInvoke<bool>('term.close', {'tabId': tabId});
   }
 
-  // Hardware Keystore Vault
+  /// When set in unit tests, routes non-Android secret persistence through [GrassBagStorage]
+  /// identically to Flutter Web (`kIsWeb`), allowing VM tests to verify Web credential reload.
+  @visibleForTesting
+  static bool useWebSecretFallbackForTest = false;
+
+  bool get _useWebSecretStorage => kIsWeb || useWebSecretFallbackForTest;
+
+  // Hardware Keystore Vault (Android) with origin-scoped browser storage fallback on Web
   Future<void> putSecret(String key, String value) async {
+    if (_useWebSecretStorage) {
+      await GrassBagStorage.instance.saveWebSecret(key, value);
+      return;
+    }
     await _safeInvoke<bool>('vault.put', {'key': key, 'value': value});
   }
 
   Future<String?> getSecret(String key) async {
+    if (_useWebSecretStorage) {
+      return GrassBagStorage.instance.loadWebSecret(key);
+    }
     return _safeInvoke<String>('vault.get', {'key': key});
   }
 
   Future<void> deleteSecret(String key) async {
+    if (_useWebSecretStorage) {
+      await GrassBagStorage.instance.deleteWebSecret(key);
+      return;
+    }
     await _safeInvoke<bool>('vault.delete', {'key': key});
   }
 
@@ -757,8 +777,20 @@ class GrassBagNativeBridge {
         true;
   }
 
-  Future<void> triggerEmergencyStop() async {
-    await _safeInvoke<bool>('safety.emergencyStop');
+  Future<List<String>> triggerEmergencyStop() async {
+    final res = await _safeInvoke<Object?>('safety.emergencyStop');
+    if (res is Map) {
+      final raw = res['sessionIds'];
+      if (raw is List) {
+        return raw
+            .map((e) => e?.toString().trim() ?? '')
+            .where((s) => s.isNotEmpty)
+            .toList(growable: false);
+      }
+      final single = res['sessionId']?.toString().trim() ?? '';
+      if (single.isNotEmpty) return [single];
+    }
+    return const [];
   }
 
   Future<bool> resetEmergencyStop() async {
@@ -1028,11 +1060,16 @@ class GrassBagNativeBridge {
     return res.trim();
   }
 
-  /// Triggers Android's system package installer via FileProvider.
+  /// Triggers Android's system package installer via FileProvider after verifying SHA-256,
+  /// target package name, and signing certificate match against the installed app.
   /// Returns `'started'`, `'permission_required'`, or `'error:<reason>'`.
-  Future<String> installApk(String filePath) async {
+  Future<String> installApk(String filePath, {String? expectedSha256}) async {
     if (!isAndroidNative) return 'error:unsupported_platform';
-    final res = await _safeInvoke<String>('app.installApk', {'path': filePath});
+    final res = await _safeInvoke<String>('app.installApk', {
+      'path': filePath,
+      if (expectedSha256 != null && expectedSha256.trim().isNotEmpty)
+        'expectedSha256': expectedSha256.trim().toLowerCase(),
+    });
     return res ?? 'error:bridge_unavailable';
   }
 }

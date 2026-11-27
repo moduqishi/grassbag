@@ -36,6 +36,7 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.Inet4Address
@@ -44,6 +45,7 @@ import java.net.NetworkInterface
 import java.net.Proxy
 import java.net.Socket
 import java.net.URL
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 
@@ -154,9 +156,16 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }
     }
 
-    private val emergencyStopListener: () -> Unit = {
+    private val emergencyStopListener: (List<String>) -> Unit = { sessionIds ->
         if (!detached) {
-            sendEvent("phone_emergency_stop", mapOf("stopped" to true))
+            sendEvent(
+                "phone_emergency_stop",
+                mapOf(
+                    "stopped" to true,
+                    "sessionIds" to sessionIds,
+                    "sessionId" to (sessionIds.firstOrNull() ?: "")
+                )
+            )
         }
     }
 
@@ -552,7 +561,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             }
             "safety.emergencyStop" -> {
                 runBg(result) {
-                    SafetyGate.triggerEmergencyStop()
+                    val sessionIds = SafetyGate.triggerEmergencyStop()
                     PhoneOverlayController.getInstance(activity.applicationContext).dismissAll()
                     if (GrassBagEngineService.isServiceActive()) {
                         GrassBagEngineService.startOrUpdate(
@@ -562,7 +571,15 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             releaseWakeLock = true
                         )
                     }
-                    replySafe(result) { it.success(true) }
+                    replySafe(result) {
+                        it.success(
+                            mapOf(
+                                "ok" to true,
+                                "sessionIds" to sessionIds,
+                                "sessionId" to (sessionIds.firstOrNull() ?: "")
+                            )
+                        )
+                    }
                 }
             }
             "safety.resetStop" -> {
@@ -631,6 +648,13 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             }
             "service.stop" -> {
                 runBg(result) {
+                    // Never allow Flutter's idle-state teardown to kill a foreground service actively
+                    // owned by native container bootstrap, engine startup/auto-recovery, or a live engine.
+                    if (runtime?.ownsForegroundService() == true) {
+                        Log.i("GrassBagBridgePlugin", "Ignoring service.stop while native runtime owns FGS")
+                        replySafe(result) { it.success(false) }
+                        return@runBg
+                    }
                     GrassBagEngineService.stop(activity.applicationContext)
                     replySafe(result) { it.success(true) }
                 }
@@ -943,6 +967,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             }
             "app.installApk" -> {
                 val rawPath = call.argument<String>("path")?.trim() ?: ""
+                val expectedSha256 = call.argument<String>("expectedSha256")?.trim()?.lowercase() ?: ""
                 if (rawPath.isEmpty()) {
                     replySafe(result) { it.success("error:missing_path") }
                     return
@@ -957,6 +982,20 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     }
                     if (!apkFile.isFile || apkFile.length() <= 0L) {
                         replySafe(result) { it.success("error:file_not_found") }
+                        return@runBg
+                    }
+                    if (expectedSha256.isNotEmpty()) {
+                        val actualSha = computeFileSha256(apkFile)
+                        if (actualSha == null || !actualSha.equals(expectedSha256, ignoreCase = true)) {
+                            runCatching { apkFile.delete() }
+                            replySafe(result) { it.success("error:sha256_mismatch") }
+                            return@runBg
+                        }
+                    }
+                    val verifyErr = verifyUpdateApkIdentity(apkFile)
+                    if (verifyErr != null) {
+                        runCatching { apkFile.delete() }
+                        replySafe(result) { it.success("error:$verifyErr") }
                         return@runBg
                     }
                     mainHandler.post {
@@ -997,6 +1036,85 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             }
             else -> replySafe(result) { it.notImplemented() }
         }
+    }
+
+    private fun computeFileSha256(file: File): String? = runCatching {
+        val md = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        md.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    private fun extractSigningCertDigests(pkgInfo: android.content.pm.PackageInfo): Set<String> {
+        val out = LinkedHashSet<String>()
+        val md = MessageDigest.getInstance("SHA-256")
+        fun addCertBytes(raw: ByteArray?) {
+            if (raw == null || raw.isEmpty()) return
+            md.reset()
+            out.add(md.digest(raw).joinToString("") { "%02x".format(it) })
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val info = pkgInfo.signingInfo
+            if (info != null) {
+                val list = if (info.hasMultipleSigners()) info.apkContentsSigners else info.signingCertificateHistory
+                list?.forEach { addCertBytes(it.toByteArray()) }
+            }
+        }
+        if (out.isEmpty()) {
+            @Suppress("DEPRECATION")
+            pkgInfo.signatures?.forEach { addCertBytes(it.toByteArray()) }
+        }
+        return out
+    }
+
+    private fun verifyUpdateApkIdentity(apkFile: File): String? {
+        val pm = activity.packageManager
+        val archiveInfo = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageArchiveInfo(
+                    apkFile.absolutePath,
+                    PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()),
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                @Suppress("DEPRECATION")
+                pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_SIGNATURES)
+            }
+        }.getOrNull() ?: return "invalid_apk_archive"
+
+        if (archiveInfo.packageName != activity.packageName) {
+            return "package_name_mismatch"
+        }
+
+        val installedInfo = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(
+                    activity.packageName,
+                    PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()),
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(activity.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(activity.packageName, PackageManager.GET_SIGNATURES)
+            }
+        }.getOrNull() ?: return "installed_signature_unavailable"
+
+        val apkSigners = runCatching { extractSigningCertDigests(archiveInfo) }.getOrDefault(emptySet())
+        val installedSigners = runCatching { extractSigningCertDigests(installedInfo) }.getOrDefault(emptySet())
+        if (apkSigners.isEmpty() || installedSigners.isEmpty() || apkSigners.none { it in installedSigners }) {
+            return "signature_mismatch"
+        }
+        return null
     }
 
     private fun readPermissionsStatus(): Map<String, Any> {

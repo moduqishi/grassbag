@@ -119,20 +119,69 @@ export function registerSystemDomain(router, { ctx, gateway }) {
         if (body[k] !== undefined && body[k] !== '') requestObj[k] = body[k];
       }
     }
-    // Resolve stored DSH credential ref server-side ONLY via DSH's credentials service (never arbitrary process.env!).
+    const normalizeDiscoverUrl = (raw) => {
+      if (typeof raw !== 'string' || !raw.trim()) return null;
+      try {
+        const u = new URL(raw.trim());
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+        return `${u.origin}${u.pathname.replace(/\/+$/, '')}`;
+      } catch {
+        return null;
+      }
+    };
+    const requestedNormUrl = requestObj.baseURL ? normalizeDiscoverUrl(requestObj.baseURL) : null;
+    if (requestObj.baseURL && !requestedNormUrl) {
+      throw new GbridgeError(400, 'gbridge/invalid_base_url', 'baseURL must be a valid http(s) URL');
+    }
+    // Resolve stored DSH credential ref server-side ONLY when the target baseURL strictly matches
+    // an already-configured provider using that exact apiKeyEnv (prevents secret exfiltration to arbitrary URLs).
     const envRef = typeof body.apiKeyEnv === 'string' ? body.apiKeyEnv.trim() : '';
     if (!requestObj.apiKey && envRef && VALID_CRED_REF_RE.test(envRef)) {
-      try {
-        const credsSvc = ctx.get?.('credentials');
-        const resolved =
-          (typeof credsSvc?.resolve === 'function' ? await credsSvc.resolve(envRef) : null) ??
-          (typeof credsSvc?.get === 'function' ? await credsSvc.get(envRef) : null) ??
-          (typeof credsSvc?.getValue === 'function' ? await credsSvc.getValue(envRef) : null);
-        const secret = typeof resolved === 'string' ? resolved : (resolved?.value ?? resolved?.secret);
-        if (typeof secret === 'string' && secret.trim()) {
-          requestObj = { ...requestObj, apiKey: secret.trim() };
-        }
-      } catch {}
+      let authorized = false;
+      if (gateway.has('settings/describe')) {
+        try {
+          const desc = await gateway.call('settings/describe', {}, { peer });
+          for (const ns of desc?.namespaces ?? []) {
+            const val = ns?.value;
+            if (!val || typeof val !== 'object') continue;
+            const customProviders = Array.isArray(val.customProviders)
+              ? val.customProviders
+              : (val.customProviders && typeof val.customProviders === 'object' ? Object.values(val.customProviders) : []);
+            const providersMap = val.providers && typeof val.providers === 'object' ? Object.values(val.providers) : [];
+            for (const entry of [...customProviders, ...providersMap]) {
+              if (!entry || typeof entry !== 'object') continue;
+              const entryEnv = typeof entry.apiKeyEnv === 'string' ? entry.apiKeyEnv.trim() : '';
+              if (entryEnv !== envRef) continue;
+              const savedNorm = normalizeDiscoverUrl(entry.baseURL ?? entry.baseUrl);
+              if (!requestedNormUrl || (savedNorm && savedNorm === requestedNormUrl)) {
+                authorized = true;
+                break;
+              }
+            }
+            if (authorized) break;
+          }
+        } catch {}
+      }
+      if (!authorized && requestedNormUrl) {
+        throw new GbridgeError(
+          403,
+          'gbridge/credential_base_url_mismatch',
+          'stored apiKeyEnv may only be resolved against its saved provider baseURL',
+        );
+      }
+      if (authorized) {
+        try {
+          const credsSvc = ctx.get?.('credentials');
+          const resolved =
+            (typeof credsSvc?.resolve === 'function' ? await credsSvc.resolve(envRef) : null) ??
+            (typeof credsSvc?.get === 'function' ? await credsSvc.get(envRef) : null) ??
+            (typeof credsSvc?.getValue === 'function' ? await credsSvc.getValue(envRef) : null);
+          const secret = typeof resolved === 'string' ? resolved : (resolved?.value ?? resolved?.secret);
+          if (typeof secret === 'string' && secret.trim()) {
+            requestObj = { ...requestObj, apiKey: secret.trim() };
+          }
+        } catch {}
+      }
     }
     const result = await gateway.call('llm/discoverModels', {
       settingsNs,

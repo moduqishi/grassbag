@@ -10,9 +10,13 @@ import 'package:gbridge_client/gbridge_client.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
+import '../common/file_preview_sheet.dart';
 import '../common/grassbag_sheets.dart';
+import '../common/preview_highlight_utils.dart';
 import '../features/jobs_page.dart';
 import '../features/subagents_page.dart';
+
+export '../common/file_preview_sheet.dart' show showWorkspaceFilePreviewSheet;
 
 /// Session Detail (Phone Full-Screen Page) & Docked Right Workbench (Tablet Inspector)
 /// implementing all 6 Workbench tabs from `docs/ia-and-flows.md`:
@@ -45,6 +49,9 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
   final Map<int, double> _tabScrollOffsets = {};
   final List<WorkspaceFileNode> _dirStack = [];
   final TextEditingController _todoCtrl = TextEditingController();
+  final TextEditingController _fileFilterCtrl = TextEditingController();
+  final Set<String> _collapsedDiffPaths = <String>{};
+  String _fileFilterQuery = '';
   bool _showAllTimelineSteps = false;
   bool _showAllTurnsUsage = false;
   bool _compacting = false;
@@ -172,6 +179,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
   void dispose() {
     _scrollCtrl.dispose();
     _todoCtrl.dispose();
+    _fileFilterCtrl.dispose();
     super.dispose();
   }
 
@@ -222,7 +230,17 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
           0.0,
           _scrollCtrl.position.maxScrollExtent,
         );
-        _scrollCtrl.jumpTo(target);
+        if ((_scrollCtrl.offset - target).abs() > 1.0) {
+          if (MediaQuery.disableAnimationsOf(context)) {
+            _scrollCtrl.jumpTo(target);
+          } else {
+            _scrollCtrl.animateTo(
+              target,
+              duration: const Duration(milliseconds: 170),
+              curve: Curves.easeOutCubic,
+            );
+          }
+        }
       }
     });
     if (i == 0) {
@@ -238,13 +256,11 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
   }
 
   void _openFilePreview(BuildContext context, WorkspaceFileNode node) {
-    showGrassBagSheet<void>(
+    showWorkspaceFilePreviewSheet(
       context,
+      path: node.path,
       title: node.name,
-      subtitle: node.path,
-      icon: CupertinoIcons.doc_text_fill,
-      expandable: true,
-      bodyBuilder: (ctx) => _WorkspaceFilePreviewBody(node: node),
+      inlineContent: node.content,
     );
   }
 
@@ -320,13 +336,15 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
       appProvider.select(
         (s) {
           final host = s.activeHost;
-          final hasSess = s.activeSession != null;
+          final activeSess = s.activeSession;
           return (
             glassTier: s.glassTier,
             activeHostId: s.activeHostId,
             hostName: host.name,
             activeSessionId: s.activeSessionId,
-            hasActiveSession: hasSess,
+            hasActiveSession: activeSess != null,
+            activeSessionTitle: activeSess?.title,
+            isStreaming: s.isStreaming,
             activeWorkspace: s.activeWorkspaceDisplayName,
             tabPayload: switch (_tab) {
               0 => (
@@ -385,7 +403,12 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                   height: 34,
                   tier: state.glassTier,
                   insideGlass: true,
-                  onTap: () => showRenameSessionSheet(context, ref, state.activeSession!),
+                  onTap: () {
+                    final active = ref.read(appProvider).activeSession;
+                    if (active != null) {
+                      showRenameSessionSheet(context, ref, active);
+                    }
+                  },
                 ),
               ),
               const SizedBox(width: 8),
@@ -418,50 +441,13 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         ],
         const SizedBox(height: 12),
 
-        // 6-tab bar: auto-scrolls active chip into view on narrow panes & large font scales!
-        LayoutBuilder(
-          builder: (ctx, box) {
-            final tabScale = MediaQuery.textScalerOf(ctx).scale(1.0).clamp(1.0, 1.5);
-            if (box.maxWidth >= 420 * tabScale) {
-              return Row(
-                children: [
-                  for (int i = 0; i < _tabLabels.length; i++) ...[
-                    if (i > 0) const SizedBox(width: 6),
-                    Expanded(
-                      child: GrassBagFilterChip(
-                        key: _tabChipKeys[i],
-                        label: _tabLabels[i],
-                        selected: _tab == i,
-                        onTap: () => _selectTab(i),
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
-                        fontSize: 12.2,
-                      ),
-                    ),
-                  ],
-                ],
-              );
-            }
-            return SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              padding: const EdgeInsets.fromLTRB(4, 6, 8, 10),
-              child: Row(
-                children: [
-                  for (int i = 0; i < _tabLabels.length; i++) ...[
-                    if (i > 0) const SizedBox(width: 6),
-                    GrassBagFilterChip(
-                      key: _tabChipKeys[i],
-                      label: _tabLabels[i],
-                      selected: _tab == i,
-                      onTap: () => _selectTab(i),
-                      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
-                      fontSize: 12.2,
-                    ),
-                  ],
-                ],
-              ),
-            );
-          },
+        // Real Kyant0 Liquid Glass scrollable segmented tab bar!
+        GrassBagSegmentedControl(
+          labels: _tabLabels,
+          selectedIndex: _tab,
+          tier: state.glassTier,
+          height: 38,
+          onSelected: _selectTab,
         ),
         const SizedBox(height: 8),
 
@@ -673,46 +659,152 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
       }
     }
 
+    final filterQ = _fileFilterQuery.trim().toLowerCase();
+    final filteredNodes = filterQ.isEmpty
+        ? currentNodes
+        : currentNodes
+            .where((n) =>
+                n.name.toLowerCase().contains(filterQ) ||
+                n.path.toLowerCase().contains(filterQ))
+            .toList(growable: false);
+
+    // Cross-reference Git modified files so the Files tab highlights modified items!
+    final diffByNormPath = <String, WorkspaceDiffRecord>{};
+    for (final d in state.workspaceDiffs) {
+      final norm = d.path
+          .trim()
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'^\./+'), '')
+          .replaceFirst(RegExp(r'^/+'), '');
+      diffByNormPath[norm] = d;
+    }
+    WorkspaceDiffRecord? diffForNode(WorkspaceFileNode node) {
+      if (node.isDir || diffByNormPath.isEmpty) return null;
+      final norm = node.path
+          .trim()
+          .replaceAll('\\', '/')
+          .replaceFirst(RegExp(r'^\./+'), '')
+          .replaceFirst(RegExp(r'^/+'), '');
+      final exact = diffByNormPath[norm];
+      if (exact != null) return exact;
+      for (final entry in diffByNormPath.entries) {
+        if (norm.endsWith('/${entry.key}') || entry.key.endsWith('/$norm')) {
+          return entry.value;
+        }
+      }
+      return null;
+    }
+
+    final relSegs = relPath.split('/').where((s) => s.isNotEmpty).toList();
+    final stackSegs = _dirStack.map((d) => d.name).toList();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (_dirStack.isNotEmpty || relPath.isNotEmpty) ...[
-          Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: GrassBagSpringTap(
-              onTap: goParent,
-              child: GrassBagFresnelGlassSurface(
-                borderRadius: 14,
-                innerWell: true,
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    Icon(CupertinoIcons.chevron_back, size: 14, color: t.primary),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        '返回上一级 · $currentBreadcrumb',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
+        // Clickable multi-segment path breadcrumbs
         Padding(
-          padding: const EdgeInsets.only(left: 4, right: 4, bottom: 6),
+          padding: const EdgeInsets.only(bottom: 8),
           child: Row(
             children: [
               Expanded(
-                child: Text(
-                  '工作区目录 · $currentBreadcrumb',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text3),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      GrassBagSpringTap(
+                        pressedScale: 0.95,
+                        onTap: () {
+                          if (_dirStack.isNotEmpty) setState(() => _dirStack.clear());
+                          if (relPath.isNotEmpty) unawaited(_refreshFiles(path: '.'));
+                        },
+                        child: GrassBagFresnelGlassSurface(
+                          isPill: true,
+                          innerWell: true,
+                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4.5),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.folder_fill, size: 11.5, color: t.primary),
+                              const SizedBox(width: 4),
+                              Text(
+                                shortRoot,
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 11.2,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.primary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      for (var i = 0; i < relSegs.length; i++) ...[
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 3),
+                          child: Icon(CupertinoIcons.chevron_right, size: 10, color: t.text3),
+                        ),
+                        GrassBagSpringTap(
+                          pressedScale: 0.95,
+                          onTap: () {
+                            if (_dirStack.isNotEmpty) setState(() => _dirStack.clear());
+                            final target = relSegs.sublist(0, i + 1).join('/');
+                            if (target != relPath) unawaited(_refreshFiles(path: target));
+                          },
+                          child: GrassBagFresnelGlassSurface(
+                            isPill: true,
+                            innerWell: true,
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+                            child: Text(
+                              relSegs[i],
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11.2,
+                                fontWeight: (i == relSegs.length - 1 && stackSegs.isEmpty)
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: (i == relSegs.length - 1 && stackSegs.isEmpty)
+                                    ? t.text
+                                    : t.text2,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                      for (var i = 0; i < stackSegs.length; i++) ...[
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 3),
+                          child: Icon(CupertinoIcons.chevron_right, size: 10, color: t.text3),
+                        ),
+                        GrassBagSpringTap(
+                          pressedScale: 0.95,
+                          onTap: () {
+                            if (i < _dirStack.length - 1) {
+                              setState(() => _dirStack.removeRange(i + 1, _dirStack.length));
+                            }
+                          },
+                          child: GrassBagFresnelGlassSurface(
+                            isPill: true,
+                            innerWell: true,
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+                            child: Text(
+                              stackSegs[i],
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11.2,
+                                fontWeight: i == stackSegs.length - 1
+                                    ? FontWeight.w700
+                                    : FontWeight.w500,
+                                color: i == stackSegs.length - 1 ? t.text : t.text2,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
@@ -746,14 +838,85 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
             ],
           ),
         ),
+        if (_dirStack.isNotEmpty || relPath.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: GrassBagSpringTap(
+              onTap: goParent,
+              child: GrassBagFresnelGlassSurface(
+                borderRadius: 14,
+                innerWell: true,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7.5),
+                child: Row(
+                  children: [
+                    Icon(CupertinoIcons.chevron_back, size: 13.5, color: t.primary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '返回上一级 · $currentBreadcrumb',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11.8, fontWeight: FontWeight.w600, color: t.primary),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+        if (currentNodes.length > 3 || _fileFilterQuery.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: GrassBagTextField(
+              controller: _fileFilterCtrl,
+              placeholder: '筛选当前目录文件 (${currentNodes.length})…',
+              insideGlass: false,
+              fontSize: 12.5,
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+              prefix: Padding(
+                padding: const EdgeInsets.only(left: 2, right: 6),
+                child: Icon(CupertinoIcons.search, size: 13.5, color: t.text3),
+              ),
+              suffix: _fileFilterQuery.isEmpty
+                  ? null
+                  : GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        _fileFilterCtrl.clear();
+                        setState(() => _fileFilterQuery = '');
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        child: Icon(CupertinoIcons.xmark_circle_fill, size: 14, color: t.text3),
+                      ),
+                    ),
+              onChanged: (v) => setState(() => _fileFilterQuery = v),
+            ),
+          ),
         GrassBagGroupedSection(
           dividerIndent: 58,
-          children: currentNodes.isEmpty
+          children: filteredNodes.isEmpty
               ? [
                   if (_loadingFiles)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 24),
                       child: Center(child: GrassBagActivityIndicator(color: t.primary)),
+                    )
+                  else if (currentNodes.isNotEmpty && filterQ.isNotEmpty)
+                    GrassBagListTile(
+                      leading: GrassBagSquircleIcon(
+                        icon: CupertinoIcons.search,
+                        color: t.text3,
+                        size: 34,
+                        iconSize: 16,
+                      ),
+                      title: Text('未找到包含「$_fileFilterQuery」的文件'),
+                      subtitle: const Text('轻点清除筛选条件'),
+                      onTap: () {
+                        _fileFilterCtrl.clear();
+                        setState(() => _fileFilterQuery = '');
+                      },
                     )
                   else if (state.connectionPhase != ConnectionPhase.connected)
                     GrassBagListTile(
@@ -796,32 +959,82 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                   ],
                 ]
               : [
-                  for (final node in currentNodes)
-                    GrassBagListTile(
-                      leading: GrassBagSquircleIcon(
-                        icon: node.isDir ? CupertinoIcons.folder_fill : CupertinoIcons.doc_text_fill,
-                        color: node.isDir ? t.primary : t.dusk,
-                        size: 34,
-                        iconSize: 16,
-                      ),
-                      title: Text(
-                        node.isDir ? '${node.name}/' : node.name,
-                        style: const TextStyle(fontSize: 13.5, fontFamily: 'monospace'),
-                      ),
-                      subtitle: Text(node.subtitle.isEmpty ? node.path : node.subtitle),
-                      showChevron: true,
-                      onTap: () {
-                        if (node.isDir) {
-                          if (node.children.isNotEmpty) {
-                            setState(() => _dirStack.add(node));
+                  for (final node in filteredNodes)
+                    () {
+                      final nodeDiff = diffForNode(node);
+                      final fKind = node.isDir ? null : classifyPreviewFile(node.path);
+                      final iconColor = node.isDir
+                          ? t.primary
+                          : switch (fKind) {
+                              PreviewFileKind.rasterImage || PreviewFileKind.svg => t.ok,
+                              PreviewFileKind.markdown => t.primary,
+                              PreviewFileKind.json || PreviewFileKind.csv => t.warn,
+                              PreviewFileKind.binary => t.text3,
+                              _ => t.dusk,
+                            };
+                      return GrassBagListTile(
+                        leading: GrassBagSquircleIcon(
+                          icon: node.isDir
+                              ? CupertinoIcons.folder_fill
+                              : previewFileIcon(node.path),
+                          color: iconColor,
+                          size: 34,
+                          iconSize: 16,
+                        ),
+                        title: Text(
+                          node.isDir ? '${node.name}/' : node.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13.5, fontFamily: 'monospace'),
+                        ),
+                        subtitle: Text(
+                          node.subtitle.isEmpty ? node.path : node.subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: nodeDiff != null
+                            ? GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                tintColor: nodeDiff.summary == '新增'
+                                    ? t.okSoft
+                                    : (nodeDiff.summary == '已删除' ? t.errSoft : t.warnSoft),
+                                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 2),
+                                child: Text(
+                                  nodeDiff.summary == '新增'
+                                      ? 'A +${nodeDiff.added}'
+                                      : (nodeDiff.summary == '已删除'
+                                          ? 'D -${nodeDiff.removed}'
+                                          : 'M +${nodeDiff.added}'),
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: nodeDiff.summary == '新增'
+                                        ? t.ok
+                                        : (nodeDiff.summary == '已删除' ? t.err : t.warn),
+                                  ),
+                                ),
+                              )
+                            : null,
+                        showChevron: true,
+                        onTap: () {
+                          if (node.isDir) {
+                            if (_fileFilterQuery.isNotEmpty) {
+                              _fileFilterCtrl.clear();
+                              _fileFilterQuery = '';
+                            }
+                            if (node.children.isNotEmpty) {
+                              setState(() => _dirStack.add(node));
+                            } else {
+                              unawaited(_refreshFiles(path: node.path));
+                            }
                           } else {
-                            unawaited(_refreshFiles(path: node.path));
+                            _openFilePreview(context, node);
                           }
-                        } else {
-                          _openFilePreview(context, node);
-                        }
-                      },
-                    ),
+                        },
+                      );
+                    }(),
                 ],
         ),
         if (liveDeliverables.isNotEmpty) ...[
@@ -1001,6 +1214,11 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         ],
       );
     }
+    final totalAdded = state.workspaceDiffs.fold<int>(0, (sum, d) => sum + d.added);
+    final totalRemoved = state.workspaceDiffs.fold<int>(0, (sum, d) => sum + d.removed);
+    final allCollapsed = state.workspaceDiffs.isNotEmpty &&
+        state.workspaceDiffs.every((d) => _collapsedDiffPaths.contains(d.path));
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1008,61 +1226,212 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
         if (_loadingDiffs)
           Padding(
             padding: const EdgeInsets.only(bottom: 8),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(2),
-              child: LinearProgressIndicator(
-                minHeight: 2.5,
-                color: t.primary,
-                backgroundColor: t.fill1,
-              ),
+            child: GrassBagProgressBar(
+              height: 3.5,
+              color: t.primary,
+              trackColor: t.fill1,
             ),
           ),
+        // Aggregate Diff stats + expand/collapse all toggle
         Padding(
-          padding: const EdgeInsets.only(bottom: 10),
-          child: Text(
-            '${state.workspaceDiffs.length} 个改动文件',
-            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text3),
+          padding: const EdgeInsets.only(left: 2, right: 2, bottom: 10),
+          child: Row(
+            children: [
+              Text(
+                '${state.workspaceDiffs.length} 个改动文件',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text3),
+              ),
+              const SizedBox(width: 8),
+              GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                tintColor: t.okSoft,
+                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 2),
+                child: Text(
+                  '+$totalAdded',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 10.8,
+                    fontWeight: FontWeight.w700,
+                    color: t.ok,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                tintColor: t.errSoft,
+                padding: const EdgeInsets.symmetric(horizontal: 6.5, vertical: 2),
+                child: Text(
+                  '-$totalRemoved',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 10.8,
+                    fontWeight: FontWeight.w700,
+                    color: t.err,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              if (state.workspaceDiffs.length > 1)
+                GrassBagSpringTap(
+                  pressedScale: 0.94,
+                  haptic: true,
+                  onTap: () {
+                    setState(() {
+                      if (allCollapsed) {
+                        _collapsedDiffPaths.clear();
+                      } else {
+                        _collapsedDiffPaths.addAll(state.workspaceDiffs.map((d) => d.path));
+                      }
+                    });
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Text(
+                      allCollapsed ? '全部展开' : '全部收起',
+                      style: TextStyle(fontSize: 11.8, fontWeight: FontWeight.w600, color: t.primary),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
         for (final diff in state.workspaceDiffs) ...[
-          RepaintBoundary(
-            child: GrassBagCard(
-              padding: const EdgeInsets.all(13),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  GrassBagSpringTap(
-                    pressedScale: 0.985,
-                    haptic: true,
-                    onTap: () => _openDiffRecordSheet(context, diff),
-                    child: Row(
+          () {
+            final collapsed = _collapsedDiffPaths.contains(diff.path);
+            final statusColor = switch (diff.summary) {
+              '新增' || '未跟踪' => t.ok,
+              '已删除' => t.err,
+              '重命名' => t.warn,
+              _ => t.primary,
+            };
+            final statusSoft = switch (diff.summary) {
+              '新增' || '未跟踪' => t.okSoft,
+              '已删除' => t.errSoft,
+              '重命名' => t.warnSoft,
+              _ => t.primarySoft,
+            };
+            return RepaintBoundary(
+              child: GrassBagCard(
+                padding: const EdgeInsets.all(13),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
                       children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                () {
-                                  final p = diff.path;
-                                  if (p.length <= 38 || !p.contains('/')) return p;
-                                  final segs = p.split('/').where((s) => s.isNotEmpty).toList();
-                                  if (segs.length < 3) return p;
-                                  return '${segs.first}/…/${segs[segs.length - 2]}/${segs.last}';
-                                }(),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                  color: t.text,
+                        GrassBagSpringTap(
+                          pressedScale: 0.88,
+                          enablePointerGlow: false,
+                          haptic: true,
+                          onTap: () {
+                            setState(() {
+                              if (collapsed) {
+                                _collapsedDiffPaths.remove(diff.path);
+                              } else {
+                                _collapsedDiffPaths.add(diff.path);
+                              }
+                            });
+                          },
+                          child: SizedBox(
+                            width: 34,
+                            height: 36,
+                            child: Center(
+                              child: AnimatedRotation(
+                                turns: collapsed ? 0.0 : 0.25,
+                                duration: GrassBagMotion.duration(
+                                  context,
+                                  const Duration(milliseconds: 210),
+                                ),
+                                curve: Curves.easeOutCubic,
+                                child: Icon(
+                                  CupertinoIcons.chevron_right,
+                                  size: 13.5,
+                                  color: t.text3,
                                 ),
                               ),
-                              const SizedBox(height: 2),
-                              Text(diff.summary, style: TextStyle(fontSize: 11.5, color: t.text3)),
-                            ],
+                            ),
                           ),
                         ),
+                        Expanded(
+                          child: GrassBagSpringTap(
+                            pressedScale: 0.985,
+                            haptic: true,
+                            onTap: () => _openDiffRecordSheet(context, diff),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  () {
+                                    final p = diff.path;
+                                    if (p.length <= 36 || !p.contains('/')) return p;
+                                    final segs = p.split('/').where((s) => s.isNotEmpty).toList();
+                                    if (segs.length < 3) return p;
+                                    return '${segs.first}/…/${segs[segs.length - 2]}/${segs.last}';
+                                  }(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.text,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Wrap(
+                                  spacing: 5,
+                                  runSpacing: 4,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  children: [
+                                    GrassBagFresnelGlassSurface(
+                                      isPill: true,
+                                      innerWell: true,
+                                      tintColor: statusSoft,
+                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                                      child: Text(
+                                        diff.summary,
+                                        style: TextStyle(
+                                          fontSize: 10.2,
+                                          fontWeight: FontWeight.w700,
+                                          color: statusColor,
+                                        ),
+                                      ),
+                                    ),
+                                    if (diff.binary)
+                                      GrassBagFresnelGlassSurface(
+                                        isPill: true,
+                                        innerWell: true,
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                                        child: Text(
+                                          '二进制',
+                                          style: TextStyle(
+                                            fontSize: 10.2,
+                                            fontWeight: FontWeight.w600,
+                                            color: t.text3,
+                                          ),
+                                        ),
+                                      ),
+                                    if (diff.previousPath != null &&
+                                        diff.previousPath != diff.path)
+                                      Text(
+                                        '原路径：${diff.previousPath}',
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontFamily: 'monospace',
+                                          fontSize: 10.5,
+                                          color: t.text3,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
@@ -1101,29 +1470,80 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                         ),
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 9),
-                  _UnifiedDiffCodeBox(diffText: diff.unifiedDiff, maxPreviewLines: 12),
-                  const SizedBox(height: 8),
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: GrassBagSpringTap(
-                      pressedScale: 0.95,
-                      haptic: true,
-                      onTap: () => _openDiffRecordSheet(context, diff),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                        child: Text(
-                          '全屏查看补丁 ›',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
-                        ),
+                    GrassBagSmoothDisclosure(
+                      expanded: !collapsed,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(height: 9),
+                          if (diff.binary || diff.unifiedDiff.trim().isEmpty)
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+                              decoration: BoxDecoration(
+                                color: t.fill1,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: t.sep, width: 0.6),
+                              ),
+                              child: Text(
+                                diff.binary
+                                    ? '二进制文件变更，不支持行级 Diff 预览'
+                                    : (diff.oversized
+                                        ? '补丁体积过大，点击下方全屏或打开完整文件查看'
+                                        : '暂无详细文本补丁'),
+                                style: TextStyle(fontSize: 11.8, color: t.text3),
+                              ),
+                            )
+                          else
+                            _UnifiedDiffCodeBox(diffText: diff.unifiedDiff, maxPreviewLines: 12),
+                          const SizedBox(height: 8),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              GrassBagSpringTap(
+                                pressedScale: 0.95,
+                                haptic: true,
+                                onTap: () => showWorkspaceFilePreviewSheet(context, path: diff.path),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                  child: Text(
+                                    '完整文件',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: t.text2,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              GrassBagSpringTap(
+                                pressedScale: 0.95,
+                                haptic: true,
+                                onTap: () => _openDiffRecordSheet(context, diff),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                                  child: Text(
+                                    '全屏查看补丁 ›',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                      color: t.primary,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-          ),
+            );
+          }(),
           const SizedBox(height: 12),
         ],
       ],
@@ -1285,7 +1705,7 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                                     confirmLabel: '关闭终端',
                                     isDestructive: true,
                                   );
-                                  if (ok) unawaited(_closeRemoteTerminal(termId));
+                                  if (ok && mounted) unawaited(_closeRemoteTerminal(termId));
                                 },
                                 child: GrassBagFresnelGlassSurface(
                                   isPill: true,
@@ -2786,10 +3206,12 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
                     if (ok) ctrl.interruptSubagent(sub.id);
                   }
                 : null,
-            onInspect: sub.id.trim().isNotEmpty &&
-                    state.sessions.any((s) => s.id == sub.id)
+            onInspect: sub.id.trim().isNotEmpty
                 ? () {
-                    ctrl.selectSession(sub.id);
+                    ctrl.openSubagentSession(
+                      sub.id,
+                      childTitle: sub.name,
+                    );
                     if (!widget.isTabletPane) Navigator.of(context).pop();
                   }
                 : null,
@@ -3260,15 +3682,12 @@ class _UnifiedDiffCodeBoxState extends State<_UnifiedDiffCodeBox> {
     _clipped = maxLines != null && allLines.length > maxLines;
     _lines = _clipped ? allLines.sublist(0, maxLines) : allLines;
     _hiddenCount = _clipped ? allLines.length - _lines.length : 0;
-    var maxCols = 40;
+    var maxPx = 280.0;
     for (final l in _lines) {
-      var cols = 0;
-      for (final cu in l.codeUnits) {
-        cols += cu > 0xFF ? 2 : 1;
-      }
-      if (cols > maxCols) maxCols = cols;
+      final px = estimateMonospaceLinePx(l, fontSize: 11.5) + 28.0;
+      if (px > maxPx) maxPx = px;
     }
-    _contentWidth = (maxCols * 7.4 + 28.0).clamp(280.0, 2600.0);
+    _contentWidth = maxPx.clamp(280.0, 3200.0);
   }
 
   @override
@@ -3297,43 +3716,53 @@ class _UnifiedDiffCodeBoxState extends State<_UnifiedDiffCodeBox> {
     final horizontalView = LayoutBuilder(
       builder: (_, box) {
         final effectiveWidth = math.max(box.maxWidth, contentWidth);
-        return SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          physics: const BouncingScrollPhysics(),
-          child: SizedBox(
-            width: effectiveWidth,
-            child: SelectionArea(
-              contextMenuBuilder: buildGrassBagSelectableContextMenu,
+        // SelectionArea strictly OUTSIDE horizontal scroller so Android horizontal drag never stalls!
+        return SelectionArea(
+          contextMenuBuilder: buildGrassBagSelectableContextMenu,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            child: SizedBox(
+              width: effectiveWidth,
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  for (final line in lines)
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                      color: line.startsWith('+') && !line.startsWith('+++')
-                          ? (t.isDark ? const Color(0x2834D399) : const Color(0x1D117A4B))
-                          : (line.startsWith('-') && !line.startsWith('---')
-                              ? (t.isDark ? const Color(0x28F87171) : const Color(0x1DA6302C))
-                              : Colors.transparent),
-                      child: Text(
-                        line,
-                        softWrap: false,
-                        overflow: TextOverflow.visible,
-                        style: TextStyle(
-                          fontFamily: 'monospace',
-                          fontSize: 11.5,
-                          height: 1.42,
-                          color: line.startsWith('@@')
-                              ? (t.isDark ? const Color(0xFF60A5FA) : const Color(0xFF2563EB))
-                              : (line.startsWith('+') && !line.startsWith('+++')
-                                  ? (t.isDark ? const Color(0xFF6EE7B7) : const Color(0xFF0D7A4F))
-                                  : (line.startsWith('-') && !line.startsWith('---')
-                                      ? (t.isDark ? const Color(0xFFFCA5A5) : const Color(0xFFA6302C))
-                                      : t.codeFg)),
+                  for (final rawLine in lines)
+                    () {
+                      final line = expandTabs(rawLine);
+                      final isAdd = line.startsWith('+') && !line.startsWith('+++');
+                      final isDel = line.startsWith('-') && !line.startsWith('---');
+                      final isHunk = line.startsWith('@@');
+                      return Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                        color: isAdd
+                            ? (t.isDark ? const Color(0x2834D399) : const Color(0x1D117A4B))
+                            : (isDel
+                                ? (t.isDark ? const Color(0x28F87171) : const Color(0x1DA6302C))
+                                : (isHunk
+                                    ? (t.isDark ? const Color(0x203B82F6) : const Color(0x142563EB))
+                                    : Colors.transparent)),
+                        child: Text(
+                          line,
+                          softWrap: false,
+                          overflow: TextOverflow.visible,
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11.5,
+                            height: 1.42,
+                            fontWeight: isHunk ? FontWeight.w600 : FontWeight.w400,
+                            color: isHunk
+                                ? (t.isDark ? const Color(0xFF60A5FA) : const Color(0xFF2563EB))
+                                : (isAdd
+                                    ? (t.isDark ? const Color(0xFF6EE7B7) : const Color(0xFF0D7A4F))
+                                    : (isDel
+                                        ? (t.isDark ? const Color(0xFFFCA5A5) : const Color(0xFFA6302C))
+                                        : t.codeFg)),
+                          ),
                         ),
-                      ),
-                    ),
+                      );
+                    }(),
                   if (clipped)
                     Padding(
                       padding: const EdgeInsets.only(left: 5, top: 4),
@@ -3391,587 +3820,6 @@ class _UnifiedDiffCodeBoxState extends State<_UnifiedDiffCodeBox> {
               ),
               child: diffBox,
             ),
-    );
-  }
-}
-
-/// Opens the virtualized workspace file preview sheet from any page (e.g. chat tool rows,
-/// modified-file badges, or clickable Markdown workspace paths).
-void showWorkspaceFilePreviewSheet(
-  BuildContext context, {
-  required String path,
-  String? title,
-}) {
-  final clean = path.trim();
-  if (clean.isEmpty) return;
-  final parts = clean.split('/').where((p) => p.isNotEmpty).toList(growable: false);
-  final displayName = (title != null && title.trim().isNotEmpty)
-      ? title.trim()
-      : (parts.isNotEmpty ? parts.last : clean);
-  final node = WorkspaceFileNode(
-    name: displayName,
-    path: clean,
-    isDir: false,
-  );
-  showGrassBagSheet(
-    context,
-    title: displayName,
-    subtitle: clean,
-    icon: CupertinoIcons.doc_text_fill,
-    preferredHeight: 460,
-    expandable: true,
-    bodyBuilder: (_) => _WorkspaceFilePreviewBody(node: node),
-  );
-}
-
-class _WorkspaceFilePreviewBody extends ConsumerStatefulWidget {
-  const _WorkspaceFilePreviewBody({required this.node});
-
-  final WorkspaceFileNode node;
-
-  @override
-  ConsumerState<_WorkspaceFilePreviewBody> createState() => _WorkspaceFilePreviewBodyState();
-}
-
-class _WorkspaceFilePreviewBodyState extends ConsumerState<_WorkspaceFilePreviewBody> {
-  static const _imageExts = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'};
-
-  final ScrollController _hScrollCtrl = ScrollController();
-  final ScrollController _vScrollCtrl = ScrollController();
-  bool _loading = true;
-  bool _loadingMore = false;
-  bool _eof = true;
-  bool _binary = false;
-  bool _softWrap = false;
-  int _nextOffset = 1;
-  String _text = '';
-  List<String> _lines = const [];
-  double _maxLinePx = 320.0;
-  Uint8List? _imageBytes;
-  String? _error;
-  String? _loadMoreError;
-
-  @override
-  void dispose() {
-    _hScrollCtrl.dispose();
-    _vScrollCtrl.dispose();
-    super.dispose();
-  }
-
-  void _rebuildLineCache(String txt) {
-    _text = txt;
-    if (txt.isEmpty) {
-      _lines = const ['// 空文件'];
-      _maxLinePx = 120.0;
-      return;
-    }
-    final split = txt.split('\n');
-    _lines = split;
-    int maxWeightedCols = 40;
-    for (final line in split) {
-      var cols = 0;
-      for (final cu in line.codeUnits) {
-        cols += cu > 0x7F ? 2 : 1;
-      }
-      if (cols > maxWeightedCols) maxWeightedCols = cols;
-    }
-    _maxLinePx = (maxWeightedCols * 7.8 + 28.0).clamp(240.0, 6400.0);
-  }
-
-  bool get _isImage {
-    final lowerName = widget.node.name.toLowerCase();
-    final lowerPath = widget.node.path.toLowerCase();
-    return _imageExts.any((ext) => lowerName.endsWith(ext) || lowerPath.endsWith(ext));
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(_loadInitial());
-  }
-
-  Future<void> _retryInitial() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-      _imageBytes = null;
-      _lines = const [];
-      _text = '';
-    });
-    await _loadInitial();
-  }
-
-  Future<void> _loadInitial() async {
-    try {
-      if (_isImage) {
-        final bytes = await ref.read(appProvider.notifier).readWorkspaceFileBytes(widget.node.path);
-        if (!mounted) return;
-        setState(() {
-          _loading = false;
-          _imageBytes = bytes;
-          if (bytes == null || bytes.isEmpty) {
-            _error = '无法加载图片字节，可能不在当前会话工作区或文件过大';
-          }
-        });
-        return;
-      }
-
-      if (widget.node.content != null) {
-        if (!mounted) return;
-        setState(() {
-          _loading = false;
-          _rebuildLineCache(widget.node.content!);
-          _eof = true;
-        });
-        return;
-      }
-
-      final page = await ref.read(appProvider.notifier).readWorkspaceFilePage(
-            widget.node.path,
-            offset: 1,
-            limit: 400,
-          );
-      if (!mounted) return;
-      final txt = (page['text'] ?? '').toString();
-      final lines = (page['lines'] as num?)?.toInt() ?? (txt.isEmpty ? 0 : txt.split('\n').length);
-      setState(() {
-        _loading = false;
-        _binary = page['binary'] == true;
-        _rebuildLineCache(txt);
-        _eof = page['eof'] != false || _binary;
-        _nextOffset = 1 + (lines > 0 ? lines : 400);
-        if (page['error'] == true) _error = txt;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = GrassBagController.formatReadableError(e);
-      });
-    }
-  }
-
-  Future<void> _loadMore() async {
-    if (_loadingMore || _eof) return;
-    setState(() {
-      _loadingMore = true;
-      _loadMoreError = null;
-    });
-    try {
-      final page = await ref.read(appProvider.notifier).readWorkspaceFilePage(
-            widget.node.path,
-            offset: _nextOffset,
-            limit: 400,
-          );
-      if (!mounted) return;
-      final chunk = (page['text'] ?? '').toString();
-      final lines = (page['lines'] as num?)?.toInt() ?? (chunk.isEmpty ? 0 : chunk.split('\n').length);
-      setState(() {
-        _loadingMore = false;
-        if (page['error'] == true) {
-          _loadMoreError = chunk.isNotEmpty ? chunk : '继续加载失败，请重试';
-        } else {
-          if (chunk.isNotEmpty) {
-            _rebuildLineCache(_text.isEmpty ? chunk : '$_text\n$chunk');
-          }
-          _eof = page['eof'] != false || lines == 0;
-          _nextOffset += lines > 0 ? lines : 400;
-        }
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loadingMore = false;
-        _loadMoreError = GrassBagController.formatReadableError(e);
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final tier = ref.watch(appProvider.select((s) => s.glassTier));
-    final t = GrassBagTokens.of(context);
-    final sheetMetrics = GrassBagSheetMetrics.maybeOf(context);
-    final maxPreviewH = (sheetMetrics != null && sheetMetrics.expanded)
-        ? math.max(440.0, sheetMetrics.maxBodyHeight - 132.0)
-        : 440.0;
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (!_isImage && !_binary && !_loading && _error == null)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(
-              children: [
-                Text(
-                  '${_lines.length} 行${_eof ? '' : '+'}',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w500,
-                    fontFeatures: const [FontFeature.tabularFigures()],
-                    color: t.text3,
-                  ),
-                ),
-                const Spacer(),
-                GrassBagSpringTap(
-                  pressedScale: 0.94,
-                  haptic: true,
-                  onTap: () => setState(() => _softWrap = !_softWrap),
-                  child: GrassBagFresnelGlassSurface(
-                    isPill: true,
-                    innerWell: true,
-                    interactive: true,
-                    tintColor: _softWrap ? t.primarySoft : null,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4.5),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          CupertinoIcons.text_alignleft,
-                          size: 12,
-                          color: _softWrap ? t.primary : t.text2,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          _softWrap ? '单行滚动' : '自动换行',
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w600,
-                            color: _softWrap ? t.primary : t.text2,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        CustomPaint(
-          foregroundPainter: tier == GrassBagGlassTier.solid
-              ? null
-              : GrassBagFresnelRimPainter(
-                  isDark: t.isDark,
-                  borderRadius: 16,
-                  accent: (!_isImage && !_binary && t.isDark) ? t.primaryHi : null,
-                  innerWell: true,
-                  frosted: tier == GrassBagGlassTier.frosted,
-                  paintTopSheen: false,
-                  strokeWidth: 0.8,
-                ),
-          child: ClipRSuperellipse(
-            borderRadius: BorderRadius.circular(16),
-            child: Container(
-              constraints: BoxConstraints(
-                minHeight: (_loading || _isImage || _binary || _error != null) ? 140 : 96,
-                maxHeight: maxPreviewH,
-              ),
-              padding: const EdgeInsets.all(12),
-              decoration: ShapeDecoration(
-                color: (_isImage || _binary) ? t.fill1 : t.codeBg,
-                shape: RoundedSuperellipseBorder(
-                  borderRadius: BorderRadius.circular(16),
-                  side: tier == GrassBagGlassTier.solid
-                      ? BorderSide(
-                          color: (_isImage || _binary)
-                              ? t.sep
-                              : (t.isDark ? Colors.white.withValues(alpha: 0.11) : t.sep),
-                          width: 0.7,
-                        )
-                      : BorderSide.none,
-                ),
-              ),
-              child: _loading
-                  ? Center(
-                      child: GrassBagActivityIndicator(
-                        color: (_isImage || _binary || !t.isDark) ? t.primary : Colors.white70,
-                      ),
-                    )
-              : (_isImage
-                  ? (_imageBytes != null && _imageBytes!.isNotEmpty
-                      ? InteractiveViewer(
-                          minScale: 0.5,
-                          maxScale: 4.0,
-                          child: Center(
-                            child: Image.memory(
-                              _imageBytes!,
-                              fit: BoxFit.contain,
-                              errorBuilder: (_, __, ___) => Text(
-                                '图片解码失败',
-                                style: TextStyle(fontSize: 13, color: t.err),
-                              ),
-                            ),
-                          ),
-                        )
-                      : Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                _error ?? '图片暂不可预览',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(fontSize: 12.5, color: t.text3),
-                              ),
-                              const SizedBox(height: 10),
-                              GrassBagSecondaryGlassButton(
-                                label: '重新加载',
-                                icon: CupertinoIcons.refresh,
-                                height: 34,
-                                tier: tier,
-                                insideGlass: true,
-                                onTap: _retryInitial,
-                              ),
-                            ],
-                          ),
-                        ))
-                  : (_binary
-                      ? Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.doc_fill, size: 32, color: t.text3),
-                              const SizedBox(height: 8),
-                              Text(
-                                '二进制文件，不支持纯文本预览',
-                                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: t.text2),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '可复制路径并在终端中检查',
-                                style: TextStyle(fontSize: 11.5, color: t.text3),
-                              ),
-                            ],
-                          ),
-                        )
-                      : (_error != null
-                          ? Center(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    _error!,
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      fontSize: 12.5,
-                                      color: t.isDark ? const Color(0xFFFF8582) : t.err,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 10),
-                                  GrassBagSecondaryGlassButton(
-                                    label: '重新加载',
-                                    icon: CupertinoIcons.refresh,
-                                    height: 34,
-                                    tier: tier,
-                                    insideGlass: true,
-                                    onTap: _retryInitial,
-                                  ),
-                                ],
-                              ),
-                            )
-                          : LayoutBuilder(
-                              builder: (ctx, box) {
-                                final textScaler = MediaQuery.textScalerOf(ctx);
-                                final lineExtent =
-                                    math.max(18.0, textScaler.scale(12.0) * 1.55).ceilToDouble();
-                                final scaledMaxLinePx =
-                                    (_maxLinePx * (textScaler.scale(12.0) / 12.0))
-                                        .clamp(240.0, 8000.0);
-                                final viewW = math.max(
-                                  box.maxWidth.isFinite ? box.maxWidth : 320.0,
-                                  scaledMaxLinePx,
-                                );
-                                final maxContentH = math.max(120.0, maxPreviewH - 24.0);
-                                final contentH = math.min(
-                                  maxContentH,
-                                  math.max(72.0, _lines.length * lineExtent + 8.0),
-                                );
-                                final digits = math.max(2, _lines.length.toString().length);
-                                final gutterW =
-                                    (digits * textScaler.scale(7.4) + 12.0)
-                                        .ceilToDouble()
-                                        .clamp(28.0, 80.0);
-                                if (_softWrap) {
-                                  return SizedBox(
-                                    height: math.min(maxContentH, math.max(120.0, contentH)),
-                                    child: SelectionArea(
-                                      contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                                      child: ListView.builder(
-                                        controller: _vScrollCtrl,
-                                        itemCount: _lines.length,
-                                        physics: const BouncingScrollPhysics(),
-                                        itemBuilder: (_, idx) => Padding(
-                                          padding: const EdgeInsets.symmetric(vertical: 1.0),
-                                          child: Row(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              SelectionContainer.disabled(
-                                                child: SizedBox(
-                                                  width: gutterW,
-                                                  child: Text(
-                                                    '${idx + 1}',
-                                                    textAlign: TextAlign.right,
-                                                    style: TextStyle(
-                                                      fontFamily: 'monospace',
-                                                      fontSize: 10.5,
-                                                      height: 1.5,
-                                                      fontFeatures: const [
-                                                        FontFeature.tabularFigures(),
-                                                      ],
-                                                      color: t.text3.withValues(alpha: 0.58),
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 8),
-                                              Expanded(
-                                                child: Text(
-                                                  _lines[idx],
-                                                  softWrap: true,
-                                                  style: TextStyle(
-                                                    fontFamily: 'monospace',
-                                                    fontSize: 12,
-                                                    height: 1.5,
-                                                    color: t.codeFg,
-                                                  ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                }
-                                final totalViewW = viewW + gutterW + 8.0;
-                                return SizedBox(
-                                  height: contentH,
-                                  child: Scrollbar(
-                                    controller: _hScrollCtrl,
-                                    child: SingleChildScrollView(
-                                      controller: _hScrollCtrl,
-                                      scrollDirection: Axis.horizontal,
-                                      physics: const BouncingScrollPhysics(),
-                                      child: SizedBox(
-                                        width: totalViewW,
-                                        child: SelectionArea(
-                                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                                          child: ListView.builder(
-                                            controller: _vScrollCtrl,
-                                            itemCount: _lines.length,
-                                            itemExtent: lineExtent,
-                                            physics: const BouncingScrollPhysics(),
-                                            itemBuilder: (_, idx) => Row(
-                                              crossAxisAlignment: CrossAxisAlignment.center,
-                                              children: [
-                                                SelectionContainer.disabled(
-                                                  child: SizedBox(
-                                                    width: gutterW,
-                                                    child: Text(
-                                                      '${idx + 1}',
-                                                      textAlign: TextAlign.right,
-                                                      style: TextStyle(
-                                                        fontFamily: 'monospace',
-                                                        fontSize: 10.5,
-                                                        height: 1.5,
-                                                        fontFeatures: const [
-                                                          FontFeature.tabularFigures(),
-                                                        ],
-                                                        color: t.text3.withValues(alpha: 0.58),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 8),
-                                                Expanded(
-                                                  child: Text(
-                                                    _lines[idx],
-                                                    maxLines: 1,
-                                                    softWrap: false,
-                                                    overflow: TextOverflow.visible,
-                                                    style: TextStyle(
-                                                      fontFamily: 'monospace',
-                                                      fontSize: 12,
-                                                      height: 1.5,
-                                                      color: t.codeFg,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                );
-                              },
-                            )))),
-            ),
-          ),
-        ),
-        if (_loadMoreError != null) ...[
-          const SizedBox(height: 8),
-          GrassBagStatusBanner(
-            tone: GrassBagBannerTone.warn,
-            message: '继续加载失败：$_loadMoreError',
-            borderRadius: 12,
-            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-          ),
-        ],
-        if (!_isImage && !_binary && !_loading && !_eof) ...[
-          const SizedBox(height: 10),
-          GrassBagSecondaryGlassButton(
-            label: _loadingMore
-                ? '正在加载更多行…'
-                : (_loadMoreError != null
-                    ? '重试加载（从第 $_nextOffset 行起）'
-                    : '加载下 400 行（从第 $_nextOffset 行起）'),
-            icon: _loadMoreError != null ? CupertinoIcons.refresh : CupertinoIcons.chevron_down,
-            height: 36,
-            tier: tier,
-            insideGlass: true,
-            accentForeground: true,
-            enabled: !_loadingMore,
-            onTap: _loadingMore ? null : _loadMore,
-          ),
-        ],
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: GrassBagSecondaryGlassButton(
-                label: '复制路径',
-                tier: tier,
-                insideGlass: true,
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: widget.node.path));
-                  ref.read(appProvider.notifier).showToast('已复制路径 ${widget.node.path}', tone: ToastTone.info);
-                  Navigator.of(context).pop();
-                },
-              ),
-            ),
-            if (!_isImage && !_loading && !_binary && _error == null) ...[
-              const SizedBox(width: 10),
-              Expanded(
-                child: GrassBagPrimaryGlassButton(
-                  label: _eof ? '复制内容' : '复制已加载内容',
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () {
-                    Clipboard.setData(ClipboardData(text: _text));
-                    ref.read(appProvider.notifier).showToast(
-                          _eof ? '已复制文件内容' : '已复制当前已加载片段（文件未加载完整）',
-                        );
-                    Navigator.of(context).pop();
-                  },
-                ),
-              ),
-            ],
-          ],
-        ),
-      ],
     );
   }
 }

@@ -124,13 +124,17 @@ if (term) {
   try { process.stdout.write('\x1b]777;gbmode;pty\x07'); } catch {}
 
   const cleanupPty = () => {
+    const pid = typeof term.pid === 'number' && term.pid > 1 ? term.pid : null;
     try {
-      if (typeof term.pid === 'number' && term.pid > 1) {
-        process.kill(-term.pid, 'SIGHUP');
-      }
+      if (pid) process.kill(-pid, 'SIGHUP');
     } catch {}
     try { term.kill('SIGHUP'); } catch {}
     try { term.kill('SIGTERM'); } catch {}
+    if (pid) {
+      setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL'); } catch {}
+      }, 90).unref?.();
+    }
   };
 
   term.onData((data) => {
@@ -148,8 +152,9 @@ if (term) {
       if (sig === 'SIGINT') {
         try { term.write('\x03'); } catch {}
       } else {
+        const safeSig = sig === 'SIGTERM' || sig === 'SIGKILL' ? sig : 'SIGINT';
         try {
-          if (typeof term.pid === 'number' && term.pid > 1) process.kill(-term.pid, sig);
+          if (typeof term.pid === 'number' && term.pid > 1) process.kill(-term.pid, safeSig);
         } catch {}
       }
     },
@@ -167,11 +172,11 @@ if (term) {
   });
   process.stdin.on('end', () => {
     cleanupPty();
-    setTimeout(() => process.exit(0), 60).unref?.();
+    setTimeout(() => process.exit(0), 130).unref?.();
   });
-  process.on('SIGTERM', () => { cleanupPty(); process.exit(0); });
-  process.on('SIGHUP', () => { cleanupPty(); process.exit(0); });
-  process.on('SIGINT', () => { cleanupPty(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanupPty(); setTimeout(() => process.exit(0), 120).unref?.(); });
+  process.on('SIGHUP', () => { cleanupPty(); setTimeout(() => process.exit(0), 120).unref?.(); });
+  process.on('SIGINT', () => { cleanupPty(); setTimeout(() => process.exit(0), 120).unref?.(); });
 } else {
   try { process.stdout.write('\x1b]777;gbmode;pipe\x07'); } catch {}
 
@@ -182,12 +187,18 @@ if (term) {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const cleanupChild = () => {
+    const pid = typeof child.pid === 'number' && child.pid > 1 ? child.pid : null;
+    try { child.stdin.end(); } catch {}
     try {
-      if (typeof child.pid === 'number' && child.pid > 1) {
-        process.kill(-child.pid, 'SIGHUP');
-      }
+      if (pid) process.kill(-pid, 'SIGHUP');
     } catch {}
     try { child.kill('SIGTERM'); } catch {}
+    if (pid) {
+      setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL'); } catch {}
+        try { child.kill('SIGKILL'); } catch {}
+      }, 90).unref?.();
+    }
   };
   child.stdout.on('data', (d) => {
     try { process.stdout.write(d); } catch {}
@@ -195,7 +206,7 @@ if (term) {
   child.stderr.on('data', (d) => {
     try { process.stdout.write(d); } catch {}
   });
-  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('close', (code) => process.exit(code ?? 0));
 
   const strip = createControlStripper({
     onResize: () => {},
@@ -224,9 +235,9 @@ if (term) {
   });
   process.stdin.on('end', () => {
     cleanupChild();
-    setTimeout(() => process.exit(0), 60).unref?.();
+    setTimeout(() => process.exit(0), 130).unref?.();
   });
-  process.on('SIGTERM', () => { cleanupChild(); process.exit(0); });
-  process.on('SIGHUP', () => { cleanupChild(); process.exit(0); });
-  process.on('SIGINT', () => { cleanupChild(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanupChild(); setTimeout(() => process.exit(0), 120).unref?.(); });
+  process.on('SIGHUP', () => { cleanupChild(); setTimeout(() => process.exit(0), 120).unref?.(); });
+  process.on('SIGINT', () => { cleanupChild(); setTimeout(() => process.exit(0), 120).unref?.(); });
 }

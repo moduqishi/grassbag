@@ -53,8 +53,12 @@ class PhoneControlDaemon(
     @Volatile
     private var cachedAppsAtMs: Long = 0L
 
+    private fun JSONObject.optCleanString(key: String, fallback: String = ""): String =
+        if (isNull(key)) fallback else optString(key, fallback)
+
     fun start(): Boolean = synchronized(lifecycleLock) {
         if (running.get()) return true
+        var bindSocket: LocalSocket? = null
         return try {
             val exec = if (pool.isShutdown || pool.isTerminated) {
                 Executors.newCachedThreadPool().also { pool = it }
@@ -63,14 +67,15 @@ class PhoneControlDaemon(
             }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
-            val bindSocket = LocalSocket()
-            bindSocket.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+            val sock = LocalSocket()
+            bindSocket = sock
+            sock.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
             socketFile.setReadable(false, false)
             socketFile.setWritable(false, false)
             socketFile.setReadable(true, true)
             socketFile.setWritable(true, true)
-            val ss = LocalServerSocket(bindSocket.fileDescriptor)
-            boundSocket = bindSocket
+            val ss = LocalServerSocket(sock.fileDescriptor)
+            boundSocket = sock
             serverSocket = ss
             running.set(true)
             exec.execute { acceptLoop(ss, exec) }
@@ -79,8 +84,10 @@ class PhoneControlDaemon(
             running.set(false)
             runCatching { serverSocket?.close() }
             runCatching { boundSocket?.close() }
+            runCatching { bindSocket?.close() }
             boundSocket = null
             serverSocket = null
+            runCatching { if (socketFile.exists()) socketFile.delete() }
             false
         }
     }
@@ -137,10 +144,10 @@ class PhoneControlDaemon(
                 }
                 when (req.path) {
                     "/v1/turn-end" -> {
-                        val sid = body.optString("sessionId").ifBlank { null }
-                        val tid = body.optString("turnId").ifBlank { null }
-                        val reason = body.optString("reason", "completed").ifBlank { "completed" }
-                        val summary = body.optString("summary", "").trim()
+                        val sid = body.optCleanString("sessionId").ifBlank { null }
+                        val tid = body.optCleanString("turnId").ifBlank { null }
+                        val reason = body.optCleanString("reason", "completed").ifBlank { "completed" }
+                        val summary = body.optCleanString("summary", "").trim()
                         val endedPhoneTurn = SafetyGate.endTurn(sid, tid)
                         val overlay = PhoneOverlayController.getInstance(context)
                         val shouldFinalize = endedPhoneTurn || overlay.isHudSessionActive()
@@ -174,7 +181,7 @@ class PhoneControlDaemon(
                         writeJson(out, 200, JSONObject().put("ok", true).put("autoReturn", shouldAutoReturn))
                     }
                     "/v1/tool" -> {
-                        val tool = body.optString("tool")
+                        val tool = body.optCleanString("tool")
                         val args = body.optJSONObject("args") ?: JSONObject()
                         val caller = body.optJSONObject("caller")
                         // Never accept client-supplied `userApproved` or self-elevating `permissionPreset`
@@ -182,7 +189,7 @@ class PhoneControlDaemon(
                         // Flutter's live synced SafetyGate chat permission preset.
                         val userApproved = false
                         val syncedPreset = SafetyGate.getSyncedChatPermissionPreset()
-                        val requestedPreset = body.optString("permissionPreset", "").ifBlank { null }
+                        val requestedPreset = body.optCleanString("permissionPreset", "").ifBlank { null }
                         val permissionPreset = if (
                             requestedPreset == "danger-full-access" || requestedPreset == "full-access"
                         ) {
@@ -521,7 +528,7 @@ class PhoneControlDaemon(
         val overlay = PhoneOverlayController.getInstance(context)
         return when (tool) {
             "phone_apps" -> {
-                val query = args.optString("query", "")
+                val query = args.optCleanString("query", "")
                 val refresh = args.optBoolean("refresh", false)
                 val denied = gateAndConfirm(
                     tool = tool,
@@ -595,7 +602,7 @@ class PhoneControlDaemon(
                         .put("blockedPackage", blockedMultiWin)
                 }
                 val pkg = svc.currentForegroundPackage()
-                val nodeId = args.optString("nodeId", "").trim()
+                val nodeId = args.optCleanString("nodeId", "").trim()
                 val cachedNode = if (nodeId.isNotEmpty()) svc.getCachedNode(nodeId) else null
                 if (cachedNode != null && !pkg.isNullOrBlank() && cachedNode.packageName.isNotBlank() && cachedNode.packageName != pkg) {
                     return JSONObject().put("ok", false).put("reason", "stale_node_package_mismatch")
@@ -637,7 +644,7 @@ class PhoneControlDaemon(
                 if (showedPrompt.get()) {
                     val postPkg = svc.currentForegroundPackage()
                     val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                    val appSwappedDuringConfirm = postPkg.isNullOrBlank() || (!pkg.isNullOrBlank() && postPkg != pkg)
                     val preSensitive = hitsSensitive || (cachedNode?.sensitive == true)
                     val (postLabel, postSensitive) = svc.inspectPointTarget(x.toFloat(), y.toFloat())
                     val prevSensWord = SafetyGate.sensitiveActionHit(gateLabel)
@@ -645,6 +652,7 @@ class PhoneControlDaemon(
                     val newSensitiveAppeared = (postSensitive && !preSensitive) ||
                         (postSensWord != null && postSensWord != prevSensWord)
                     if (SafetyGate.isPackageBlocked(postPkg) ||
+                        SafetyGate.isSystemWriteBlocked(postPkg) ||
                         postBlockedWin != null ||
                         appSwappedDuringConfirm ||
                         newSensitiveAppeared
@@ -695,8 +703,12 @@ class PhoneControlDaemon(
                 if (showedPrompt.get()) {
                     val postPkg = svc.currentForegroundPackage()
                     val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
-                    if (SafetyGate.isPackageBlocked(postPkg) || postBlockedWin != null || appSwappedDuringConfirm) {
+                    val appSwappedDuringConfirm = postPkg.isNullOrBlank() || (!pkg.isNullOrBlank() && postPkg != pkg)
+                    if (SafetyGate.isPackageBlocked(postPkg) ||
+                        SafetyGate.isSystemWriteBlocked(postPkg) ||
+                        postBlockedWin != null ||
+                        appSwappedDuringConfirm
+                    ) {
                         return JSONObject().put("ok", false).put("blocked", true).put("reason", "foreground_changed_or_stopped")
                     }
                 }
@@ -704,7 +716,7 @@ class PhoneControlDaemon(
             }
             "phone_key" -> {
                 val svc = GrassBagAccessibilityService.current() ?: return accessibilityMissingError()
-                val action = args.optString("action", "back").lowercase()
+                val action = args.optCleanString("action", "back").ifBlank { "back" }.lowercase()
                 val label = when (action) {
                     "back" -> "返回上一页"
                     "home" -> "回到手机桌面"
@@ -736,7 +748,7 @@ class PhoneControlDaemon(
                     return JSONObject().put("ok", false).put("blocked", true).put("reason", "blocked_sensitive_package")
                         .put("blockedPackage", blockedMultiWin)
                 }
-                val text = args.optString("text", "")
+                val text = args.optCleanString("text", "")
                 val pkg = svc.currentForegroundPackage()
                 val appLabel = svc.resolveAppLabel(pkg) ?: (pkg ?: "当前应用")
                 val (_, sensitive, fieldLabel) = svc.inspectFocusedInput()
@@ -764,13 +776,14 @@ class PhoneControlDaemon(
                 if (showedPrompt.get()) {
                     val postPkg = svc.currentForegroundPackage()
                     val postBlockedWin = svc.findBlockedVisibleWindowPackage(ignoreSelf = true)
-                    val appSwappedDuringConfirm = !pkg.isNullOrBlank() && !postPkg.isNullOrBlank() && postPkg != pkg
+                    val appSwappedDuringConfirm = postPkg.isNullOrBlank() || (!pkg.isNullOrBlank() && postPkg != pkg)
                     val (_, postSensitive, postFieldLabel) = svc.inspectFocusedInput()
                     val prevSensWord = SafetyGate.sensitiveActionHit(fieldLabel)
                     val postSensWord = SafetyGate.sensitiveActionHit(postFieldLabel)
                     val newSensitiveAppeared = (postSensitive && !sensitive) ||
                         (postSensWord != null && postSensWord != prevSensWord)
                     if (SafetyGate.isPackageBlocked(postPkg) ||
+                        SafetyGate.isSystemWriteBlocked(postPkg) ||
                         postBlockedWin != null ||
                         appSwappedDuringConfirm ||
                         newSensitiveAppeared
@@ -782,9 +795,9 @@ class PhoneControlDaemon(
                 svc.executeType(text, submit = submit)
             }
             "phone_open" -> {
-                val rawPkg = args.optString("package", "").trim()
-                val rawAppName = args.optString("appName", args.optString("name", "")).trim()
-                val url = args.optString("url", "").trim()
+                val rawPkg = args.optCleanString("package", "").trim()
+                val rawAppName = args.optCleanString("appName", "").ifBlank { args.optCleanString("name", "") }.trim()
+                val url = args.optCleanString("url", "").trim()
                 if (url.isNotEmpty() && rawPkg.isEmpty() && rawAppName.isEmpty()) {
                     val parsed = runCatching { Uri.parse(url) }.getOrNull()
                     val scheme = parsed?.scheme?.lowercase()
@@ -866,7 +879,7 @@ class PhoneControlDaemon(
                 }
             }
             "phone_intent" -> {
-                val kind = args.optString("kind", "").trim()
+                val kind = args.optCleanString("kind", "").trim()
                 val supportedKinds = setOf("alarm", "timer", "share", "navigation", "calendar")
                 if (kind !in supportedKinds) {
                     return JSONObject()
@@ -874,21 +887,22 @@ class PhoneControlDaemon(
                         .put("reason", "unsupported_intent_kind")
                         .put("hint", "不支持的系统快捷动作类型：$kind（支持 alarm / timer / share / navigation / calendar）")
                 }
-                if (kind == "navigation") {
-                    val dest = args.optString("query", args.optString("destination", "")).trim()
-                    if (dest.isEmpty()) {
-                        return JSONObject()
-                            .put("ok", false)
-                            .put("reason", "destination_required")
-                            .put("hint", "地图导航需要提供目的地 query 或 destination 参数。")
-                    }
+                val navDest = args.optCleanString("query", "").ifBlank { args.optCleanString("destination", "") }.trim()
+                if (kind == "navigation" && navDest.isEmpty()) {
+                    return JSONObject()
+                        .put("ok", false)
+                        .put("reason", "destination_required")
+                        .put("hint", "地图导航需要提供目的地 query 或 destination 参数。")
                 }
+                val calTitle = args.optCleanString("title", "")
+                    .ifBlank { args.optCleanString("label", "") }
+                    .ifBlank { "GrassBag 日程" }
                 val summary = when (kind) {
                     "alarm" -> "设置闹钟 ${args.optInt("hour", 8)}:${args.optInt("minute", 0).toString().padStart(2, '0')}"
                     "timer" -> "启动计时器 ${args.optInt("seconds", 60)} 秒"
                     "share" -> "调用系统分享文本"
-                    "navigation" -> "打开地图导航：${args.optString("query", args.optString("destination", ""))}"
-                    "calendar" -> "新建系统日程：${args.optString("title", args.optString("label", "日程"))}"
+                    "navigation" -> "打开地图导航：$navDest"
+                    "calendar" -> "新建系统日程：$calTitle"
                     else -> "执行系统快捷动作：$kind"
                 }
                 val denied = gateAndConfirm(
@@ -910,7 +924,7 @@ class PhoneControlDaemon(
                             val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
                                 putExtra(AlarmClock.EXTRA_HOUR, args.optInt("hour", 8))
                                 putExtra(AlarmClock.EXTRA_MINUTES, args.optInt("minute", 0))
-                                putExtra(AlarmClock.EXTRA_MESSAGE, args.optString("label", "GrassBag 闹钟"))
+                                putExtra(AlarmClock.EXTRA_MESSAGE, args.optCleanString("label", "GrassBag 闹钟").ifBlank { "GrassBag 闹钟" })
                                 putExtra(AlarmClock.EXTRA_SKIP_UI, false)
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
@@ -920,14 +934,14 @@ class PhoneControlDaemon(
                         "timer" -> {
                             val intent = Intent(AlarmClock.ACTION_SET_TIMER).apply {
                                 putExtra(AlarmClock.EXTRA_LENGTH, args.optInt("seconds", 60))
-                                putExtra(AlarmClock.EXTRA_MESSAGE, args.optString("label", "GrassBag 计时器"))
+                                putExtra(AlarmClock.EXTRA_MESSAGE, args.optCleanString("label", "GrassBag 计时器").ifBlank { "GrassBag 计时器" })
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                             launchCtx.startActivity(intent)
                             JSONObject().put("ok", true).put("kind", "timer")
                         }
                         "share" -> {
-                            val text = args.optString("text", args.optString("label", ""))
+                            val text = args.optCleanString("text", "").ifBlank { args.optCleanString("label", "") }
                             val intent = Intent(Intent.ACTION_SEND).apply {
                                 type = "text/plain"
                                 putExtra(Intent.EXTRA_TEXT, text)
@@ -937,23 +951,22 @@ class PhoneControlDaemon(
                             JSONObject().put("ok", true).put("kind", "share")
                         }
                         "navigation" -> {
-                            val query = args.optString("query", args.optString("destination", "")).trim()
-                            if (query.isEmpty()) {
+                            if (navDest.isEmpty()) {
                                 JSONObject().put("ok", false).put("reason", "destination_required")
                             } else {
-                                val uri = Uri.parse("geo:0,0?q=${Uri.encode(query)}")
+                                val uri = Uri.parse("geo:0,0?q=${Uri.encode(navDest)}")
                                 val intent = Intent(Intent.ACTION_VIEW, uri).apply {
                                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 }
                                 launchCtx.startActivity(intent)
-                                JSONObject().put("ok", true).put("kind", "navigation").put("query", query)
+                                JSONObject().put("ok", true).put("kind", "navigation").put("query", navDest)
                             }
                         }
                         "calendar" -> {
                             val intent = Intent(Intent.ACTION_INSERT).apply {
                                 data = Uri.parse("content://com.android.calendar/events")
-                                putExtra("title", args.optString("title", args.optString("label", "GrassBag 日程")))
-                                putExtra("description", args.optString("description", ""))
+                                putExtra("title", calTitle)
+                                putExtra("description", args.optCleanString("description", ""))
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                             launchCtx.startActivity(intent)
@@ -966,7 +979,7 @@ class PhoneControlDaemon(
                 }
             }
             "phone_handoff" -> {
-                val message = args.optString("message", "请手动完成当前敏感步骤，完成后点击继续")
+                val message = args.optCleanString("message", "").ifBlank { "请手动完成当前敏感步骤，完成后点击继续" }
                 SafetyGate.beginTurn(turnId, sessionId)
                 onEvent("phone_handoff", mapOf("message" to message))
                 val svc = GrassBagAccessibilityService.current()
@@ -992,7 +1005,7 @@ class PhoneControlDaemon(
                 }
             }
             "phone_return_app" -> {
-                val summary = args.optString("summary", "").trim()
+                val summary = args.optCleanString("summary", "").trim()
                 val steps = overlay.currentStepCount()
                 SafetyGate.endTurn(sessionId, turnId)
                 overlay.showCompletionAndReturn(

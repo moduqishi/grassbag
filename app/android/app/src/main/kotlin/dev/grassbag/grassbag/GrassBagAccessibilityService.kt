@@ -254,11 +254,21 @@ class GrassBagAccessibilityService : AccessibilityService() {
             if (directOk) return true
         }
         return runCatching {
+            val creatorOpts = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                ActivityOptions.makeBasic()
+                    .setPendingIntentCreatorBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    )
+                    .toBundle()
+            } else {
+                null
+            }
             val pi = PendingIntent.getActivity(
                 this,
                 7701,
                 intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                creatorOpts
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 val opts = ActivityOptions.makeBasic()
@@ -468,19 +478,17 @@ class GrassBagAccessibilityService : AccessibilityService() {
                 if (node == null || depth > 42 || visited >= 1200) return
                 val visible = runCatching { node.isVisibleToUser }.getOrDefault(true)
                 if (!visible) return
-                runCatching { node.getBoundsInScreen(rect) }
-                if (rect.isEmpty) return
-                if (depth > 0 && !rect.contains(cx.toInt(), cy.toInt())) return
                 visited++
+                rect.setEmpty()
+                runCatching { node.getBoundsInScreen(rect) }
 
-                val isPwd = runCatching { node.isPassword }.getOrDefault(false)
-                val editable = runCatching { node.isEditable }.getOrDefault(false)
-                val text = runCatching { node.text?.toString() }.getOrNull()?.trim()
-                val desc = runCatching { node.contentDescription?.toString() }.getOrNull()?.trim()
-                val hint = runCatching { nodeHintCompat(node) }.getOrNull()?.trim()
-                val viewId = runCatching { node.viewIdResourceName }.getOrNull()
-
-                if (rect.contains(cx.toInt(), cy.toInt())) {
+                if (!rect.isEmpty && rect.contains(cx.toInt(), cy.toInt())) {
+                    val isPwd = runCatching { node.isPassword }.getOrDefault(false)
+                    val editable = runCatching { node.isEditable }.getOrDefault(false)
+                    val text = runCatching { node.text?.toString() }.getOrNull()?.trim()
+                    val desc = runCatching { node.contentDescription?.toString() }.getOrNull()?.trim()
+                    val hint = runCatching { nodeHintCompat(node) }.getOrNull()?.trim()
+                    val viewId = runCatching { node.viewIdResourceName }.getOrNull()
                     val hintDesc = listOfNotNull(desc, hint).joinToString(" ").ifBlank { null }
                     if (isPwd || SafetyGate.isSensitiveNode(false, if (editable) text else null, hintDesc, viewId)) {
                         hitsSensitive = true
@@ -576,6 +584,7 @@ class GrassBagAccessibilityService : AccessibilityService() {
                     }
 
                     if (visible && (clickable || editable || !text.isNullOrBlank() || !desc.isNullOrBlank())) {
+                        rect.setEmpty()
                         runCatching { node.getBoundsInScreen(rect) }
                         val onScreen = !rect.isEmpty &&
                             rect.right > 0 &&

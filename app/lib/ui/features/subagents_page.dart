@@ -106,7 +106,6 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
     final runningCount = state.subagents
         .where((s) => s.status.toLowerCase() == 'running')
         .length;
-    final sessionIdSet = {for (final s in state.sessions) s.id};
 
     return GrassBagGlassPage(
       child: Scaffold(
@@ -238,9 +237,12 @@ class _SubagentsPageState extends ConsumerState<SubagentsPage> {
                                                   if (ok) ctrl.interruptSubagent(sub.id);
                                                 }
                                               : null,
-                                          onInspect: sessionIdSet.contains(sub.id)
+                                          onInspect: sub.id.trim().isNotEmpty
                                               ? () {
-                                                  ctrl.selectSession(sub.id);
+                                                  ctrl.openSubagentSession(
+                                                    sub.id,
+                                                    childTitle: sub.name,
+                                                  );
                                                   Navigator.of(context).pop();
                                                 }
                                               : null,
@@ -363,13 +365,26 @@ class SubagentLineageCard extends StatelessWidget {
                           innerWell: true,
                           tintColor: statusColor.withValues(alpha: t.isDark ? 0.22 : 0.12),
                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2.5),
-                          child: Text(
-                            statusLabel,
-                            style: TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                              color: statusColor,
-                            ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (isRunning || isPending) ...[
+                                GrassBagStatusDot(
+                                  color: statusColor,
+                                  size: 6,
+                                  pulsing: true,
+                                ),
+                                const SizedBox(width: 5),
+                              ],
+                              Text(
+                                statusLabel,
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: statusColor,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -418,26 +433,31 @@ class SubagentLineageCard extends StatelessWidget {
               ),
             ),
           ],
-          if (item.outputPreview.isNotEmpty) ...[
-            const SizedBox(height: 9),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 140),
-              child: GrassBagFresnelGlassSurface(
-                borderRadius: 12,
-                innerWell: true,
-                width: double.infinity,
-                clipBehavior: Clip.antiAlias,
-                padding: const EdgeInsets.all(10),
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    item.outputPreview,
-                    contextMenuBuilder: buildGrassBagEditableContextMenu,
-                    style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+          GrassBagSmoothDisclosure(
+            expanded: item.outputPreview.isNotEmpty,
+            duration: const Duration(milliseconds: 200),
+            child: Padding(
+              padding: const EdgeInsets.only(top: 9),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 140),
+                child: GrassBagFresnelGlassSurface(
+                  borderRadius: 12,
+                  innerWell: true,
+                  width: double.infinity,
+                  clipBehavior: Clip.antiAlias,
+                  padding: const EdgeInsets.all(10),
+                  child: SingleChildScrollView(
+                    physics: const BouncingScrollPhysics(),
+                    child: SelectableText(
+                      item.outputPreview,
+                      contextMenuBuilder: buildGrassBagEditableContextMenu,
+                      style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
+                    ),
                   ),
                 ),
               ),
             ),
-          ],
+          ),
           const SizedBox(height: 11),
           Wrap(
             spacing: 8,

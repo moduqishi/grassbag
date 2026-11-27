@@ -28,3 +28,17 @@ Future<({String name, String mimeType, Uint8List bytes})?> pickWebFile({
     null;
 
 bool downloadWebTextFile(String filename, String content) => false;
+
+bool downloadWebBytes(
+  String filename,
+  Uint8List bytes, {
+  String mimeType = 'application/octet-stream',
+}) =>
+    false;
+
+Future<Uint8List?> fetchRemoteBytes(
+  String url, {
+  int maxBytes = 24 * 1024 * 1024,
+  Duration timeout = const Duration(seconds: 15),
+}) async =>
+    null;

@@ -72,7 +72,7 @@ class ParsedAppVersion {
 }
 
 final RegExp _kSemVerRegex = RegExp(
-  r'^(?:beta-)?v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+(\d+)|\s*\((\d+)\))?$',
+  r'^(beta-)?v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+(\d+)|\s*\((\d+)\))?$',
   caseSensitive: false,
 );
 
@@ -82,19 +82,23 @@ ParsedAppVersion? parseAppVersion(String raw) {
   if (trimmed.isEmpty) return null;
   final match = _kSemVerRegex.firstMatch(trimmed);
   if (match == null) return null;
-  final major = int.tryParse(match.group(1) ?? '');
-  final minor = int.tryParse(match.group(2) ?? '');
-  final patch = int.tryParse(match.group(3) ?? '');
+  final hasBetaPrefix = (match.group(1)?.isNotEmpty ?? false);
+  final major = int.tryParse(match.group(2) ?? '');
+  final minor = int.tryParse(match.group(3) ?? '');
+  final patch = int.tryParse(match.group(4) ?? '');
   if (major == null || minor == null || patch == null) return null;
-  final prerelease = match.group(4)?.trim();
-  final buildStr = match.group(5) ?? match.group(6);
+  final rawPre = match.group(5)?.trim();
+  final prerelease = (rawPre != null && rawPre.isNotEmpty)
+      ? rawPre
+      : (hasBetaPrefix ? 'beta' : null);
+  final buildStr = match.group(6) ?? match.group(7);
   final buildNumber = buildStr == null ? null : int.tryParse(buildStr);
   return ParsedAppVersion(
     major: major,
     minor: minor,
     patch: patch,
     buildNumber: buildNumber,
-    prerelease: (prerelease == null || prerelease.isEmpty) ? null : prerelease,
+    prerelease: prerelease,
   );
 }
 

@@ -337,35 +337,10 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  if (coreReady && !needsRetoggle && perms.batteryOptIgnored)
+                  if (coreReady && !needsRetoggle && perms.batteryOptIgnored) ...[
+                    const SizedBox(width: 8),
                     _PermBadge(label: '核心就绪', bg: t.okSoft, fg: t.ok),
-                  const SizedBox(width: 6),
-                  Tooltip(
-                    message: '刷新系统权限状态',
-                    excludeFromSemantics: true,
-                    child: Semantics(
-                      button: true,
-                      label: '刷新系统权限状态',
-                      child: GrassBagSpringTap(
-                        enablePointerGlow: false,
-                        haptic: true,
-                        onTap: () async {
-                          await ctrl.refreshNativeStatus(skipAutoConnect: true, forceFresh: true);
-                          ctrl.showToast('已刷新系统权限状态', tone: ToastTone.info);
-                        },
-                        child: GrassBagFresnelGlassSurface(
-                          isCircle: true,
-                          innerWell: true,
-                          interactive: true,
-                          width: 34,
-                          height: 34,
-                          alignment: Alignment.center,
-                          child: Icon(CupertinoIcons.refresh, size: 15, color: t.text2),
-                        ),
-                      ),
-                    ),
-                  ),
+                  ],
                 ],
               ),
               const SizedBox(height: 12),
@@ -375,92 +350,105 @@ class _PermissionsCenterViewState extends ConsumerState<PermissionsCenterView> {
                 color: needsRetoggle ? t.err : (coreReady ? t.ok : t.primary),
                 trackColor: t.fill1,
               ),
-              if (needsRetoggle || !perms.accessibilityEnabled || !perms.batteryOptIgnored) ...[
-                const SizedBox(height: 12),
-                if (needsRetoggle)
-                  GrassBagPrimaryGlassButton(
-                    label: '前往修复无障碍服务',
-                    icon: CupertinoIcons.wrench_fill,
-                    height: 38,
-                    tier: tier,
-                    insideGlass: true,
-                    onTap: () => native.openPermissionSettings('accessibility'),
-                  )
-                else if (!perms.accessibilityEnabled)
-                  GrassBagPrimaryGlassButton(
-                    label: perms.sdkInt >= 33 ? '开启无障碍（含解锁指南）' : '开启无障碍服务',
-                    icon: CupertinoIcons.hand_draw_fill,
-                    height: 38,
-                    tier: tier,
-                    insideGlass: true,
-                    onTap: () {
-                      if (perms.sdkInt >= 33) {
-                        _showRestrictedSettingsGuide(context, tier);
-                      } else {
-                        native.openPermissionSettings('accessibility');
-                      }
-                    },
-                  )
-                else
-                  GrassBagSecondaryGlassButton(
-                    label: '开启后台保活（忽略电池优化）',
-                    icon: CupertinoIcons.battery_100,
-                    height: 38,
-                    tier: tier,
-                    insideGlass: true,
-                    accentForeground: true,
-                    onTap: () => native.openPermissionSettings('battery'),
+              GrassBagSmoothDisclosure(
+                expanded: needsRetoggle || !perms.accessibilityEnabled || !perms.batteryOptIgnored,
+                duration: const Duration(milliseconds: 220),
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: AnimatedSwitcher(
+                    duration: GrassBagMotion.duration(context, const Duration(milliseconds: 180)),
+                    child: needsRetoggle
+                        ? GrassBagPrimaryGlassButton(
+                            key: const ValueKey('perm-cta-retoggle'),
+                            label: '前往修复无障碍服务',
+                            icon: CupertinoIcons.wrench_fill,
+                            height: 38,
+                            tier: tier,
+                            insideGlass: true,
+                            onTap: () => native.openPermissionSettings('accessibility'),
+                          )
+                        : !perms.accessibilityEnabled
+                            ? GrassBagPrimaryGlassButton(
+                                key: const ValueKey('perm-cta-a11y'),
+                                label: perms.sdkInt >= 33 ? '开启无障碍（含解锁指南）' : '开启无障碍服务',
+                                icon: CupertinoIcons.hand_draw_fill,
+                                height: 38,
+                                tier: tier,
+                                insideGlass: true,
+                                onTap: () {
+                                  if (perms.sdkInt >= 33) {
+                                    _showRestrictedSettingsGuide(context, tier);
+                                  } else {
+                                    native.openPermissionSettings('accessibility');
+                                  }
+                                },
+                              )
+                            : GrassBagSecondaryGlassButton(
+                                key: const ValueKey('perm-cta-battery'),
+                                label: '开启后台保活（忽略电池优化）',
+                                icon: CupertinoIcons.battery_100,
+                                height: 38,
+                                tier: tier,
+                                insideGlass: true,
+                                accentForeground: true,
+                                onTap: () => native.openPermissionSettings('battery'),
+                              ),
                   ),
-              ],
+                ),
+              ),
             ],
           ),
         ),
 
         // 2. Special Diagnostic Card when Android Settings says ON but service is NOT bound!
-        if (needsRetoggle) ...[
-          const SizedBox(height: 12),
-          GrassBagStatusBanner(
-            tone: GrassBagBannerTone.error,
-            title: '无障碍服务未绑定 / 系统提示「服务出现故障」',
-            message: '覆盖安装更新、应用被后台强杀或 Android 13+ 受限设置会导致系统开关虽开但底层服务连接已断开（设置中常显示「服务出现故障」）。请进入系统无障碍设置先关闭再重新开启「GrassBag 手机操控助手」，并将电池策略设为无限制。',
-            padding: const EdgeInsets.all(14),
-            borderRadius: 20,
-            action: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                GrassBagPrimaryGlassButton(
-                  label: '重新开关无障碍',
-                  icon: CupertinoIcons.hand_draw_fill,
-                  height: 34,
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () => native.openPermissionSettings('accessibility'),
-                ),
-                GrassBagSecondaryGlassButton(
-                  label: '允许受限设置',
-                  icon: CupertinoIcons.info_circle,
-                  height: 34,
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  tier: tier,
-                  insideGlass: true,
-                  onTap: () => _showRestrictedSettingsGuide(context, tier),
-                ),
-                if (!perms.batteryOptIgnored)
-                  GrassBagSecondaryGlassButton(
-                    label: '关闭电池优化',
-                    icon: CupertinoIcons.battery_100,
+        GrassBagSmoothDisclosure(
+          expanded: needsRetoggle,
+          duration: const Duration(milliseconds: 240),
+          child: Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: GrassBagStatusBanner(
+              tone: GrassBagBannerTone.error,
+              title: '无障碍服务未绑定 / 系统提示「服务出现故障」',
+              message: '覆盖安装更新、应用被后台强杀或 Android 13+ 受限设置会导致系统开关虽开但底层服务连接已断开（设置中常显示「服务出现故障」）。请进入系统无障碍设置先关闭再重新开启「GrassBag 手机操控助手」，并将电池策略设为无限制。',
+              padding: const EdgeInsets.all(14),
+              borderRadius: 20,
+              action: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  GrassBagPrimaryGlassButton(
+                    label: '重新开关无障碍',
+                    icon: CupertinoIcons.hand_draw_fill,
                     height: 34,
                     padding: const EdgeInsets.symmetric(horizontal: 12),
                     tier: tier,
                     insideGlass: true,
-                    onTap: () => native.openPermissionSettings('battery'),
+                    onTap: () => native.openPermissionSettings('accessibility'),
                   ),
-              ],
+                  GrassBagSecondaryGlassButton(
+                    label: '允许受限设置',
+                    icon: CupertinoIcons.info_circle,
+                    height: 34,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: () => _showRestrictedSettingsGuide(context, tier),
+                  ),
+                  if (!perms.batteryOptIgnored)
+                    GrassBagSecondaryGlassButton(
+                      label: '关闭电池优化',
+                      icon: CupertinoIcons.battery_100,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: tier,
+                      insideGlass: true,
+                      onTap: () => native.openPermissionSettings('battery'),
+                    ),
+                ],
+              ),
             ),
           ),
-        ],
+        ),
 
         const SizedBox(height: 16),
 

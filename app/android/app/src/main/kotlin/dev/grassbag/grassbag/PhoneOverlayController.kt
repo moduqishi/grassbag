@@ -565,6 +565,7 @@ class PhoneOverlayController(private val appContext: Context) {
     ) {
         if (!isPreview && previewDemoActive.getAndSet(false)) {
             previewDemoGen.incrementAndGet()
+            cancelActivePrompt(ConfirmDecision.STOP, immediate = true)
         }
         val canAttachOverlay = resolveWindowTarget() != null
         // Only real phone-control runs with an attachable window target claim hudSessionActiveAtomic
@@ -577,7 +578,7 @@ class PhoneOverlayController(private val appContext: Context) {
         if (startedFreshAtomic) {
             stepCountAtomic.set(0)
         }
-        val nextStep = if (incrementStep) stepCountAtomic.incrementAndGet() else stepCountAtomic.get()
+        val nextStep = if (incrementStep && !isPreview) stepCountAtomic.incrementAndGet() else stepCountAtomic.get()
         if (!appLabel.isNullOrBlank()) {
             currentAppAtomic.set(appLabel)
         }
@@ -768,11 +769,21 @@ class PhoneOverlayController(private val appContext: Context) {
         }
 
         return runCatching {
+            val creatorOpts = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                ActivityOptions.makeBasic()
+                    .setPendingIntentCreatorBackgroundActivityStartMode(
+                        ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
+                    )
+                    .toBundle()
+            } else {
+                null
+            }
             val pi = PendingIntent.getActivity(
                 appContext,
                 7702,
                 intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                creatorOpts
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 val opts = ActivityOptions.makeBasic()
@@ -1104,12 +1115,22 @@ class PhoneOverlayController(private val appContext: Context) {
                 onStop = {
                     if (!isPreview) {
                         SafetyGate.triggerEmergencyStop()
+                        if (GrassBagEngineService.isServiceActive()) {
+                            GrassBagEngineService.startOrUpdate(
+                                ctx = appContext,
+                                heading = "GrassBag 本机引擎运行中",
+                                detail = "手机操控已急停 · 后台待命保活",
+                                releaseWakeLock = true
+                            )
+                        }
                     } else {
                         previewDemoGen.incrementAndGet()
                         previewDemoActive.set(false)
                     }
                     finish(ConfirmDecision.STOP)
-                    hideHud()
+                    if (!isPreview || !hudSessionActiveAtomic.get()) {
+                        hideHud()
+                    }
                 }
             )
             cardRef.set(card)
@@ -2323,6 +2344,14 @@ class PhoneOverlayController(private val appContext: Context) {
         previewDemoGen.incrementAndGet()
         previewDemoActive.set(false)
         SafetyGate.triggerEmergencyStop()
+        if (GrassBagEngineService.isServiceActive()) {
+            GrassBagEngineService.startOrUpdate(
+                ctx = appContext,
+                heading = "GrassBag 本机引擎运行中",
+                detail = "手机操控已急停 · 后台待命保活",
+                releaseWakeLock = true
+            )
+        }
         cancelActivePrompt(ConfirmDecision.STOP)
         hideHud()
     }

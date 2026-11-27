@@ -92,6 +92,7 @@ Future<void> main() async {
       enablePerformanceMonitor: false,
     ),
   );
+  unawaited(KyantLiquidGlassEngine.warmUp());
 
   runApp(
     const ProviderScope(
@@ -100,16 +101,30 @@ Future<void> main() async {
   );
 }
 
-class GrassBagApp extends ConsumerWidget {
+class GrassBagApp extends ConsumerStatefulWidget {
   const GrassBagApp({super.key, this.skipLaunchGate = false});
 
   final bool skipLaunchGate;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<GrassBagApp> createState() => _GrassBagAppState();
+}
+
+class _GrassBagAppState extends ConsumerState<GrassBagApp> {
+  bool? _lastOverlayDark;
+
+  void _syncSystemOverlay(bool isDark) {
+    if (_lastOverlayDark == isDark) return;
+    _lastOverlayDark = isDark;
+    SystemChrome.setSystemUIOverlayStyle(_systemOverlayStyleFor(isDark));
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final accent = ref.watch(appProvider.select((s) => s.accent));
     final isDark = ref.watch(appProvider.select((s) => s.isDark));
     final glassTier = ref.watch(appProvider.select((s) => s.glassTier));
+    _syncSystemOverlay(isDark);
 
     final lightTokens = GrassBagTokens.resolve(accent, Brightness.light);
     final darkTokens = GrassBagTokens.resolve(accent, Brightness.dark);
@@ -129,7 +144,10 @@ class GrassBagApp extends ConsumerWidget {
             theme: lightTokens.toMaterialTheme(),
             darkTheme: darkTokens.toMaterialTheme(),
             themeMode: isDark ? ThemeMode.dark : ThemeMode.light,
-            themeAnimationDuration: const Duration(milliseconds: 220),
+            themeAnimationDuration:
+                ui.PlatformDispatcher.instance.accessibilityFeatures.disableAnimations
+                    ? Duration.zero
+                    : const Duration(milliseconds: 220),
             themeAnimationCurve: Curves.easeOutCubic,
             builder: (context, child) {
               final highContrast = MediaQuery.highContrastOf(context);
@@ -151,7 +169,7 @@ class GrassBagApp extends ConsumerWidget {
                 ),
               );
             },
-            home: skipLaunchGate ? const GrassBagShell() : const GrassBagAppGate(),
+            home: widget.skipLaunchGate ? const GrassBagShell() : const GrassBagAppGate(),
           ),
         ),
       ),

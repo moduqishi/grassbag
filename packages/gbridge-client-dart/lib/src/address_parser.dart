@@ -188,15 +188,15 @@ ParsedRemoteHostInput? parseRemoteHostInput(
   var autoPorted = false;
   if (!RegExp(r'^[a-zA-Z][a-zA-Z0-9+.-]*://').hasMatch(withScheme)) {
     final hostPart = withScheme.split('/').first.split('?').first;
-    final hasPort = _hasExplicitPort(hostPart);
-    final bareHost = _extractHostOnly(hostPart);
-    final isLocalOrIp = _isLocalOrIpHost(bareHost);
-    final scheme = (isLocalOrIp || hasPort) ? 'http' : 'https';
-    // Bracket bare IPv6 literals (e.g. `::1` or `fd7a:115c::1`) before forming a URI authority,
-    // stripping any `user:pass@` prefix so credentials with a colon aren't misread as IPv6.
+    // Strip any `user:pass@` prefix BEFORE checking port / bare host / IPv6 so credentials
+    // containing a colon are never misread as an IPv6 literal or port separator!
     final authorityHost = hostPart.contains('@')
         ? hostPart.substring(hostPart.lastIndexOf('@') + 1)
         : hostPart;
+    final hasPort = _hasExplicitPort(authorityHost);
+    final bareHost = _extractHostOnly(authorityHost);
+    final isLocalOrIp = _isLocalOrIpHost(bareHost);
+    final scheme = (isLocalOrIp || hasPort) ? 'http' : 'https';
     final isBareIpv6 = !authorityHost.startsWith('[') &&
         authorityHost.indexOf(':') != authorityHost.lastIndexOf(':');
     final rest = withScheme.substring(hostPart.length);

@@ -256,7 +256,7 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
   }
 
   Future<void> _handleCancelBack() async {
-    if (_popped) return;
+    if (_popped || !mounted) return;
     _popped = true;
     // Do NOT cancel the DSH OAuth session if the user handed off to an external browser or copied the link!
     if (!_completed && !_handedOffExternally && !ref.read(appProvider).isAccountSignedIn) {
@@ -291,12 +291,15 @@ class _DeepSeekSignInPageState extends ConsumerState<DeepSeekSignInPage> {
         if (_canGoBack && !_callbackHit && _loadError == null) {
           try {
             if (await _controller.canGoBack()) {
+              if (!mounted) return;
               await _controller.goBack();
+              if (!mounted) return;
               unawaited(_syncCanGoBack());
               return;
             }
           } catch (_) {}
         }
+        if (!mounted) return;
         unawaited(_handleCancelBack());
       },
       child: GrassBagGlassPage(

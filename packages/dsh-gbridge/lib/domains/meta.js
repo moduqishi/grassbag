@@ -267,7 +267,13 @@ export function registerMetaDomain(router, { ctx, gateway, hub, sdui, bridgeVers
       const constructed = `${proto}://${candidateHost}`;
       try {
         const parsed = new URL(constructed);
-        if (!parsed.username && !parsed.password && parsed.pathname === '/' && parsed.host.toLowerCase() === candidateHost.toLowerCase()) {
+        const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
+        const effectiveParsedHost = `${parsed.hostname}:${parsed.port || defaultPort}`.toLowerCase();
+        const candLower = candidateHost.toLowerCase();
+        const candWithDefault = /:\d+$/.test(candLower) && !candLower.endsWith(']')
+          ? candLower
+          : `${candLower}:${defaultPort}`;
+        if (!parsed.username && !parsed.password && parsed.pathname === '/' && effectiveParsedHost === candWithDefault) {
           baseUrl = `${parsed.protocol}//${parsed.host}`;
         }
       } catch {}

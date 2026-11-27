@@ -338,6 +338,8 @@ class RuntimeController private constructor(
     private var lastHomeSizeAtMs: Long = 0L
     @Volatile
     private var activeStartupLatch: CountDownLatch? = null
+    @Volatile
+    private var activeStartupEpoch: Int = -1
 
     private val homeSizeRefreshing = AtomicBoolean(false)
     private val prewarmTriggered = AtomicBoolean(false)
@@ -350,6 +352,7 @@ class RuntimeController private constructor(
     private val bootstrapLock = Any()
     private val metaLock = Any()
     private val dnsLock = Any()
+    private val etcLock = Any()
     private val readinessSignal = Object()
 
     fun addListener(listener: (String, Map<String, Any?>) -> Unit) {
@@ -579,8 +582,8 @@ class RuntimeController private constructor(
         )
     }
 
-    private fun ensureContainerEtcFiles(force: Boolean = false) {
-        if (etcPrepared && !force) return
+    private fun ensureContainerEtcFiles(force: Boolean = false): Unit = synchronized(etcLock) {
+        if (etcPrepared && !force) return@synchronized
         runCatching {
             val etcDir = File(ubuntuRoot, "etc")
             etcDir.mkdirs()
@@ -666,8 +669,15 @@ class RuntimeController private constructor(
                 val caDst = File(etcDir, "ssl/certs/ca-certificates.crt")
                 if (!caDst.exists() || caDst.length() < 4096L) {
                     caDst.parentFile?.mkdirs()
-                    runCatching { Os.remove(caDst.absolutePath) }
-                    bundledCa.copyTo(caDst, overwrite = true)
+                    val caTmp = File(caDst.parentFile, ".ca-certificates.crt.tmp.${System.nanoTime()}")
+                    bundledCa.copyTo(caTmp, overwrite = true)
+                    if (!caTmp.renameTo(caDst)) {
+                        runCatching { Os.remove(caDst.absolutePath) }
+                        if (!caTmp.renameTo(caDst)) {
+                            bundledCa.copyTo(caDst, overwrite = true)
+                            runCatching { caTmp.delete() }
+                        }
+                    }
                 }
             }
 
@@ -720,6 +730,7 @@ class RuntimeController private constructor(
             }
             etcPrepared = true
         }
+        Unit
     }
 
     private fun updateRelativeSymlink(linkFile: File, relativeTarget: String) {
@@ -1279,6 +1290,11 @@ class RuntimeController private constructor(
                 }
             }
             activeDownloadConn.set(conn)
+            if (bootstrapCancelRequested.get()) {
+                runCatching { conn.disconnect() }
+                activeDownloadConn.compareAndSet(conn, null)
+                throw BootstrapCancelledException()
+            }
             val code = try {
                 conn.responseCode
             } catch (t: Throwable) {
@@ -1297,6 +1313,9 @@ class RuntimeController private constructor(
                 val nextProto = resolved.protocol.lowercase()
                 if (nextProto != "http" && nextProto != "https") {
                     throw java.io.IOException("重定向目标协议不受支持：$nextProto")
+                }
+                if (proto == "https" && nextProto != "https") {
+                    throw java.io.IOException("拒绝从 HTTPS 降级重定向至非加密协议：$nextProto")
                 }
                 current = resolved.toString()
                 continue
@@ -1419,14 +1438,15 @@ class RuntimeController private constructor(
                 val cr = conn.getHeaderField("Content-Range") ?: ""
                 val appendMode = if (code == 206 && resumeFrom > 0L) {
                     if (!cr.startsWith("bytes $resumeFrom-")) {
-                        false
-                    } else {
-                        val declaredTotal = cr.substringAfter('/', "").trim().toLongOrNull()
-                        if (expectedBytes > 0L && declaredTotal != null && declaredTotal != expectedBytes) {
-                            throw java.io.IOException("镜像 Content-Range 总大小不匹配 ($declaredTotal != $expectedBytes)")
-                        }
-                        true
+                        throw java.io.IOException("镜像返回无效的 206 Content-Range（期望 bytes $resumeFrom-，实际：$cr）")
                     }
+                    val declaredTotal = cr.substringAfter('/', "").trim().toLongOrNull()
+                    if (expectedBytes > 0L && declaredTotal != null && declaredTotal != expectedBytes) {
+                        throw java.io.IOException("镜像 Content-Range 总大小不匹配 ($declaredTotal != $expectedBytes)")
+                    }
+                    true
+                } else if (code == 206) {
+                    throw java.io.IOException("非续传请求意外收到 HTTP 206 ($cr)")
                 } else {
                     false
                 }
@@ -1447,6 +1467,7 @@ class RuntimeController private constructor(
                     contentLen > 0L -> resumeFrom + contentLen
                     else -> 0L
                 }
+                val hardMaxBytes = if (expectedBytes > 0L) expectedBytes else 512L * 1024L * 1024L
 
                 val expectGzipHeader = resumeFrom == 0L &&
                     (filename.endsWith(".gbag", ignoreCase = true) ||
@@ -1470,6 +1491,11 @@ class RuntimeController private constructor(
                             val n = ins.read(buf)
                             if (n < 0) break
                             if (n > 0) {
+                                if (downloaded + n > hardMaxBytes) {
+                                    fos.close()
+                                    runCatching { partFile.delete() }
+                                    throw java.io.IOException("下载数据超出预期大小上限（>${hardMaxBytes / (1024 * 1024)} MB）")
+                                }
                                 if (expectGzipHeader && magicCount < 2) {
                                     var i = 0
                                     while (i < n && magicCount < 2) {
@@ -1746,6 +1772,14 @@ class RuntimeController private constructor(
     }
 
     fun bootstrapRuntime(alreadyAcquiredLock: Boolean = false, done: (Map<String, Any?>) -> Unit) {
+        if (!alreadyAcquiredLock && upgradeInProgress.get()) {
+            done(mapOf("ok" to false, "error" to "当前有版本升级或回滚任务在进行中，请稍候完成", "status" to getStatus()))
+            return
+        }
+        if (!alreadyAcquiredLock && activeToolkitInstalls.get() > 0) {
+            done(mapOf("ok" to false, "error" to "当前有工具包正在安装，请等待完成后重试", "status" to getStatus()))
+            return
+        }
         if (!alreadyAcquiredLock && !bootstrapRunning.compareAndSet(false, true)) {
             done(mapOf("ok" to false, "error" to "本机环境正在下载或部署中，请稍候…", "status" to getStatus()))
             return
@@ -1756,7 +1790,38 @@ class RuntimeController private constructor(
             var bootstrapErr: String? = null
             var bootstrapCancelled = false
             var startedFgForBootstrap = false
+            var overlaysUpdated = false
             try {
+                // Pre-stop any in-flight/running engine OUTSIDE bootstrapLock when rootfs or engine slot
+                // needs re-deployment so stopEngineSync never waits on startEngineSync while holding bootstrapLock!
+                val preCheckManifest = bundled.loadManifest()
+                val preCheckArts = preCheckManifest?.optJSONObject("artifacts")
+                val preCheckMeta = readMeta()
+                val preCheckSlot = preCheckMeta.optString("activeSlot", "slot-a")
+                val preBaseArt = preCheckArts?.optJSONObject("baseRootfs")
+                val preEngArt = preCheckArts?.optJSONObject("engineInit")
+                val preNeedRootfs = preBaseArt != null && (
+                    !isContainerExtracted() ||
+                        (preBaseArt.optString("sha256", "").isNotEmpty() &&
+                            preBaseArt.optString("sha256", "") != preCheckMeta.optString("baseRootfsSha256", ""))
+                    )
+                val preEngSha = preEngArt?.optString("sha256", "") ?: ""
+                val preStoredEngSha = preCheckMeta.optString("engineInitSha256", "")
+                val preManifestVer = preCheckManifest?.optString("dshVersion", "0.2.2-rc.5") ?: "0.2.2-rc.5"
+                val preNeedEngine = preEngArt != null && (
+                    !isSlotExtracted(preCheckSlot) ||
+                        (!preCheckMeta.optBoolean("userUpgradedAb", false) && (
+                            (preManifestVer.isNotEmpty() &&
+                                preCheckMeta.optString("bundledDshVersion", "").isNotEmpty() &&
+                                preManifestVer != preCheckMeta.optString("bundledDshVersion", "")) ||
+                                (preEngSha.isNotEmpty() &&
+                                    preStoredEngSha.isNotEmpty() &&
+                                    preEngSha != preStoredEngSha)
+                            ))
+                    )
+                if (preNeedRootfs || preNeedEngine) {
+                    stopEngineSync(keepForegroundService = true)
+                }
                 synchronized(bootstrapLock) {
                     extractedOk = try {
                         sendProgress("layout", 2, "检查设备架构、网络与存储空间…", mapOf("canCancel" to true))
@@ -1828,7 +1893,7 @@ class RuntimeController private constructor(
                         )
                         startedFgForBootstrap = true
 
-                        // 1. Shims & droid-* wrappers (always bundled ~156KB inside APK)
+                        // 1. Shims & droid-* wrappers (always bundled ~156KB inside APK; atomic swap so live engine isn't broken mid-read)
                         arts.optJSONObject("shims")?.let { art ->
                             val wantSha = art.optString("sha256", "")
                             val prevSha = st.optString("shimsSha256", "")
@@ -1837,17 +1902,32 @@ class RuntimeController private constructor(
                                 (wantSha.isNotEmpty() && wantSha != prevSha)
                             if (needShims) {
                                 sendProgress("shims", 5, "部署 android-shim、CA 证书与 droid-* 工具链…")
-                                TarGzExtractor.deleteTreeNoFollow(shimsRoot)
-                                shimsRoot.mkdirs()
+                                val stageDir = File(ctx.filesDir, "shims.stage-${System.currentTimeMillis()}")
+                                TarGzExtractor.deleteTreeNoFollow(stageDir)
                                 bundled.openStream(art.optString("asset"))?.use { ins ->
                                     TarGzExtractor.extractStream(
                                         compressedStream = ins,
-                                        destDir = shimsRoot,
+                                        destDir = stageDir,
                                         expectedSha256 = wantSha,
                                         totalCompressedBytes = art.optLong("bytes", 0L),
                                         freshDir = true
                                     )
                                 } ?: error("无法读取 ${art.optString("asset")}")
+                                val backupDir = File(ctx.filesDir, "shims.old-${System.currentTimeMillis()}")
+                                TarGzExtractor.deleteTreeNoFollow(backupDir)
+                                val movedOld = if (shimsRoot.exists()) shimsRoot.renameTo(backupDir) else false
+                                if (!stageDir.renameTo(shimsRoot)) {
+                                    TarGzExtractor.deleteTreeNoFollow(shimsRoot)
+                                    try {
+                                        stageDir.copyRecursively(shimsRoot, overwrite = true)
+                                        TarGzExtractor.deleteTreeNoFollow(stageDir)
+                                    } catch (t: Throwable) {
+                                        if (movedOld && !shimsRoot.exists()) backupDir.renameTo(shimsRoot)
+                                        throw t
+                                    }
+                                }
+                                if (movedOld) TarGzExtractor.deleteTreeNoFollow(backupDir)
+                                overlaysUpdated = true
                                 if (wantSha.isNotEmpty()) {
                                     st.put("shimsSha256", wantSha)
                                     updateMeta { it.put("shimsSha256", wantSha) }
@@ -1858,7 +1938,7 @@ class RuntimeController private constructor(
                         }
 
                         if (needRootfsCheck || needEngineCheck) {
-                            stopEngineSync(keepForegroundService = true)
+                            stopEngineSync(keepForegroundService = true, cancelStartup = false)
                         }
 
                         // 2 & 3. Deploy Ubuntu + Node 24 rootfs and @deepseek-ai/dsh engine slot.
@@ -2065,11 +2145,26 @@ class RuntimeController private constructor(
                                 (wantSha.isNotEmpty() && wantSha != prevSha)
                             if (needBridge) {
                                 sendProgress("gbridge", 90, "增量更新零侵入桥 dsh-gbridge…")
-                                TarGzExtractor.deleteTreeNoFollow(bridgeDir)
-                                bridgeDir.mkdirs()
+                                val stageBridge = File(targetSlotDir, "dsh-gbridge.stage-${System.currentTimeMillis()}")
+                                TarGzExtractor.deleteTreeNoFollow(stageBridge)
                                 bundled.openStream(art.optString("asset"))?.use { ins ->
-                                    TarGzExtractor.extractStream(ins, bridgeDir, wantSha, art.optLong("bytes", 0L), freshDir = true)
+                                    TarGzExtractor.extractStream(ins, stageBridge, wantSha, art.optLong("bytes", 0L), freshDir = true)
                                 } ?: error("无法读取 ${art.optString("asset")}")
+                                val backupBridge = File(targetSlotDir, "dsh-gbridge.old-${System.currentTimeMillis()}")
+                                TarGzExtractor.deleteTreeNoFollow(backupBridge)
+                                val movedOld = if (bridgeDir.exists()) bridgeDir.renameTo(backupBridge) else false
+                                if (!stageBridge.renameTo(bridgeDir)) {
+                                    TarGzExtractor.deleteTreeNoFollow(bridgeDir)
+                                    try {
+                                        stageBridge.copyRecursively(bridgeDir, overwrite = true)
+                                        TarGzExtractor.deleteTreeNoFollow(stageBridge)
+                                    } catch (t: Throwable) {
+                                        if (movedOld && !bridgeDir.exists()) backupBridge.renameTo(bridgeDir)
+                                        throw t
+                                    }
+                                }
+                                if (movedOld) TarGzExtractor.deleteTreeNoFollow(backupBridge)
+                                overlaysUpdated = true
                                 if (wantSha.isNotEmpty()) {
                                     st.put("gbridgeSha256", wantSha)
                                     st.put("gbridgeSha256_$activeSlot", wantSha)
@@ -2118,7 +2213,11 @@ class RuntimeController private constructor(
                         true
                     } catch (c: BootstrapCancelledException) {
                         bootstrapCancelled = true
-                        if (startedFgForBootstrap) {
+                        if ((startedFgForBootstrap || alreadyAcquiredLock) &&
+                            !isEngineAlive() &&
+                            activeToolkitInstalls.get() <= 0 &&
+                            !upgradeInProgress.get()
+                        ) {
                             GrassBagEngineService.stop(ctx)
                         }
                         sendProgress("cancelled", 0, c.message ?: "已暂停下载，断点进度已保留")
@@ -2127,7 +2226,11 @@ class RuntimeController private constructor(
                         Log.e(TAG, "bootstrapRuntime failed", err)
                         bootstrapErr = err.message ?: "bootstrap_failed"
                         lastEngineError = bootstrapErr
-                        if (startedFgForBootstrap) {
+                        if ((startedFgForBootstrap || alreadyAcquiredLock) &&
+                            !isEngineAlive() &&
+                            activeToolkitInstalls.get() <= 0 &&
+                            !upgradeInProgress.get()
+                        ) {
                             GrassBagEngineService.stop(ctx)
                         }
                         sendProgress("error", 0, "本机环境部署失败：${bootstrapErr}")
@@ -2149,12 +2252,20 @@ class RuntimeController private constructor(
 
                 // Release bootstrapLock BEFORE starting DSH engine so status/start calls never stall!
                 if (bootstrapCancelRequested.get()) {
-                    if (startedFgForBootstrap) {
+                    if ((startedFgForBootstrap || alreadyAcquiredLock) &&
+                        !isEngineAlive() &&
+                        activeToolkitInstalls.get() <= 0 &&
+                        !upgradeInProgress.get()
+                    ) {
                         GrassBagEngineService.stop(ctx)
                     }
                     sendProgress("cancelled", 0, "已暂停部署，容器环境已保留", mapOf("canCancel" to false), force = true)
                     done(mapOf("ok" to false, "cancelled" to true, "status" to getStatus()))
                     return@execute
+                }
+                if (overlaysUpdated && isEngineAlive()) {
+                    appendLog("[runtime] overlays updated during bootstrap; restarting DSH engine to apply updates...")
+                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
                 }
                 sendProgress("engine_boot", 92, "正在高速拉起本机 DSH 引擎（首次编译缓存约需 6-15 秒）…", mapOf("canCancel" to false), force = true)
                 val engineRes = try {
@@ -2205,11 +2316,20 @@ class RuntimeController private constructor(
         return mapOf("ok" to true, "status" to getStatus())
     }
 
-    private fun extractProcessPid(proc: Process): Int? = runCatching {
-        val field = proc.javaClass.getDeclaredField("pid")
-        field.isAccessible = true
-        (field.get(proc) as? Number)?.toInt()
-    }.getOrNull()
+    private fun extractProcessPid(proc: Process): Int? {
+        Regex("""pid=(\d+)""").find(proc.toString())?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+            if (it > 1) return it
+        }
+        runCatching {
+            val m = proc.javaClass.getMethod("pid")
+            (m.invoke(proc) as? Number)?.toInt()
+        }.getOrNull()?.let { if (it > 1) return it }
+        return runCatching {
+            val field = proc.javaClass.getDeclaredField("pid")
+            field.isAccessible = true
+            (field.get(proc) as? Number)?.toInt()
+        }.getOrNull()
+    }
 
     private fun killProcessGroupSafe(pid: Int) {
         if (pid <= 1 || pid == android.os.Process.myPid()) return
@@ -2320,6 +2440,7 @@ class RuntimeController private constructor(
             activeExecutorUsed = null
             engineState = nextState
             SafetyGate.endTurn()
+            PhoneOverlayController.getInstance(ctx).dismissAll()
             runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
             if (!keepForegroundService) {
                 GrassBagEngineService.stop(ctx)
@@ -2371,8 +2492,11 @@ class RuntimeController private constructor(
         val prootLoader = File(nativeLibDir, "libproot_loader.so")
 
         val meta = readMeta()
+        val cachedDisableProotSeccomp =
+            meta.optString("prootSeccompUnsupportedFingerprint", "") == Build.FINGERPRINT
         val effectiveForceProot = forceProot ?: (activeExecutorUsed == "proot" || activeExecutorUsed == "proot-legacy")
-        val effectiveDisableSeccomp = disableProotSeccomp ?: (activeExecutorUsed == "proot-legacy")
+        val effectiveDisableSeccomp =
+            disableProotSeccomp ?: (activeExecutorUsed == "proot-legacy" || cachedDisableProotSeccomp)
         val wantTawc = !effectiveForceProot && tawcBin.exists() && effectiveExecutorMode(meta) == "tawcroot"
         if (!wantTawc) {
             check(prootBin.exists()) { "libproot.so not found in ${nativeLibDir.absolutePath}" }
@@ -2558,24 +2682,39 @@ class RuntimeController private constructor(
     }
 
     private fun startEngineSync(): Map<String, Any?> {
-        val myStartEpoch = stopEpoch.get()
-        // Coalesce concurrent startup attempts atomically (MainActivity prewarm + Flutter refreshNativeStatus).
-        val waitLatch: CountDownLatch? = synchronized(engineLock) {
-            if (isEngineAlive() && engineState == "running") {
-                return mapOf("ok" to true, "alreadyRunning" to true, "status" to getStatus())
+        var myStartEpoch = stopEpoch.get()
+        // Coalesce concurrent startup attempts atomically, but NEVER coalesce onto an aborted
+        // startup whose epoch was already superseded by stopEngineSync()!
+        while (true) {
+            var existingEpoch = -1
+            val waitLatch: CountDownLatch? = synchronized(engineLock) {
+                if (isEngineAlive() && engineState == "running") {
+                    return mapOf("ok" to true, "alreadyRunning" to true, "status" to getStatus())
+                }
+                val existingLatch = activeStartupLatch
+                if (existingLatch != null) {
+                    existingEpoch = activeStartupEpoch
+                    existingLatch
+                } else {
+                    myStartEpoch = stopEpoch.get()
+                    activeStartupEpoch = myStartEpoch
+                    activeStartupLatch = CountDownLatch(1)
+                    engineState = "starting"
+                    lastEngineError = null
+                    null
+                }
             }
-            val existingLatch = activeStartupLatch
-            if (existingLatch != null) {
-                existingLatch
-            } else {
-                activeStartupLatch = CountDownLatch(1)
-                engineState = "starting"
-                lastEngineError = null
-                null
-            }
-        }
-        if (waitLatch != null) {
+            if (waitLatch == null) break
             runCatching { waitLatch.await(360, TimeUnit.SECONDS) }
+            val currentStopEpoch = stopEpoch.get()
+            if (currentStopEpoch != existingEpoch) {
+                // Previous startup was cancelled by an earlier stopEngineSync(); if our own caller
+                // hasn't been cancelled since entry, loop and initiate a fresh startup cleanly!
+                if (currentStopEpoch == myStartEpoch) {
+                    continue
+                }
+                return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+            }
             val ok = isEngineAlive() && engineState == "running"
             return mapOf(
                 "ok" to ok,
@@ -2642,9 +2781,15 @@ class RuntimeController private constructor(
             }
 
             // Fast ~20ms atomic sync if APK shipped updated shims or dsh-gbridge.
-            runCatching { syncFastOverlaysIfNeeded(activeSlot) }.onFailure { err ->
-                Log.w(TAG, "syncFastOverlaysIfNeeded failed: ${err.message}", err)
-                appendLog("[runtime] WARN: fast overlay sync failed: ${err.message}")
+            if (stopEpoch.get() != myStartEpoch) {
+                appendLog("[runtime] startup cancelled before overlay sync")
+                return mapOf("ok" to false, "error" to "engine_stopped", "status" to getStatus())
+            }
+            if (hasPendingFastOverlayUpdate(activeSlot)) {
+                runCatching { syncFastOverlaysIfNeeded(activeSlot) }.onFailure { err ->
+                    Log.w(TAG, "syncFastOverlaysIfNeeded failed: ${err.message}", err)
+                    appendLog("[runtime] WARN: fast overlay sync failed: ${err.message}")
+                }
             }
 
             val nativeLibDir = File(ctx.applicationInfo.nativeLibraryDir)
@@ -2684,18 +2829,23 @@ class RuntimeController private constructor(
             // Try fast path first (`tawcroot`), automatically falling back to `proot` (seccomp) -> `proot-legacy` if needed.
             val freshMeta = readMeta()
             val wantTawcFirst = hasTawc && effectiveExecutorMode(freshMeta) == "tawcroot"
+            val skipProotSeccomp =
+                freshMeta.optString("prootSeccompUnsupportedFingerprint", "") == Build.FINGERPRINT
             val attempts = mutableListOf<Pair<Boolean, Boolean>>() // (forceProot, disableProotSeccomp)
             if (wantTawcFirst) {
                 attempts.add(false to false)
             }
             if (hasProot) {
-                attempts.add(true to false)
+                if (!skipProotSeccomp) {
+                    attempts.add(true to false)
+                }
                 attempts.add(true to true)
             }
 
             val attemptErrors = mutableListOf<String>()
             var lastAttemptErr: String? = null
             var tawcTimedOutNoOutput = false
+            var prootSeccompTimedOutNoOutput = false
             for ((idx, attempt) in attempts.withIndex()) {
                 if (stopEpoch.get() != myStartEpoch) {
                     appendLog("[runtime] startup cancelled by stop request before attempt #${idx + 1}")
@@ -2716,13 +2866,19 @@ class RuntimeController private constructor(
                 }
                 val res = launchAndWaitForEngine(activeSlot, forceProot, disableSeccomp, myStartEpoch)
                 if (res["ok"] == true) {
-                    // If tawcroot hung silently (timeout with zero stdout progress) while proot succeeded,
-                    // remember fallback for this OS fingerprint so subsequent launches skip the 60s hang!
+                    // If tawcroot or proot (seccomp) hung silently while a fallback succeeded,
+                    // remember fallback for this OS fingerprint so subsequent launches skip the hang!
                     if (forceProot && tawcTimedOutNoOutput) {
                         runCatching {
                             updateMeta { it.put("tawcUnsupportedFingerprint", Build.FINGERPRINT) }
                         }
                         appendLog("[runtime] cached proot fallback for fingerprint after silent tawcroot hang")
+                    }
+                    if (forceProot && disableSeccomp && prootSeccompTimedOutNoOutput) {
+                        runCatching {
+                            updateMeta { it.put("prootSeccompUnsupportedFingerprint", Build.FINGERPRINT) }
+                        }
+                        appendLog("[runtime] cached proot-legacy (NO_SECCOMP) fallback for fingerprint after silent proot seccomp hang")
                     }
                     return res
                 }
@@ -2755,6 +2911,8 @@ class RuntimeController private constructor(
                         skipFurtherFallback = true
                         appendLog("[runtime] tawcroot reached Node/JS userland before exiting; skipping redundant proot fallback")
                     }
+                } else if (forceProot && !disableSeccomp && res["timedOutNoOutput"] == true) {
+                    prootSeccompTimedOutNoOutput = true
                 }
                 // Clean up failed/timed-out attempt; keep FGS & keep engineState="starting" while falling back!
                 val hasMoreAttempts = !skipFurtherFallback && idx + 1 < attempts.size
@@ -2804,6 +2962,7 @@ class RuntimeController private constructor(
                 if (engineState == "starting") {
                     engineState = if (lastEngineError != null) "error" else "stopped"
                 }
+                activeStartupEpoch = -1
                 activeStartupLatch?.countDown()
                 activeStartupLatch = null
             }
@@ -2912,6 +3071,7 @@ class RuntimeController private constructor(
                 synchronized(engineLock) {
                     if (dshProcess === proc) {
                         SafetyGate.endTurn()
+                        PhoneOverlayController.getInstance(ctx).dismissAll()
                         dshProcess = null
                         runCatching { if (bridgeSocket.exists()) bridgeSocket.delete() }
                         runCatching { if (pidFile.exists()) pidFile.delete() }
@@ -3075,7 +3235,21 @@ class RuntimeController private constructor(
                 "Connection: close\r\n\r\n"
             sock.outputStream.write(req.toByteArray(Charsets.UTF_8))
             sock.outputStream.flush()
-            val raw = sock.inputStream.bufferedReader(Charsets.UTF_8).readText()
+            val rawBytes = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(4096)
+            var total = 0
+            val maxProbeBytes = 128 * 1024
+            while (true) {
+                val n = sock.inputStream.read(buf)
+                if (n <= 0) break
+                val take = n.coerceAtMost(maxProbeBytes - total)
+                if (take > 0) {
+                    rawBytes.write(buf, 0, take)
+                    total += take
+                }
+                if (total >= maxProbeBytes) break
+            }
+            val raw = rawBytes.toString(Charsets.UTF_8.name())
             val headerEnd = raw.indexOf("\r\n\r\n")
             if (headerEnd < 0) return@runCatching null to -1
             val statusLine = raw.substring(0, raw.indexOf("\r\n").coerceAtLeast(0))
@@ -3084,10 +3258,24 @@ class RuntimeController private constructor(
             if (code !in 200..299) return@runCatching null to code
             var body = raw.substring(headerEnd + 4)
             if (raw.substring(0, headerEnd).contains("transfer-encoding: chunked", ignoreCase = true)) {
-                val jsonStart = body.indexOf('{')
-                val jsonEnd = body.lastIndexOf('}')
-                if (jsonStart in 0..jsonEnd) {
-                    body = body.substring(jsonStart, jsonEnd + 1)
+                val decoded = StringBuilder()
+                var pos = 0
+                while (pos < body.length) {
+                    val lineEnd = body.indexOf("\r\n", pos)
+                    if (lineEnd < 0) break
+                    val sizeHex = body.substring(pos, lineEnd).substringBefore(';').trim()
+                    val chunkLen = sizeHex.toIntOrNull(16) ?: break
+                    pos = lineEnd + 2
+                    if (chunkLen == 0) break
+                    val end = (pos + chunkLen).coerceAtMost(body.length)
+                    decoded.append(body, pos, end)
+                    pos = end
+                    if (pos + 2 <= body.length && body.startsWith("\r\n", pos)) {
+                        pos += 2
+                    }
+                }
+                if (decoded.isNotEmpty()) {
+                    body = decoded.toString()
                 }
             }
             JSONObject(body) to code
@@ -3185,10 +3373,11 @@ class RuntimeController private constructor(
                     done(mapOf("ok" to false, "error" to "当前有工具包正在安装，请等待安装完成后再重建容器", "status" to getStatus()))
                     return@execute
                 }
+                shells.keys.toList().forEach { closeLocalShell(it) }
+                // Keep FGS alive while deleting ubuntuRoot so Android 12-16 won't reject FGS re-start if backgrounded.
+                // Stop engine OUTSIDE bootstrapLock to prevent AB-BA inversion with syncFastOverlaysIfNeeded().
+                stopEngineSync(keepForegroundService = true)
                 synchronized(bootstrapLock) {
-                    shells.keys.toList().forEach { closeLocalShell(it) }
-                    // Keep FGS alive while deleting ubuntuRoot so Android 12-16 won't reject FGS re-start if backgrounded.
-                    stopEngineSync(keepForegroundService = true)
                     sendProgress("rebuild", 15, "保留 /root 数据卷，清理旧容器根文件系统…")
                     TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
                     TarGzExtractor.deleteTreeNoFollow(File(containersRoot, "tawcroot"))
@@ -3216,6 +3405,10 @@ class RuntimeController private constructor(
 
     fun performAbUpgrade(targetVersion: String, remoteBaseUrl: String?, done: (Map<String, Any?>) -> Unit) {
         worker.execute {
+            if (bootstrapRunning.get()) {
+                done(mapOf("ok" to false, "error" to "当前正在下载或部署运行环境，请等待完成后再升级", "status" to getStatus()))
+                return@execute
+            }
             if (!upgradeInProgress.compareAndSet(false, true)) {
                 done(mapOf("ok" to false, "error" to "已有版本升级或回滚任务正在进行中，请稍候完成", "status" to getStatus()))
                 return@execute
@@ -3422,14 +3615,17 @@ class RuntimeController private constructor(
                 if (res["ok"] != true) {
                     // Automatic LKG rollback on healthcheck failure: restore metadata + symlinks & remove broken slot!
                     appendLog("[upgrade] 新版本启动失败，自动回滚至 LKG 槽位 $prevSlotForRollback (v$prevVersionForRollback)…")
+                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
                     synchronized(bootstrapLock) {
                         revertMetaFn?.invoke()
                         switchedMeta = false
-                        stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
                         stagedTargetDir?.let { runCatching { TarGzExtractor.deleteTreeNoFollow(it) } }
                         stagedTargetDir = null
                     }
-                    startEngineSync()
+                    val rbRes = startEngineSync()
+                    if (rbRes["ok"] != true && !isEngineAlive() && activeToolkitInstalls.get() <= 0) {
+                        GrassBagEngineService.stop(ctx)
+                    }
                     val errMsg = "v$installedVer 启动自检未通过，已自动回滚至 v$prevVersionForRollback：${res["error"]}"
                     sendProgress("error", 0, errMsg)
                     done(mapOf("ok" to false, "error" to errMsg, "status" to getStatus()))
@@ -3473,6 +3669,10 @@ class RuntimeController private constructor(
 
     fun rollbackLkg(done: (Map<String, Any?>) -> Unit) {
         worker.execute {
+            if (bootstrapRunning.get()) {
+                done(mapOf("ok" to false, "error" to "当前正在下载或部署运行环境，请等待完成后再回滚", "status" to getStatus()))
+                return@execute
+            }
             if (!upgradeInProgress.compareAndSet(false, true)) {
                 done(mapOf("ok" to false, "error" to "已有版本升级或回滚任务正在进行中，请稍候完成", "status" to getStatus()))
                 return@execute
@@ -3550,6 +3750,10 @@ class RuntimeController private constructor(
         toolkitExecutor.execute {
             var startedFg = false
             try {
+                if (bootstrapRunning.get() || upgradeInProgress.get()) {
+                    done(mapOf("ok" to false, "error" to "当前正在部署或升级运行环境，请等待完成后再安装工具链", "status" to getStatus()))
+                    return@execute
+                }
                 if (!isContainerExtracted()) {
                     done(mapOf("ok" to false, "error" to "请先初始化本机 Ubuntu 容器后再安装工具链", "status" to getStatus()))
                     return@execute
@@ -3846,8 +4050,11 @@ class RuntimeController private constructor(
             val session = ShellSession(proc = proc, usesPtyBridge = usesPtyBridge, cwd = effectiveCwd)
             val displaced = shells.put(tabId, session)
             if (displaced != null && displaced !== session) {
-                runCatching { displaced.proc.destroy() }
-                runCatching { displaced.proc.destroyForcibly() }
+                runCatching { displaced.proc.outputStream.close() }
+                worker.execute {
+                    killSubprocessGroup(displaced.proc, graceMs = 200L)
+                    runCatching { displaced.proc.inputStream.close() }
+                }
             }
             worker.execute {
                 val cbuf = CharArray(4096)
@@ -3945,14 +4152,15 @@ class RuntimeController private constructor(
     fun signalLocalShell(tabId: String, signal: String): Boolean {
         val session = shells[tabId] ?: return false
         val cleanSig = if (signal.equals("SIGTERM", ignoreCase = true)) "SIGTERM" else "SIGINT"
-        if (session.usesPtyBridge) {
-            return writeLocalShell(tabId, "\u001b]777;gbsignal;$cleanSig\u0007")
-        }
+        // Deliver SIGTERM directly via OS signal so a blocked stdin pipe can never deadlock termination!
         if (cleanSig == "SIGTERM") {
             extractProcessPid(session.proc)?.let { pid ->
                 if (pid > 1) return runCatching { Os.kill(pid, 15); true }.getOrDefault(false)
             }
             return runCatching { session.proc.destroy(); true }.getOrDefault(false)
+        }
+        if (session.usesPtyBridge) {
+            return writeLocalShell(tabId, "\u001b]777;gbsignal;$cleanSig\u0007")
         }
         return writeLocalShell(tabId, "\u0003")
     }

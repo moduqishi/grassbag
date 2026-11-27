@@ -16,8 +16,9 @@ import '../../services/native_bridge.dart';
 import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
+import '../common/file_preview_sheet.dart';
 import '../common/grassbag_sheets.dart';
-import '../detail/session_detail_page.dart';
+import '../common/preview_highlight_utils.dart';
 import '../sdui/sdui_renderer.dart';
 import '../web/deepseek_signin_page.dart';
 import '../web/web_embed.dart';
@@ -397,8 +398,10 @@ class TurnView extends ConsumerWidget {
     super.key,
     required this.turn,
     required this.onOpenTerminal,
+    this.isLastTurn = true,
     this.animateEntrance = false,
     this.onPrefillPrompt,
+    this.onQuoteExcerpt,
     this.onEditTurn,
     this.onRegenerate,
     this.onOpenModelSettings,
@@ -407,8 +410,10 @@ class TurnView extends ConsumerWidget {
 
   final NormalizedTurn turn;
   final VoidCallback onOpenTerminal;
+  final bool isLastTurn;
   final bool animateEntrance;
   final ValueChanged<String>? onPrefillPrompt;
+  final ValueChanged<String>? onQuoteExcerpt;
   final ValueChanged<NormalizedTurn>? onEditTurn;
   final VoidCallback? onRegenerate;
   final VoidCallback? onOpenModelSettings;
@@ -420,6 +425,7 @@ class TurnView extends ConsumerWidget {
     for (final s in steps) {
       if (s is! ToolStep || s.status == 'error' || s.status == 'cancelled') continue;
       final n = s.name.toLowerCase();
+      if (n.contains('todo')) continue;
       final isEdit = n.contains('edit') ||
           n.contains('write') ||
           n.contains('patch') ||
@@ -430,7 +436,12 @@ class TurnView extends ConsumerWidget {
       final candidate = s.title.startsWith(prefix)
           ? s.title.substring(prefix.length).trim()
           : s.title.trim();
-      if (candidate.isEmpty || candidate.contains(' ') && !candidate.contains('/')) continue;
+      if (candidate.isEmpty ||
+          candidate.toLowerCase() == n ||
+          (candidate.contains(' ') && !candidate.contains('/')) ||
+          (!candidate.contains('/') && !candidate.contains('.'))) {
+        continue;
+      }
       if (seen.add(candidate)) out.add(candidate);
     }
     return out;
@@ -448,6 +459,11 @@ class TurnView extends ConsumerWidget {
               s.expandedTurnProcessIds.contains(turn.turnId),
           isCollapsed: s.collapsedTurnProcessIds.contains(turn.stableKey) ||
               s.collapsedTurnProcessIds.contains(turn.turnId),
+          hasExpandedChildStep: turn.steps.any(
+            (st) =>
+                (st is ReasoningStep && s.expandedStepIds.contains(st.id)) ||
+                (st is ToolStep && s.expandedStepIds.contains(st.callId)),
+          ),
           canTranslateCot: s.connectionPhase == ConnectionPhase.connected,
           glassTier: s.glassTier,
           feedback: s.turnFeedback.isEmpty || s.activeSessionId == null
@@ -466,32 +482,25 @@ class TurnView extends ConsumerWidget {
     );
     final ctrl = ref.read(appProvider.notifier);
     final t = GrassBagTokens.of(context);
-    // Smooth iOS 26 / Claude-style lifecycle with hysteresis: stay open while actively reasoning
-    // or executing tools, and wait until the answer clearly establishes (>= 60 chars or paragraph
-    // break) before auto-folding so short pre-tool narrations never flap the accordion!
-    // Never auto-fold cancelled turns so users can still inspect partial thinking/steps.
-    final hasLiveRunningTool = turn.steps.any((s) => s is ToolStep && s.status == 'running');
-    final answerEstablished =
-        turn.assistantText.length >= 60 || turn.assistantText.contains('\n\n');
+    // Calm Claude/iOS-26 process folding without violent mid-stream layout jumps:
+    // - Never fold mid-stream while streaming (eliminates the jarring ~140px upward yank at char 200!);
+    //   keep the timeline smoothly open during streaming unless explicitly collapsed by the user,
+    //   and gently fold once the turn settles (`!turn.isStreaming`).
     final isCancelledTurn = turn.status == 'cancelled' || turn.status == 'interrupted';
     final processOpen = turn.isStreaming
-        ? (answerEstablished && !hasLiveRunningTool && slice.autoFoldSteps
-            ? slice.isExpanded
-            : !slice.isCollapsed)
+        ? !slice.isCollapsed
         : (isCancelledTurn
             ? !slice.isCollapsed
-            : (slice.autoFoldSteps ? slice.isExpanded : !slice.isCollapsed));
+            : (slice.autoFoldSteps
+                ? (slice.isExpanded || slice.hasExpandedChildStep)
+                : !slice.isCollapsed));
     final effectiveRegenerate = onRegenerate ??
         (turn.userMessage != null
             ? () {
-                final turns = ref.read(appProvider).turns;
-                final isEarlierTurn = turns.length > 1 &&
-                    turns.last.turnId != turn.turnId &&
-                    turns.last.stableKey != turn.stableKey;
                 unawaited(
                   ctrl.regenerateOrRetryTurn(
                     turn,
-                    forkBefore: isEarlierTurn && !turn.hasError,
+                    forkBefore: !turn.hasError,
                   ),
                 );
               }
@@ -510,9 +519,40 @@ class TurnView extends ConsumerWidget {
         .where((s) => !(s is NoticeStep && s.level == 'error'))
         .toList(growable: false);
     final completedToolCount = visibleProcessSteps.whereType<ToolStep>().length;
+    final subagentSteps = visibleProcessSteps
+        .whereType<ToolStep>()
+        .where((s) => (s.subagentSessionId ?? '').trim().isNotEmpty)
+        .toList(growable: false);
     final modifiedFiles = turn.isStreaming
         ? const <String>[]
         : _extractModifiedFiles(visibleProcessSteps);
+    void handleQuoteExcerpt(String rawExcerpt) {
+      final clean = rawExcerpt.trim();
+      if (clean.isEmpty) return;
+      if (onQuoteExcerpt != null) {
+        onQuoteExcerpt!(clean);
+        ctrl.showToast('已引用到输入框', tone: ToastTone.info);
+        return;
+      }
+      final runes = clean.runes.toList(growable: false);
+      final clipped = runes.length > 360
+          ? '${String.fromCharCodes(runes.take(360))}…'
+          : clean;
+      final quoted = clipped.split('\n').map((l) => '> $l').join('\n');
+      final existingDraft = ctrl.getComposerDraftForActiveHost().trim();
+      final nextText = existingDraft.isEmpty ? '$quoted\n\n' : '$existingDraft\n\n$quoted\n\n';
+      if (onPrefillPrompt != null) {
+        onPrefillPrompt!(nextText);
+      } else {
+        ctrl.setComposerDraftForActiveHost(nextText);
+        ctrl.bumpDraftHydratedSignal();
+      }
+      ctrl.showToast('已引用到输入框', tone: ToastTone.info);
+    }
+    final isLocalEphemeralTurn = turn.turnId.startsWith('client-turn-');
+    final effectiveDismissLocal = isLocalEphemeralTurn
+        ? () => ctrl.dismissLocalFailedTurn(turn.turnId)
+        : null;
     final isExplicitlyCancelled = !turn.isStreaming &&
         (turn.status == 'cancelled' || turn.status == 'interrupted') &&
         !turn.hasError;
@@ -541,6 +581,7 @@ class TurnView extends ConsumerWidget {
                 Clipboard.setData(ClipboardData(text: turn.userMessage!.text));
               },
               onPrefillPrompt: effectiveEditTurn != null ? (_) => effectiveEditTurn() : onPrefillPrompt,
+              onQuoteText: handleQuoteExcerpt,
             ),
           ),
         if (visibleProcessSteps.isNotEmpty) ...[
@@ -566,46 +607,51 @@ class TurnView extends ConsumerWidget {
           ),
         ] else if (turn.isStreaming && turn.assistantText.isEmpty) ...[
           const SizedBox(height: 16),
-          _LiveAwaitingResponseRow(
-            isCreatingSession: slice.isCreatingSession,
-            sendStage: slice.sendStage,
-            uploadDone: slice.uploadDoneCount,
-            uploadTotal: slice.uploadTotalCount,
-            startedAtMs: turn.userMessage?.createdAt,
+          RepaintBoundary(
+            child: _LiveAwaitingResponseRow(
+              isCreatingSession: slice.isCreatingSession,
+              sendStage: slice.sendStage,
+              uploadDone: slice.uploadDoneCount,
+              uploadTotal: slice.uploadTotalCount,
+              startedAtMs: turn.userMessage?.createdAt,
+            ),
           ),
         ],
-        if (turn.isStreaming && slice.streamStalled) ...[
-          const SizedBox(height: 10),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: GrassBagSpringTap(
-              pressedScale: 0.95,
-              haptic: true,
-              onTap: () => unawaited(ctrl.syncStalledStream()),
-              child: GrassBagFresnelGlassSurface(
-                isPill: true,
-                innerWell: true,
-                tintColor: t.warnSoft,
-                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(CupertinoIcons.arrow_2_circlepath, size: 12.5, color: t.warn),
-                    const SizedBox(width: 5),
-                    Text(
-                      '响应较慢 · 点击同步状态',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: t.warn,
+        GrassBagSmoothDisclosure(
+          expanded: turn.isStreaming && slice.streamStalled,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: GrassBagSpringTap(
+                pressedScale: 0.95,
+                haptic: true,
+                onTap: () => unawaited(ctrl.syncStalledStream()),
+                child: GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  tintColor: t.warnSoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(CupertinoIcons.arrow_2_circlepath, size: 12.5, color: t.warn),
+                      const SizedBox(width: 5),
+                      Text(
+                        '响应较慢 · 点击同步状态',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: t.warn,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
           ),
-        ],
+        ),
         if (showCancelledRow) ...[
           const SizedBox(height: 12),
           Consumer(
@@ -687,6 +733,36 @@ class TurnView extends ConsumerWidget {
                         ),
                       ),
                     ),
+                  if (effectiveDismissLocal != null)
+                    GrassBagSpringTap(
+                      enabled: !streaming,
+                      onTap: effectiveDismissLocal,
+                      pressedScale: 0.94,
+                      child: GrassBagFresnelGlassSurface(
+                        isPill: true,
+                        innerWell: true,
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              CupertinoIcons.xmark,
+                              size: 11,
+                              color: streaming ? t.text3.withValues(alpha: 0.45) : t.text3,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '移除',
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: streaming ? t.text3.withValues(alpha: 0.45) : t.text3,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                 ],
               );
             },
@@ -708,6 +784,7 @@ class TurnView extends ConsumerWidget {
                 isStreaming: turn.isStreaming,
                 deliverables: turn.deliverables,
                 modifiedFiles: modifiedFiles,
+                subagentSteps: subagentSteps,
                 completedToolCount: completedToolCount,
                 cancelledPartial: showCancelledPartialBadge,
                 usage: turn.usage,
@@ -715,10 +792,39 @@ class TurnView extends ConsumerWidget {
                 onCopy: () {
                   Clipboard.setData(ClipboardData(text: turn.assistantText));
                 },
+                onExportTurnMarkdown: () {
+                  final buf = StringBuffer();
+                  final u = turn.userMessage?.text.trim() ?? '';
+                  if (u.isNotEmpty) {
+                    buf.writeln('## 提问\n');
+                    buf.writeln(u);
+                    buf.writeln();
+                  }
+                  if (turn.assistantText.trim().isNotEmpty) {
+                    buf.writeln('## 回复\n');
+                    buf.writeln(turn.assistantText.trim());
+                  }
+                  Clipboard.setData(ClipboardData(text: buf.toString().trim()));
+                  ctrl.showToast('已复制本轮 Markdown', tone: ToastTone.ok);
+                },
+                onQuoteText: handleQuoteExcerpt,
+                onOpenSubagent: (step) => ctrl.openSubagentSession(
+                  step.subagentSessionId!,
+                  childTitle: step.title,
+                ),
                 onFork: () => ctrl.forkActiveSession(turnId: turn.turnId),
                 onFeedback: (rating) => ctrl.putTurnFeedback(turn.turnId, rating),
                 onRegenerate: turn.hasError ? null : effectiveRegenerate,
-                onContinue: showCancelledPartialBadge
+                onSwitchModelAndRetry: (!turn.hasError && effectiveRegenerate != null)
+                    ? () => showModelSheet(
+                          context,
+                          ref,
+                          sheetTitle: '换模型重新生成',
+                          onOpenModelSettings: onOpenModelSettings,
+                          onAfterModelSelected: effectiveRegenerate,
+                        )
+                    : null,
+                onContinue: (showCancelledPartialBadge && isLastTurn)
                     ? () => unawaited(ctrl.continueTurn(turn))
                     : null,
                 onDeliverableTap: (item) {
@@ -750,6 +856,15 @@ class TurnView extends ConsumerWidget {
               ref,
               onOpenModelSettings: onOpenModelSettings,
             ),
+            onSwitchModelAndRetry: effectiveRegenerate != null
+                ? () => showModelSheet(
+                      context,
+                      ref,
+                      sheetTitle: '换模型并重试',
+                      onOpenModelSettings: onOpenModelSettings,
+                      onAfterModelSelected: effectiveRegenerate,
+                    )
+                : null,
             onOpenHost: onOpenHostSettings ??
                 () => showHostQuickSheet(
                       context,
@@ -758,6 +873,7 @@ class TurnView extends ConsumerWidget {
                     ),
             onSignIn: () => launchDeepSeekSignInFlow(context, ref),
             onCompact: () => unawaited(ctrl.compactContext()),
+            onDismiss: effectiveDismissLocal,
           ),
         ],
         const SizedBox(height: 24),
@@ -770,7 +886,8 @@ class TurnView extends ConsumerWidget {
   }
 }
 
-/// Calm pure-fade entrance for a newly sent live turn (zero vertical jump & zero Frame-2 remount!).
+/// Calm fade + subtle 6px compositor-only vertical settle for a newly sent live turn
+/// (zero layout height change so scroll anchoring stays locked, respects Reduce Motion).
 class _TurnEntrance extends StatefulWidget {
   const _TurnEntrance({required this.animate, required this.child});
   final bool animate;
@@ -783,7 +900,8 @@ class _TurnEntrance extends StatefulWidget {
 class _TurnEntranceState extends State<_TurnEntrance>
     with SingleTickerProviderStateMixin {
   AnimationController? _ctrl;
-  Animation<double>? _opacity;
+  CurvedAnimation? _curve;
+  bool _started = false;
 
   @override
   void initState() {
@@ -791,26 +909,53 @@ class _TurnEntranceState extends State<_TurnEntrance>
     if (widget.animate) {
       _ctrl = AnimationController(
         vsync: this,
-        duration: const Duration(milliseconds: 140),
+        duration: const Duration(milliseconds: 220),
       );
-      _opacity = CurvedAnimation(parent: _ctrl!, curve: Curves.easeOut);
-      _ctrl!.forward();
+      _curve = CurvedAnimation(parent: _ctrl!, curve: Curves.easeOutCubic);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_started && _ctrl != null) {
+      _started = true;
+      if (MediaQuery.disableAnimationsOf(context)) {
+        _ctrl!.value = 1.0;
+      } else {
+        _ctrl!.forward();
+      }
     }
   }
 
   @override
   void dispose() {
+    _curve?.dispose();
     _ctrl?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final opacity = _opacity;
-    if (opacity == null) return widget.child;
-    return FadeTransition(
-      opacity: opacity,
+    final curve = _curve;
+    if (curve == null) return widget.child;
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+    return AnimatedBuilder(
+      animation: curve,
       child: widget.child,
+      builder: (_, child) {
+        final v = curve.value;
+        if (v >= 0.999) return child!;
+        return GrassBagControlledOpacity(
+          opacity: v,
+          child: reduceMotion
+              ? child!
+              : Transform.translate(
+                  offset: Offset(0, (1.0 - v) * 6.0),
+                  child: child,
+                ),
+        );
+      },
     );
   }
 }
@@ -933,20 +1078,27 @@ class _LiveAwaitingResponseRowState extends ConsumerState<_LiveAwaitingResponseR
               ),
             ),
           ),
-          ValueListenableBuilder<int>(
-            valueListenable: _elapsedTenthsNotifier,
-            builder: (_, tenths, __) {
-              if (tenths < 3) return const SizedBox.shrink();
-              return Text(
-                '${(tenths * 0.1).toStringAsFixed(1)}s',
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w500,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                  color: t.text3,
-                ),
-              );
-            },
+          RepaintBoundary(
+            child: ValueListenableBuilder<int>(
+              valueListenable: _elapsedTenthsNotifier,
+              builder: (_, tenths, __) {
+                return AnimatedOpacity(
+                  opacity: tenths < 3 ? 0.0 : 1.0,
+                  duration: GrassBagMotion.duration(context, const Duration(milliseconds: 160)),
+                  child: tenths < 3
+                      ? const SizedBox.shrink()
+                      : Text(
+                          '${(tenths * 0.1).toStringAsFixed(1)}s',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w500,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                            color: t.text3,
+                          ),
+                        ),
+                );
+              },
+            ),
           ),
         ],
       ),
@@ -959,11 +1111,13 @@ class _UserMessageBlock extends StatefulWidget {
     required this.msg,
     required this.onCopy,
     this.onPrefillPrompt,
+    this.onQuoteText,
   });
 
   final NormalizedUserMessage msg;
   final VoidCallback onCopy;
   final ValueChanged<String>? onPrefillPrompt;
+  final ValueChanged<String>? onQuoteText;
 
   @override
   State<_UserMessageBlock> createState() => _UserMessageBlockState();
@@ -975,6 +1129,7 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
   bool _copied = false;
   bool _secretRevealed = false;
   bool _longExpanded = false;
+  String _selectedPlainText = '';
 
   String? _formatTime(int? ms) {
     if (ms == null || ms <= 0) return null;
@@ -991,8 +1146,33 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
     return '${dt.year}/${dt.month}/${dt.day} $hh:$mm';
   }
 
+  String _maskedCopyText() {
+    final msg = widget.msg;
+    if (msg.maskedRanges.isEmpty || _secretRevealed) return msg.text;
+    final ranges = List<MaskedRange>.of(msg.maskedRanges)
+      ..sort((a, b) => a.start.compareTo(b.start));
+    final buf = StringBuffer();
+    var cursor = 0;
+    for (final range in ranges) {
+      final start = range.start.clamp(cursor, msg.text.length);
+      final end = range.end.clamp(start, msg.text.length);
+      if (start > cursor) buf.write(msg.text.substring(cursor, start));
+      final rawSecret = msg.text.substring(start, end);
+      buf.write(
+        '${rawSecret.substring(0, range.visiblePrefix.clamp(0, rawSecret.length))}••••••••',
+      );
+      cursor = end;
+    }
+    if (cursor < msg.text.length) buf.write(msg.text.substring(cursor));
+    return buf.toString();
+  }
+
   void _handleCopy() {
-    widget.onCopy();
+    if (widget.msg.maskedRanges.isNotEmpty && !_secretRevealed) {
+      Clipboard.setData(ClipboardData(text: _maskedCopyText()));
+    } else {
+      widget.onCopy();
+    }
     if (!_copied) {
       setState(() => _copied = true);
       Future<void>.delayed(const Duration(milliseconds: 1400), () {
@@ -1037,14 +1217,14 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                 ],
         ),
         borderRadius: bubbleRadius,
-        border: isSolid
-            ? Border.all(
-                color: t.isDark
-                    ? Colors.white.withValues(alpha: 0.10)
-                    : t.sep,
-                width: 0.75,
-              )
-            : null,
+        border: Border.all(
+          color: isSolid
+              ? (t.isDark ? Colors.white.withValues(alpha: 0.12) : t.sep)
+              : (t.isDark
+                  ? Colors.white.withValues(alpha: 0.11)
+                  : t.primary.withValues(alpha: 0.14)),
+          width: 0.65,
+        ),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: t.isDark ? 0.28 : 0.065),
@@ -1063,107 +1243,72 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
     );
     final bubble = Material(
       type: MaterialType.transparency,
-      child: isSolid
-          ? bubbleBox
-          : CustomPaint(
-              foregroundPainter: GrassBagFresnelRimPainter(
-                isDark: t.isDark,
-                customBorderRadius: bubbleRadius,
-                accent: t.primaryHi,
-                frosted: ambientTier == GrassBagGlassTier.frosted,
-                strokeWidth: 0.95,
-              ),
-              child: bubbleBox,
-            ),
+      child: bubbleBox,
     );
 
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovered = true),
-      onExit: (_) => setState(() => _hovered = false),
-      child: Align(
-        alignment: Alignment.centerRight,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 480),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SelectionArea(
-                contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                child: bubble,
-              ),
-              Padding(
-                padding: const EdgeInsets.only(top: 4, right: 4),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (timeStr != null)
-                      Text(
-                        timeStr,
-                        style: TextStyle(
-                          fontSize: 10.5,
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                          color: t.text3.withValues(alpha: 0.72),
-                        ),
-                      ),
-                    Focus(
-                      canRequestFocus: false,
-                      onFocusChange: (focused) {
-                        if (_actionsFocused != focused) {
-                          setState(() => _actionsFocused = focused);
-                        }
-                      },
-                      child: () {
-                        final iconColor = isDesktop ? t.text3 : t.text3.withValues(alpha: 0.78);
-                        final row = Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (timeStr != null) const SizedBox(width: 4),
-                            if (widget.msg.text.isNotEmpty)
-                              Tooltip(
-                                message: _copied ? '已复制' : '复制消息',
-                                child: FocusableActionDetector(
-                                  shortcuts: const {
-                                    SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
-                                    SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
-                                  },
-                                  actions: {
-                                    ActivateIntent: CallbackAction<ActivateIntent>(
-                                      onInvoke: (_) {
-                                        _handleCopy();
-                                        return null;
-                                      },
-                                    ),
-                                  },
-                                  child: GrassBagSpringTap(
-                                    onTap: _handleCopy,
-                                    pressedScale: 0.9,
-                                    haptic: true,
-                                    child: SizedBox(
-                                      width: 36,
-                                      height: 32,
-                                      child: Center(
-                                        child: Icon(
-                                          _copied
-                                              ? CupertinoIcons.checkmark
-                                              : CupertinoIcons.doc_on_doc,
-                                          size: 13.5,
-                                          color: _copied ? t.ok : iconColor,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            if (widget.onPrefillPrompt != null && widget.msg.text.trim().isNotEmpty)
-                              Consumer(
-                                builder: (_, ref, __) {
-                                  final streaming =
-                                      ref.watch(appProvider.select((s) => s.isStreaming));
-                                  return Tooltip(
-                                    message: streaming ? '生成中暂不可编辑重发' : '编辑重发',
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxBubbleW = constraints.maxWidth.isFinite
+            ? math.min(480.0, math.max(220.0, constraints.maxWidth * 0.84))
+            : 480.0;
+        return Align(
+          alignment: Alignment.centerRight,
+          child: MouseRegion(
+            onEnter: (_) => setState(() => _hovered = true),
+            onExit: (_) => setState(() => _hovered = false),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: maxBubbleW),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SelectionArea(
+                    onSelectionChanged: (content) {
+                      _selectedPlainText = content?.plainText ?? '';
+                    },
+                    contextMenuBuilder: widget.onQuoteText != null
+                        ? buildGrassBagSelectableContextMenuWithQuote(
+                            onQuoteSelectedText: widget.onQuoteText!,
+                            getSelectedText: () => _selectedPlainText,
+                          )
+                        : buildGrassBagSelectableContextMenu,
+                    child: bubble,
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4, right: 4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (timeStr != null)
+                          Text(
+                            timeStr,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.text3.withValues(alpha: 0.72),
+                            ),
+                          ),
+                        Focus(
+                          canRequestFocus: false,
+                          onFocusChange: (focused) {
+                            if (_actionsFocused != focused) {
+                              setState(() => _actionsFocused = focused);
+                            }
+                          },
+                          child: () {
+                            final iconColor = isDesktop ? t.text3 : t.text3.withValues(alpha: 0.78);
+                            final row = Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (timeStr != null) const SizedBox(width: 4),
+                                if (widget.msg.text.isNotEmpty)
+                                  Tooltip(
+                                    message: _copied
+                                        ? (widget.msg.maskedRanges.isNotEmpty && !_secretRevealed
+                                            ? '已复制脱敏文本'
+                                            : '已复制')
+                                        : '复制消息',
                                     child: FocusableActionDetector(
-                                      enabled: !streaming,
                                       shortcuts: const {
                                         SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
                                         SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
@@ -1171,57 +1316,104 @@ class _UserMessageBlockState extends State<_UserMessageBlock> {
                                       actions: {
                                         ActivateIntent: CallbackAction<ActivateIntent>(
                                           onInvoke: (_) {
-                                            if (!streaming) {
-                                              widget.onPrefillPrompt!(widget.msg.text);
-                                            }
+                                            _handleCopy();
                                             return null;
                                           },
                                         ),
                                       },
                                       child: GrassBagSpringTap(
-                                        enabled: !streaming,
-                                        onTap: () {
-                                          if (!streaming) {
-                                            widget.onPrefillPrompt!(widget.msg.text);
-                                          }
-                                        },
+                                        onTap: _handleCopy,
                                         pressedScale: 0.9,
                                         haptic: true,
                                         child: SizedBox(
-                                          width: 36,
-                                          height: 32,
+                                          width: 42,
+                                          height: 36,
                                           child: Center(
                                             child: Icon(
-                                              CupertinoIcons.pencil,
+                                              _copied
+                                                  ? CupertinoIcons.checkmark
+                                                  : CupertinoIcons.doc_on_doc,
                                               size: 13.5,
-                                              color: streaming
-                                                  ? iconColor.withValues(alpha: 0.35)
-                                                  : iconColor,
+                                              color: _copied ? t.ok : iconColor,
                                             ),
                                           ),
                                         ),
                                       ),
                                     ),
-                                  );
-                                },
+                                  ),
+                                if (widget.onPrefillPrompt != null && widget.msg.text.trim().isNotEmpty)
+                                  Consumer(
+                                    builder: (_, ref, __) {
+                                      final streaming =
+                                          ref.watch(appProvider.select((s) => s.isStreaming));
+                                      return Tooltip(
+                                        message: streaming ? '生成中暂不可编辑重发' : '编辑重发',
+                                        child: FocusableActionDetector(
+                                          enabled: !streaming,
+                                          shortcuts: const {
+                                            SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+                                            SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
+                                          },
+                                          actions: {
+                                            ActivateIntent: CallbackAction<ActivateIntent>(
+                                              onInvoke: (_) {
+                                                if (!streaming) {
+                                                  widget.onPrefillPrompt!(widget.msg.text);
+                                                }
+                                                return null;
+                                              },
+                                            ),
+                                          },
+                                          child: GrassBagSpringTap(
+                                            enabled: !streaming,
+                                            onTap: () {
+                                              if (!streaming) {
+                                                widget.onPrefillPrompt!(widget.msg.text);
+                                              }
+                                            },
+                                            pressedScale: 0.9,
+                                            haptic: true,
+                                            child: SizedBox(
+                                              width: 36,
+                                              height: 32,
+                                              child: Center(
+                                                child: Icon(
+                                                  CupertinoIcons.pencil,
+                                                  size: 13.5,
+                                                  color: streaming
+                                                      ? iconColor.withValues(alpha: 0.35)
+                                                      : iconColor,
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                              ],
+                            );
+                            if (!isDesktop) return row;
+                            final showActions = _hovered || _copied || _actionsFocused;
+                            return IgnorePointer(
+                              ignoring: !showActions,
+                              child: AnimatedOpacity(
+                                opacity: showActions ? 1.0 : 0.0,
+                                duration: const Duration(milliseconds: 140),
+                                child: row,
                               ),
-                          ],
-                        );
-                        if (!isDesktop) return row;
-                        return AnimatedOpacity(
-                          opacity: (_hovered || _copied || _actionsFocused) ? 1.0 : 0.0,
-                          duration: const Duration(milliseconds: 140),
-                          child: row,
-                        );
-                      }(),
+                            );
+                          }(),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -1255,26 +1447,6 @@ class _UserMessageContent extends StatelessWidget {
     if (b < 1024) return '${b.round()} B';
     if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
     return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-
-  static IconData _fileIconFor(String name, String mime) {
-    final lower = name.toLowerCase();
-    if (mime.startsWith('image/')) return CupertinoIcons.photo_fill;
-    if (lower.endsWith('.pdf')) return CupertinoIcons.doc_richtext;
-    if (lower.endsWith('.zip') || lower.endsWith('.tar') || lower.endsWith('.gz')) {
-      return CupertinoIcons.archivebox_fill;
-    }
-    if (lower.endsWith('.dart') ||
-        lower.endsWith('.ts') ||
-        lower.endsWith('.js') ||
-        lower.endsWith('.py') ||
-        lower.endsWith('.json') ||
-        lower.endsWith('.yaml') ||
-        lower.endsWith('.yml') ||
-        lower.endsWith('.md')) {
-      return CupertinoIcons.doc_text_fill;
-    }
-    return CupertinoIcons.doc_fill;
   }
 
   @override
@@ -1368,41 +1540,43 @@ class _UserMessageContent extends StatelessWidget {
         spans.add(
           WidgetSpan(
             alignment: PlaceholderAlignment.middle,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 2),
-              child: GrassBagSpringTap(
-                onTap: onToggleReveal,
-                pressedScale: 0.94,
-                enablePointerGlow: false,
-                haptic: true,
-                child: GrassBagFresnelGlassSurface(
-                  borderRadius: 8,
-                  innerWell: true,
-                  interactive: true,
-                  tintColor: t.primarySoft,
-                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
-                        child: Text(
-                          masked,
-                          softWrap: true,
-                          style: TextStyle(
-                            fontFamily: 'monospace',
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w500,
-                            color: t.text,
+            child: SelectionContainer.disabled(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: GrassBagSpringTap(
+                  onTap: onToggleReveal,
+                  pressedScale: 0.94,
+                  enablePointerGlow: false,
+                  haptic: true,
+                  child: GrassBagFresnelGlassSurface(
+                    borderRadius: 8,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: t.primarySoft,
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            masked,
+                            softWrap: true,
+                            style: TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                              color: t.text,
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 5),
-                      Icon(
-                        revealed ? CupertinoIcons.eye_slash : CupertinoIcons.eye,
-                        size: 13,
-                        color: t.primary,
-                      ),
-                    ],
+                        const SizedBox(width: 5),
+                        Icon(
+                          revealed ? CupertinoIcons.eye_slash : CupertinoIcons.eye,
+                          size: 13,
+                          color: t.primary,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -1461,9 +1635,12 @@ class _UserMessageContent extends StatelessWidget {
     ({Uint8List? bytes, String? payload, String? cacheKey}) resolveAttImage(
       Map<String, dynamic> att,
     ) {
-      final rawBytes = att['bytes'];
+      final rawBytes = att['previewBytes'] ?? att['bytes'];
       if (rawBytes is Uint8List && rawBytes.isNotEmpty) {
         return (bytes: rawBytes, payload: null, cacheKey: null);
+      }
+      if (rawBytes is List<int> && rawBytes.isNotEmpty) {
+        return (bytes: Uint8List.fromList(rawBytes), payload: null, cacheKey: null);
       }
       final b64 = (att['data'] ?? att['base64'])?.toString().trim() ?? '';
       if (b64.isEmpty) return (bytes: null, payload: null, cacheKey: null);
@@ -1494,125 +1671,228 @@ class _UserMessageContent extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         if (hasAttachments)
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: [
-              for (final att in msg.attachments)
-                Builder(
-                  builder: (ctx) {
-                    final name = (att['name'] ?? att['filename'] ?? '附件').toString();
-                    final mime = att['mimeType']?.toString() ?? '';
-                    final sizeStr = _formatBytes(att['size'] as num?);
-                    final isImg = mime.startsWith('image/') || att['type']?.toString() == 'image';
-                    final resolved = isImg
-                        ? resolveAttImage(att)
-                        : (bytes: null, payload: null, cacheKey: null);
-                    final imgBytes = resolved.bytes;
-                    final imgPayload = resolved.payload;
-                    final imgCacheKey = resolved.cacheKey;
-                    final imgUrl = isImg
-                        ? (att['url'] ?? att['previewUrl'] ?? att['src'] ?? att['uri'])
-                            ?.toString()
-                            .trim()
-                        : null;
-                    if (imgPayload != null && imgCacheKey != null) {
-                      return _AsyncAttachmentThumb(
-                        cacheKey: imgCacheKey,
-                        payload: imgPayload,
-                        title: name,
-                        thumbCachePx: thumbCachePx,
-                      );
-                    }
-                    if (imgBytes != null ||
-                        (imgUrl != null &&
-                            (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')))) {
-                      return GestureDetector(
-                        onTap: () => showImagePreviewDialog(
-                          ctx,
-                          bytes: imgBytes,
-                          url: imgUrl,
-                          title: name,
-                        ),
-                        child: Container(
-                          width: 76,
-                          height: 76,
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: t.sepStrong, width: 0.7),
-                          ),
-                          clipBehavior: Clip.antiAlias,
-                          child: imgBytes != null
-                              ? Image.memory(
-                                  imgBytes,
-                                  fit: BoxFit.cover,
-                                  gaplessPlayback: true,
-                                  cacheWidth: thumbCachePx,
-                                  errorBuilder: (_, __, ___) => Center(
-                                    child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
-                                  ),
-                                )
-                              : Image.network(
-                                  imgUrl!,
-                                  fit: BoxFit.cover,
-                                  gaplessPlayback: true,
-                                  cacheWidth: thumbCachePx,
-                                  errorBuilder: (_, __, ___) => Center(
-                                    child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
-                                  ),
-                                ),
-                        ),
-                      );
-                    }
-                    final attPath = (att['path'] ?? att['workspacePath'])?.toString().trim() ?? '';
-                    final chip = Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
-                      decoration: BoxDecoration(
-                        color: t.isDark
-                            ? Colors.white.withValues(alpha: 0.08)
-                            : Colors.white.withValues(alpha: 0.72),
-                        borderRadius: BorderRadius.circular(9),
-                        border: Border.all(color: t.sep, width: 0.5),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(_fileIconFor(name, mime), size: 12.5, color: t.primary),
-                          const SizedBox(width: 5),
-                          ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 160),
-                            child: Text(
-                              name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
-                            ),
-                          ),
-                          if (sizeStr.isNotEmpty) ...[
-                            const SizedBox(width: 5),
-                            Text(
-                              sizeStr,
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                fontFeatures: const [FontFeature.tabularFigures()],
-                                color: t.text3,
-                              ),
-                            ),
-                          ],
-                        ],
+          SelectionContainer.disabled(
+            child: Builder(
+              builder: (wrapCtx) {
+                // Pre-collect sibling raster images so tapping any sent photo opens a
+                // swipeable multi-image lightbox gallery!
+                final bubbleGallery = <GrassBagImagePreviewItem>[];
+                final attGalleryIndex = <int, int>{};
+                for (var idx = 0; idx < msg.attachments.length; idx++) {
+                  final a = msg.attachments[idx];
+                  final n = (a['name'] ?? a['filename'] ?? '附件').toString();
+                  final m = (a['mimeType'] ?? a['mediaType'] ?? '').toString();
+                  final kind = classifyPreviewFile(n, mimeType: m);
+                  final isRaster = kind == PreviewFileKind.rasterImage ||
+                      (kind != PreviewFileKind.svg && a['type']?.toString() == 'image');
+                  if (!isRaster) continue;
+                  final res = resolveAttImage(a);
+                  final u = (a['url'] ?? a['previewUrl'] ?? a['src'] ?? a['uri'])
+                      ?.toString()
+                      .trim();
+                  if (res.bytes != null ||
+                      (u != null && (u.startsWith('http://') || u.startsWith('https://')))) {
+                    attGalleryIndex[idx] = bubbleGallery.length;
+                    bubbleGallery.add(
+                      GrassBagImagePreviewItem(
+                        bytes: res.bytes,
+                        url: (u != null && (u.startsWith('http://') || u.startsWith('https://')))
+                            ? u
+                            : null,
+                        title: n,
+                        mimeType: m.isNotEmpty ? m : null,
                       ),
                     );
-                    if (attPath.isNotEmpty) {
-                      return GrassBagSpringTap(
-                        onTap: () => showWorkspaceFilePreviewSheet(ctx, path: attPath, title: name),
-                        pressedScale: 0.95,
-                        child: chip,
-                      );
-                    }
-                    return chip;
-                  },
-                ),
-            ],
+                  }
+                }
+                return Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (var idx = 0; idx < msg.attachments.length; idx++)
+                      Builder(
+                        builder: (ctx) {
+                          final att = msg.attachments[idx];
+                          final name = (att['name'] ?? att['filename'] ?? '附件').toString();
+                          final mime = (att['mimeType'] ?? att['mediaType'] ?? '').toString();
+                          final sizeNum = att['size'] is num
+                              ? att['size'] as num
+                              : (att['bytes'] is num ? att['bytes'] as num : null);
+                          final sizeStr = _formatBytes(sizeNum);
+                          final attId = (att['attachmentId'] ?? att['receiptId'] ?? att['id'])
+                                  ?.toString()
+                                  .trim() ??
+                              '';
+                          final fileKind = classifyPreviewFile(name, mimeType: mime);
+                          // Explicitly exclude `.svg` / `image/svg+xml` from raster Image.memory decoding!
+                          final isImg = fileKind == PreviewFileKind.rasterImage ||
+                              (fileKind != PreviewFileKind.svg &&
+                                  att['type']?.toString() == 'image');
+                          final resolved = isImg
+                              ? resolveAttImage(att)
+                              : (bytes: null, payload: null, cacheKey: null);
+                          final imgBytes = resolved.bytes;
+                          final imgPayload = resolved.payload;
+                          final imgCacheKey = resolved.cacheKey;
+                          final imgUrl = isImg
+                              ? (att['url'] ?? att['previewUrl'] ?? att['src'] ?? att['uri'])
+                                  ?.toString()
+                                  .trim()
+                              : null;
+                          if (imgPayload != null && imgCacheKey != null) {
+                            return _AsyncAttachmentThumb(
+                              cacheKey: imgCacheKey,
+                              payload: imgPayload,
+                              title: name,
+                              thumbCachePx: thumbCachePx,
+                            );
+                          }
+                          if (imgBytes != null ||
+                              (imgUrl != null &&
+                                  (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')))) {
+                            final galleryIdx = attGalleryIndex[idx];
+                            final heroTag = 'chat-att-img-${msg.id}-$idx-${name.hashCode}';
+                            return GrassBagSpringTap(
+                              pressedScale: 0.95,
+                              enablePointerGlow: false,
+                              haptic: true,
+                              onTap: () => galleryIdx != null && bubbleGallery.isNotEmpty
+                                  ? showImagePreviewDialog(
+                                      ctx,
+                                      items: [
+                                        for (var gi = 0; gi < bubbleGallery.length; gi++)
+                                          gi == galleryIdx
+                                              ? GrassBagImagePreviewItem(
+                                                  bytes: bubbleGallery[gi].bytes,
+                                                  url: bubbleGallery[gi].url,
+                                                  title: bubbleGallery[gi].title,
+                                                  mimeType: bubbleGallery[gi].mimeType,
+                                                  heroTag: heroTag,
+                                                )
+                                              : bubbleGallery[gi],
+                                      ],
+                                      initialIndex: galleryIdx,
+                                    )
+                                  : showImagePreviewDialog(
+                                      ctx,
+                                      bytes: imgBytes,
+                                      url: imgUrl,
+                                      title: name,
+                                      mimeType: mime.isNotEmpty ? mime : null,
+                                      heroTag: heroTag,
+                                    ),
+                              child: Hero(
+                                tag: heroTag,
+                                child: Container(
+                                  width: 76,
+                                  height: 76,
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: t.sepStrong, width: 0.7),
+                                  ),
+                                  clipBehavior: Clip.antiAlias,
+                                  child: imgBytes != null
+                                      ? Image.memory(
+                                          imgBytes,
+                                          fit: BoxFit.cover,
+                                          gaplessPlayback: true,
+                                          cacheWidth: thumbCachePx,
+                                          errorBuilder: (_, __, ___) => Center(
+                                            child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                                          ),
+                                        )
+                                      : Image.network(
+                                          imgUrl!,
+                                          fit: BoxFit.cover,
+                                          gaplessPlayback: true,
+                                          cacheWidth: thumbCachePx,
+                                          errorBuilder: (_, __, ___) => Center(
+                                            child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                                          ),
+                                        ),
+                                ),
+                              ),
+                            );
+                          }
+                          if (isImg && attId.isNotEmpty) {
+                            return _RemoteAttachmentThumb(
+                              attachmentId: attId,
+                              title: name,
+                              thumbCachePx: thumbCachePx,
+                            );
+                          }
+                          final attPath = (att['path'] ?? att['workspacePath'])?.toString().trim() ?? '';
+                          final rawLocalFileBytes = att['previewBytes'] ?? att['bytes'];
+                          final localFileBytes = rawLocalFileBytes is Uint8List
+                              ? rawLocalFileBytes
+                              : (rawLocalFileBytes is List<int>
+                                  ? Uint8List.fromList(rawLocalFileBytes)
+                                  : null);
+                          final chip = Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+                            decoration: BoxDecoration(
+                              color: t.isDark
+                                  ? Colors.white.withValues(alpha: 0.08)
+                                  : Colors.white.withValues(alpha: 0.72),
+                              borderRadius: BorderRadius.circular(9),
+                              border: Border.all(color: t.sep, width: 0.5),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(previewFileIcon(name, mimeType: mime), size: 12.5, color: t.primary),
+                                const SizedBox(width: 5),
+                                ConstrainedBox(
+                                  constraints: const BoxConstraints(maxWidth: 160),
+                                  child: Text(
+                                    name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text2),
+                                  ),
+                                ),
+                                if (sizeStr.isNotEmpty) ...[
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    sizeStr,
+                                    style: TextStyle(
+                                      fontSize: 10.5,
+                                      fontFeatures: const [FontFeature.tabularFigures()],
+                                      color: t.text3,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          );
+                          if (attPath.isNotEmpty) {
+                            return GrassBagSpringTap(
+                              onTap: () => showWorkspaceFilePreviewSheet(ctx, path: attPath, title: name),
+                              pressedScale: 0.95,
+                              child: chip,
+                            );
+                          }
+                          if (localFileBytes != null || attId.isNotEmpty) {
+                            return GrassBagSpringTap(
+                              onTap: () => showSessionAttachmentPreviewSheet(
+                                ctx,
+                                name: name,
+                                attachmentId: attId,
+                                mimeType: mime,
+                                sizeLabel: sizeStr,
+                                localBytes: localFileBytes,
+                              ),
+                              pressedScale: 0.95,
+                              child: chip,
+                            );
+                          }
+                          return chip;
+                        },
+                      ),
+                  ],
+                );
+              },
+            ),
           ),
         if (hasReferences) ...[
           if (hasAttachments) const SizedBox(height: 6),
@@ -1691,7 +1971,128 @@ class _UserMessageContent extends StatelessWidget {
   }
 }
 
-/// Tiny isolated live tabular elapsed timer (`0.4s`, `12s`) that pauses off-route & in tests.
+/// Fetches and caches a historical session image attachment via `downloadSessionAttachment`
+/// so past photos in chat history render as crisp tappable 76×76 thumbnails instead of dead chips!
+class _RemoteAttachmentThumb extends ConsumerStatefulWidget {
+  const _RemoteAttachmentThumb({
+    required this.attachmentId,
+    required this.title,
+    required this.thumbCachePx,
+  });
+
+  final String attachmentId;
+  final String title;
+  final int thumbCachePx;
+
+  @override
+  ConsumerState<_RemoteAttachmentThumb> createState() => _RemoteAttachmentThumbState();
+}
+
+class _RemoteAttachmentThumbState extends ConsumerState<_RemoteAttachmentThumb> {
+  Uint8List? _bytes;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _RemoteAttachmentThumb oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.attachmentId != widget.attachmentId) {
+      _bytes = null;
+      _loading = true;
+      _load();
+    }
+  }
+
+  Future<void> _load() async {
+    final targetId = widget.attachmentId;
+    final reqHostId = ref.read(appProvider).activeHostId;
+    final cacheKey = 'remote:$reqHostId:$targetId';
+    final cached = _getCachedAttachmentBytes(cacheKey);
+    if (cached != null) {
+      if (mounted) {
+        setState(() {
+          _bytes = cached;
+          _loading = false;
+        });
+      }
+      return;
+    }
+    final data = await ref.read(appProvider.notifier).downloadSessionAttachment(targetId);
+    if (!mounted ||
+        widget.attachmentId != targetId ||
+        ref.read(appProvider).activeHostId != reqHostId) {
+      return;
+    }
+    if (data != null && data.isNotEmpty) {
+      _putCachedAttachmentBytes(cacheKey, data);
+    }
+    setState(() {
+      _bytes = data;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final bytes = _bytes;
+    return GestureDetector(
+      onTap: bytes != null
+          ? () => showImagePreviewDialog(context, bytes: bytes, title: widget.title)
+          : (!_loading
+              ? () {
+                  HapticFeedback.selectionClick();
+                  setState(() => _loading = true);
+                  unawaited(_load());
+                }
+              : null),
+      child: Container(
+        width: 76,
+        height: 76,
+        decoration: BoxDecoration(
+          color: t.fill2,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: t.sepStrong, width: 0.7),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: bytes != null
+            ? Image.memory(
+                bytes,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                cacheWidth: widget.thumbCachePx,
+                errorBuilder: (_, __, ___) => Center(
+                  child: Icon(CupertinoIcons.photo_fill, size: 20, color: t.primary),
+                ),
+              )
+            : Center(
+                child: _loading
+                    ? GrassBagActivityIndicator(radius: 7, color: t.text3)
+                    : Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(CupertinoIcons.refresh, size: 16, color: t.text3),
+                          const SizedBox(height: 3),
+                          Text(
+                            '点击重试',
+                            style: TextStyle(fontSize: 9.5, color: t.text3),
+                          ),
+                        ],
+                      ),
+              ),
+      ),
+    );
+  }
+}
+
+/// Tiny `RepaintBoundary`-isolated live tabular elapsed timer (`0.4s`, `12s`) with
+/// smooth 100ms tenth progression (no skipped odd tenths!), ValueNotifier zero-rebuild ticks,
+/// and automatic off-route/test pause.
 class _LiveElapsedClock extends StatefulWidget {
   const _LiveElapsedClock({
     this.startedAtMs,
@@ -1709,19 +2110,33 @@ class _LiveElapsedClock extends StatefulWidget {
 
 class _LiveElapsedClockState extends State<_LiveElapsedClock> {
   Timer? _timer;
-  int _elapsedTenths = 0;
-  late final int _originMs;
+  late final ValueNotifier<int> _tenthsNotifier;
+  late int _originMs;
+
+  void _initOrigin() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final started = widget.startedAtMs;
+    if (started != null && started > 0 && now - started >= 0 && now - started < 3600 * 1000) {
+      _originMs = started;
+      _tenthsNotifier.value = (now - started) ~/ 100;
+    } else {
+      _originMs = now;
+      _tenthsNotifier.value = 0;
+    }
+  }
 
   void _syncTimer() {
     final active = WidgetsBinding.instance is WidgetsFlutterBinding &&
         TickerMode.valuesOf(context).enabled &&
         (ModalRoute.of(context)?.isCurrent ?? true);
     if (active) {
-      _timer ??= Timer.periodic(const Duration(milliseconds: 200), (_) {
+      _timer ??= Timer.periodic(const Duration(milliseconds: 100), (_) {
         if (!mounted) return;
         final tenths = (DateTime.now().millisecondsSinceEpoch - _originMs) ~/ 100;
-        if (tenths != _elapsedTenths) {
-          setState(() => _elapsedTenths = tenths);
+        // After 10s we only display integer seconds, so avoid redundant repaints on sub-second ticks.
+        final prev = _tenthsNotifier.value;
+        if (tenths >= 100 ? (tenths ~/ 10 != prev ~/ 10) : (tenths != prev)) {
+          _tenthsNotifier.value = tenths;
         }
       });
     } else {
@@ -1733,13 +2148,15 @@ class _LiveElapsedClockState extends State<_LiveElapsedClock> {
   @override
   void initState() {
     super.initState();
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final started = widget.startedAtMs;
-    if (started != null && started > 0 && now - started >= 0 && now - started < 3600 * 1000) {
-      _originMs = started;
-      _elapsedTenths = (now - started) ~/ 100;
-    } else {
-      _originMs = now;
+    _tenthsNotifier = ValueNotifier<int>(0);
+    _initOrigin();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveElapsedClock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.startedAtMs != widget.startedAtMs && widget.startedAtMs != null) {
+      _initOrigin();
     }
   }
 
@@ -1752,25 +2169,35 @@ class _LiveElapsedClockState extends State<_LiveElapsedClock> {
   @override
   void dispose() {
     _timer?.cancel();
+    _tenthsNotifier.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_elapsedTenths < widget.minTenths) return const SizedBox.shrink();
     final t = GrassBagTokens.of(context);
-    final label = _elapsedTenths >= 100
-        ? '${_elapsedTenths ~/ 10}s'
-        : '${(_elapsedTenths * 0.1).toStringAsFixed(1)}s';
-    return Text(
-      label,
-      style: widget.style ??
-          TextStyle(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w500,
-            fontFeatures: const [FontFeature.tabularFigures()],
-            color: t.text3,
-          ),
+    final resolvedStyle = widget.style ??
+        TextStyle(
+          fontSize: 11.5,
+          fontWeight: FontWeight.w500,
+          fontFeatures: const [FontFeature.tabularFigures()],
+          color: t.text3,
+        );
+    return RepaintBoundary(
+      child: ValueListenableBuilder<int>(
+        valueListenable: _tenthsNotifier,
+        builder: (_, tenths, __) {
+          final visible = tenths >= widget.minTenths;
+          final label = tenths >= 100
+              ? '${tenths ~/ 10}s'
+              : '${(tenths * 0.1).toStringAsFixed(1)}s';
+          return AnimatedOpacity(
+            opacity: visible ? 1.0 : 0.0,
+            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 160)),
+            child: visible ? Text(label, style: resolvedStyle) : const SizedBox.shrink(),
+          );
+        },
+      ),
     );
   }
 }
@@ -1796,11 +2223,33 @@ class _LiveProcessSummaryText extends ConsumerWidget {
     if (raw.isEmpty || raw == humanName || raw.toLowerCase() == tool.name.toLowerCase()) {
       return '';
     }
-    if (raw.contains('/')) {
+    final n = tool.name.toLowerCase();
+    final isFileOrDir = n == 'read' ||
+        n == 'read_file' ||
+        n.contains('read_file') ||
+        n == 'write' ||
+        n == 'write_file' ||
+        n == 'create_file' ||
+        n == 'edit' ||
+        n == 'edit_file' ||
+        n == 'patch' ||
+        n == 'apply_patch' ||
+        n == 'ls' ||
+        n == 'list_dir' ||
+        n == 'list_directory' ||
+        n == 'listdir';
+    if (isFileOrDir && raw.contains('/')) {
       final segs = raw.split('/').where((s) => s.isNotEmpty).toList();
       if (segs.isNotEmpty) {
         final tail = segs.last;
         return tail.length > 26 ? '${tail.substring(0, 25)}…' : tail;
+      }
+    }
+    if (raw.startsWith('http://') || raw.startsWith('https://')) {
+      final uri = Uri.tryParse(raw);
+      if (uri != null && uri.host.isNotEmpty) {
+        final compact = uri.path.length > 1 ? '${uri.host}${uri.path}' : uri.host;
+        return compact.length > 26 ? '${compact.substring(0, 25)}…' : compact;
       }
     }
     return raw.length > 26 ? '${raw.substring(0, 25)}…' : raw;
@@ -2068,6 +2517,38 @@ class _TurnProcessBlock extends StatelessWidget {
                           ),
                         ),
                       ),
+                  // Quiet live tail row between tool calls so the open timeline NEVER looks frozen
+                  // after a tool finishes while the LLM plans the next call or final answer!
+                  if (turn.isStreaming &&
+                      runningTool == null &&
+                      turn.assistantText.isEmpty &&
+                      !(lastVisibleStep is ReasoningStep &&
+                          !lastVisibleStep.id.startsWith('narration-')))
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: Center(
+                              child: _BreathingStatusDot(color: t.primary),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: GrassBagShimmerText(
+                              '正在分析结果并规划下一步…',
+                              style: TextStyle(
+                                fontSize: 12.2,
+                                fontWeight: FontWeight.w500,
+                                color: t.text3,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -2200,6 +2681,7 @@ class _BreathingStatusDotState extends State<_BreathingStatusDot>
   void didChangeDependencies() {
     super.didChangeDependencies();
     final shouldRun = WidgetsBinding.instance is WidgetsFlutterBinding &&
+        TickerMode.valuesOf(context).enabled &&
         (ModalRoute.of(context)?.isCurrent ?? true) &&
         !MediaQuery.disableAnimationsOf(context);
     if (shouldRun && !_running) {
@@ -2242,7 +2724,7 @@ class _BreathingDotPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final v = Curves.easeInOut.transform(animation.value);
+    final v = Curves.easeInOutSine.transform(animation.value);
     final dim = math.min(size.width, size.height);
     final scale = (dim / 20.0).clamp(0.55, 1.25);
     final center = Offset(size.width * 0.5, size.height * 0.5);
@@ -2389,6 +2871,17 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
     );
   }
 
+  static final Map<String, int> _thinkingStartedAtMs = <String, int>{};
+
+  static int _startedMsFor(String stepId) {
+    final existing = _thinkingStartedAtMs[stepId];
+    if (existing != null) return existing;
+    if (_thinkingStartedAtMs.length >= 64) {
+      _thinkingStartedAtMs.remove(_thinkingStartedAtMs.keys.first);
+    }
+    return _thinkingStartedAtMs[stepId] = DateTime.now().millisecondsSinceEpoch;
+  }
+
   bool _copied = false;
 
   void _handleCopyThinking(String text) {
@@ -2497,6 +2990,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                   ),
                   const SizedBox(width: 4),
                   _LiveElapsedClock(
+                    startedAtMs: _startedMsFor(step.id),
                     minTenths: 5,
                     style: TextStyle(
                       fontSize: 11.5,
@@ -2570,9 +3064,9 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
               viewportText,
               key: ValueKey('${step.id}-$translated'),
               style: TextStyle(
-                fontSize: showLiveViewport ? 12.0 : 12.5,
+                fontSize: showLiveViewport ? 12.2 : 12.5,
                 height: 1.58,
-                color: showLiveViewport ? t.text3 : t.text2,
+                color: t.text2,
               ),
             );
             final textNode = showLiveViewport
@@ -2650,30 +3144,38 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                     curve: Curves.easeOutCubic,
                     constraints: BoxConstraints(maxHeight: showLiveViewport ? 96 : 280),
                     child: showLiveViewport
-                        ? RepaintBoundary(
-                            child: ShaderMask(
-                              blendMode: BlendMode.dstIn,
-                              shaderCallback: (rect) => const LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                stops: [0.0, 0.16, 0.86, 1.0],
-                                colors: [
-                                  Colors.transparent,
-                                  Colors.black,
-                                  Colors.black,
-                                  Colors.transparent,
-                                ],
-                              ).createShader(rect),
-                              child: scrollViewport,
+                        ? GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: widget.onToggleExpand,
+                            child: RepaintBoundary(
+                              child: ShaderMask(
+                                blendMode: BlendMode.dstIn,
+                                shaderCallback: (rect) => const LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  stops: [0.0, 0.28, 1.0],
+                                  colors: [
+                                    Colors.transparent,
+                                    Colors.black,
+                                    Colors.black,
+                                  ],
+                                ).createShader(rect),
+                                // Ignore pointer drags on the collapsed preview so vertical chat
+                                // scrolling is never trapped while tapping expands full CoT!
+                                child: IgnorePointer(child: scrollViewport),
+                              ),
                             ),
                           )
                         : scrollViewport,
                   ),
                   if (expanded) ...[
                     const SizedBox(height: 8),
-                    Row(
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        if (showTranslateBtn) ...[
+                        if (showTranslateBtn)
                           GrassBagSpringTap(
                             enabled: !translating,
                             onTap: translating ? () {} : widget.onToggleTranslate,
@@ -2703,8 +3205,6 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                               ),
                             ),
                           ),
-                          const SizedBox(width: 6),
-                        ],
                         if (bodyText.trim().isNotEmpty)
                           GrassBagSpringTap(
                             onTap: () => _handleCopyThinking(bodyText),
@@ -2733,8 +3233,7 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                               ),
                             ),
                           ),
-                        if (bodyText.length > 240 || '\n'.allMatches(bodyText).length >= 8) ...[
-                          const SizedBox(width: 6),
+                        if (bodyText.length > 240 || '\n'.allMatches(bodyText).length >= 8)
                           GrassBagSpringTap(
                             onTap: () => _openFullscreenThinking(context, bodyText, isNarration),
                             pressedScale: 0.94,
@@ -2762,7 +3261,6 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                               ),
                             ),
                           ),
-                        ],
                       ],
                     ),
                   ],
@@ -2817,6 +3315,61 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
   /// Synchronous LRU cache scoped by `(hostId, sessionRenderGen, callId)` so re-mounted or
   /// re-expanded tool cards render full output immediately on frame 0 without cross-host/session bleed.
   static final Map<String, Map<String, dynamic>> _kDetailCache = {};
+  static final Map<String, int> _kDetailCacheChars = {};
+  static int _kDetailCacheTotalChars = 0;
+  static const int _kDetailCacheMaxTotalChars = 4 * 1024 * 1024; // ~8 MiB UTF-16 budget
+  static const int _kDetailCacheMaxSingleChars = 1536 * 1024;
+  static final Map<String, int> _toolStartedAtMs = <String, int>{};
+
+  static int _estimateDetailChars(Map<String, dynamic> detail) {
+    var total = 64;
+    void walk(Object? v, int depth) {
+      if (v == null || depth > 4) return;
+      if (v is String) {
+        total += v.length;
+      } else if (v is Map) {
+        for (final entry in v.entries) {
+          total += entry.key.toString().length + 8;
+          walk(entry.value, depth + 1);
+        }
+      } else if (v is List) {
+        for (final item in v) {
+          walk(item, depth + 1);
+        }
+      }
+    }
+    walk(detail, 0);
+    return total;
+  }
+
+  static void _putDetailCache(String cacheKey, Map<String, dynamic> detail) {
+    final prevChars = _kDetailCacheChars.remove(cacheKey);
+    if (prevChars != null) {
+      _kDetailCacheTotalChars = math.max(0, _kDetailCacheTotalChars - prevChars);
+    }
+    _kDetailCache.remove(cacheKey);
+    final chars = _estimateDetailChars(detail);
+    if (chars > _kDetailCacheMaxSingleChars) return;
+    _kDetailCache[cacheKey] = detail;
+    _kDetailCacheChars[cacheKey] = chars;
+    _kDetailCacheTotalChars += chars;
+    while ((_kDetailCache.length > 128 || _kDetailCacheTotalChars > _kDetailCacheMaxTotalChars) &&
+        _kDetailCache.isNotEmpty) {
+      final evictKey = _kDetailCache.keys.first;
+      _kDetailCache.remove(evictKey);
+      final evicted = _kDetailCacheChars.remove(evictKey) ?? 0;
+      _kDetailCacheTotalChars = math.max(0, _kDetailCacheTotalChars - evicted);
+    }
+  }
+
+  static int _startedMsForTool(String callId) {
+    final existing = _toolStartedAtMs[callId];
+    if (existing != null) return existing;
+    if (_toolStartedAtMs.length >= 64) {
+      _toolStartedAtMs.remove(_toolStartedAtMs.keys.first);
+    }
+    return _toolStartedAtMs[callId] = DateTime.now().millisecondsSinceEpoch;
+  }
 
   Map<String, dynamic>? _detail;
   String _loadedCacheKey = '';
@@ -2867,6 +3420,33 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
   bool? _memoDiffIsDark;
   ({int added, int removed, String unified})? _memoSynthDiff;
   TextSpan? _memoDiffSpan;
+  String? _memoOutRaw;
+  bool? _memoOutIsErr;
+  bool? _memoOutIsDark;
+  String _memoOutClean = '';
+  TextSpan? _memoOutJsonSpan;
+
+  ({String clean, TextSpan? jsonSpan}) _resolveMemoizedOutput(
+    String raw, {
+    required bool isErr,
+    required bool isDark,
+  }) {
+    if (_memoOutRaw == raw && _memoOutIsErr == isErr && _memoOutIsDark == isDark) {
+      return (clean: _memoOutClean, jsonSpan: _memoOutJsonSpan);
+    }
+    _memoOutRaw = raw;
+    _memoOutIsErr = isErr;
+    _memoOutIsDark = isDark;
+    final cleanOut = _stripAnsiEscapes(raw);
+    _memoOutClean = cleanOut;
+    final trimmedOut = cleanOut.trim();
+    final looksJson = !isErr &&
+        cleanOut.length <= 16000 &&
+        ((trimmedOut.startsWith('{') && trimmedOut.endsWith('}')) ||
+            (trimmedOut.startsWith('[') && trimmedOut.endsWith(']')));
+    _memoOutJsonSpan = looksJson ? _highlightCodeSpan(cleanOut, 'json', isDark: isDark) : null;
+    return (clean: _memoOutClean, jsonSpan: _memoOutJsonSpan);
+  }
 
   ({({int added, int removed, String unified})? diff, TextSpan? span}) _resolveMemoizedDiff(
     bool isEdit,
@@ -2974,11 +3554,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     final res = await widget.onLoadToolDetail(callId, forceRefresh: forceRefresh);
     if (!mounted || widget.step.callId != callId || _currentCacheKey() != cacheKey) return;
     if (res.isNotEmpty) {
-      _kDetailCache.remove(cacheKey);
-      _kDetailCache[cacheKey] = res;
-      if (_kDetailCache.length > 128) {
-        _kDetailCache.remove(_kDetailCache.keys.first);
-      }
+      _putDetailCache(cacheKey, res);
     }
     final shouldReload = _pendingForceReload;
     _pendingForceReload = false;
@@ -3002,97 +3578,14 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     required String commandOrTitle,
     required String fullOut,
   }) {
-    if (isCmd) {
-      showCommandOutputSheet(
-        context,
-        command: commandOrTitle,
-        failed: isErr,
-        outputText: fullOut,
-        onOpenTerminal: widget.onOpenTerminal,
-      );
-      return;
-    }
-    showGrassBagSheet<void>(
+    showCommandOutputSheet(
       context,
-      title: widget.step.title,
-      subtitle: isErr ? '执行失败 · 完整输出' : '执行完成 · 完整输出',
-      icon: isErr ? CupertinoIcons.exclamationmark_triangle_fill : CupertinoIcons.doc_plaintext,
-      iconColor: isErr ? GrassBagTokens.of(context).err : null,
-      expandable: true,
-      bodyBuilder: (ctx) {
-        final st = GrassBagTokens.of(ctx);
-        final tier = ProviderScope.containerOf(ctx, listen: false).read(appProvider).glassTier;
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            CustomPaint(
-              foregroundPainter: tier == GrassBagGlassTier.solid
-                  ? null
-                  : GrassBagFresnelRimPainter(
-                      isDark: st.isDark,
-                      borderRadius: 16,
-                      accent: isErr ? st.err : (st.isDark ? st.primaryHi : null),
-                      innerWell: true,
-                      frosted: tier == GrassBagGlassTier.frosted,
-                      paintTopSheen: false,
-                      strokeWidth: 0.8,
-                    ),
-              child: Container(
-                constraints: const BoxConstraints(maxHeight: 420),
-                width: double.infinity,
-                padding: const EdgeInsets.all(13),
-                decoration: ShapeDecoration(
-                  color: st.codeBg,
-                  shape: RoundedSuperellipseBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    side: tier == GrassBagGlassTier.solid
-                        ? BorderSide(
-                            color: isErr
-                                ? st.err.withValues(alpha: 0.45)
-                                : (st.isDark ? Colors.white.withValues(alpha: 0.11) : st.sep),
-                            width: 0.75,
-                          )
-                        : BorderSide.none,
-                  ),
-                ),
-                child: SingleChildScrollView(
-                  child: SelectionArea(
-                    contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                    child: Text(
-                      fullOut,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11.8,
-                        height: 1.52,
-                        color: isErr
-                            ? (st.isDark ? const Color(0xFFFCA5A5) : st.err)
-                            : st.codeFg,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            GrassBagSecondaryGlassButton(
-              label: '复制完整输出',
-              icon: CupertinoIcons.doc_on_doc,
-              height: 40,
-              tier: tier,
-              insideGlass: true,
-              onTap: () {
-                Clipboard.setData(ClipboardData(text: fullOut));
-                HapticFeedback.selectionClick();
-                ProviderScope.containerOf(ctx, listen: false)
-                    .read(appProvider.notifier)
-                    .showToast('已复制完整输出', tone: ToastTone.ok);
-                Navigator.of(ctx).pop();
-              },
-            ),
-          ],
-        );
-      },
+      title: isCmd ? '命令输出' : widget.step.title,
+      subtitle: isErr ? '执行失败 · 完整输出' : (isCmd ? '命令执行结果' : '执行完成 · 完整输出'),
+      command: isCmd ? commandOrTitle : '',
+      failed: isErr,
+      outputText: fullOut,
+      onOpenTerminal: isCmd ? widget.onOpenTerminal : null,
     );
   }
 
@@ -3134,7 +3627,11 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
         n.contains('shell') ||
         n.contains('exec');
     final isWeb = n.contains('web') || n.contains('fetch') || n.contains('http');
-    final isSubagent = n.contains('subagent') || n.contains('agent') || n.contains('delegate');
+    final isSubagent = n == 'task' ||
+        n == 'spawn_subagent' ||
+        n.contains('subagent') ||
+        n.contains('agent') ||
+        n.contains('delegate');
     final isPhone = n.startsWith('phone_');
     final isErr = step.status == 'error';
     final isCancelled = step.status == 'cancelled';
@@ -3245,9 +3742,18 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
     }
     _syncMemoizedLabels(step);
     final rawDisplayTitle = _memoDisplayTitle;
-    // Middle-shorten deep file paths so the actual filename is ALWAYS visible instead of ellipsis!
+    final isFileTool = isEdit ||
+        isWrite ||
+        n == 'read' ||
+        n == 'read_file' ||
+        n.contains('read_file') ||
+        n == 'delete' ||
+        n == 'delete_file' ||
+        n == 'remove_file';
+    final isDirTool = n == 'ls' || n == 'list_dir' || n == 'list_directory' || n == 'listdir';
+    // Only middle-shorten deep file/directory paths; preserve bash command prefixes and format URLs cleanly!
     final displayTitle = () {
-      if (rawDisplayTitle.length > 34 && rawDisplayTitle.contains('/')) {
+      if ((isFileTool || isDirTool) && rawDisplayTitle.length > 34 && rawDisplayTitle.contains('/')) {
         final segs = rawDisplayTitle.split('/').where((s) => s.isNotEmpty).toList();
         if (segs.length >= 3) {
           final tail2 = '${segs[segs.length - 2]}/${segs.last}';
@@ -3255,14 +3761,18 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
             return '…/$tail2';
           }
         }
+      } else if (isWeb && (rawDisplayTitle.startsWith('http://') || rawDisplayTitle.startsWith('https://'))) {
+        final uri = Uri.tryParse(rawDisplayTitle);
+        if (uri != null && uri.host.isNotEmpty) {
+          final segs = uri.pathSegments.where((s) => s.isNotEmpty).toList();
+          if (segs.length >= 2) {
+            return '${uri.host}/…/${segs.last}';
+          }
+          return segs.isEmpty ? uri.host : '${uri.host}/${segs.first}';
+        }
       }
       return rawDisplayTitle;
     }();
-    final isFileTool = isEdit ||
-        isWrite ||
-        n == 'read' ||
-        n == 'read_file' ||
-        n.contains('read_file');
     final summaryPill = _memoSummaryPill;
     final durLabel = step.durationMs != null
         ? (step.durationMs! < 1000
@@ -3317,9 +3827,12 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       final isRedundantTitle = displayTitle.trim().isEmpty ||
                           displayTitle.trim() == _humanizeToolName(step.name).trim() ||
                           displayTitle.trim().toLowerCase() == step.name.trim().toLowerCase();
-                      final shownTitle = isRedundantTitle
+                      var shownTitle = isRedundantTitle
                           ? (isRunning ? '准备参数…' : _humanizeToolName(step.name))
                           : displayTitle;
+                      if (verb == 'MCP' && shownTitle.startsWith('MCP · ')) {
+                        shownTitle = shownTitle.substring('MCP · '.length);
+                      }
                       return [
                         Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -3348,6 +3861,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                     if (isRunning) ...[
                       const SizedBox(width: 6),
                       _LiveElapsedClock(
+                        startedAtMs: _startedMsForTool(step.callId),
                         minTenths: 5,
                         style: TextStyle(
                           fontSize: 10.5,
@@ -3356,14 +3870,14 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                           color: t.primary,
                         ),
                       ),
-                    ] else if (durLabel != null && !isErr && !isCancelled) ...[
+                    ] else if (durLabel != null) ...[
                       const SizedBox(width: 6),
                       Text(
                         durLabel,
                         style: TextStyle(
                           fontSize: 10.5,
                           fontFeatures: const [FontFeature.tabularFigures()],
-                          color: t.text3,
+                          color: isErr ? t.err.withValues(alpha: 0.78) : t.text3,
                         ),
                       ),
                     ],
@@ -3446,8 +3960,9 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                     ),
                   ],
                 ),
-                if (isErr && !expanded && step.summary.isNotEmpty)
-                  Padding(
+                GrassBagSmoothDisclosure(
+                  expanded: isErr && !expanded && step.summary.isNotEmpty,
+                  child: Padding(
                     padding: const EdgeInsets.only(left: 28, top: 4),
                     child: Text(
                       _memoSummaryPill.isNotEmpty ? _memoSummaryPill : step.summary,
@@ -3456,6 +3971,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       style: TextStyle(fontFamily: 'monospace', fontSize: 11.5, height: 1.38, color: t.err),
                     ),
                   ),
+                ),
               ],
             ),
           ),
@@ -3527,10 +4043,14 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       : BorderSide.none,
                 ),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_loading && _detail == null)
+              child: AnimatedSize(
+                duration: GrassBagMotion.duration(context, const Duration(milliseconds: 210)),
+                curve: Curves.easeOutCubic,
+                alignment: Alignment.topCenter,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (_loading && _detail == null)
                     Row(
                       children: [
                         GrassBagActivityIndicator(
@@ -3596,11 +4116,11 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       const SizedBox(height: 4),
                       ConstrainedBox(
                         constraints: const BoxConstraints(maxHeight: 170),
-                        child: SingleChildScrollView(
+                        child: SelectionArea(
+                          contextMenuBuilder: buildGrassBagSelectableContextMenu,
                           child: SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: SelectionArea(
-                              contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
                               child: Text.rich(
                                 synthDiffSpan ??
                                     _highlightDiffSpan(synthDiff.unified, isDark: t.isDark),
@@ -3653,15 +4173,33 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                       child: SingleChildScrollView(
                         child: SelectionArea(
                           contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                          child: Text(
-                            effectiveOutput,
-                            style: TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 11.5,
-                              height: 1.48,
-                              color: isErr ? errInk : t.codeFg,
-                            ),
-                          ),
+                          child: () {
+                            final memoOut = _resolveMemoizedOutput(
+                              effectiveOutput,
+                              isErr: isErr,
+                              isDark: t.isDark,
+                            );
+                            if (memoOut.jsonSpan != null) {
+                              return Text.rich(
+                                memoOut.jsonSpan!,
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 11.5,
+                                  height: 1.48,
+                                  color: t.codeFg,
+                                ),
+                              );
+                            }
+                            return Text(
+                              memoOut.clean,
+                              style: TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 11.5,
+                                height: 1.48,
+                                color: isErr ? errInk : t.codeFg,
+                              ),
+                            );
+                          }(),
                         ),
                       ),
                     ),
@@ -3808,8 +4346,10 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                           ),
                         if (step.subagentSessionId != null && step.subagentSessionId!.isNotEmpty)
                           GrassBagSpringTap(
-                            onTap: () =>
-                                ref.read(appProvider.notifier).selectSession(step.subagentSessionId!),
+                            onTap: () => ref.read(appProvider.notifier).openSubagentSession(
+                                  step.subagentSessionId!,
+                                  childTitle: step.title,
+                                ),
                             child: Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
                               child: Row(
@@ -3857,6 +4397,7 @@ class _ToolStepRowState extends ConsumerState<_ToolStepRow> {
                   ],
                 ],
               ),
+              ),
             );
             return Padding(
               padding: const EdgeInsets.only(left: 28, top: 2, bottom: 8),
@@ -3892,9 +4433,11 @@ class _TurnErrorCard extends StatefulWidget {
     this.onRetry,
     this.onEdit,
     this.onOpenModel,
+    this.onSwitchModelAndRetry,
     this.onOpenHost,
     this.onSignIn,
     this.onCompact,
+    this.onDismiss,
   });
 
   final NormalizedTurn turn;
@@ -3903,9 +4446,11 @@ class _TurnErrorCard extends StatefulWidget {
   final VoidCallback? onRetry;
   final VoidCallback? onEdit;
   final VoidCallback? onOpenModel;
+  final VoidCallback? onSwitchModelAndRetry;
   final VoidCallback? onOpenHost;
   final VoidCallback? onSignIn;
   final VoidCallback? onCompact;
+  final VoidCallback? onDismiss;
 
   @override
   State<_TurnErrorCard> createState() => _TurnErrorCardState();
@@ -3944,8 +4489,12 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
     final classified = GrassBagController.classifyReadableError(rawDetail, code: code);
     final showCompactRawInDefault = _isMostlyChinese(rawDetail);
     final primaryBody = showCompactRawInDefault ? rawDetail : classified.guidance;
+    final primaryIsLongClipped = showCompactRawInDefault &&
+        (rawDetail.length > 320 || '\n'.allMatches(rawDetail).length >= 6);
     final hasInspectableDetail = copyPayload.isNotEmpty &&
-        (copyPayload != primaryBody || (code != null && code.isNotEmpty));
+        (copyPayload != primaryBody ||
+            primaryIsLongClipped ||
+            (code != null && code.isNotEmpty));
 
     final isSolid = widget.tier == GrassBagGlassTier.solid;
     final errBody = Container(
@@ -4033,6 +4582,8 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
             contextMenuBuilder: buildGrassBagSelectableContextMenu,
             child: Text(
               primaryBody,
+              maxLines: showCompactRawInDefault ? 6 : null,
+              overflow: showCompactRawInDefault ? TextOverflow.ellipsis : null,
               style: TextStyle(
                 fontSize: 12.5,
                 height: 1.48,
@@ -4040,6 +4591,25 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
               ),
             ),
           ),
+          if (!showCompactRawInDefault &&
+              classified.actionKind == null &&
+              rawDetail.isNotEmpty &&
+              !_showTechDetail) ...[
+            const SizedBox(height: 5),
+            Text(
+              rawDetail,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 11.2,
+                height: 1.42,
+                color: t.isDark
+                    ? t.text2.withValues(alpha: 0.86)
+                    : Color.lerp(t.err, t.text2, 0.55)!,
+              ),
+            ),
+          ],
           _SmoothDisclosure(
             expanded: _showTechDetail && hasInspectableDetail,
             builder: () => Padding(
@@ -4078,7 +4648,23 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
           const SizedBox(height: 12),
           Consumer(
             builder: (_, ref, __) {
-              final streaming = ref.watch(appProvider.select((s) => s.isStreaming));
+              final errSlice = ref.watch(
+                appProvider.select(
+                  (s) => (
+                    streaming: s.isStreaming,
+                    compacting: s.isCompactingContext,
+                    routableModelsCount: s.modelGroups
+                        .where((g) => g.routable)
+                        .fold<int>(0, (acc, g) => acc + g.models.length),
+                  ),
+                ),
+              );
+              final streaming = errSlice.streaming;
+              final showSwitchModelRetry = widget.onSwitchModelAndRetry != null &&
+                  errSlice.routableModelsCount > 1 &&
+                  (classified.actionKind == null ||
+                      classified.actionKind == 'retry' ||
+                      classified.actionKind == 'model');
               return Wrap(
                 spacing: 8,
                 runSpacing: 8,
@@ -4095,6 +4681,17 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                       color: t.isDark ? const Color(0xFFD94444) : t.err,
                       foregroundColor: Colors.white,
                       onTap: widget.onRetry!,
+                    ),
+                  if (showSwitchModelRetry)
+                    GrassBagSecondaryGlassButton(
+                      label: '换模型重试',
+                      icon: CupertinoIcons.cube_box,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !streaming,
+                      onTap: widget.onSwitchModelAndRetry!,
                     ),
                   if (widget.onEdit != null)
                     GrassBagSecondaryGlassButton(
@@ -4127,7 +4724,9 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                       insideGlass: true,
                       onTap: widget.onOpenHost!,
                     ),
-                  if (classified.actionKind == 'model' && widget.onOpenModel != null)
+                  if (classified.actionKind == 'model' &&
+                      !showSwitchModelRetry &&
+                      widget.onOpenModel != null)
                     GrassBagSecondaryGlassButton(
                       label: '切换模型 / 密钥',
                       icon: CupertinoIcons.sparkles,
@@ -4139,14 +4738,16 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                     ),
                   if (classified.actionKind == 'compact' && widget.onCompact != null)
                     GrassBagSecondaryGlassButton(
-                      label: '精简上下文',
-                      icon: CupertinoIcons.arrow_down_right_arrow_up_left,
+                      label: errSlice.compacting ? '精简中…' : '精简上下文',
+                      icon: errSlice.compacting
+                          ? null
+                          : CupertinoIcons.arrow_down_right_arrow_up_left,
                       height: 34,
                       padding: const EdgeInsets.symmetric(horizontal: 12),
                       tier: widget.tier,
                       insideGlass: true,
-                      enabled: !streaming,
-                      onTap: streaming ? null : widget.onCompact!,
+                      enabled: !streaming && !errSlice.compacting,
+                      onTap: (streaming || errSlice.compacting) ? null : widget.onCompact!,
                     ),
                   GrassBagSecondaryGlassButton(
                     label: _copied ? '已复制' : '复制报错',
@@ -4157,6 +4758,17 @@ class _TurnErrorCardState extends State<_TurnErrorCard> {
                     insideGlass: true,
                     onTap: () => _handleCopy(copyPayload),
                   ),
+                  if (widget.onDismiss != null)
+                    GrassBagSecondaryGlassButton(
+                      label: '移除',
+                      icon: CupertinoIcons.xmark,
+                      height: 34,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      tier: widget.tier,
+                      insideGlass: true,
+                      enabled: !streaming,
+                      onTap: widget.onDismiss!,
+                    ),
                 ],
               );
             },
@@ -4187,14 +4799,19 @@ class _AssistantBody extends StatefulWidget {
     required this.isStreaming,
     required this.deliverables,
     this.modifiedFiles = const [],
+    this.subagentSteps = const [],
     this.completedToolCount = 0,
     this.cancelledPartial = false,
     this.usage,
     this.feedback,
     required this.onCopy,
+    this.onExportTurnMarkdown,
+    this.onQuoteText,
+    this.onOpenSubagent,
     required this.onFork,
     required this.onFeedback,
     this.onRegenerate,
+    this.onSwitchModelAndRetry,
     this.onContinue,
     required this.onDeliverableTap,
   });
@@ -4204,14 +4821,19 @@ class _AssistantBody extends StatefulWidget {
   final bool isStreaming;
   final List<Map<String, dynamic>> deliverables;
   final List<String> modifiedFiles;
+  final List<ToolStep> subagentSteps;
   final int completedToolCount;
   final bool cancelledPartial;
   final TurnUsage? usage;
   final String? feedback;
   final VoidCallback onCopy;
+  final VoidCallback? onExportTurnMarkdown;
+  final ValueChanged<String>? onQuoteText;
+  final ValueChanged<ToolStep>? onOpenSubagent;
   final VoidCallback onFork;
   final ValueChanged<String> onFeedback;
   final VoidCallback? onRegenerate;
+  final VoidCallback? onSwitchModelAndRetry;
   final VoidCallback? onContinue;
   final ValueChanged<Map<String, dynamic>> onDeliverableTap;
 
@@ -4286,6 +4908,8 @@ class _AssistantBodyState extends State<_AssistantBody>
   static final Map<String, int> _revealedProgressByTurn = <String, int>{};
 
   bool _copied = false;
+  bool _allFilesExpanded = false;
+  String _selectedPlainText = '';
   Widget? _cachedRichBody;
   bool? _cachedStreaming;
   bool? _cachedDark;
@@ -4502,7 +5126,11 @@ class _AssistantBodyState extends State<_AssistantBody>
         (_typeTicker?.isActive == true) &&
         _revealedLen < targetLen &&
         (oldWidget.text == widget.text || _fastStartsWithPrev(widget.text, oldWidget.text));
-    if (!widget.isStreaming && !oldWidget.isStreaming && !stillRevealingCompletedTail) {
+    if (mounted && GrassBagMotion.reduceMotion(context)) {
+      _revealedLen = targetLen;
+      _revealedProgressByTurn.remove(widget.turnId);
+      _stopTypeTicker();
+    } else if (!widget.isStreaming && !oldWidget.isStreaming && !stillRevealingCompletedTail) {
       // Static completed turn update -> show immediately (without snapping an active
       // post-turn typewriter catch-up tail during session reconcile!).
       _revealedLen = targetLen;
@@ -4518,6 +5146,23 @@ class _AssistantBodyState extends State<_AssistantBody>
     } else if (!widget.isStreaming && _revealedLen >= targetLen) {
       _revealedProgressByTurn.remove(widget.turnId);
       _stopTypeTicker();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final routeActive = ModalRoute.of(context)?.isCurrent ?? true;
+    final reduced = GrassBagMotion.reduceMotion(context);
+    if (reduced) {
+      if (_revealedLen < widget.text.length) {
+        _revealedLen = widget.text.length;
+      }
+      _stopTypeTicker();
+    } else if (!routeActive) {
+      _stopTypeTicker();
+    } else if (_revealedLen < widget.text.length) {
+      _startTypeTicker();
     }
   }
 
@@ -4633,6 +5278,7 @@ class _AssistantBodyState extends State<_AssistantBody>
     if (raw.isEmpty) return raw;
     String? openChar;
     var openLen = 0;
+    var openFenceLineStart = -1;
     var inMathBlock = false;
     var mathBlockCloser = r'$$';
     var pos = settledOffset.clamp(0, raw.length);
@@ -4653,6 +5299,7 @@ class _AssistantBodyState extends State<_AssistantBody>
           if (!(f[0] == '`' && info.contains('`'))) {
             openChar = f[0];
             openLen = f.length;
+            openFenceLineStart = pos;
           }
         } else if (exactTrim.startsWith(r'$$') && !exactTrim.substring(2).contains(r'$$')) {
           inMathBlock = true;
@@ -4668,14 +5315,20 @@ class _AssistantBodyState extends State<_AssistantBody>
       } else if (_isClosingFence(t, openChar!, openLen)) {
         openChar = null;
         openLen = 0;
+        openFenceLineStart = -1;
       }
       if (nl < 0) break;
       pos = nl + 1;
     }
 
-    // 1. Inside an open fenced code block: strip a half-typed closing fence (`\n`` `)
-    //    so literal backticks never flash on the last line of the code card!
+    // 1. Inside an open fenced code block:
+    //    - If still streaming the opening fence header line (` ```da` with no `\n` yet),
+    //      hold it cleanly so a half-typed language badge doesn't flash an empty code card!
+    //    - Strip a half-typed closing fence (`\n`` `) so literal backticks never flash!
     if (openChar != null) {
+      if (lastLineStart == openFenceLineStart) {
+        return openFenceLineStart > 0 ? raw.substring(0, openFenceLineStart - 1) : '';
+      }
       final lastLine = raw.substring(lastLineStart);
       final lt = lastLine.trimLeft();
       if (lastLineStart > settledOffset &&
@@ -4754,6 +5407,8 @@ class _AssistantBodyState extends State<_AssistantBody>
     int openTickStart = -1;
     bool openBold = false;
     int openBoldStart = -1;
+    bool openItalic = false;
+    int openItalicStart = -1;
     bool openStrike = false;
     int openStrikeStart = -1;
     bool openDollarMath = false;
@@ -4858,6 +5513,24 @@ class _AssistantBodyState extends State<_AssistantBody>
         i += 2;
         continue;
       }
+      if (ch == '*' && !openBold) {
+        final prevSpaceOrStart = i == 0 || activePara[i - 1] == ' ' || activePara[i - 1] == '\n' || activePara[i - 1] == '(';
+        final nextNonSpace = i + 1 < pLen && activePara[i + 1] != ' ' && activePara[i + 1] != '\n' && activePara[i + 1] != '*';
+        if (!openItalic) {
+          if (prevSpaceOrStart && nextNonSpace) {
+            openItalic = true;
+            openItalicStart = i;
+          }
+        } else {
+          final prevNonSpace = i > 0 && activePara[i - 1] != ' ' && activePara[i - 1] != '\n';
+          if (prevNonSpace) {
+            openItalic = false;
+            openItalicStart = -1;
+          }
+        }
+        i++;
+        continue;
+      }
       if (ch == '~' && i + 1 < pLen && activePara[i + 1] == '~') {
         if (openStrike) {
           openStrike = false;
@@ -4907,6 +5580,16 @@ class _AssistantBodyState extends State<_AssistantBody>
       }
       if (openBoldStart + 2 < pLen && activePara[openBoldStart + 2] != ' ') {
         return '$basePrefix$activePara**';
+      }
+    }
+    if (openItalic) {
+      if (openItalicStart + 1 == pLen) {
+        return '$basePrefix${activePara.substring(0, openItalicStart)}';
+      }
+      if (openItalicStart + 1 < pLen &&
+          activePara[openItalicStart + 1] != ' ' &&
+          !activePara.endsWith(' ')) {
+        return '$basePrefix$activePara*';
       }
     }
     if (openStrike) {
@@ -5138,8 +5821,14 @@ class _AssistantBodyState extends State<_AssistantBody>
       '&gt;': '>',
       '&quot;': '"',
       '&#39;': "'",
+      '&#x27;': "'",
       '&apos;': "'",
       '&nbsp;': ' ',
+      '&mdash;': '—',
+      '&ndash;': '–',
+      '&hellip;': '…',
+      '&rarr;': '→',
+      '&larr;': '←',
     };
     for (final entry in table.entries) {
       if (input.startsWith(entry.key, i)) {
@@ -5148,6 +5837,8 @@ class _AssistantBodyState extends State<_AssistantBody>
     }
     return null;
   }
+
+  static final RegExp _inlineHtmlBrRe = RegExp(r'^<br\s*/?>', caseSensitive: false);
 
   static List<InlineSpan> _buildMarkdownSpans(
     String input,
@@ -5172,6 +5863,16 @@ class _AssistantBodyState extends State<_AssistantBody>
     var i = 0;
     while (i < len) {
       final ch = input[i];
+
+      // Convert `<br>` / `<br/>` tags cleanly into real line breaks across prose, lists & quotes!
+      if (ch == '<' && i + 3 < len && (input[i + 1] == 'b' || input[i + 1] == 'B')) {
+        final brMatch = _inlineHtmlBrRe.matchAsPrefix(input, i);
+        if (brMatch != null) {
+          buf.write('\n');
+          i = brMatch.end;
+          continue;
+        }
+      }
 
       // DeepSeek inline/display LaTeX `\(...\)` and `\[...\]` BEFORE generic backslash unescaping!
       if (ch == r'\' && i + 1 < len && (input[i + 1] == '(' || input[i + 1] == '[')) {
@@ -5208,13 +5909,16 @@ class _AssistantBodyState extends State<_AssistantBody>
         continue;
       }
 
-      // Inline/display LaTeX math `$...$` or `$$...$$` — currency-safe & escape/backtick-aware!
+      // Inline/display LaTeX math `$...$` or `$$...$$` — currency-safe, shell `${VAR}`-safe & escape-aware!
       if (ch == r'$') {
         final isDouble = i + 1 < len && input[i + 1] == r'$';
         final prevBlocked = !isDouble && i > 0 && _isWordChar(input.codeUnitAt(i - 1));
         final delim = isDouble ? r'$$' : r'$';
         final start = i + delim.length;
+        // Never misparse shell variable expansions like `${HOME}/bin:${PATH}` as inline LaTeX!
+        final isShellBraceVar = !isDouble && start < len && input[start] == '{';
         if (!prevBlocked &&
+            !isShellBraceVar &&
             start < len &&
             (isDouble || (input[start] != ' ' && input[start] != '\t' && input[start] != r'$'))) {
           final closeIdx = _findClosingDelim(input, start, delim, allowNewline: false);
@@ -5382,15 +6086,16 @@ class _AssistantBodyState extends State<_AssistantBody>
                     cleanPath = raw;
                   }
                 }
-                final hashIdx = cleanPath.indexOf('#');
-                if (hashIdx > 0) cleanPath = cleanPath.substring(0, hashIdx);
+                final anchor = parseFilePathAnchor(cleanPath);
                 recognizer = TapGestureRecognizer()
                   ..onTap = () {
                     if (previewContext != null && previewContext.mounted) {
                       showWorkspaceFilePreviewSheet(
                         previewContext,
-                        path: cleanPath,
+                        path: anchor.path,
                         title: linkLabel.trim().isNotEmpty ? linkLabel.trim() : null,
+                        initialLine: anchor.startLine,
+                        highlightEndLine: anchor.endLine,
                       );
                     }
                   };
@@ -5774,11 +6479,22 @@ class _AssistantBodyState extends State<_AssistantBody>
         final fenceStr = openFence.group(1)!;
         final fenceChar = fenceStr[0];
         final fenceLen = fenceStr.length;
+        final fenceIndent = line.length - trimmed.length;
         final lang = (openFence.group(2) ?? '').trim();
         final codeLines = <String>[];
         i++;
         while (i < lines.length && !_isClosingFence(lines[i].trimLeft(), fenceChar, fenceLen)) {
-          codeLines.add(lines[i]);
+          var codeLine = lines[i];
+          if (fenceIndent > 0 && codeLine.isNotEmpty) {
+            var strip = 0;
+            while (strip < fenceIndent &&
+                strip < codeLine.length &&
+                (codeLine.codeUnitAt(strip) == 0x20 || codeLine.codeUnitAt(strip) == 0x09)) {
+              strip++;
+            }
+            if (strip > 0) codeLine = codeLine.substring(strip);
+          }
+          codeLines.add(codeLine);
           i++;
         }
         if (i < lines.length) i++;
@@ -5935,6 +6651,7 @@ class _AssistantBodyState extends State<_AssistantBody>
       }
 
       // Bullet, numbered list, or task-checkbox item (`- [x]`, `- [ ]`, `1.`, `1)`)
+      // Accumulate indented continuation lines cleanly into the same bullet body!
       final bulletMatch = _bulletPattern.firstMatch(trimmed);
       if (bulletMatch != null) {
         flushParagraph();
@@ -5950,17 +6667,38 @@ class _AssistantBodyState extends State<_AssistantBody>
           taskChecked = taskMatch.group(1)!.toLowerCase() == 'x';
           itemBody = taskMatch.group(2)!;
         }
+        final rawLines = <String>[line];
+        final bodyLines = <String>[itemBody];
+        var nextI = i + 1;
+        while (nextI < lines.length) {
+          final cont = lines[nextI];
+          final contTrim = cont.trim();
+          if (contTrim.isEmpty) break;
+          final contLead = cont.length - cont.trimLeft().length;
+          if (contLead < leadingCols + 2) break;
+          if (_bulletPattern.hasMatch(contTrim) ||
+              contTrim.startsWith('```') ||
+              contTrim.startsWith('~~~') ||
+              contTrim.startsWith('>') ||
+              contTrim.startsWith('#') ||
+              contTrim.startsWith('|')) {
+            break;
+          }
+          rawLines.add(cont);
+          bodyLines.add(contTrim);
+          nextI++;
+        }
         out.add(
           _RawMdBlock(
             kind: _MdBlockKind.bullet,
-            raw: line,
+            raw: rawLines.join('\n'),
             marker: bulletMatch.group(1)!,
             indent: indent,
-            body: itemBody,
+            body: bodyLines.join('\n'),
             taskChecked: taskChecked,
           ),
         );
-        i++;
+        i = nextI;
         continue;
       }
 
@@ -6005,19 +6743,39 @@ class _AssistantBodyState extends State<_AssistantBody>
         );
       case _MdBlockKind.heading:
         final fontSize = switch (blk.level) {
-          1 => 18.5,
-          2 => 16.5,
+          1 => 20.0,
+          2 => 17.5,
           3 => 15.5,
-          _ => 14.5,
+          _ => 15.0,
+        };
+        final lineHeight = switch (blk.level) {
+          1 => 1.32,
+          2 => 1.35,
+          3 => 1.40,
+          _ => 1.45,
+        };
+        final topPad = idx == 0
+            ? 0.0
+            : switch (blk.level) {
+                1 => 18.0,
+                2 => 16.0,
+                3 => 12.0,
+                _ => 10.0,
+              };
+        final botPad = switch (blk.level) {
+          1 => 8.0,
+          2 => 6.0,
+          _ => 4.0,
         };
         return Padding(
           key: key,
-          padding: const EdgeInsets.only(top: 8, bottom: 6),
+          padding: EdgeInsets.only(top: topPad, bottom: botPad),
           child: Text.rich(
             TextSpan(
               style: TextStyle(
                 fontSize: fontSize,
-                fontWeight: FontWeight.w700,
+                height: lineHeight,
+                fontWeight: blk.level <= 3 ? FontWeight.w700 : FontWeight.w600,
                 letterSpacing: -0.25,
                 color: t.text,
               ),
@@ -6034,82 +6792,39 @@ class _AssistantBodyState extends State<_AssistantBody>
       case _MdBlockKind.hr:
         return Padding(
           key: key,
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          child: Divider(height: 0.6, color: t.sep),
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          child: Divider(height: 0.75, thickness: 0.75, color: t.sepStrong),
         );
       case _MdBlockKind.image:
+        final gallery = <GrassBagImagePreviewItem>[];
+        var galleryIdx = 0;
+        var matchedGallery = false;
+        final imgRe = RegExp(r'!\[([^\]]*)\]\((https?://[^)\s]+)\)');
+        for (final m in imgRe.allMatches(widget.text)) {
+          final u = (m.group(2) ?? '').trim();
+          final a = (m.group(1) ?? '').trim();
+          if (u.isEmpty) continue;
+          if (!matchedGallery && u == blk.imageUrl) {
+            galleryIdx = gallery.length;
+            matchedGallery = true;
+          }
+          gallery.add(
+            GrassBagImagePreviewItem(
+              url: u,
+              title: a.isEmpty ? '图片预览' : a,
+            ),
+          );
+        }
         return Padding(
           key: key,
           padding: const EdgeInsets.only(top: 4, bottom: 10),
           child: Align(
             alignment: Alignment.centerLeft,
-            child: GestureDetector(
-              onTap: () => showImagePreviewDialog(
-                context,
-                url: blk.imageUrl,
-                title: blk.body.isEmpty ? '图片预览' : blk.body,
-              ),
-              child: Container(
-                constraints: const BoxConstraints(maxWidth: 360, maxHeight: 260),
-                decoration: BoxDecoration(
-                  color: t.fill1,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: t.sep, width: 0.7),
-                ),
-                clipBehavior: Clip.antiAlias,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Flexible(
-                      child: Image.network(
-                        blk.imageUrl,
-                        cacheWidth: 720,
-                        fit: BoxFit.contain,
-                        gaplessPlayback: true,
-                        loadingBuilder: (ctx, child, progress) {
-                          if (progress == null) return child;
-                          return Container(
-                            width: 240,
-                            height: 140,
-                            alignment: Alignment.center,
-                            color: t.fill1,
-                            child: GrassBagActivityIndicator(radius: 9, color: t.text3),
-                          );
-                        },
-                        errorBuilder: (_, __, ___) => Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(CupertinoIcons.photo, size: 16, color: t.text3),
-                              const SizedBox(width: 6),
-                              Flexible(
-                                child: Text(
-                                  blk.body.isEmpty ? blk.imageUrl : blk.body,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(fontSize: 12.5, color: t.text2),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (blk.body.isNotEmpty)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        child: Text(
-                          blk.body,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 11.5, color: t.text3),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
+            child: _MarkdownImageCard(
+              imageUrl: blk.imageUrl,
+              altText: blk.body,
+              gallery: gallery,
+              galleryIndex: galleryIdx,
             ),
           ),
         );
@@ -6293,35 +7008,40 @@ class _AssistantBodyState extends State<_AssistantBody>
                 ),
         );
       case _MdBlockKind.bullet:
+        final bulletLevel = (blk.indent / 14.0).round();
+        final bulletGlyph = (blk.marker == '-' || blk.marker == '*' || blk.marker == '+')
+            ? (bulletLevel == 0 ? '•' : (bulletLevel == 1 ? '◦' : '▪'))
+            : blk.marker;
         return Padding(
           key: key,
           padding: EdgeInsets.only(left: 4 + blk.indent, bottom: 5),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ConstrainedBox(
-                constraints: const BoxConstraints(minWidth: 22),
-                child: Padding(
-                  padding: EdgeInsets.only(right: 4, top: blk.taskChecked != null ? 4.5 : 2),
-                  child: blk.taskChecked != null
-                      ? Icon(
-                          blk.taskChecked!
-                              ? CupertinoIcons.checkmark_square_fill
-                              : CupertinoIcons.square,
-                          size: 15,
-                          color: blk.taskChecked! ? t.ok : t.text3,
-                        )
-                      : Text(
-                          blk.marker == '-' || blk.marker == '*' || blk.marker == '+'
-                              ? '•'
-                              : blk.marker,
-                          style: TextStyle(
-                            fontSize: 14.5,
-                            fontWeight: FontWeight.w600,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                            color: t.primary,
+              SelectionContainer.disabled(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(minWidth: 22),
+                  child: Padding(
+                    padding: EdgeInsets.only(right: 4, top: blk.taskChecked != null ? 4.5 : 0),
+                    child: blk.taskChecked != null
+                        ? Icon(
+                            blk.taskChecked!
+                                ? CupertinoIcons.checkmark_square_fill
+                                : CupertinoIcons.square,
+                            size: 15,
+                            color: blk.taskChecked! ? t.ok : t.text3,
+                          )
+                        : Text(
+                            bulletGlyph,
+                            style: TextStyle(
+                              fontSize: 14.5,
+                              height: 1.65,
+                              fontWeight: FontWeight.w600,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: t.primary,
+                            ),
                           ),
-                        ),
+                  ),
                 ),
               ),
               Expanded(
@@ -6349,7 +7069,7 @@ class _AssistantBodyState extends State<_AssistantBody>
       case _MdBlockKind.paragraph:
         return Padding(
           key: key,
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: 12),
           child: Text.rich(
             TextSpan(
               style: TextStyle(
@@ -6505,17 +7225,23 @@ class _AssistantBodyState extends State<_AssistantBody>
         _deferDisposeRecognizers(b.recognizers);
       }
       _tailCachedBlocks.clear();
-      return Text.rich(
-        TextSpan(
-          style: TextStyle(fontSize: 15, height: 1.72, color: t.text),
-          children: _buildMarkdownSpans(
-            tailText,
-            t,
-            _fallbackRecognizers,
-            showCursor: showCursor,
-            previewContext: context,
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text.rich(
+            TextSpan(
+              style: TextStyle(fontSize: 15, height: 1.72, color: t.text),
+              children: _buildMarkdownSpans(
+                tailText,
+                t,
+                _fallbackRecognizers,
+                showCursor: showCursor,
+                previewContext: context,
+              ),
+            ),
           ),
-        ),
+        ],
       );
     }
 
@@ -6635,13 +7361,19 @@ class _AssistantBodyState extends State<_AssistantBody>
     }
 
     // O(1) fast-path short-circuit: skip substring(), prefix scan, and _stabilizeStreamingText()
-    // whenever neither visible frontier, source string, streaming state, nor theme changed!
+    // whenever neither visible frontier, streaming state, nor theme changed — including when
+    // incoming WS deltas purely append BEYOND the current typewriter `visibleLen`!
+    final sourcePrefixUnchanged = _cachedSourceText != null &&
+        (identical(_cachedSourceText, widget.text) ||
+            (widget.text.length >= visibleLen &&
+                _cachedSourceText!.length >= visibleLen &&
+                _fastStartsWithPrev(widget.text, _cachedSourceText!)));
     final canReuseCachedBody = !themeChanged &&
         _cachedRichBody != null &&
         _cachedVisibleLen == visibleLen &&
         _cachedSettledLen == _settledLen &&
         _cachedStreaming == isTyping &&
-        identical(_cachedSourceText, widget.text);
+        sourcePrefixUnchanged;
 
     late final String displayTail;
     if (canReuseCachedBody) {
@@ -6690,7 +7422,18 @@ class _AssistantBodyState extends State<_AssistantBody>
         // Keep mounted whenever typing with non-empty source text so Frame 0 never collapses
         // if the first character is temporarily stripped syntax (e.g. leading `**`).
         if (_settledLen > 0 || displayTail.isNotEmpty || (isTyping && widget.text.isNotEmpty))
-          SelectionArea(contextMenuBuilder: buildGrassBagSelectableContextMenu, child: richBody)
+          SelectionArea(
+            onSelectionChanged: (content) {
+              _selectedPlainText = content?.plainText ?? '';
+            },
+            contextMenuBuilder: widget.onQuoteText != null
+                ? buildGrassBagSelectableContextMenuWithQuote(
+                    onQuoteSelectedText: widget.onQuoteText!,
+                    getSelectedText: () => _selectedPlainText,
+                  )
+                : buildGrassBagSelectableContextMenu,
+            child: richBody,
+          )
         else if (!isTyping &&
             widget.text.isEmpty &&
             widget.deliverables.isEmpty &&
@@ -6788,6 +7531,68 @@ class _AssistantBodyState extends State<_AssistantBody>
             ),
           ),
         ],
+        if (widget.subagentSteps.isNotEmpty && widget.onOpenSubagent != null) ...[
+          const SizedBox(height: 10),
+          SelectionContainer.disabled(
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final sub in widget.subagentSteps)
+                  GrassBagSpringTap(
+                    pressedScale: 0.96,
+                    enablePointerGlow: false,
+                    haptic: true,
+                    onTap: () => widget.onOpenSubagent!(sub),
+                    child: GrassBagFresnelGlassSurface(
+                      borderRadius: 12,
+                      innerWell: true,
+                      interactive: true,
+                      tintColor: t.dusk.withValues(alpha: t.isDark ? 0.20 : 0.10),
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6.5),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          GrassBagStatusDot(
+                            color: sub.status == 'running'
+                                ? t.primary
+                                : (sub.status == 'error' ? t.err : t.ok),
+                            pulsing: sub.status == 'running',
+                            size: 6.5,
+                          ),
+                          const SizedBox(width: 6),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 190),
+                            child: Text(
+                              sub.title.trim().isNotEmpty ? sub.title.trim() : '子代理任务',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                                color: t.text,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            '查看过程',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: t.primary,
+                            ),
+                          ),
+                          const SizedBox(width: 2),
+                          Icon(CupertinoIcons.chevron_right, size: 11, color: t.primary),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
         // Quiet minimalist bottom chrome (modified files + one-tap action pills) smoothly revealed
         // with SizeTransition + FadeTransition so completion NEVER causes a 1-frame layout pop!
         if (!isTyping)
@@ -6800,60 +7605,101 @@ class _AssistantBodyState extends State<_AssistantBody>
                 if (widget.modifiedFiles.isNotEmpty) ...[
                   const SizedBox(height: 10),
                   SelectionContainer.disabled(
-                    child: Wrap(
-                      spacing: 6,
-                      runSpacing: 6,
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      children: [
-                        Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(CupertinoIcons.pencil_outline, size: 12.5, color: t.text3),
-                            const SizedBox(width: 4),
-                            Text(
-                              '已修改 ${widget.modifiedFiles.length} 个文件',
-                              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text3),
-                            ),
-                          ],
-                        ),
-                        for (final path in widget.modifiedFiles.take(5))
-                          GrassBagSpringTap(
-                            pressedScale: 0.95,
-                            enablePointerGlow: false,
-                            haptic: true,
-                            onTap: () => showDiffSheet(context, path),
-                            child: GrassBagFresnelGlassSurface(
-                              borderRadius: 10,
-                              innerWell: true,
-                              interactive: true,
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(CupertinoIcons.doc_text, size: 11.5, color: t.primary),
-                                  const SizedBox(width: 4),
-                                  ConstrainedBox(
-                                    constraints: const BoxConstraints(maxWidth: 150),
-                                    child: Text(
-                                      path.contains('/')
-                                          ? (path.split('/').where((s) => s.isNotEmpty).lastOrNull ?? path)
-                                          : path,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        fontFamily: 'monospace',
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w500,
-                                        color: t.text2,
+                    child: () {
+                      final allFiles = widget.modifiedFiles;
+                      final baseCounts = <String, int>{};
+                      String baseOf(String p) => p.contains('/')
+                          ? (p.split('/').where((s) => s.isNotEmpty).lastOrNull ?? p)
+                          : p;
+                      for (final p in allFiles) {
+                        final b = baseOf(p);
+                        baseCounts[b] = (baseCounts[b] ?? 0) + 1;
+                      }
+                      String labelOf(String p) {
+                        final b = baseOf(p);
+                        if ((baseCounts[b] ?? 0) <= 1 || !p.contains('/')) return b;
+                        final segs = p.split('/').where((s) => s.isNotEmpty).toList();
+                        if (segs.length >= 2) {
+                          return '${segs[segs.length - 2]}/${segs.last}';
+                        }
+                        return b;
+                      }
+                      final shownFiles = _allFilesExpanded ? allFiles : allFiles.take(5);
+                      return Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(CupertinoIcons.pencil_outline, size: 12.5, color: t.text3),
+                              const SizedBox(width: 4),
+                              Text(
+                                '已修改 ${allFiles.length} 个文件',
+                                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text3),
+                              ),
+                            ],
+                          ),
+                          for (final path in shownFiles)
+                            GrassBagSpringTap(
+                              pressedScale: 0.95,
+                              enablePointerGlow: false,
+                              haptic: true,
+                              onTap: () => showDiffSheet(context, path),
+                              child: GrassBagFresnelGlassSurface(
+                                borderRadius: 10,
+                                innerWell: true,
+                                interactive: true,
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(CupertinoIcons.doc_text, size: 11.5, color: t.primary),
+                                    const SizedBox(width: 4),
+                                    ConstrainedBox(
+                                      constraints: const BoxConstraints(maxWidth: 168),
+                                      child: Text(
+                                        labelOf(path),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontFamily: 'monospace',
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w500,
+                                          color: t.text2,
+                                        ),
                                       ),
                                     ),
-                                  ),
-                                ],
+                                  ],
+                                ),
                               ),
                             ),
-                          ),
-                      ],
-                    ),
+                          if (allFiles.length > 5 && !_allFilesExpanded)
+                            GrassBagSpringTap(
+                              pressedScale: 0.95,
+                              enablePointerGlow: false,
+                              haptic: true,
+                              onTap: () => setState(() => _allFilesExpanded = true),
+                              child: GrassBagFresnelGlassSurface(
+                                borderRadius: 10,
+                                innerWell: true,
+                                interactive: true,
+                                tintColor: t.primarySoft,
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                child: Text(
+                                  '+${allFiles.length - 5} 更多',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: t.primary,
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
+                      );
+                    }(),
                   ),
                 ],
                 Padding(
@@ -6897,6 +7743,51 @@ class _AssistantBodyState extends State<_AssistantBody>
                                   label: '重新生成',
                                   enabled: !streaming,
                                   onTap: widget.onRegenerate!,
+                                ),
+                              if (widget.onSwitchModelAndRetry != null ||
+                                  widget.onExportTurnMarkdown != null)
+                                Builder(
+                                  builder: (moreCtx) => _QuietReplyAction(
+                                    icon: CupertinoIcons.ellipsis,
+                                    label: '更多操作',
+                                    onTap: () {
+                                      final box = moreCtx.findRenderObject();
+                                      var anchor = Offset(
+                                        MediaQuery.sizeOf(moreCtx).width * 0.5,
+                                        MediaQuery.sizeOf(moreCtx).height * 0.65,
+                                      );
+                                      if (box is RenderBox && box.hasSize && box.attached) {
+                                        final p = box.localToGlobal(Offset.zero);
+                                        anchor = Offset(
+                                          p.dx + box.size.width * 0.5,
+                                          p.dy,
+                                        );
+                                      }
+                                      unawaited(
+                                        showGrassBagGlassContextMenu(
+                                          moreCtx,
+                                          tier: ref.read(appProvider).glassTier,
+                                          globalAnchor: anchor,
+                                          items: [
+                                            if (widget.onSwitchModelAndRetry != null && !streaming)
+                                              GrassBagContextMenuItem(
+                                                label: '换模型重新生成',
+                                                subtitle: '选择另一模型重答本轮',
+                                                icon: CupertinoIcons.cube_box,
+                                                onTap: widget.onSwitchModelAndRetry!,
+                                              ),
+                                            if (widget.onExportTurnMarkdown != null)
+                                              GrassBagContextMenuItem(
+                                                label: '复制本轮 Markdown',
+                                                subtitle: '含本轮提问与完整回复',
+                                                icon: CupertinoIcons.share,
+                                                onTap: widget.onExportTurnMarkdown!,
+                                              ),
+                                          ],
+                                        ),
+                                      );
+                                    },
+                                  ),
                                 ),
                             ],
                           );
@@ -7284,11 +8175,13 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
             math.min(textScale, 1.35);
 
         // Precompute fixed column widths incrementally during streaming:
-        // when headers, colCount, card width, and textScale are unchanged and rows grow monotonically,
-        // only measure the new/last row instead of rescanning rows 0..31 on every character!
+        // hysteresis-lock column widths during active streaming on completed row count so
+        // table columns NEVER thrash horizontally on every single streamed character!
         final sampleLimit = widget.rows.length < 32 ? widget.rows.length : 32;
         final headersSig = widget.headers.join('|');
-        final lastRowSig = sampleLimit > 0 ? widget.rows[sampleLimit - 1].join('|') : '';
+        final lastRowSig = (!widget.isStreaming && sampleLimit > 0)
+            ? widget.rows[sampleLimit - 1].join('|')
+            : 'stream:$sampleLimit';
         final widthSig = '$headersSig#$lastRowSig';
         Map<int, TableColumnWidth> colWidths;
         if (_cachedColWidths != null &&
@@ -7300,14 +8193,21 @@ class _MarkdownTableCardState extends State<_MarkdownTableCard> {
           colWidths = _cachedColWidths!;
         } else {
           double estimatedCellWidth(String raw, {bool isHeader = false}) {
-            final stripped = raw
-                .replaceAll(_cellMarkdownStripRe, '')
-                .replaceAll(_cellUrlStripRe, '');
-            double units = 0;
-            for (final rune in stripped.runes) {
-              units += (rune > 0x2E80) ? 1.85 : 0.96;
+            // Split on `<br>` / `\n` so multi-line table cells measure max single-line width
+            // instead of summing all wrapped lines onto one giant inflated column!
+            final lines = raw.replaceAll(_AssistantBodyState._htmlBrTagRe, '\n').split('\n');
+            double maxUnits = 0;
+            for (final ln in lines) {
+              final stripped = ln
+                  .replaceAll(_cellMarkdownStripRe, '')
+                  .replaceAll(_cellUrlStripRe, '');
+              double units = 0;
+              for (final rune in stripped.runes) {
+                units += (rune > 0x2E80) ? 1.85 : 0.96;
+              }
+              if (units > maxUnits) maxUnits = units;
             }
-            final px = units * (isHeader ? 8.2 : 7.8) * textScale + 30.0;
+            final px = maxUnits * (isHeader ? 8.2 : 7.8) * textScale + 30.0;
             return px.clamp(68.0, cellMaxW);
           }
 
@@ -7884,6 +8784,9 @@ const Map<String, String> _latexSymbolMap = <String, String>{
   r'\Leftarrow': '⇐',
   r'\Leftrightarrow': '⇔',
   r'\iff': '⇔',
+  r'\implies': '⇒',
+  r'\impliedby': '⇐',
+  r'\mapsto': '↦',
   r'\in': '∈',
   r'\notin': '∉',
   r'\subset': '⊂',
@@ -7898,7 +8801,29 @@ const Map<String, String> _latexSymbolMap = <String, String>{
   r'\sum': '∑',
   r'\prod': '∏',
   r'\int': '∫',
+  r'\cong': '≅',
+  r'\simeq': '≃',
+  r'\perp': '⊥',
+  r'\parallel': '∥',
+  r'\mid': '∣',
+  r'\sin': 'sin',
+  r'\cos': 'cos',
+  r'\tan': 'tan',
+  r'\log': 'log',
+  r'\ln': 'ln',
+  r'\lim': 'lim',
+  r'\max': 'max',
+  r'\min': 'min',
+  r'\sup': 'sup',
+  r'\inf': 'inf',
+  r'\exp': 'exp',
+  r'\det': 'det',
+  r'\arg': 'arg',
+  r'\gcd': 'gcd',
+  r'\deg': 'deg',
   r'\degree': '°',
+  r'\vdots': '⋮',
+  r'\ddots': '⋱',
   r'\quad': '  ',
   r'\qquad': '   ',
   r'\,': ' ',
@@ -7906,6 +8831,35 @@ const Map<String, String> _latexSymbolMap = <String, String>{
   r'\!': '',
   r'\left': '',
   r'\right': '',
+};
+
+const Map<String, String> _latexCalMap = <String, String>{
+  'A': '𝒜',
+  'B': 'ℬ',
+  'C': '𝒞',
+  'D': '𝒟',
+  'E': 'ℰ',
+  'F': 'ℱ',
+  'G': '𝒢',
+  'H': 'ℋ',
+  'I': 'ℐ',
+  'J': '𝒥',
+  'K': '𝒦',
+  'L': 'ℒ',
+  'M': 'ℳ',
+  'N': '𝒩',
+  'O': '𝒪',
+  'P': '𝒫',
+  'Q': '𝒬',
+  'R': 'ℛ',
+  'S': '𝒮',
+  'T': '𝒯',
+  'U': '𝒰',
+  'V': '𝒱',
+  'W': '𝒲',
+  'X': '𝒳',
+  'Y': '𝒴',
+  'Z': '𝒵',
 };
 
 const Map<String, String> _latexSupMap = <String, String>{
@@ -8100,12 +9054,20 @@ String _formatReadableLatex(String tex) {
     r'\text',
   ];
   const sqrtCmds = <String>[r'\sqrt'];
+  const calCmds = <String>[r'\mathcal', r'\mathscr'];
   const fracCmds = <String>[r'\dfrac', r'\tfrac', r'\frac'];
+  const binomCmds = <String>[r'\binom', r'\dbinom', r'\tbinom'];
   for (var pass = 0; pass < 4; pass++) {
     final prev = s;
     s = _replaceLatexCmd1(s, textCmds, (arg) => arg);
+    s = _replaceLatexCmd1(
+      s,
+      calCmds,
+      (arg) => arg.split('').map((c) => _latexCalMap[c] ?? c).join(),
+    );
     s = _replaceLatexCmd1(s, sqrtCmds, (arg) => '√(${arg.trim()})');
     s = _replaceLatexCmd2(s, fracCmds, (a, b) => '(${a.trim()}) / (${b.trim()})');
+    s = _replaceLatexCmd2(s, binomCmds, (a, b) => 'C(${a.trim()}, ${b.trim()})');
     if (s == prev) break;
   }
   s = s.replaceAllMapped(_latexSymbolRe, (m) {
@@ -8116,6 +9078,9 @@ String _formatReadableLatex(String tex) {
   s = s.replaceAllMapped(_latexSubBracedRe, (m) => _mapScriptChars(m.group(1)!, _latexSubMap));
   s = s.replaceAllMapped(_latexSupSingleRe, (m) => _latexSupMap[m.group(1)!] ?? m.group(0)!);
   s = s.replaceAllMapped(_latexSubSingleRe, (m) => _latexSubMap[m.group(1)!] ?? m.group(0)!);
+  // Strip raw braces on non-Unicode superscripts/subscripts like `e^{x}`, `x_{max}`, `A^{T}`
+  s = s.replaceAllMapped(RegExp(r'\^\{([^{}]+)\}'), (m) => '^${m.group(1)!}');
+  s = s.replaceAllMapped(RegExp(r'_\{([^{}]+)\}'), (m) => '_${m.group(1)!}');
   return s.trim();
 }
 
@@ -8229,18 +9194,26 @@ class _DisplayMathCardState extends State<_DisplayMathCard> {
                 ),
               ),
             ),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              padding: const EdgeInsets.fromLTRB(14, 4, 16, 12),
-              child: Text(
-                formatted,
-                style: TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 14,
-                  height: 1.6,
-                  fontStyle: FontStyle.italic,
-                  color: t.isDark ? t.primaryHi : t.primary,
+            LayoutBuilder(
+              builder: (_, box) => SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(16, 6, 16, 14),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    minWidth: box.maxWidth.isFinite ? math.max(0.0, box.maxWidth - 32.0) : 0.0,
+                  ),
+                  child: Center(
+                    child: Text(
+                      formatted,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 14.2,
+                        height: 1.65,
+                        color: t.text,
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -8249,6 +9222,13 @@ class _DisplayMathCardState extends State<_DisplayMathCard> {
       ),
     );
   }
+}
+
+final RegExp _ansiEscapeRe = RegExp(r'\x1B\[[0-?]*[ -/]*[@-~]');
+
+String _stripAnsiEscapes(String raw) {
+  if (!raw.contains('\x1B')) return raw;
+  return raw.replaceAll(_ansiEscapeRe, '');
 }
 
 /// Synthesizes a clean unified diff preview from tool call args (`old_string`/`new_string`,
@@ -8291,17 +9271,43 @@ class _DisplayMathCardState extends State<_DisplayMathCard> {
   final oldLines = (oldStr != null && oldStr.isNotEmpty) ? oldStr.split('\n') : const <String>[];
   final newLines = (newStr != null && newStr.isNotEmpty) ? newStr.split('\n') : const <String>[];
   if (oldLines.isEmpty && newLines.isEmpty) return null;
-  final buf = StringBuffer('@@ -1,${oldLines.length} +1,${newLines.length} @@\n');
-  for (final l in oldLines) {
-    buf.writeln('-$l');
+  // Trim shared unchanged prefix & suffix lines (keeping up to 2 context lines around the edit)
+  // so 1-line fixes inside 30-line context snippets remain crisp and readable!
+  var prefix = 0;
+  final minLen = math.min(oldLines.length, newLines.length);
+  while (prefix < minLen && oldLines[prefix] == newLines[prefix]) {
+    prefix++;
   }
-  for (final l in newLines) {
-    buf.writeln('+$l');
+  var suffix = 0;
+  while (suffix < (minLen - prefix) &&
+      oldLines[oldLines.length - 1 - suffix] == newLines[newLines.length - 1 - suffix]) {
+    suffix++;
+  }
+  final ctxBeforeStart = math.max(0, prefix - 2);
+  final oldDiffEnd = oldLines.length - suffix;
+  final newDiffEnd = newLines.length - suffix;
+  final ctxAfterEndOld = math.min(oldLines.length, oldDiffEnd + 2);
+  final removedCount = oldDiffEnd - prefix;
+  final addedCount = newDiffEnd - prefix;
+  final buf = StringBuffer(
+    '@@ -${ctxBeforeStart + 1},${ctxAfterEndOld - ctxBeforeStart} +${ctxBeforeStart + 1},${(newDiffEnd - ctxBeforeStart) + (ctxAfterEndOld - oldDiffEnd)} @@\n',
+  );
+  for (var i = ctxBeforeStart; i < prefix; i++) {
+    buf.writeln(' ${oldLines[i]}');
+  }
+  for (var i = prefix; i < oldDiffEnd; i++) {
+    buf.writeln('-${oldLines[i]}');
+  }
+  for (var i = prefix; i < newDiffEnd; i++) {
+    buf.writeln('+${newLines[i]}');
+  }
+  for (var i = oldDiffEnd; i < ctxAfterEndOld; i++) {
+    buf.writeln(' ${oldLines[i]}');
   }
   return (
     unified: buf.toString().trimRight(),
-    added: newLines.length,
-    removed: oldLines.length,
+    added: addedCount,
+    removed: removedCount,
   );
 }
 
@@ -8448,6 +9454,13 @@ TextSpan _highlightCodeSpan(String code, String rawLang, {bool isDark = true}) {
   final typeStyle = TextStyle(
     color: isDark ? const Color(0xFF93C5FD) : const Color(0xFF1B56B5),
   );
+
+  // Bypass code tokenization for plain prose/text/markdown/tabular languages so normal English
+  // words (`if`, `in`, `from`) and `https://` URLs are never mangled as code keywords/comments!
+  const plainTextLangs = {'txt', 'text', 'plaintext', 'plain', 'markdown', 'md', 'csv', 'tsv', 'log'};
+  if (plainTextLangs.contains(lang)) {
+    return TextSpan(text: code, style: baseStyle);
+  }
 
   final isHashOnly = _hashCommentLangs.contains(lang);
   final allowHashComment = lang.isEmpty || isHashOnly;
@@ -8792,136 +9805,20 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
   }
 
   void _openFullscreenCode(BuildContext context, int lineCount) {
-    final t = GrassBagTokens.of(context);
     final label = widget.lang.isEmpty ? '代码查看' : '${widget.lang} · $lineCount 行';
-    final fullSpan = (_cachedHighlightText == widget.code &&
-            _cachedHighlightIsDark == t.isDark &&
-            _cachedBaseSpan != null)
-        ? _cachedBaseSpan!
-        : _highlightCodeSpan(widget.code, widget.lang, isDark: t.isDark);
-    var sheetSoftWrap = _softWrap;
-    var sheetCopied = false;
     showGrassBagSheet(
       context,
       title: label,
-      subtitle: '可横向滚动、切换自动换行或划选复制',
+      subtitle: '支持行号、搜索、字号缩放、自动换行与导出',
       icon: CupertinoIcons.chevron_left_slash_chevron_right,
-      preferredHeight: 500,
       expandable: true,
-      bodyBuilder: (_) => StatefulBuilder(
-        builder: (sheetCtx, setSheetState) {
-          final st = GrassBagTokens.of(sheetCtx);
-          return Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  GrassBagSpringTap(
-                    onTap: () => setSheetState(() => sheetSoftWrap = !sheetSoftWrap),
-                    child: GrassBagFresnelGlassSurface(
-                      isPill: true,
-                      innerWell: true,
-                      tintColor: sheetSoftWrap ? st.primarySoft : null,
-                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6.5),
-                      child: Text(
-                        sheetSoftWrap ? '切换单行' : '自动换行',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: sheetSoftWrap ? (st.isDark ? st.primaryHi : st.primary) : st.text2,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  GrassBagSpringTap(
-                    onTap: () {
-                      Clipboard.setData(ClipboardData(text: widget.code));
-                      HapticFeedback.selectionClick();
-                      setSheetState(() => sheetCopied = true);
-                      Future<void>.delayed(const Duration(milliseconds: 1400), () {
-                        if (sheetCtx.mounted) setSheetState(() => sheetCopied = false);
-                      });
-                    },
-                    child: GrassBagFresnelGlassSurface(
-                      isPill: true,
-                      innerWell: true,
-                      tintColor: sheetCopied ? st.okSoft : null,
-                      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6.5),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            sheetCopied ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
-                            size: 12.5,
-                            color: sheetCopied ? st.ok : st.text2,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            sheetCopied ? '已复制' : '复制代码',
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: sheetCopied ? st.ok : st.text2,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Builder(
-                builder: (wellCtx) {
-                  final wellTier = resolveAmbientGlassTier(wellCtx);
-                  final wellBox = Container(
-                    decoration: ShapeDecoration(
-                      color: st.codeBg,
-                      shape: RoundedSuperellipseBorder(
-                        borderRadius: BorderRadius.circular(16),
-                        side: wellTier == GrassBagGlassTier.solid
-                            ? BorderSide(
-                                color: st.isDark ? Colors.white.withValues(alpha: 0.11) : st.sep,
-                                width: 0.7,
-                              )
-                            : BorderSide.none,
-                      ),
-                    ),
-                    padding: const EdgeInsets.all(13),
-                    child: sheetSoftWrap
-                        ? SelectionArea(
-                            contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                            child: Text.rich(fullSpan, softWrap: true),
-                          )
-                        : SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: SelectionArea(
-                              contextMenuBuilder: buildGrassBagSelectableContextMenu,
-                              child: Text.rich(fullSpan, softWrap: false),
-                            ),
-                          ),
-                  );
-                  if (wellTier == GrassBagGlassTier.solid) return wellBox;
-                  return CustomPaint(
-                    foregroundPainter: GrassBagFresnelRimPainter(
-                      isDark: st.isDark,
-                      borderRadius: 16,
-                      accent: st.isDark ? st.primaryHi : null,
-                      innerWell: true,
-                      frosted: wellTier == GrassBagGlassTier.frosted,
-                      paintTopSheen: false,
-                      strokeWidth: 0.8,
-                    ),
-                    child: wellBox,
-                  );
-                },
-              ),
-            ],
-          );
-        },
+      initialExpanded: true,
+      wideLayout: true,
+      scrollableBody: false,
+      bodyBuilder: (_) => _FullscreenCodeViewer(
+        code: widget.code,
+        lang: widget.lang,
+        initialSoftWrap: _softWrap,
       ),
     );
   }
@@ -8946,12 +9843,14 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
         color: t.codeBg,
         shape: RoundedSuperellipseBorder(
           borderRadius: BorderRadius.circular(16),
-          side: codeSolid
-              ? BorderSide(
-                  color: t.isDark ? Colors.white.withValues(alpha: 0.10) : t.sep,
-                  width: 0.7,
-                )
-              : BorderSide.none,
+          side: BorderSide(
+            color: codeSolid
+                ? (t.isDark ? Colors.white.withValues(alpha: 0.12) : t.sep)
+                : (t.isDark
+                    ? Colors.white.withValues(alpha: 0.085)
+                    : t.primary.withValues(alpha: 0.10)),
+            width: 0.65,
+          ),
         ),
       ),
       child: ClipRSuperellipse(
@@ -9173,16 +10072,41 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
                     : const Duration(milliseconds: 220),
                 curve: Curves.easeOutCubic,
                 alignment: Alignment.topCenter,
-                child: _softWrap
-                    ? Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: _buildCodeText(displayText, t),
-                      )
-                    : _HorizontalCodeScroller(
-                        controller: _hCtrl,
-                        fadeColor: t.codeBg,
-                        child: _buildCodeText(displayText, t),
+                child: Stack(
+                  children: [
+                    _softWrap
+                        ? Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: _buildCodeText(displayText, t),
+                          )
+                        : _HorizontalCodeScroller(
+                            controller: _hCtrl,
+                            fadeColor: t.codeBg,
+                            child: _buildCodeText(displayText, t),
+                          ),
+                    if (isLong && !_expanded)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        height: 28,
+                        child: IgnorePointer(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [
+                                  t.codeBg.withValues(alpha: 0.0),
+                                  t.codeBg.withValues(alpha: 0.92),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
+                  ],
+                ),
               ),
               if (isLong && !_expanded)
                 SelectionContainer.disabled(
@@ -9253,20 +10177,7 @@ class _FencedCodeBlockState extends State<_FencedCodeBlock> {
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: codeSolid
-          ? codeBox
-          : CustomPaint(
-              foregroundPainter: GrassBagFresnelRimPainter(
-                isDark: t.isDark,
-                borderRadius: 16,
-                accent: t.isDark ? t.primaryHi : null,
-                innerWell: true,
-                frosted: codeTier == GrassBagGlassTier.frosted,
-                paintTopSheen: false,
-                strokeWidth: 0.82,
-              ),
-              child: codeBox,
-            ),
+      child: codeBox,
     );
   }
 }
@@ -9298,23 +10209,21 @@ class _TurnUsageMicroBadge extends StatelessWidget {
         ? (usage.outputTokens / (durMs / 1000.0))
         : null;
     final parts = <String>[
-      if (usage.inputTokens > 0) '↑${_fmtTok(usage.inputTokens)}',
+      if (totalIn > 0) '↑${_fmtTok(totalIn)}',
       if (usage.outputTokens > 0) '↓${_fmtTok(usage.outputTokens)}',
       if (hitPct != null) '缓存 $hitPct%',
       if (durLabel != null) durLabel,
       if (tps != null && tps >= 1.0) '${tps.round()} t/s',
     ];
     if (parts.isEmpty) return const SizedBox.shrink();
-    return GrassBagFresnelGlassSurface(
-      isPill: true,
-      innerWell: true,
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
       child: Text(
         parts.join(' · '),
         style: TextStyle(
           fontSize: 11,
           fontFeatures: const [FontFeature.tabularFigures()],
-          color: t.text3,
+          color: t.text3.withValues(alpha: 0.85),
         ),
       ),
     );
@@ -9375,8 +10284,9 @@ class _ReplyActionStripRevealState extends State<_ReplyActionStripReveal>
       animation: ctrl,
       child: widget.child,
       builder: (_, child) {
-        if (ctrl.status == AnimationStatus.completed) return child!;
+        final done = ctrl.status == AnimationStatus.completed;
         return ClipRect(
+          clipBehavior: done ? Clip.none : Clip.hardEdge,
           child: SizeTransition(
             sizeFactor: size,
             axisAlignment: -1.0,
@@ -9467,7 +10377,7 @@ class _StreamingCaretPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final v = Curves.easeInOut.transform(animation.value);
+    final v = Curves.easeInOutSine.transform(animation.value);
     _paint.color = color.withValues(alpha: 0.28 + 0.66 * v);
     final rrect = RRect.fromRectAndRadius(
       Offset.zero & size,
@@ -9479,6 +10389,817 @@ class _StreamingCaretPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _StreamingCaretPainter oldDelegate) =>
       oldDelegate.color != color || oldDelegate.animation != animation;
+}
+
+/// Stateful inline Markdown image card with smooth shimmer placeholder, 180ms fade-in,
+/// zero duplicate alt-text on error, one-tap retry with imageCache eviction, external open,
+/// and swipeable gallery lightbox launch.
+class _MarkdownImageCard extends StatefulWidget {
+  const _MarkdownImageCard({
+    required this.imageUrl,
+    required this.altText,
+    required this.gallery,
+    required this.galleryIndex,
+  });
+
+  final String imageUrl;
+  final String altText;
+  final List<GrassBagImagePreviewItem> gallery;
+  final int galleryIndex;
+
+  @override
+  State<_MarkdownImageCard> createState() => _MarkdownImageCardState();
+}
+
+class _MarkdownImageCardState extends State<_MarkdownImageCard> {
+  // Globally unique per mounted card so repeated image URLs across turns or within
+  // the same message never collide on Flutter's Hero tag registry.
+  late final Object _heroTag = Object();
+  int _retryNonce = 0;
+  bool _hasError = false;
+
+  void _retry() {
+    HapticFeedback.selectionClick();
+    PaintingBinding.instance.imageCache.evict(NetworkImage(widget.imageUrl));
+    setState(() {
+      _hasError = false;
+      _retryNonce++;
+    });
+  }
+
+  void _openLightbox(BuildContext context) {
+    if (widget.gallery.isNotEmpty) {
+      final safeIdx = widget.galleryIndex.clamp(0, widget.gallery.length - 1);
+      showImagePreviewDialog(
+        context,
+        items: [
+          for (var i = 0; i < widget.gallery.length; i++)
+            i == safeIdx
+                ? GrassBagImagePreviewItem(
+                    bytes: widget.gallery[i].bytes,
+                    url: widget.gallery[i].url,
+                    title: widget.gallery[i].title,
+                    mimeType: widget.gallery[i].mimeType,
+                    heroTag: _heroTag,
+                  )
+                : widget.gallery[i],
+        ],
+        initialIndex: safeIdx,
+      );
+    } else {
+      showImagePreviewDialog(
+        context,
+        url: widget.imageUrl,
+        title: widget.altText.isEmpty ? '图片预览' : widget.altText,
+        heroTag: _heroTag,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    return GrassBagSpringTap(
+      pressedScale: 0.96,
+      enablePointerGlow: false,
+      haptic: true,
+      onTap: _hasError ? _retry : () => _openLightbox(context),
+      child: AnimatedSize(
+        duration: GrassBagMotion.duration(context, const Duration(milliseconds: 210)),
+        curve: Curves.easeOutCubic,
+        alignment: Alignment.topLeft,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 360, maxHeight: 280),
+          decoration: BoxDecoration(
+            color: t.fill1,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: t.sep, width: 0.7),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Flexible(
+                child: Hero(
+                  tag: _heroTag,
+                  child: Image.network(
+                widget.imageUrl,
+                key: ValueKey('md-img-${widget.imageUrl}-$_retryNonce'),
+                cacheWidth: 900,
+                fit: BoxFit.contain,
+                gaplessPlayback: true,
+                frameBuilder: (ctx, child, frame, wasSynchronouslyLoaded) {
+                  if (wasSynchronouslyLoaded) return child;
+                  return AnimatedOpacity(
+                    opacity: frame == null ? 0.0 : 1.0,
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOut,
+                    child: child,
+                  );
+                },
+                loadingBuilder: (ctx, child, progress) {
+                  if (progress == null) return child;
+                  final total = progress.expectedTotalBytes;
+                  final pct = total != null && total > 0
+                      ? (progress.cumulativeBytesLoaded / total).clamp(0.0, 1.0)
+                      : null;
+                  return Container(
+                    width: 248,
+                    height: 144,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          t.fill1,
+                          t.fill2,
+                          t.fill1,
+                        ],
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (pct != null)
+                          SizedBox(
+                            width: 26,
+                            height: 26,
+                            child: CircularProgressIndicator(
+                              value: pct,
+                              strokeWidth: 2.2,
+                              color: t.primary,
+                              backgroundColor: t.sep,
+                            ),
+                          )
+                        else
+                          GrassBagActivityIndicator(radius: 9, color: t.text3),
+                        const SizedBox(height: 7),
+                        Text(
+                          pct != null ? '加载图片 ${(pct * 100).round()}%' : '加载图片中…',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                            color: t.text3,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+                errorBuilder: (_, __, ___) {
+                  if (!_hasError) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted && !_hasError) setState(() => _hasError = true);
+                    });
+                  }
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 11, 12, 11),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(CupertinoIcons.photo, size: 16, color: t.text3),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                widget.altText.isEmpty ? '图片加载失败' : widget.altText,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 12.2,
+                                  fontWeight: FontWeight.w600,
+                                  color: t.text2,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            GrassBagSpringTap(
+                              onTap: _retry,
+                              pressedScale: 0.94,
+                              child: GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                tintColor: t.primarySoft,
+                                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(CupertinoIcons.refresh, size: 11.5, color: t.primary),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      '重试',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.primary,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            GrassBagSpringTap(
+                              onTap: () {
+                                if (!openUrlInNewTab(widget.imageUrl) &&
+                                    GrassBagNativeBridge.instance.isAndroidNative) {
+                                  GrassBagNativeBridge.instance.openExternalUrl(widget.imageUrl);
+                                }
+                              },
+                              pressedScale: 0.94,
+                              child: GrassBagFresnelGlassSurface(
+                                isPill: true,
+                                innerWell: true,
+                                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(CupertinoIcons.arrow_up_right_square,
+                                        size: 11.5, color: t.text2),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      '打开原图',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: t.text2,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+                ),
+            ),
+            if (widget.altText.isNotEmpty && !_hasError)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                child: Text(
+                  widget.altText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11.5, color: t.text3),
+                ),
+              ),
+          ],
+        ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Flagship fullscreen code snippet viewer opened from Markdown fenced code blocks:
+/// pinned toolbar, non-selectable line numbers, in-code search, A-/A+ font stepper,
+/// soft-wrap toggle, theme-reactive per-line syntax highlighting, and Share/Export.
+class _FullscreenCodeViewer extends ConsumerStatefulWidget {
+  const _FullscreenCodeViewer({
+    required this.code,
+    required this.lang,
+    this.initialSoftWrap = false,
+  });
+
+  final String code;
+  final String lang;
+  final bool initialSoftWrap;
+
+  @override
+  ConsumerState<_FullscreenCodeViewer> createState() => _FullscreenCodeViewerState();
+}
+
+class _FullscreenCodeViewerState extends ConsumerState<_FullscreenCodeViewer> {
+  final ScrollController _vCtrl = ScrollController();
+  final ScrollController _hCtrl = ScrollController();
+  final TextEditingController _searchCtrl = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
+
+  late final List<String> _lines;
+  late final List<bool> _blockStates;
+  late final double _maxLinePx;
+
+  late bool _softWrap;
+  bool _showSearch = false;
+  bool _copiedFlash = false;
+  Timer? _copyTimer;
+  double _fontSize = 12.2;
+  String _searchQuery = '';
+  List<int> _matches = const [];
+  int _activeMatch = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _softWrap = widget.initialSoftWrap;
+    final norm = widget.code.replaceAll('\r\n', '\n');
+    final split = norm.isEmpty ? const <String>[''] : norm.split('\n');
+    if (split.length > 1 && split.last.isEmpty) {
+      split.removeLast();
+    }
+    _lines = split;
+    _blockStates = computeBlockCommentStates(_lines, widget.lang);
+    var maxPx = 220.0;
+    for (final l in _lines) {
+      final px = estimateMonospaceLinePx(l, fontSize: 12.0);
+      if (px > maxPx) maxPx = px;
+    }
+    _maxLinePx = maxPx.clamp(220.0, 9600.0);
+  }
+
+  @override
+  void dispose() {
+    _copyTimer?.cancel();
+    _vCtrl.dispose();
+    _hCtrl.dispose();
+    _searchCtrl.dispose();
+    _searchFocus.dispose();
+    super.dispose();
+  }
+
+  void _recomputeMatches() {
+    final q = _searchQuery.trim().toLowerCase();
+    if (q.isEmpty) {
+      _matches = const [];
+      _activeMatch = 0;
+      return;
+    }
+    final hits = <int>[];
+    for (var i = 0; i < _lines.length; i++) {
+      if (_lines[i].toLowerCase().contains(q)) hits.add(i);
+    }
+    _matches = hits;
+    if (hits.isEmpty || _activeMatch >= hits.length) _activeMatch = 0;
+  }
+
+  void _jumpMatch(int delta) {
+    if (_matches.isEmpty) return;
+    HapticFeedback.selectionClick();
+    final next = (_activeMatch + delta) % _matches.length;
+    setState(() => _activeMatch = next < 0 ? next + _matches.length : next);
+    if (_vCtrl.hasClients) {
+      final extent = math.max(18.0, MediaQuery.textScalerOf(context).scale(_fontSize) * 1.54);
+      final target = math.max(0.0, (_matches[_activeMatch] - 2) * extent);
+      _vCtrl.animateTo(
+        target.clamp(0.0, _vCtrl.position.maxScrollExtent),
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
+
+  Future<void> _exportCode() async {
+    HapticFeedback.selectionClick();
+    final ext = switch (widget.lang.trim().toLowerCase()) {
+      'dart' => 'dart',
+      'typescript' || 'ts' => 'ts',
+      'tsx' => 'tsx',
+      'javascript' || 'js' => 'js',
+      'python' || 'py' => 'py',
+      'json' => 'json',
+      'yaml' || 'yml' => 'yaml',
+      'bash' || 'sh' || 'zsh' => 'sh',
+      'kotlin' || 'kt' => 'kt',
+      'swift' => 'swift',
+      'rust' || 'rs' => 'rs',
+      'go' => 'go',
+      'sql' => 'sql',
+      'html' => 'html',
+      'css' => 'css',
+      'markdown' || 'md' => 'md',
+      _ => 'txt',
+    };
+    final filename = 'grassbag-snippet.$ext';
+    final ctrl = ref.read(appProvider.notifier);
+    if (GrassBagNativeBridge.instance.isAndroidNative) {
+      final ok = await GrassBagNativeBridge.instance.shareTextFile(
+        text: widget.code,
+        filename: filename,
+        mimeType: 'text/plain',
+      );
+      if (!ok) await GrassBagNativeBridge.instance.shareText(widget.code);
+    } else if (downloadWebBytes(
+      filename,
+      Uint8List.fromList(utf8.encode(widget.code)),
+      mimeType: 'text/plain',
+    )) {
+      ctrl.showToast(kIsWeb ? '已下载 $filename' : '已保存至下载目录 · $filename');
+    } else {
+      await Clipboard.setData(ClipboardData(text: widget.code));
+      ctrl.showToast('已复制代码到剪贴板');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final tier = ref.watch(appProvider.select((s) => s.glassTier));
+    final matchBg = t.isDark ? const Color(0xCC9A6700) : const Color(0xFFFFE58F);
+    final matchFg = t.isDark ? Colors.white : const Color(0xFF1F2937);
+    final activeLine = _matches.isNotEmpty
+        ? _matches[_activeMatch.clamp(0, _matches.length - 1)]
+        : -1;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            child: Row(
+              children: [
+                GrassBagSpringTap(
+                  pressedScale: 0.94,
+                  haptic: true,
+                  onTap: () {
+                    setState(() {
+                      _showSearch = !_showSearch;
+                      if (!_showSearch) {
+                        _searchQuery = '';
+                        _searchCtrl.clear();
+                        _recomputeMatches();
+                      }
+                    });
+                    if (_showSearch) {
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) _searchFocus.requestFocus();
+                      });
+                    }
+                  },
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: _showSearch ? t.primarySoft : null,
+                    padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 5),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          CupertinoIcons.search,
+                          size: 12,
+                          color: _showSearch ? (t.isDark ? t.primaryHi : t.primary) : t.text2,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '查找',
+                          style: TextStyle(
+                            fontSize: 11.4,
+                            fontWeight: FontWeight.w600,
+                            color: _showSearch ? (t.isDark ? t.primaryHi : t.primary) : t.text2,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                GrassBagSpringTap(
+                  pressedScale: 0.94,
+                  haptic: true,
+                  onTap: () => setState(() => _softWrap = !_softWrap),
+                  child: GrassBagFresnelGlassSurface(
+                    isPill: true,
+                    innerWell: true,
+                    interactive: true,
+                    tintColor: _softWrap ? t.primarySoft : null,
+                    padding: const EdgeInsets.symmetric(horizontal: 9.5, vertical: 5),
+                    child: Text(
+                      _softWrap ? '切换单行' : '自动换行',
+                      style: TextStyle(
+                        fontSize: 11.4,
+                        fontWeight: FontWeight.w600,
+                        color: _softWrap ? (t.isDark ? t.primaryHi : t.primary) : t.text2,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                GrassBagFresnelGlassSurface(
+                  isPill: true,
+                  innerWell: true,
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _fontSize > 10.0
+                            ? () {
+                                HapticFeedback.selectionClick();
+                                setState(() => _fontSize = (_fontSize - 1.0).clamp(10.0, 18.0));
+                              }
+                            : null,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                          child: Text(
+                            'A-',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: _fontSize > 10.0 ? t.text2 : t.text3.withValues(alpha: 0.4),
+                            ),
+                          ),
+                        ),
+                      ),
+                      Text(
+                        '${_fontSize.round()}',
+                        style: TextStyle(
+                          fontSize: 10.8,
+                          fontWeight: FontWeight.w600,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.text3,
+                        ),
+                      ),
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _fontSize < 18.0
+                            ? () {
+                                HapticFeedback.selectionClick();
+                                setState(() => _fontSize = (_fontSize + 1.0).clamp(10.0, 18.0));
+                              }
+                            : null,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                          child: Text(
+                            'A+',
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: _fontSize < 18.0 ? t.text2 : t.text3.withValues(alpha: 0.4),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (_showSearch)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: GrassBagTextField(
+                    controller: _searchCtrl,
+                    focusNode: _searchFocus,
+                    placeholder: '在代码段中查找…',
+                    insideGlass: true,
+                    fontSize: 12.5,
+                    padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 7.5),
+                    onChanged: (v) {
+                      setState(() {
+                        _searchQuery = v;
+                        _activeMatch = 0;
+                        _recomputeMatches();
+                      });
+                      if (_matches.isNotEmpty) _jumpMatch(0);
+                    },
+                    onSubmitted: (_) => _jumpMatch(1),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  _searchQuery.trim().isEmpty
+                      ? ''
+                      : (_matches.isEmpty
+                          ? '0 匹配'
+                          : '${_activeMatch + 1}/${_matches.length}'),
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                    color: _matches.isEmpty && _searchQuery.trim().isNotEmpty ? t.warn : t.text3,
+                  ),
+                ),
+                const SizedBox(width: 4),
+                GrassBagSpringTap(
+                  onTap: () => _jumpMatch(-1),
+                  child: GrassBagFresnelGlassSurface(
+                    isCircle: true,
+                    innerWell: true,
+                    width: 28,
+                    height: 28,
+                    alignment: Alignment.center,
+                    child: Icon(CupertinoIcons.chevron_up, size: 12.5, color: t.text2),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                GrassBagSpringTap(
+                  onTap: () => _jumpMatch(1),
+                  child: GrassBagFresnelGlassSurface(
+                    isCircle: true,
+                    innerWell: true,
+                    width: 28,
+                    height: 28,
+                    alignment: Alignment.center,
+                    child: Icon(CupertinoIcons.chevron_down, size: 12.5, color: t.text2),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        Expanded(
+          child: CustomPaint(
+            foregroundPainter: tier == GrassBagGlassTier.solid
+                ? null
+                : GrassBagFresnelRimPainter(
+                    isDark: t.isDark,
+                    borderRadius: 16,
+                    accent: t.isDark ? t.primaryHi : null,
+                    innerWell: true,
+                    frosted: tier == GrassBagGlassTier.frosted,
+                    paintTopSheen: false,
+                    strokeWidth: 0.8,
+                  ),
+            child: ClipRSuperellipse(
+              borderRadius: BorderRadius.circular(16),
+              child: Container(
+                decoration: ShapeDecoration(
+                  color: t.codeBg,
+                  shape: RoundedSuperellipseBorder(
+                    borderRadius: BorderRadius.circular(16),
+                    side: tier == GrassBagGlassTier.solid
+                        ? BorderSide(
+                            color: t.isDark ? Colors.white.withValues(alpha: 0.11) : t.sep,
+                            width: 0.7,
+                          )
+                        : BorderSide.none,
+                  ),
+                ),
+                child: LayoutBuilder(
+                  builder: (ctx, box) {
+                    final scaler = MediaQuery.textScalerOf(ctx);
+                    final lineExtent = math.max(18.0, scaler.scale(_fontSize) * 1.54).ceilToDouble();
+                    final digits = math.max(2, _lines.length.toString().length);
+                    final gutterW = (digits * scaler.scale(_fontSize * 0.62) + 16.0)
+                        .ceilToDouble()
+                        .clamp(32.0, 74.0);
+
+                    Widget buildRow(int idx, {required bool wrap}) {
+                      final hl = highlightCodeLineIncremental(
+                        _lines[idx],
+                        widget.lang,
+                        isDark: t.isDark,
+                        fontSize: _fontSize,
+                        height: 1.52,
+                        inBlockComment: idx < _blockStates.length ? _blockStates[idx] : false,
+                        searchQuery: _searchQuery,
+                        matchBg: matchBg,
+                        matchFg: matchFg,
+                      );
+                      return Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 0.5),
+                        color: idx == activeLine
+                            ? t.warn.withValues(alpha: t.isDark ? 0.22 : 0.16)
+                            : null,
+                        child: Row(
+                          crossAxisAlignment:
+                              wrap ? CrossAxisAlignment.start : CrossAxisAlignment.center,
+                          children: [
+                            SelectionContainer.disabled(
+                              child: SizedBox(
+                                width: gutterW,
+                                child: Padding(
+                                  padding: const EdgeInsets.only(right: 10),
+                                  child: Text(
+                                    '${idx + 1}',
+                                    textAlign: TextAlign.right,
+                                    style: TextStyle(
+                                      fontFamily: 'monospace',
+                                      fontSize: math.max(9.5, _fontSize - 1.5),
+                                      height: 1.52,
+                                      fontFeatures: const [FontFeature.tabularFigures()],
+                                      color: t.text3.withValues(alpha: 0.54),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: Text.rich(
+                                hl.span,
+                                softWrap: wrap,
+                                maxLines: wrap ? null : 1,
+                                overflow: wrap ? TextOverflow.clip : TextOverflow.visible,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+
+                    if (_softWrap) {
+                      return SelectionArea(
+                        contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                        child: Scrollbar(
+                          controller: _vCtrl,
+                          child: ListView.builder(
+                            controller: _vCtrl,
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            itemCount: _lines.length,
+                            physics: const BouncingScrollPhysics(),
+                            itemBuilder: (_, idx) => buildRow(idx, wrap: true),
+                          ),
+                        ),
+                      );
+                    }
+
+                    final availW = box.maxWidth.isFinite ? box.maxWidth : 320.0;
+                    final scaledPx = (_maxLinePx * (scaler.scale(_fontSize) / 12.0)).clamp(200.0, 12000.0);
+                    final contentW = math.max(availW, scaledPx + gutterW + 36.0);
+                    return SelectionArea(
+                      contextMenuBuilder: buildGrassBagSelectableContextMenu,
+                      child: Scrollbar(
+                        controller: _hCtrl,
+                        notificationPredicate: (n) => n.metrics.axis == Axis.horizontal,
+                        child: SingleChildScrollView(
+                          controller: _hCtrl,
+                          scrollDirection: Axis.horizontal,
+                          physics: const BouncingScrollPhysics(),
+                          child: SizedBox(
+                            width: contentW,
+                            height: box.maxHeight,
+                            child: Scrollbar(
+                              controller: _vCtrl,
+                              child: ListView.builder(
+                                controller: _vCtrl,
+                                padding: const EdgeInsets.symmetric(vertical: 8),
+                                itemCount: _lines.length,
+                                itemExtent: lineExtent,
+                                physics: const BouncingScrollPhysics(),
+                                itemBuilder: (_, idx) => buildRow(idx, wrap: false),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '分享 / 导出',
+                icon: CupertinoIcons.share,
+                height: 38,
+                tier: tier,
+                insideGlass: true,
+                onTap: _exportCode,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: GrassBagPrimaryGlassButton(
+                label: _copiedFlash ? '已复制' : '复制代码',
+                icon: _copiedFlash ? CupertinoIcons.checkmark : CupertinoIcons.doc_on_doc,
+                height: 38,
+                tier: tier,
+                insideGlass: true,
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  Clipboard.setData(ClipboardData(text: widget.code));
+                  ref.read(appProvider.notifier).showToast('已复制代码');
+                  _copyTimer?.cancel();
+                  setState(() => _copiedFlash = true);
+                  _copyTimer = Timer(const Duration(milliseconds: 1600), () {
+                    if (mounted) setState(() => _copiedFlash = false);
+                  });
+                },
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
 }
 
 class _QuietReplyAction extends StatelessWidget {
@@ -9539,23 +11260,40 @@ class _QuietReplyAction extends StatelessWidget {
               ),
             ),
           ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 14, color: fg),
-              if (showLabel) ...[
-                const SizedBox(width: 4),
-                Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w500,
-                    color: fg,
+          child: AnimatedSize(
+            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 180)),
+            curve: Curves.easeOutCubic,
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                AnimatedSwitcher(
+                  duration: GrassBagMotion.duration(context, const Duration(milliseconds: 170)),
+                  switchInCurve: Curves.easeOutBack,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, anim) => FadeTransition(
+                    opacity: anim,
+                    child: ScaleTransition(
+                      scale: Tween<double>(begin: 0.72, end: 1.0).animate(anim),
+                      child: child,
+                    ),
                   ),
+                  child: Icon(icon, key: ValueKey(icon.codePoint), size: 14, color: fg),
                 ),
+                if (showLabel) ...[
+                  const SizedBox(width: 4),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w500,
+                      color: fg,
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -9630,11 +11368,21 @@ class _HorizontalCodeScrollerState extends State<_HorizontalCodeScroller> {
               child: CupertinoScrollbar(
                 controller: widget.controller,
                 thumbVisibility: false,
-                child: SingleChildScrollView(
-                  controller: widget.controller,
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.all(12),
-                  child: widget.child,
+                child: ScrollConfiguration(
+                  behavior: ScrollConfiguration.of(context).copyWith(
+                    dragDevices: const {
+                      PointerDeviceKind.touch,
+                      PointerDeviceKind.trackpad,
+                      PointerDeviceKind.stylus,
+                    },
+                  ),
+                  child: SingleChildScrollView(
+                    controller: widget.controller,
+                    scrollDirection: Axis.horizontal,
+                    physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.all(12),
+                    child: widget.child,
+                  ),
                 ),
               ),
             ),
@@ -9648,9 +11396,11 @@ class _HorizontalCodeScrollerState extends State<_HorizontalCodeScroller> {
           child: IgnorePointer(
             child: ValueListenableBuilder<(bool, bool)>(
               valueListenable: _fadeEdges,
-              builder: (_, edges, __) {
-                if (!edges.$1) return const SizedBox.shrink();
-                return DecoratedBox(
+              builder: (_, edges, __) => AnimatedOpacity(
+                opacity: edges.$1 ? 1.0 : 0.0,
+                duration: GrassBagMotion.duration(context, const Duration(milliseconds: 150)),
+                curve: Curves.easeOutCubic,
+                child: DecoratedBox(
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.centerLeft,
@@ -9661,8 +11411,8 @@ class _HorizontalCodeScrollerState extends State<_HorizontalCodeScroller> {
                       ],
                     ),
                   ),
-                );
-              },
+                ),
+              ),
             ),
           ),
         ),
@@ -9674,9 +11424,11 @@ class _HorizontalCodeScrollerState extends State<_HorizontalCodeScroller> {
           child: IgnorePointer(
             child: ValueListenableBuilder<(bool, bool)>(
               valueListenable: _fadeEdges,
-              builder: (_, edges, __) {
-                if (!edges.$2) return const SizedBox.shrink();
-                return DecoratedBox(
+              builder: (_, edges, __) => AnimatedOpacity(
+                opacity: edges.$2 ? 1.0 : 0.0,
+                duration: GrassBagMotion.duration(context, const Duration(milliseconds: 150)),
+                curve: Curves.easeOutCubic,
+                child: DecoratedBox(
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.centerLeft,
@@ -9687,8 +11439,8 @@ class _HorizontalCodeScrollerState extends State<_HorizontalCodeScroller> {
                       ],
                     ),
                   ),
-                );
-              },
+                ),
+              ),
             ),
           ),
         ),

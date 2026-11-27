@@ -18,7 +18,7 @@ function assertContainedWorkspacePath(baseDir, requestedPath) {
   const candidate = isAbsolute(cleanRel) ? resolve(cleanRel) : resolve(realBase, cleanRel);
   // Check both lexical resolution and symlink-resolved target when it exists.
   const relLex = relative(realBase, candidate);
-  if (relLex.startsWith('..') || isAbsolute(relLex)) {
+  if (relLex === '..' || relLex.startsWith('..' + sep) || isAbsolute(relLex)) {
     throw new GbridgeError(403, 'gbridge/path_outside_workspace', 'requested path escapes workspace root');
   }
   const realTarget = safeRealpath(candidate);
@@ -810,7 +810,7 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
     const matched =
       snap.workspaces.find((w) => w.id === idParam || w.workspaceId === idParam) ||
       (requestedReal ? snap.workspaces.find((w) => safeRealpath(w.path) === requestedReal) : null) ||
-      (sid ? snap.workspaces.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(sid)) : null) ||
+      (!requestedReal && sid ? snap.workspaces.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(sid)) : null) ||
       snap.workspaces.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(idParam));
     if (matched) {
       if (matched.path) dirPath = matched.path;
@@ -1121,12 +1121,18 @@ export function registerWorkspaceDomain(router, { ctx, gateway, isLocalAndroid =
         title: body.title,
       }, { peer });
     }
-    if (typeof body.cols === 'number' && typeof body.rows === 'number' && gateway.has('terminal/resize')) {
+    if (
+      typeof body.cols === 'number' &&
+      typeof body.rows === 'number' &&
+      Number.isFinite(body.cols) &&
+      Number.isFinite(body.rows) &&
+      gateway.has('terminal/resize')
+    ) {
       results.resize = await gateway.call('terminal/resize', {
         id: params.id,
         terminalId: params.id,
-        cols: body.cols,
-        rows: body.rows,
+        cols: Math.max(10, Math.min(500, Math.round(body.cols))),
+        rows: Math.max(4, Math.min(200, Math.round(body.rows))),
       }, { peer });
     }
     // Note: in DSH 0.2.2-rc.5 `terminal/retain` is a stream endpoint (`mode: 'stream'`) managed via

@@ -310,9 +310,10 @@ class GrassBagEngineService : Service() {
                 startRequested.set(false)
                 // When backgrounded on Android 8+, avoid ctx.startService(ACTION_STOP) which can race with
                 // OS background start restrictions; stopping an already-foregrounded service via stopService() is safe.
+                // Keep pendingStop=true (with stopGen=gen) so any in-flight startService intent with cmdGen <= stopGen
+                // cannot resurrect the FGS + WakeLock if delivered before onDestroy().
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !isProcessForeground(ctx)) {
                     serviceActive.set(false)
-                    pendingStop.set(false)
                     runCatching { ctx.stopService(Intent(ctx, GrassBagEngineService::class.java)) }
                     return
                 }
@@ -323,7 +324,6 @@ class GrassBagEngineService : Service() {
                 runCatching { ctx.startService(stopIntent) }.onFailure {
                     // Service is already active and foregrounded, so stopService fallback is safe here.
                     serviceActive.set(false)
-                    pendingStop.set(false)
                     runCatching { ctx.stopService(Intent(ctx, GrassBagEngineService::class.java)) }
                 }
             }

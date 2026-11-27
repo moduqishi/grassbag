@@ -890,6 +890,60 @@ class GrassBagNativeBridge {
     await _safeInvoke<bool>('device.shareText', {'text': text});
   }
 
+  /// Shares arbitrary bytes as a real named file via Android FileProvider (`ACTION_SEND`).
+  Future<bool> shareFileBytes({
+    required Uint8List bytes,
+    required String filename,
+    String mimeType = 'application/octet-stream',
+  }) async {
+    if (!isAndroidNative || bytes.isEmpty) return false;
+    return (await _safeInvoke<bool>('device.shareFile', {
+          'bytes': bytes,
+          'filename': filename,
+          'mimeType': mimeType,
+        })) ==
+        true;
+  }
+
+  /// Shares UTF-8 text as a named file via Android FileProvider (`ACTION_SEND`).
+  Future<bool> shareTextFile({
+    required String text,
+    required String filename,
+    String mimeType = 'text/plain',
+  }) async {
+    if (!isAndroidNative) return false;
+    return (await _safeInvoke<bool>('device.shareFile', {
+          'text': text,
+          'filename': filename,
+          'mimeType': mimeType,
+        })) ==
+        true;
+  }
+
+  /// Saves image bytes directly into Android system gallery (`Pictures/GrassBag` via MediaStore).
+  Future<({bool ok, String? location, String? error})> saveImageBytes({
+    required Uint8List bytes,
+    required String filename,
+    String mimeType = 'image/png',
+  }) async {
+    if (!isAndroidNative || bytes.isEmpty) {
+      return (ok: false, location: null, error: '当前平台不支持原生相册保存');
+    }
+    final res = await _safeInvoke<Map<Object?, Object?>>('device.saveImage', {
+      'bytes': bytes,
+      'filename': filename,
+      'mimeType': mimeType,
+    });
+    if (res == null) {
+      return (ok: false, location: null, error: '系统相册服务无响应');
+    }
+    return (
+      ok: res['ok'] == true,
+      location: res['location']?.toString(),
+      error: res['error']?.toString(),
+    );
+  }
+
   Future<bool> openExternalUrl(String url) async {
     return (await _safeInvoke<bool>('device.openUrl', {'url': url})) == true;
   }

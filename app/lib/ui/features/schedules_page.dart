@@ -754,11 +754,27 @@ class _ScheduleCard extends StatelessWidget {
                     onTap: onToggleHistory,
                     child: Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                      child: Text(
-                        historyExpanded
-                            ? '收起记录'
-                            : (item.history.isEmpty ? '运行记录' : '记录 (${item.history.length})'),
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            historyExpanded
+                                ? '收起记录'
+                                : (item.history.isEmpty ? '运行记录' : '记录 (${item.history.length})'),
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.text2),
+                          ),
+                          const SizedBox(width: 3),
+                          AnimatedRotation(
+                            turns: historyExpanded ? 0.25 : 0.0,
+                            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 200)),
+                            curve: Curves.easeOutCubic,
+                            child: Icon(
+                              CupertinoIcons.chevron_right,
+                              size: 11,
+                              color: t.text3,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
@@ -834,66 +850,72 @@ class _ScheduleCard extends StatelessWidget {
             ],
           ),
           ),
-          AnimatedSize(
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.topCenter,
-            child: historyExpanded
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: GrassBagFresnelGlassSurface(
-                      borderRadius: 12,
-                      innerWell: true,
-                      paintTopSheen: !t.isDark,
-                      width: double.infinity,
-                      tintColor: t.isDark ? t.codeBg : null,
-                      padding: const EdgeInsets.all(10),
-                      child: loadingHistory && item.history.isEmpty
-                          ? Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                              child: Center(child: GrassBagActivityIndicator(radius: 8, color: t.primary)),
+          GrassBagSmoothDisclosure(
+            expanded: historyExpanded,
+            duration: const Duration(milliseconds: 220),
+            child: Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: GrassBagFresnelGlassSurface(
+                borderRadius: 12,
+                innerWell: true,
+                paintTopSheen: !t.isDark,
+                width: double.infinity,
+                tintColor: t.isDark ? t.codeBg : null,
+                padding: const EdgeInsets.all(10),
+                child: AnimatedSwitcher(
+                  duration: GrassBagMotion.duration(context, const Duration(milliseconds: 160)),
+                  child: loadingHistory && item.history.isEmpty
+                      ? Padding(
+                          key: const ValueKey('sched-hist-loading'),
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Center(child: GrassBagActivityIndicator(radius: 8, color: t.primary)),
+                        )
+                      : item.history.isEmpty
+                          ? Text(
+                              '暂无执行历史',
+                              key: const ValueKey('sched-hist-empty'),
+                              style: TextStyle(fontSize: 12, color: t.text3),
                             )
-                          : item.history.isEmpty
-                              ? Text('暂无执行历史', style: TextStyle(fontSize: 12, color: t.text3))
-                              : Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    for (final h in item.history)
-                                      Builder(
-                                        builder: (_) {
-                                          final lower = h.toLowerCase();
-                                          final isErr = lower.contains('error') ||
-                                              lower.contains('failed') ||
-                                              lower.contains('失败');
-                                          return Padding(
-                                            padding: const EdgeInsets.symmetric(vertical: 3),
-                                            child: Row(
-                                              crossAxisAlignment: CrossAxisAlignment.start,
-                                              children: [
-                                                Icon(
-                                                  isErr
-                                                      ? CupertinoIcons.xmark_circle_fill
-                                                      : CupertinoIcons.checkmark_alt_circle_fill,
-                                                  size: 13,
-                                                  color: isErr ? t.err : t.ok,
-                                                ),
-                                                const SizedBox(width: 6),
-                                                Expanded(
-                                                  child: Text(
-                                                    _localizeHistoryLine(h),
-                                                    style: TextStyle(fontSize: 12, color: t.text2),
-                                                  ),
-                                                ),
-                                              ],
+                          : Column(
+                              key: ValueKey('sched-hist-${item.history.length}'),
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                for (final h in item.history)
+                                  Builder(
+                                    builder: (_) {
+                                      final lower = h.toLowerCase();
+                                      final isErr = lower.contains('error') ||
+                                          lower.contains('failed') ||
+                                          lower.contains('失败');
+                                      return Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 3),
+                                        child: Row(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Icon(
+                                              isErr
+                                                  ? CupertinoIcons.xmark_circle_fill
+                                                  : CupertinoIcons.checkmark_alt_circle_fill,
+                                              size: 13,
+                                              color: isErr ? t.err : t.ok,
                                             ),
-                                          );
-                                        },
-                                      ),
-                                  ],
-                                ),
-                    ),
-                  )
-                : const SizedBox.shrink(),
+                                            const SizedBox(width: 6),
+                                            Expanded(
+                                              child: Text(
+                                                _localizeHistoryLine(h),
+                                                style: TextStyle(fontSize: 12, color: t.text2),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+                                    },
+                                  ),
+                              ],
+                            ),
+                ),
+              ),
+            ),
           ),
         ],
       ),

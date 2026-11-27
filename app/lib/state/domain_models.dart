@@ -74,6 +74,10 @@ class WorkspaceDiffRecord {
     required this.added,
     required this.removed,
     required this.unifiedDiff,
+    this.previousPath,
+    this.binary = false,
+    this.oversized = false,
+    this.untracked = false,
   });
 
   final String path;
@@ -81,6 +85,10 @@ class WorkspaceDiffRecord {
   final int added;
   final int removed;
   final String unifiedDiff;
+  final String? previousPath;
+  final bool binary;
+  final bool oversized;
+  final bool untracked;
 
   @override
   bool operator ==(Object other) {
@@ -90,11 +98,25 @@ class WorkspaceDiffRecord {
         other.summary == summary &&
         other.added == added &&
         other.removed == removed &&
-        other.unifiedDiff == unifiedDiff;
+        other.unifiedDiff == unifiedDiff &&
+        other.previousPath == previousPath &&
+        other.binary == binary &&
+        other.oversized == oversized &&
+        other.untracked == untracked;
   }
 
   @override
-  int get hashCode => Object.hash(path, summary, added, removed, unifiedDiff);
+  int get hashCode => Object.hash(
+        path,
+        summary,
+        added,
+        removed,
+        unifiedDiff,
+        previousPath,
+        binary,
+        oversized,
+        untracked,
+      );
 }
 
 /// Task checklist item tracked inside the Session Workbench Progress tab.
@@ -792,6 +814,30 @@ class UserQuestionItem {
   final List<String> optionDescriptions;
   final bool multiSelect;
   final bool allowFreeText;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is UserQuestionItem &&
+        other.id == id &&
+        other.title == title &&
+        other.prompt == prompt &&
+        other.multiSelect == multiSelect &&
+        other.allowFreeText == allowFreeText &&
+        listEquals(other.options, options) &&
+        listEquals(other.optionDescriptions, optionDescriptions);
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        id,
+        title,
+        prompt,
+        multiSelect,
+        allowFreeText,
+        Object.hashAll(options),
+        Object.hashAll(optionDescriptions),
+      );
 }
 
 /// Interactive question prompt (`user-questions/request`) or Cordis run confirmation
@@ -849,7 +895,7 @@ class ActiveUserQuestion {
         other.sessionId == sessionId &&
         listEquals(other.options, options) &&
         listEquals(other.optionDescriptions, optionDescriptions) &&
-        other.questions.length == questions.length;
+        listEquals(other.questions, questions);
   }
 
   @override
@@ -863,7 +909,7 @@ class ActiveUserQuestion {
         sessionId,
         Object.hashAll(options),
         Object.hashAll(optionDescriptions),
-        questions.length,
+        Object.hashAll(questions),
       );
 }
 
@@ -1356,6 +1402,30 @@ class ModelUsageGroup {
 
   double? get cacheHitRate =>
       totalInputTokens > 0 ? (cacheReadTokens / totalInputTokens).clamp(0.0, 1.0) : null;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is ModelUsageGroup &&
+        other.provider == provider &&
+        other.model == model &&
+        other.uncachedInputTokens == uncachedInputTokens &&
+        other.outputTokens == outputTokens &&
+        other.cacheReadTokens == cacheReadTokens &&
+        other.cacheWriteTokens == cacheWriteTokens &&
+        other.contextTokens == contextTokens;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        provider,
+        model,
+        uncachedInputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+        contextTokens,
+      );
 }
 
 /// Full real-time session telemetry parsed from DSH 0.2.x `projections.values`
@@ -1658,7 +1728,7 @@ class SessionTelemetry {
         other.systemTokens == systemTokens &&
         other.toolsTokens == toolsTokens &&
         other.messageTokens == messageTokens &&
-        other.modelGroups.length == modelGroups.length &&
+        listEquals(other.modelGroups, modelGroups) &&
         other.summaryInputTokens == summaryInputTokens &&
         other.summaryOutputTokens == summaryOutputTokens &&
         other.summaryCacheReadTokens == summaryCacheReadTokens &&
@@ -1693,7 +1763,7 @@ class SessionTelemetry {
         systemTokens,
         toolsTokens,
         messageTokens,
-        modelGroups.length,
+        Object.hashAll(modelGroups),
         summaryInputTokens,
         summaryOutputTokens,
         summaryCacheReadTokens,

@@ -623,16 +623,12 @@ class _JobCard extends StatelessWidget {
                 ),
             ],
           ),
-          AnimatedSize(
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.topCenter,
-            child: expanded
-                ? Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: _JobLogConsole(lines: job.outputLines),
-                  )
-                : const SizedBox.shrink(),
+          GrassBagSmoothDisclosure(
+            expanded: expanded,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: _JobLogConsole(lines: job.outputLines),
+            ),
           ),
         ],
       ),
@@ -781,20 +777,43 @@ class _JobLogConsoleState extends State<_JobLogConsole> {
                       ),
                     ],
                   ),
-                  if (_scrolledUp)
-                    Positioned(
-                      right: 2,
-                      bottom: 2,
-                      child: GrassBagPrimaryGlassButton(
-                        label: '最新输出',
-                        icon: CupertinoIcons.arrow_down,
-                        height: 36,
-                        padding: const EdgeInsets.symmetric(horizontal: 11),
-                        tier: logTier,
-                        insideGlass: true,
-                        onTap: () => _jumpToTailIfNearBottom(force: true),
+                  Positioned(
+                    right: 2,
+                    bottom: 2,
+                    child: AnimatedScale(
+                      scale: _scrolledUp ? 1.0 : 0.85,
+                      duration: GrassBagMotion.duration(context, const Duration(milliseconds: 170)),
+                      curve: Curves.easeOutCubic,
+                      child: AnimatedOpacity(
+                        opacity: _scrolledUp ? 1.0 : 0.0,
+                        duration: GrassBagMotion.duration(context, const Duration(milliseconds: 160)),
+                        child: IgnorePointer(
+                          ignoring: !_scrolledUp,
+                          child: GrassBagPrimaryGlassButton(
+                            label: '最新输出',
+                            icon: CupertinoIcons.arrow_down,
+                            height: 36,
+                            padding: const EdgeInsets.symmetric(horizontal: 11),
+                            tier: logTier,
+                            insideGlass: true,
+                            onTap: () {
+                              if (!_ctrl.hasClients) return;
+                              if (MediaQuery.disableAnimationsOf(context)) {
+                                _jumpToTailIfNearBottom(force: true);
+                              } else {
+                                if (_scrolledUp) setState(() => _scrolledUp = false);
+                                _ctrl.animateTo(
+                                  _ctrl.position.maxScrollExtent,
+                                  duration: const Duration(milliseconds: 220),
+                                  curve: Curves.easeOutCubic,
+                                );
+                              }
+                            },
+                          ),
+                        ),
                       ),
                     ),
+                  ),
                 ],
               ),
       ),

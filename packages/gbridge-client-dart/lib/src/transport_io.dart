@@ -502,6 +502,16 @@ class GbridgeHttpTransport {
       }
     }
     if (res.statusCode == 401 && retryAuth && !endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
+      if (_cookieHeader != null && _cookieHeader != usedCookie) {
+        return requestJson(
+          method,
+          path,
+          query: query,
+          body: body,
+          retryAuth: false,
+          reloadRetryAttempt: reloadRetryAttempt,
+        );
+      }
       // Do NOT wipe `_cookieHeader` before `exchangeAuthToken()` so reverse-proxy / SSO cookies
       // (Cloudflare Access, Authelia, etc.) stay attached to the token-exchange request!
       final exchanged = await exchangeAuthToken();
@@ -559,6 +569,17 @@ class GbridgeHttpTransport {
       }
     }
     if (res.statusCode == 401 && retryAuth && !endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
+      if (_cookieHeader != null && _cookieHeader != usedCookie) {
+        return requestBytes(
+          method,
+          path,
+          query: query,
+          bodyBytes: bodyBytes,
+          contentType: contentType,
+          retryAuth: false,
+          reloadRetryAttempt: reloadRetryAttempt,
+        );
+      }
       final exchanged = await exchangeAuthToken();
       if (exchanged) {
         return requestBytes(
@@ -1221,8 +1242,10 @@ class GbridgeStreamClient {
       return _vanillaMux!.checkLiveness(timeout: timeout, force: force);
     }
     if (_disposed || _manualDisconnect) return false;
-    // Never abort an in-flight handshake/reconnect!
-    if (_phase == ConnectionPhase.connecting || _phase == ConnectionPhase.reconnecting) {
+    // Never abort an in-flight handshake/reconnect or override an auth-rejected state!
+    if (_phase == ConnectionPhase.connecting ||
+        _phase == ConnectionPhase.reconnecting ||
+        _phase == ConnectionPhase.needsAuth) {
       return false;
     }
     if (_ws == null || _phase != ConnectionPhase.connected) {
@@ -1336,15 +1359,19 @@ class GbridgeStreamClient {
     _pongTimeoutTimer?.cancel();
     _missedHeartbeats = 0;
     final epoch = _connEpoch;
-    final period = Duration(milliseconds: heartbeatMs.clamp(8000, 60000));
+    final periodMs = heartbeatMs.clamp(8000, 60000);
+    final period = Duration(milliseconds: periodMs);
+    // Keep pong deadline strictly shorter than heartbeat period so the next periodic tick
+    // never cancels an unexpired pong timer on a blackholed socket!
+    final pongTimeoutMs = (periodMs * 0.6).round().clamp(4000, 12000);
     _heartbeatTimer = Timer.periodic(period, (_) {
       if (_phase == ConnectionPhase.connected && epoch == _connEpoch) {
         sendPing();
         _pongTimeoutTimer?.cancel();
-        _pongTimeoutTimer = Timer(const Duration(seconds: 20), () {
+        _pongTimeoutTimer = Timer(Duration(milliseconds: pongTimeoutMs), () {
           if (epoch != _connEpoch || _phase != ConnectionPhase.connected) return;
           final sinceLastInbound = DateTime.now().millisecondsSinceEpoch - _lastInboundAtMs;
-          if (sinceLastInbound < 20000) {
+          if (sinceLastInbound < pongTimeoutMs) {
             _missedHeartbeats = 0;
             return;
           }

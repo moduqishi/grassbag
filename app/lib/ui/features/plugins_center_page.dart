@@ -853,64 +853,67 @@ class _PluginsCenterPageState extends ConsumerState<PluginsCenterPage> {
                         m.desc,
                         style: TextStyle(fontSize: 12.5, height: 1.4, color: t.text2),
                       ),
-                      if (m.installLogs.isNotEmpty) ...[
-                        const SizedBox(height: 9),
-                        GrassBagFresnelGlassSurface(
-                          borderRadius: 12,
-                          innerWell: true,
-                          paintTopSheen: false,
-                          tintColor: t.codeBg,
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(10),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(
-                                    '安装日志 (${m.installLogs.length} 行)',
-                                    style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.text3),
-                                  ),
-                                  const Spacer(),
-                                  GrassBagSpringTap(
-                                    enablePointerGlow: false,
-                                    haptic: true,
-                                    onTap: () {
-                                      Clipboard.setData(ClipboardData(text: m.installLogs.join('\n')));
-                                      ctrl.showToast('已复制安装日志', tone: ToastTone.ok);
-                                    },
-                                    child: Padding(
-                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                      child: Text(
-                                        '复制',
-                                        style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                      GrassBagSmoothDisclosure(
+                        expanded: m.installLogs.isNotEmpty,
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 9),
+                          child: GrassBagFresnelGlassSurface(
+                            borderRadius: 12,
+                            innerWell: true,
+                            paintTopSheen: false,
+                            tintColor: t.codeBg,
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(10),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Row(
+                                  children: [
+                                    Text(
+                                      '安装日志 (${m.installLogs.length} 行)',
+                                      style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.text3),
+                                    ),
+                                    const Spacer(),
+                                    GrassBagSpringTap(
+                                      enablePointerGlow: false,
+                                      haptic: true,
+                                      onTap: () {
+                                        Clipboard.setData(ClipboardData(text: m.installLogs.join('\n')));
+                                        ctrl.showToast('已复制安装日志', tone: ToastTone.ok);
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        child: Text(
+                                          '复制',
+                                          style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: t.primary),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                ConstrainedBox(
+                                  constraints: const BoxConstraints(maxHeight: 160),
+                                  child: SingleChildScrollView(
+                                    physics: const BouncingScrollPhysics(),
+                                    child: SelectableText(
+                                      m.installLogs.join('\n'),
+                                      contextMenuBuilder: buildGrassBagEditableContextMenu,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        height: 1.45,
+                                        fontFamily: 'monospace',
+                                        color: t.codeFg,
                                       ),
                                     ),
                                   ),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              ConstrainedBox(
-                                constraints: const BoxConstraints(maxHeight: 160),
-                                child: SingleChildScrollView(
-                                  physics: const BouncingScrollPhysics(),
-                                  child: SelectableText(
-                                    m.installLogs.join('\n'),
-                                    contextMenuBuilder: buildGrassBagEditableContextMenu,
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      height: 1.45,
-                                      fontFamily: 'monospace',
-                                      color: t.codeFg,
-                                    ),
-                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
-                      ],
+                      ),
                     ],
                   ),
                 ),

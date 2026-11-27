@@ -16,12 +16,49 @@ if (!socketPath || !token) {
 }
 
 const STDIN_ACTIONS = new Set(['clip', 'notify', 'share', 'tts']);
+const MAX_STDIN_BYTES = 512 * 1024;
+const STDIN_IDLE_TIMEOUT_MS = 250;
 
-async function readStdinIfPiped(shouldRead) {
-  if (!shouldRead || process.stdin.isTTY) return '';
-  const chunks = [];
-  for await (const c of process.stdin) chunks.push(c);
-  return Buffer.concat(chunks).toString('utf8');
+function readStdinIfPiped(shouldRead) {
+  if (!shouldRead || process.stdin.isTTY) return Promise.resolve('');
+  return new Promise((resolve) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    let sawData = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(idleTimer);
+      process.stdin.removeListener('data', onData);
+      process.stdin.removeListener('end', finish);
+      process.stdin.removeListener('error', finish);
+      process.stdin.pause();
+      resolve(Buffer.concat(chunks, total).toString('utf8'));
+    };
+    const onData = (chunk) => {
+      sawData = true;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = MAX_STDIN_BYTES - total;
+      if (remaining <= 0) {
+        finish();
+        return;
+      }
+      const slice = buf.length > remaining ? buf.subarray(0, remaining) : buf;
+      chunks.push(slice);
+      total += slice.length;
+      if (total >= MAX_STDIN_BYTES) finish();
+    };
+    // Guard against non-TTY subshells keeping stdin open with no data (e.g. `droid-clip` read mode in tool exec).
+    const idleTimer = setTimeout(() => {
+      if (!sawData) finish();
+    }, STDIN_IDLE_TIMEOUT_MS);
+    idleTimer.unref?.();
+    process.stdin.on('data', onData);
+    process.stdin.once('end', finish);
+    process.stdin.once('error', finish);
+    process.stdin.resume();
+  });
 }
 
 const args = process.argv.slice(3);
@@ -54,7 +91,11 @@ const req = request(
           }
           process.exit(0);
         } else {
-          console.error(json?.error?.message || json?.reason || `droid-rpc failed (${res.statusCode})`);
+          const errText =
+            typeof json?.error === 'string'
+              ? json.error
+              : (json?.error?.message || json?.reason || `droid-rpc failed (${res.statusCode})`);
+          console.error(errText);
           process.exit(1);
         }
       } catch {

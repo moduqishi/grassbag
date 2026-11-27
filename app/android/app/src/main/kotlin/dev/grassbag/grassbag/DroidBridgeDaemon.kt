@@ -47,6 +47,7 @@ class DroidBridgeDaemon(
 
     fun start(): Boolean = synchronized(lifecycleLock) {
         if (running.get()) return true
+        var bindSocket: LocalSocket? = null
         return try {
             val exec = if (pool.isShutdown || pool.isTerminated) {
                 Executors.newCachedThreadPool().also { pool = it }
@@ -55,15 +56,16 @@ class DroidBridgeDaemon(
             }
             socketFile.parentFile?.mkdirs()
             if (socketFile.exists()) socketFile.delete()
-            val bindSocket = LocalSocket()
-            bindSocket.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+            val sock = LocalSocket()
+            bindSocket = sock
+            sock.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
             socketFile.setReadable(false, false)
             socketFile.setWritable(false, false)
             socketFile.setReadable(true, true)
             socketFile.setWritable(true, true)
             // Keep strong reference so GC cannot close bindSocket FD underneath serverSocket.
-            val ss = LocalServerSocket(bindSocket.fileDescriptor)
-            boundSocket = bindSocket
+            val ss = LocalServerSocket(sock.fileDescriptor)
+            boundSocket = sock
             serverSocket = ss
             running.set(true)
             exec.execute { acceptLoop(ss, exec) }
@@ -72,8 +74,10 @@ class DroidBridgeDaemon(
             running.set(false)
             runCatching { serverSocket?.close() }
             runCatching { boundSocket?.close() }
+            runCatching { bindSocket?.close() }
             boundSocket = null
             serverSocket = null
+            runCatching { if (socketFile.exists()) socketFile.delete() }
             false
         }
     }
@@ -134,10 +138,12 @@ class DroidBridgeDaemon(
                     PhoneControlDaemon.writeJson(out, 400, JSONObject().put("error", JSONObject().put("message", "invalid_json")))
                     return
                 }
-                val action = body.optString("action", "")
+                val action = if (body.isNull("action")) "" else body.optString("action", "")
                 val argsArr = body.optJSONArray("args")
-                val args = List(argsArr?.length() ?: 0) { argsArr!!.optString(it) }
-                val stdin = body.optString("stdin", "")
+                val args = List(argsArr?.length() ?: 0) { idx ->
+                    if (argsArr == null || argsArr.isNull(idx)) "" else argsArr.optString(idx, "")
+                }
+                val stdin = if (body.isNull("stdin")) "" else body.optString("stdin", "")
                 val result = executeAction(action, args, stdin)
                 PhoneControlDaemon.writeJson(out, 200, result)
             } catch (t: Throwable) {
@@ -248,6 +254,7 @@ class DroidBridgeDaemon(
                 val text = args.joinToString(" ").ifEmpty { stdin }
                 if (text.isNotEmpty()) {
                     mainHandler.post {
+                        if (!running.get()) return@post
                         if (tts == null) {
                             pendingTtsText = text
                             ttsReady = false

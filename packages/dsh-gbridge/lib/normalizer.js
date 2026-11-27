@@ -296,10 +296,12 @@ export function extractFailureInfo(reason, data = {}) {
   return null;
 }
 
-function formatErrorObject(err) {
-  if (!err) return '';
+function formatErrorObject(err, depth = 0, seen = new Set()) {
+  if (!err || depth > 5) return '';
   if (typeof err === 'string') return err.trim();
   if (typeof err !== 'object') return String(err);
+  if (seen.has(err)) return '';
+  seen.add(err);
   const parts = [];
   const main = err.message ?? err.reason ?? err.detail ?? err.summary ?? err.error;
   if (typeof main === 'string' && main.trim()) parts.push(main.trim());
@@ -310,7 +312,7 @@ function formatErrorObject(err) {
     parts.push(`HTTP ${err.status}`);
   }
   if (err.cause) {
-    const c = formatErrorObject(err.cause);
+    const c = formatErrorObject(err.cause, depth + 1, seen);
     if (c && !parts.includes(c)) parts.push(`原因: ${c}`);
   }
   if (parts.length > 0) return parts.join(' · ');
@@ -388,6 +390,34 @@ export class SessionNormalizer {
         }
       } catch {}
       bytes = Math.max(256, jsonLen * 2);
+    }
+    if (normalizedRecord && normalizedRecord.args != null) {
+      let argsLen = 0;
+      if (typeof normalizedRecord.args === 'string') {
+        argsLen = normalizedRecord.args.length;
+        if (argsLen > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
+          normalizedRecord = {
+            ...normalizedRecord,
+            args: `${normalizedRecord.args.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${argsLen} 字符]`,
+            truncated: true,
+          };
+          argsLen = normalizedRecord.args.length;
+        }
+      } else {
+        try {
+          const encodedArgs = JSON.stringify(normalizedRecord.args);
+          argsLen = encodedArgs ? encodedArgs.length : 0;
+          if (argsLen > MAX_SINGLE_TOOL_OUTPUT_CHARS) {
+            normalizedRecord = {
+              ...normalizedRecord,
+              args: `${encodedArgs.slice(0, MAX_SINGLE_TOOL_OUTPUT_CHARS)}\n…[已截断，原始长度 ${argsLen} 字符]`,
+              truncated: true,
+            };
+            argsLen = normalizedRecord.args.length;
+          }
+        } catch {}
+      }
+      bytes += argsLen * 2;
     }
     this.toolOutputs.set(key, { record: normalizedRecord, bytes });
     this.toolOutputBytes += bytes;

@@ -77,20 +77,28 @@ class _RemoteWebLoginPageState extends ConsumerState<RemoteWebLoginPage> {
   }
 
   static String? _extractSslErrorHost(Object request) {
+    final candidates = <dynamic>[];
     final dynamic dyn = request;
     try {
-      final rawUrl = dyn.url;
-      if (rawUrl is String && rawUrl.isNotEmpty) {
-        final uri = Uri.tryParse(rawUrl);
-        if (uri != null && uri.host.isNotEmpty) return uri.host.toLowerCase();
-      }
+      final platform = dyn.platform;
+      if (platform != null) candidates.add(platform);
     } catch (_) {}
-    try {
-      final rawHost = dyn.host;
-      if (rawHost is String && rawHost.isNotEmpty) {
-        return rawHost.toLowerCase();
-      }
-    } catch (_) {}
+    candidates.add(dyn);
+    for (final candidate in candidates) {
+      try {
+        final rawUrl = candidate.url;
+        if (rawUrl is String && rawUrl.isNotEmpty) {
+          final uri = Uri.tryParse(rawUrl);
+          if (uri != null && uri.host.isNotEmpty) return uri.host.toLowerCase();
+        }
+      } catch (_) {}
+      try {
+        final rawHost = candidate.host;
+        if (rawHost is String && rawHost.isNotEmpty) {
+          return rawHost.toLowerCase();
+        }
+      } catch (_) {}
+    }
     return null;
   }
 

@@ -908,7 +908,7 @@ class VanillaDshNormalizer {
     final now = DateTime.now().millisecondsSinceEpoch;
     var stat = _turnStats[sessionId];
     final ctype = chunk['type']?.toString() ?? '';
-    if (stat == null || ctype == 'turn/start' || ctype == 'snapshot') {
+    if (stat == null || ctype == 'turn/start') {
       stat = _SessionStreamStat(startedAt: now);
       _turnStats[sessionId] = stat;
     } else if (ctype == 'step/start') {

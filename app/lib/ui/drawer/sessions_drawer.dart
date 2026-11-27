@@ -40,10 +40,13 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
   static final Map<String, Set<String>> _persistedCollapsedByHost = <String, Set<String>>{};
 
   late final TextEditingController _searchCtrl;
+  final ScrollController _listScrollCtrl = ScrollController();
   final ValueNotifier<bool> _searchFocused = ValueNotifier<bool>(false);
   bool _multiSelectMode = false;
   final Set<String> _selectedIds = {};
   final Set<String> _collapsedGroups = {};
+  Set<String>? _collapsedBeforeMultiSelect;
+  String? _lastAutoExpandedSessionId;
   int _collapsedGroupsVersion = 0;
   String? _lastHostId;
 
@@ -55,6 +58,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
   Map<String, String>? _cacheSearchSnippets;
   SessionFilter? _cacheFilter;
   SessionGroupMode? _cacheGroupMode;
+  String? _cacheActiveSessionId;
   int _cacheCollapsedVer = -1;
   List<Object> _cachedFlatItems = const [];
   int _cachedUngroupedWithCwdCount = 0;
@@ -73,6 +77,25 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     return idx >= 0 && idx < clean.length - 1 ? clean.substring(idx + 1) : clean;
   }
 
+  static bool _sessionMatchesWorkspaceFilter(
+    ChatSessionItem s,
+    String wsFilter,
+    String normWsFilter,
+    WorkspaceItem? filterWsItem,
+    String normFilterItemPath,
+  ) {
+    if (wsFilter.isEmpty) return true;
+    final normCwd = (s.cwd != null && s.cwd!.isNotEmpty) ? _normalizeDirPath(s.cwd!) : '';
+    return (filterWsItem != null &&
+            (s.workspaceId == filterWsItem.id ||
+                s.workspaceName == filterWsItem.name ||
+                (normFilterItemPath.isNotEmpty && normCwd == normFilterItemPath))) ||
+        s.workspaceId == wsFilter ||
+        s.workspaceName == wsFilter ||
+        (normCwd.isNotEmpty && normCwd == normWsFilter) ||
+        (normCwd.isNotEmpty && _basenamePath(normCwd) == wsFilter);
+  }
+
   void _ensureFlatItems({
     required List<ChatSessionItem> sessions,
     required List<WorkspaceItem> workspaces,
@@ -81,6 +104,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     required Map<String, String> searchSnippets,
     required SessionFilter filter,
     required SessionGroupMode groupMode,
+    required String? activeSessionId,
   }) {
     if (identical(_cacheSessions, sessions) &&
         identical(_cacheWorkspaces, workspaces) &&
@@ -89,6 +113,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
         identical(_cacheSearchSnippets, searchSnippets) &&
         _cacheFilter == filter &&
         _cacheGroupMode == groupMode &&
+        _cacheActiveSessionId == activeSessionId &&
         _cacheCollapsedVer == _collapsedGroupsVersion) {
       return;
     }
@@ -100,6 +125,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     _cacheSearchSnippets = searchSnippets;
     _cacheFilter = filter;
     _cacheGroupMode = groupMode;
+    _cacheActiveSessionId = activeSessionId;
     _cacheCollapsedVer = _collapsedGroupsVersion;
 
     final q = searchQuery.trim().toLowerCase();
@@ -123,17 +149,14 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
             : '';
 
     final matched = sessions.where((s) {
-      if (wsFilter.isNotEmpty) {
-        final normCwd = (s.cwd != null && s.cwd!.isNotEmpty) ? _normalizeDirPath(s.cwd!) : '';
-        final matchWs = (filterWsItem != null &&
-                (s.workspaceId == filterWsItem.id ||
-                    s.workspaceName == filterWsItem.name ||
-                    (normFilterItemPath.isNotEmpty && normCwd == normFilterItemPath))) ||
-            s.workspaceId == wsFilter ||
-            s.workspaceName == wsFilter ||
-            (normCwd.isNotEmpty && normCwd == normWsFilter) ||
-            (normCwd.isNotEmpty && _basenamePath(normCwd) == wsFilter);
-        if (!matchWs) return false;
+      if (!_sessionMatchesWorkspaceFilter(
+        s,
+        wsFilter,
+        normWsFilter,
+        filterWsItem,
+        normFilterItemPath,
+      )) {
+        return false;
       }
       if (q.isNotEmpty &&
           !s.title.toLowerCase().contains(q) &&
@@ -228,7 +251,26 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
       for (final k in orderedKeys) {
         final list = grouped[k]!;
         final meta = groupLabels[k]!;
+        final containsActive =
+            activeSessionId != null && list.any((s) => s.id == activeSessionId);
+        if (containsActive &&
+            activeSessionId != _lastAutoExpandedSessionId &&
+            _collapsedGroups.remove(k)) {
+          _lastAutoExpandedSessionId = activeSessionId;
+          final hostKey = _lastHostId;
+          if (hostKey != null) {
+            _persistedCollapsedByHost[hostKey] = Set<String>.of(_collapsedGroups);
+          }
+        }
         final collapsed = q.isEmpty && _collapsedGroups.contains(k);
+        var pendingCnt = 0;
+        var runningCnt = 0;
+        var unreadCnt = 0;
+        for (final s in list) {
+          if (s.pendingApproval) pendingCnt++;
+          if (s.running) runningCnt++;
+          if (s.unread) unreadCnt++;
+        }
         flatItems.add(_SidebarGroupHeader(
           groupKey: k,
           title: meta.$1,
@@ -237,6 +279,10 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           isExplicitWorkspace: meta.$2,
           dirPath: meta.$3,
           collapsed: collapsed,
+          pendingCount: pendingCnt,
+          runningCount: runningCnt,
+          unreadCount: unreadCnt,
+          hasActiveSession: containsActive,
         ));
         if (!collapsed) {
           flatItems.addAll(list);
@@ -247,31 +293,49 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
         grouped.putIfAbsent(s.group, () => []).add(s);
       }
       const groupOrder = ['今天', '昨天', '本周', '更早'];
+      void emitDateGroup(String title, List<ChatSessionItem> list) {
+        final key = 'date:$title';
+        final containsActive =
+            activeSessionId != null && list.any((s) => s.id == activeSessionId);
+        if (containsActive &&
+            activeSessionId != _lastAutoExpandedSessionId &&
+            _collapsedGroups.remove(key)) {
+          _lastAutoExpandedSessionId = activeSessionId;
+        }
+        final collapsed = q.isEmpty && _collapsedGroups.contains(key);
+        var pendingCnt = 0;
+        var runningCnt = 0;
+        var unreadCnt = 0;
+        for (final s in list) {
+          if (s.pendingApproval) pendingCnt++;
+          if (s.running) runningCnt++;
+          if (s.unread) unreadCnt++;
+        }
+        flatItems.add(_SidebarGroupHeader(
+          groupKey: key,
+          title: title,
+          count: list.length,
+          isWorkspace: false,
+          isExplicitWorkspace: false,
+          collapsed: collapsed,
+          pendingCount: pendingCnt,
+          runningCount: runningCnt,
+          unreadCount: unreadCnt,
+          hasActiveSession: containsActive,
+        ));
+        if (!collapsed) {
+          flatItems.addAll(list);
+        }
+      }
       for (final g in groupOrder) {
         final list = grouped[g];
         if (list != null && list.isNotEmpty) {
-          flatItems.add(_SidebarGroupHeader(
-            groupKey: 'date:$g',
-            title: g,
-            count: list.length,
-            isWorkspace: false,
-            isExplicitWorkspace: false,
-            collapsed: false,
-          ));
-          flatItems.addAll(list);
+          emitDateGroup(g, list);
         }
       }
       for (final entry in grouped.entries) {
         if (!groupOrder.contains(entry.key) && entry.value.isNotEmpty) {
-          flatItems.add(_SidebarGroupHeader(
-            groupKey: 'date:${entry.key}',
-            title: entry.key,
-            count: entry.value.length,
-            isWorkspace: false,
-            isExplicitWorkspace: false,
-            collapsed: false,
-          ));
-          flatItems.addAll(entry.value);
+          emitDateGroup(entry.key, entry.value);
         }
       }
     }
@@ -280,13 +344,22 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     _cachedUngroupedWithCwdCount = ungroupedWithCwdCount;
   }
 
+  void _exitMultiSelectRestoringCollapsed() {
+    _multiSelectMode = false;
+    _selectedIds.clear();
+    if (_collapsedBeforeMultiSelect != null) {
+      _collapsedGroups
+        ..clear()
+        ..addAll(_collapsedBeforeMultiSelect!);
+      _collapsedBeforeMultiSelect = null;
+      _collapsedGroupsVersion++;
+    }
+  }
+
   bool _handleDrawerBack() {
     if (!mounted) return false;
     if (_multiSelectMode) {
-      setState(() {
-        _multiSelectMode = false;
-        _selectedIds.clear();
-      });
+      setState(_exitMultiSelectRestoringCollapsed);
       return true;
     }
     if (_searchCtrl.text.isNotEmpty || ref.read(appProvider).searchQuery.isNotEmpty) {
@@ -328,6 +401,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
       widget.backHandlerNotifier?.value = null;
     }
     _searchCtrl.dispose();
+    _listScrollCtrl.dispose();
     _searchFocused.dispose();
     super.dispose();
   }
@@ -399,6 +473,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           workspaces: s.workspaces,
           sessions: s.sessions,
           loadingSessions: s.loadingSessions,
+          loadingSession: s.loadingSession,
           activeSessionId: s.activeSessionId,
           activeWorkspace: s.activeWorkspace,
           sidebarWorkspaceFilter: s.sidebarWorkspaceFilter,
@@ -424,6 +499,8 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     if (_lastHostId != state.activeHostId) {
       _lastHostId = state.activeHostId;
       _multiSelectMode = false;
+      _collapsedBeforeMultiSelect = null;
+      _lastAutoExpandedSessionId = null;
       _selectedIds.clear();
       _collapsedGroups
         ..clear()
@@ -434,8 +511,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
         (_cacheFilter != state.filter ||
             _cacheWsFilter != state.sidebarWorkspaceFilter ||
             _cacheSearchQuery != state.searchQuery)) {
-      _multiSelectMode = false;
-      _selectedIds.clear();
+      _exitMultiSelectRestoringCollapsed();
     }
     if (state.searchQuery.isEmpty && _searchCtrl.text.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -459,6 +535,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
       searchSnippets: state.searchSnippets,
       filter: state.filter,
       groupMode: state.sessionGroupMode,
+      activeSessionId: state.activeSessionId,
     );
     final flatItems = _cachedFlatItems;
     final ungroupedWithCwdCount = _cachedUngroupedWithCwdCount;
@@ -472,11 +549,38 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
     }
 
     final host = state.activeHost;
-    final hasPending = state.sessions.any((s) => !s.archived && s.pendingApproval);
+    final wsFilterTrim = state.sidebarWorkspaceFilter?.trim() ?? '';
+    final normWsFilterChip = wsFilterTrim.isNotEmpty ? _normalizeDirPath(wsFilterTrim) : '';
+    WorkspaceItem? chipWsItem;
+    if (wsFilterTrim.isNotEmpty) {
+      for (final w in state.workspaces) {
+        if (w.id == wsFilterTrim ||
+            w.name == wsFilterTrim ||
+            w.path == wsFilterTrim ||
+            (w.path.isNotEmpty && _normalizeDirPath(w.path) == normWsFilterChip)) {
+          chipWsItem = w;
+          break;
+        }
+      }
+    }
+    final normChipItemPath = (chipWsItem != null && chipWsItem.path.isNotEmpty)
+        ? _normalizeDirPath(chipWsItem.path)
+        : '';
+    final scopedNonArchived = state.sessions.where((s) =>
+        !s.archived &&
+        _sessionMatchesWorkspaceFilter(
+          s,
+          wsFilterTrim,
+          normWsFilterChip,
+          chipWsItem,
+          normChipItemPath,
+        ));
+    final hasPending = scopedNonArchived.any((s) => s.pendingApproval);
 
     final content = Column(
       children: [
-        // Brand Header: Cute GrassBag Mascot directly beside wordmark (no bulky box!)
+        // Brand Header: Cute GrassBag Mascot directly beside wordmark (non-destructive tap:
+        // scrolls session list to top & dismisses search focus without wiping current chat!)
         Padding(
           padding: EdgeInsets.fromLTRB(16, topPad + 8, 12, 8),
           child: SizedBox(
@@ -486,8 +590,17 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                 Expanded(
                   child: GestureDetector(
                     onTap: () {
-                      ctrl.startNewChat();
-                      widget.onCloseDrawer?.call();
+                      FocusScope.of(context).unfocus();
+                      if (_listScrollCtrl.hasClients && _listScrollCtrl.offset > 2.0) {
+                        HapticFeedback.selectionClick();
+                        unawaited(
+                          _listScrollCtrl.animateTo(
+                            0.0,
+                            duration: const Duration(milliseconds: 240),
+                            curve: Curves.easeOutCubic,
+                          ),
+                        );
+                      }
                     },
                     behavior: HitTestBehavior.opaque,
                     child: Row(
@@ -607,6 +720,10 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                   tier: state.glassTier,
                   insideGlass: true,
                   onChanged: ctrl.setSearchQuery,
+                  onSubmitted: (val) {
+                    FocusScope.of(context).unfocus();
+                    ctrl.setSearchQuery(val);
+                  },
                 ),
                 if (state.searchingSessions && state.searchQuery.trim().isNotEmpty)
                   Positioned(
@@ -620,37 +737,52 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           ),
         ),
 
-        // Horizontal Editorial Filter Pills with subtle right-edge fade cue only when narrow
-        LayoutBuilder(
-          builder: (_, box) {
-            final row = SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              padding: EdgeInsets.fromLTRB(14, 0, box.maxWidth < 310 ? 22 : 14, 8),
-              child: Row(
-                children: [
-                  for (final f in SessionFilter.values) ...[
-                    _FilterChipPill(
-                      label: f.label,
-                      active: state.filter == f,
-                      showWarnDot: f == SessionFilter.pending && hasPending && state.filter != f,
-                      onTap: () => ctrl.setFilter(f),
-                    ),
-                    if (f != SessionFilter.values.last) const SizedBox(width: 4.5),
-                  ],
-                ],
-              ),
-            );
-            if (box.maxWidth >= 310) return row;
-            return ShaderMask(
-              blendMode: BlendMode.dstIn,
-              shaderCallback: (bounds) => const LinearGradient(
-                begin: Alignment.centerLeft,
-                end: Alignment.centerRight,
-                colors: [Colors.white, Colors.white, Colors.transparent],
-                stops: [0.0, 0.93, 1.0],
-              ).createShader(bounds),
-              child: row,
+        // Horizontal Editorial Filter Pills with workspace-scoped live counts & right-edge fade cue
+        Builder(
+          builder: (_) {
+            final runningCnt = scopedNonArchived.where((s) => s.running).length;
+            final pendingCnt = scopedNonArchived.where((s) => s.pendingApproval).length;
+            final unreadCnt = scopedNonArchived.where((s) => s.unread).length;
+            String chipLabel(SessionFilter f) {
+              return switch (f) {
+                SessionFilter.running when runningCnt > 0 => '${f.label} $runningCnt',
+                SessionFilter.pending when pendingCnt > 0 => '${f.label} $pendingCnt',
+                SessionFilter.unread when unreadCnt > 0 => '${f.label} $unreadCnt',
+                _ => f.label,
+              };
+            }
+            return LayoutBuilder(
+              builder: (_, box) {
+                final row = SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  physics: const BouncingScrollPhysics(),
+                  padding: EdgeInsets.fromLTRB(14, 0, box.maxWidth < 310 ? 22 : 14, 8),
+                  child: Row(
+                    children: [
+                      for (final f in SessionFilter.values) ...[
+                        _FilterChipPill(
+                          label: chipLabel(f),
+                          active: state.filter == f,
+                          showWarnDot: f == SessionFilter.pending && hasPending && state.filter != f,
+                          onTap: () => ctrl.setFilter(f),
+                        ),
+                        if (f != SessionFilter.values.last) const SizedBox(width: 4.5),
+                      ],
+                    ],
+                  ),
+                );
+                if (box.maxWidth >= 310) return row;
+                return ShaderMask(
+                  blendMode: BlendMode.dstIn,
+                  shaderCallback: (bounds) => const LinearGradient(
+                    begin: Alignment.centerLeft,
+                    end: Alignment.centerRight,
+                    colors: [Colors.white, Colors.white, Colors.transparent],
+                    stops: [0.0, 0.93, 1.0],
+                  ).createShader(bounds),
+                  child: row,
+                );
+              },
             );
           },
         ),
@@ -791,13 +923,18 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                       pressedScale: 0.9,
                       haptic: true,
                       onTap: () => setState(() {
-                        _multiSelectMode = !_multiSelectMode;
-                        _selectedIds.clear();
-                        // Auto-expand collapsed groups when entering multi-select so all visible
-                        // sessions can be checked immediately without manual expansion.
-                        if (_multiSelectMode && _collapsedGroups.isNotEmpty) {
-                          _collapsedGroups.clear();
-                          _collapsedGroupsVersion++;
+                        if (!_multiSelectMode) {
+                          _multiSelectMode = true;
+                          _selectedIds.clear();
+                          // Temporarily expand collapsed groups for multi-select, preserving the
+                          // user's saved fold layout to restore cleanly on exit!
+                          if (_collapsedGroups.isNotEmpty) {
+                            _collapsedBeforeMultiSelect = Set<String>.of(_collapsedGroups);
+                            _collapsedGroups.clear();
+                            _collapsedGroupsVersion++;
+                          }
+                        } else {
+                          _exitMultiSelectRestoringCollapsed();
                         }
                       }),
                       child: SizedBox(
@@ -861,10 +998,11 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
             ],
           ),
         ),
-        if (state.sessionGroupMode == SessionGroupMode.workspace &&
-            ungroupedWithCwdCount > 0 &&
-            state.connectionPhase == ConnectionPhase.connected)
-          Padding(
+        GrassBagSmoothDisclosure(
+          expanded: state.sessionGroupMode == SessionGroupMode.workspace &&
+              ungroupedWithCwdCount > 0 &&
+              state.connectionPhase == ConnectionPhase.connected,
+          child: Padding(
             padding: const EdgeInsets.fromLTRB(14, 2, 14, 6),
             child: GrassBagSpringTap(
               onTap: () => ctrl.organizeWorkspacesByCwd(),
@@ -892,8 +1030,10 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               ),
             ),
           ),
-        if (_multiSelectMode)
-          Builder(
+        ),
+        GrassBagSmoothDisclosure(
+          expanded: _multiSelectMode,
+          child: Builder(
             builder: (_) {
               final allVisibleIds = allVisibleSessionIds;
               final allSelected =
@@ -940,7 +1080,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             child: GrassBagFresnelGlassSurface(
                               isPill: true,
                               innerWell: true,
-                              interactive: true,
+                              interactive: false,
                               tintColor: t.primarySoft,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               child: Text(
@@ -969,7 +1109,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             child: GrassBagFresnelGlassSurface(
                               isPill: true,
                               innerWell: true,
-                              interactive: true,
+                              interactive: false,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               child: Text(
                                 state.filter == SessionFilter.archived ? '还原' : '归档',
@@ -999,7 +1139,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             child: GrassBagFresnelGlassSurface(
                               isPill: true,
                               innerWell: true,
-                              interactive: true,
+                              interactive: false,
                               tintColor: t.errSoft,
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               child: Text('删除', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.err)),
@@ -1014,14 +1154,16 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               );
             },
           ),
+        ),
 
         // Compact offline / auth banner when cached sessions are still displayed
-        if (flatItems.isNotEmpty &&
-            (state.connectionPhase == ConnectionPhase.needsAuth ||
-                host.needsAuth ||
-                state.connectionPhase == ConnectionPhase.error ||
-                state.connectionPhase == ConnectionPhase.disconnected))
-          Padding(
+        GrassBagSmoothDisclosure(
+          expanded: flatItems.isNotEmpty &&
+              (state.connectionPhase == ConnectionPhase.needsAuth ||
+                  host.needsAuth ||
+                  state.connectionPhase == ConnectionPhase.error ||
+                  state.connectionPhase == ConnectionPhase.disconnected),
+          child: Padding(
             padding: const EdgeInsets.fromLTRB(14, 2, 14, 6),
             child: GrassBagSpringTap(
               pressedScale: 0.985,
@@ -1073,11 +1215,13 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               ),
             ),
           ),
+        ),
 
         // Grouped Sessions List (always keeps CustomScrollView + pull-to-refresh + keyboard dismiss;
         // zero ShaderMask saveLayer and zero opaque top band over translucent Liquid Glass!)
         Expanded(
           child: CustomScrollView(
+                controller: _listScrollCtrl,
                 key: PageStorageKey<String>(
                   'sessions-drawer-${state.activeHostId}-${state.sessionGroupMode.name}',
                 ),
@@ -1126,83 +1270,35 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
                             child: Builder(
                               builder: (_) {
-                                final emblemAccent = isNeedsAuth
-                                    ? t.primary
-                                    : (isConnectError ? t.err : t.primary);
                                 Widget buildEmptyPill({
                                   required String label,
                                   required VoidCallback onTap,
                                   bool primary = false,
                                 }) {
-                                  return GrassBagSpringTap(
+                                  if (primary) {
+                                    return GrassBagPrimaryGlassButton(
+                                      label: label,
+                                      height: 34,
+                                      padding: const EdgeInsets.symmetric(horizontal: 15),
+                                      tier: state.glassTier,
+                                      insideGlass: true,
+                                      onTap: onTap,
+                                    );
+                                  }
+                                  return GrassBagSecondaryGlassButton(
+                                    label: label,
+                                    height: 34,
+                                    padding: const EdgeInsets.symmetric(horizontal: 14),
+                                    tier: state.glassTier,
+                                    insideGlass: true,
                                     onTap: onTap,
-                                    pressedScale: 0.94,
-                                    enablePointerGlow: false,
-                                    haptic: true,
-                                    child: Container(
-                                      padding: EdgeInsets.symmetric(
-                                        horizontal: primary ? 15 : 14,
-                                        vertical: 7.5,
-                                      ),
-                                      decoration: ShapeDecoration(
-                                        color: primary
-                                            ? t.primary
-                                            : Colors.white.withValues(alpha: t.isDark ? 0.10 : 0.72),
-                                        shape: StadiumBorder(
-                                          side: BorderSide(
-                                            color: primary
-                                                ? Colors.white.withValues(
-                                                    alpha: t.isDark ? 0.24 : 0.34,
-                                                  )
-                                                : Colors.white.withValues(
-                                                    alpha: t.isDark ? 0.16 : 0.92,
-                                                  ),
-                                            width: 0.7,
-                                          ),
-                                        ),
-                                        shadows: primary
-                                            ? [
-                                                BoxShadow(
-                                                  color: t.primary.withValues(
-                                                    alpha: t.isDark ? 0.28 : 0.22,
-                                                  ),
-                                                  blurRadius: 10,
-                                                  offset: const Offset(0, 3),
-                                                ),
-                                              ]
-                                            : null,
-                                      ),
-                                      child: Text(
-                                        label,
-                                        style: TextStyle(
-                                          fontSize: 12.5,
-                                          fontWeight: primary ? FontWeight.w600 : FontWeight.w500,
-                                          color: primary ? t.onPrimary : t.text2,
-                                        ),
-                                      ),
-                                    ),
                                   );
                                 }
                                 return Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    Container(
-                                      width: 48,
-                                      height: 48,
-                                      decoration: ShapeDecoration(
-                                        color: emblemAccent.withValues(
-                                          alpha: t.isDark ? 0.16 : 0.10,
-                                        ),
-                                        shape: RoundedSuperellipseBorder(
-                                          borderRadius: BorderRadius.circular(15),
-                                          side: BorderSide(
-                                            color: emblemAccent.withValues(
-                                              alpha: t.isDark ? 0.24 : 0.16,
-                                            ),
-                                            width: 0.7,
-                                          ),
-                                        ),
-                                      ),
+                                    SizedBox(
+                                      height: 38,
                                       child: Center(
                                         child: (isSyncingSessions || isSearching)
                                             ? GrassBagActivityIndicator(radius: 11, color: t.primary)
@@ -1214,16 +1310,16 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                                                         : (state.sessions.isEmpty
                                                             ? CupertinoIcons.sparkles
                                                             : CupertinoIcons.chat_bubble_2),
-                                                size: 22,
+                                                size: 30,
                                                 color: isNeedsAuth
                                                     ? (t.isDark ? t.primaryHi : t.primary)
                                                     : isConnectError
                                                         ? t.err
-                                                        : (t.isDark ? t.primaryHi : t.primary),
+                                                        : t.text3.withValues(alpha: 0.78),
                                               ),
                                       ),
                                     ),
-                                    const SizedBox(height: 12),
+                                    const SizedBox(height: 10),
                                     Text(
                                       isSyncingSessions
                                           ? '正在同步「${host.name}」的对话…'
@@ -1390,32 +1486,37 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                     itemBuilder: (ctx, idx) {
                     final item = flatItems[idx];
                     if (item is _SidebarGroupHeader) {
-                      return GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: item.isWorkspace
-                            ? () => setState(() {
-                                  if (!_collapsedGroups.add(item.groupKey)) {
-                                    _collapsedGroups.remove(item.groupKey);
-                                  }
-                                  final hostKey = _lastHostId ?? state.activeHostId;
-                                  _persistedCollapsedByHost[hostKey] =
-                                      Set<String>.of(_collapsedGroups);
-                                  _collapsedGroupsVersion++;
-                                })
-                            : null,
+                      return GrassBagSpringTap(
+                        pressedScale: 0.985,
+                        enablePointerGlow: false,
+                        haptic: true,
+                        onTap: () => setState(() {
+                          if (!_collapsedGroups.add(item.groupKey)) {
+                            _collapsedGroups.remove(item.groupKey);
+                          }
+                          final hostKey = _lastHostId ?? state.activeHostId;
+                          _persistedCollapsedByHost[hostKey] = Set<String>.of(_collapsedGroups);
+                          _collapsedGroupsVersion++;
+                        }),
                         child: Padding(
                           padding: const EdgeInsets.fromLTRB(8, 12, 6, 4),
                           child: Row(
                             children: [
-                              if (item.isWorkspace) ...[
-                                Icon(
-                                  item.collapsed
-                                      ? CupertinoIcons.chevron_right
-                                      : CupertinoIcons.chevron_down,
+                              AnimatedRotation(
+                                turns: item.collapsed ? 0.0 : 0.25,
+                                duration: GrassBagMotion.duration(
+                                  context,
+                                  const Duration(milliseconds: 210),
+                                ),
+                                curve: Curves.easeOutCubic,
+                                child: Icon(
+                                  CupertinoIcons.chevron_right,
                                   size: 11,
                                   color: t.text3,
                                 ),
-                                const SizedBox(width: 5),
+                              ),
+                              const SizedBox(width: 5),
+                              if (item.isWorkspace) ...[
                                 Icon(
                                   item.isExplicitWorkspace
                                       ? CupertinoIcons.folder_fill
@@ -1435,6 +1536,40 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                                     fontWeight: FontWeight.w600,
                                     color: item.isExplicitWorkspace ? t.text2 : t.text3,
                                   ),
+                                ),
+                              ),
+                              AnimatedOpacity(
+                                opacity: item.collapsed ? 1.0 : 0.0,
+                                duration: GrassBagMotion.duration(
+                                  context,
+                                  const Duration(milliseconds: 160),
+                                ),
+                                curve: Curves.easeOutCubic,
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    if (item.pendingCount > 0) ...[
+                                      GrassBagStatusDot(size: 6.5, color: t.warn, pulsing: true),
+                                      const SizedBox(width: 5),
+                                    ],
+                                    if (item.runningCount > 0) ...[
+                                      GrassBagStatusDot(size: 6.5, color: t.ok, pulsing: true),
+                                      const SizedBox(width: 5),
+                                    ],
+                                    if (item.unreadCount > 0 &&
+                                        item.pendingCount == 0 &&
+                                        item.runningCount == 0) ...[
+                                      Container(
+                                        width: 6,
+                                        height: 6,
+                                        decoration: BoxDecoration(
+                                          color: t.primary,
+                                          shape: BoxShape.circle,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 5),
+                                    ],
+                                  ],
                                 ),
                               ),
                               Text(
@@ -1482,10 +1617,22 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                     final snippet = state.searchQuery.trim().isNotEmpty
                         ? state.searchSnippets[s.id]
                         : null;
+                    final rowWsLabel = state.sessionGroupMode == SessionGroupMode.date
+                        ? ((s.workspaceName != null && s.workspaceName!.trim().isNotEmpty)
+                            ? s.workspaceName!.trim()
+                            : (s.cwd != null && s.cwd!.trim().isNotEmpty
+                                ? _basenamePath(s.cwd!)
+                                : ''))
+                        : '';
                     return _SessionListRow(
                       key: ValueKey('row-${s.id}'),
                       session: s,
                       snippet: snippet,
+                      searchQuery: state.searchQuery,
+                      workspaceLabel: rowWsLabel,
+                      isLoadingActive: widget.isTabletDocked &&
+                          s.id == state.activeSessionId &&
+                          state.loadingSession,
                       active: s.id == state.activeSessionId,
                       multiSelectMode: _multiSelectMode,
                       selected: _selectedIds.contains(s.id),
@@ -1722,12 +1869,18 @@ class _SessionListRow extends StatefulWidget {
     required this.onTogglePin,
     required this.onMoreActions,
     this.snippet,
+    this.searchQuery = '',
+    this.workspaceLabel = '',
+    this.isLoadingActive = false,
     this.multiSelectMode = false,
     this.selected = false,
   });
 
   final ChatSessionItem session;
   final String? snippet;
+  final String searchQuery;
+  final String workspaceLabel;
+  final bool isLoadingActive;
   final bool active;
   final VoidCallback onTap;
   final VoidCallback onTogglePin;
@@ -1782,6 +1935,53 @@ class _SessionListRowState extends State<_SessionListRow> {
     super.dispose();
   }
 
+  static String _formatRelativeUpdatedAt(int? rawMs) {
+    if (rawMs == null || rawMs <= 0) return '';
+    final ms = rawMs < 100000000000 ? rawMs * 1000 : rawMs;
+    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+    final diff = DateTime.now().difference(dt);
+    if (diff.inSeconds < 45) return '刚刚';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}分钟前';
+    if (diff.inHours < 24) return '${diff.inHours}小时前';
+    if (diff.inDays == 1) return '昨天';
+    if (diff.inDays < 7) return '${diff.inDays}天前';
+    return '${dt.month}/${dt.day}';
+  }
+
+  static List<InlineSpan> _highlightQuerySpans(
+    String text,
+    String rawQuery,
+    TextStyle baseStyle,
+    Color highlightColor,
+  ) {
+    final q = rawQuery.trim().toLowerCase();
+    if (q.isEmpty) return [TextSpan(text: text, style: baseStyle)];
+    final low = text.toLowerCase();
+    final spans = <InlineSpan>[];
+    var start = 0;
+    while (start < text.length) {
+      final hit = low.indexOf(q, start);
+      if (hit < 0) {
+        spans.add(TextSpan(text: text.substring(start), style: baseStyle));
+        break;
+      }
+      if (hit > start) {
+        spans.add(TextSpan(text: text.substring(start, hit), style: baseStyle));
+      }
+      spans.add(
+        TextSpan(
+          text: text.substring(hit, hit + q.length),
+          style: baseStyle.copyWith(
+            color: highlightColor,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
+      start = hit + q.length;
+    }
+    return spans;
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
@@ -1789,8 +1989,14 @@ class _SessionListRowState extends State<_SessionListRow> {
     final highlighted = widget.multiSelectMode ? widget.selected : widget.active;
     final cleanSnippet = widget.snippet?.trim() ?? '';
     final showSnippet = cleanSnippet.isNotEmpty && cleanSnippet != s.title.trim();
+    final relTime = _formatRelativeUpdatedAt(s.updatedAt);
+    final wsLabel = widget.workspaceLabel.trim();
+    final showMetaLine = !showSnippet && (relTime.isNotEmpty || wsLabel.isNotEmpty);
 
     Widget? buildStatusBadge() {
+      if (widget.isLoadingActive) {
+        return GrassBagActivityIndicator(radius: 5.5, color: t.primary);
+      }
       if (s.pendingApproval) {
         return GrassBagFresnelGlassSurface(
           isPill: true,
@@ -1818,16 +2024,42 @@ class _SessionListRowState extends State<_SessionListRow> {
 
     final statusBadge = buildStatusBadge();
 
+    final rowAnimDur = GrassBagMotion.duration(context, const Duration(milliseconds: 180));
     final rowContent = Row(
       children: [
-        if (widget.multiSelectMode) ...[
-          Icon(
-            widget.selected ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
-            size: 18,
-            color: widget.selected ? t.primary : t.text3,
-          ),
-          const SizedBox(width: 8),
-        ],
+        AnimatedSize(
+          duration: rowAnimDur,
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.centerLeft,
+          child: widget.multiSelectMode
+              ? Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: AnimatedSwitcher(
+                    duration: GrassBagMotion.duration(
+                      context,
+                      const Duration(milliseconds: 160),
+                    ),
+                    switchInCurve: Curves.easeOutBack,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, anim) => FadeTransition(
+                      opacity: anim,
+                      child: ScaleTransition(
+                        scale: Tween<double>(begin: 0.72, end: 1.0).animate(anim),
+                        child: child,
+                      ),
+                    ),
+                    child: Icon(
+                      widget.selected
+                          ? CupertinoIcons.checkmark_circle_fill
+                          : CupertinoIcons.circle,
+                      key: ValueKey(widget.selected),
+                      size: 18,
+                      color: widget.selected ? t.primary : t.text3,
+                    ),
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
         if (s.pinned) ...[
           Icon(CupertinoIcons.pin_fill, size: 11.5, color: t.primary),
           const SizedBox(width: 5),
@@ -1837,26 +2069,73 @@ class _SessionListRowState extends State<_SessionListRow> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                s.title,
+              Text.rich(
+                TextSpan(
+                  children: _highlightQuerySpans(
+                    s.title,
+                    widget.searchQuery,
+                    TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: widget.active ? FontWeight.w600 : FontWeight.w400,
+                      color: (widget.active || _hovered) ? t.text : t.text2,
+                    ),
+                    t.primary,
+                  ),
+                ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 13.5,
-                  fontWeight: widget.active ? FontWeight.w600 : FontWeight.w400,
-                  color: (widget.active || _hovered) ? t.text : t.text2,
-                ),
               ),
               if (showSnippet) ...[
                 const SizedBox(height: 2),
-                Text(
-                  cleanSnippet,
+                Text.rich(
+                  TextSpan(
+                    children: _highlightQuerySpans(
+                      cleanSnippet,
+                      widget.searchQuery,
+                      TextStyle(fontSize: 11, color: t.text3),
+                      t.primary,
+                    ),
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: t.text3,
-                  ),
+                ),
+              ] else if (showMetaLine) ...[
+                const SizedBox(height: 1.5),
+                Row(
+                  children: [
+                    if (wsLabel.isNotEmpty) ...[
+                      Flexible(
+                        child: Text(
+                          wsLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w500,
+                            color: t.text3.withValues(alpha: 0.85),
+                          ),
+                        ),
+                      ),
+                      if (relTime.isNotEmpty)
+                        Text(
+                          ' · ',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: t.text3.withValues(alpha: 0.65),
+                          ),
+                        ),
+                    ],
+                    if (relTime.isNotEmpty)
+                      Text(
+                        relTime,
+                        maxLines: 1,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          color: t.text3.withValues(alpha: 0.78),
+                        ),
+                      ),
+                  ],
                 ),
               ],
             ],
@@ -1866,65 +2145,83 @@ class _SessionListRowState extends State<_SessionListRow> {
           const SizedBox(width: 6),
           statusBadge,
         ],
-        if (!widget.multiSelectMode) ...[
-          const SizedBox(width: 2),
-          if (_hovered)
-            Tooltip(
-              message: s.pinned ? '取消置顶' : '置顶对话',
-              child: GrassBagSpringTap(
-                onTap: widget.onTogglePin,
-                pressedScale: 0.88,
-                borderRadius: 999,
-                haptic: true,
-                child: SizedBox(
-                  width: 32,
-                  height: 34,
-                  child: Center(
-                    child: Icon(
-                      s.pinned ? CupertinoIcons.pin_slash : CupertinoIcons.pin,
-                      size: 13.5,
-                      color: t.text3,
+        AnimatedSize(
+          duration: rowAnimDur,
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.centerRight,
+          child: !widget.multiSelectMode
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(width: 2),
+                    AnimatedSize(
+                      duration: GrassBagMotion.duration(
+                        context,
+                        const Duration(milliseconds: 140),
+                      ),
+                      curve: Curves.easeOutCubic,
+                      child: _hovered
+                          ? Tooltip(
+                              message: s.pinned ? '取消置顶' : '置顶对话',
+                              child: GrassBagSpringTap(
+                                onTap: widget.onTogglePin,
+                                pressedScale: 0.88,
+                                borderRadius: 999,
+                                haptic: true,
+                                child: SizedBox(
+                                  width: 32,
+                                  height: 34,
+                                  child: Center(
+                                    child: Icon(
+                                      s.pinned ? CupertinoIcons.pin_slash : CupertinoIcons.pin,
+                                      size: 13.5,
+                                      color: t.text3,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            )
+                          : const SizedBox.shrink(),
                     ),
-                  ),
-                ),
-              ),
-            ),
-          Builder(
-            builder: (btnCtx) => Tooltip(
-              message: '更多操作',
-              excludeFromSemantics: true,
-              child: Semantics(
-                button: true,
-                label: '更多操作',
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () {
-                      HapticFeedback.selectionClick();
-                      final box = btnCtx.findRenderObject() as RenderBox?;
-                      final anchor = box?.localToGlobal(box.size.center(Offset.zero));
-                      widget.onMoreActions(anchor);
-                    },
-                    child: SizedBox(
-                      width: 34,
-                      height: 38,
-                      child: Center(
-                        child: Icon(
-                          CupertinoIcons.ellipsis,
-                          size: 15,
-                          color: (widget.active || _hovered)
-                              ? t.text2
-                              : t.text3.withValues(alpha: 0.52),
+                    Builder(
+                      builder: (btnCtx) => Tooltip(
+                        message: '更多操作',
+                        excludeFromSemantics: true,
+                        child: Semantics(
+                          button: true,
+                          label: '更多操作',
+                          child: MouseRegion(
+                            cursor: SystemMouseCursors.click,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () {
+                                HapticFeedback.selectionClick();
+                                final box = btnCtx.findRenderObject() as RenderBox?;
+                                final anchor = box?.localToGlobal(box.size.center(Offset.zero));
+                                widget.onMoreActions(anchor);
+                              },
+                              child: SizedBox(
+                                width: 34,
+                                height: 38,
+                                child: Center(
+                                  child: Icon(
+                                    CupertinoIcons.ellipsis,
+                                    size: 15,
+                                    color: (widget.active || _hovered)
+                                        ? t.text2
+                                        : t.text3.withValues(alpha: 0.52),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ),
                     ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
+                  ],
+                )
+              : const SizedBox.shrink(),
+        ),
       ],
     );
 
@@ -1956,60 +2253,80 @@ class _SessionListRowState extends State<_SessionListRow> {
           child: ValueListenableBuilder<bool>(
             valueListenable: _pressed,
             child: rowContent,
-            builder: (_, pressed, child) => Stack(
-              alignment: Alignment.centerLeft,
-              children: [
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 110),
-                  constraints: BoxConstraints(minHeight: showSnippet ? 54 : 44),
-                  padding: EdgeInsets.fromLTRB(
-                    13,
-                    showSnippet ? 7 : 0,
-                    11,
-                    showSnippet ? 7 : 0,
-                  ),
-                  decoration: ShapeDecoration(
-                    // Always provide a 2-stop LinearGradient so AnimatedContainer -> ShapeDecoration.lerp
-                    // never trips `!(color != null && gradient != null)` when switching active sessions.
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: highlighted
-                          ? [
-                              t.primary.withValues(alpha: t.isDark ? 0.25 : 0.16),
-                              t.primary.withValues(alpha: t.isDark ? 0.11 : 0.07),
-                            ]
-                          : [
-                              pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent),
-                              pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent),
-                            ],
+            builder: (_, pressed, child) => AnimatedScale(
+              scale: pressed && !MediaQuery.disableAnimationsOf(context) ? 0.985 : 1.0,
+              duration: GrassBagMotion.duration(context, const Duration(milliseconds: 110)),
+              curve: Curves.easeOutCubic,
+              child: Stack(
+                alignment: Alignment.centerLeft,
+                children: [
+                  AnimatedContainer(
+                    duration: GrassBagMotion.duration(context, const Duration(milliseconds: 120)),
+                    curve: Curves.easeOutCubic,
+                    constraints: BoxConstraints(minHeight: showSnippet ? 54 : 44),
+                    padding: EdgeInsets.fromLTRB(
+                      13,
+                      showSnippet ? 7 : 0,
+                      11,
+                      showSnippet ? 7 : 0,
                     ),
-                    shape: RoundedSuperellipseBorder(
-                      borderRadius: BorderRadius.circular(18),
-                      side: BorderSide(
-                        color: highlighted
-                            ? t.primary.withValues(alpha: t.isDark ? 0.40 : 0.28)
-                            : Colors.transparent,
-                        width: 0.75,
+                    decoration: ShapeDecoration(
+                      // Always provide a 2-stop LinearGradient so AnimatedContainer -> ShapeDecoration.lerp
+                      // never trips `!(color != null && gradient != null)` when switching active sessions.
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: highlighted
+                            ? [
+                                t.primary.withValues(alpha: t.isDark ? 0.25 : 0.16),
+                                t.primary.withValues(alpha: t.isDark ? 0.11 : 0.07),
+                              ]
+                            : [
+                                pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent),
+                                pressed ? t.fill2 : (_hovered ? t.fill1 : Colors.transparent),
+                              ],
+                      ),
+                      shape: RoundedSuperellipseBorder(
+                        borderRadius: BorderRadius.circular(18),
+                        side: BorderSide(
+                          color: highlighted
+                              ? t.primary.withValues(alpha: t.isDark ? 0.40 : 0.28)
+                              : Colors.transparent,
+                          width: 0.75,
+                        ),
                       ),
                     ),
+                    child: child,
                   ),
-                  child: child,
-                ),
-                // Overlay active indicator pill on left edge -> ZERO horizontal title text shift!
-                if (!widget.multiSelectMode && widget.active)
+                  // Overlay animated active indicator pill on left edge -> ZERO horizontal title shift!
                   Positioned(
                     left: 4,
-                    child: Container(
-                      width: 3,
-                      height: 16,
-                      decoration: BoxDecoration(
-                        color: t.primary,
-                        borderRadius: BorderRadius.circular(99),
+                    child: AnimatedScale(
+                      scale: (!widget.multiSelectMode && widget.active) ? 1.0 : 0.0,
+                      duration: GrassBagMotion.duration(
+                        context,
+                        const Duration(milliseconds: 180),
+                      ),
+                      curve: Curves.easeOutCubic,
+                      child: AnimatedOpacity(
+                        opacity: (!widget.multiSelectMode && widget.active) ? 1.0 : 0.0,
+                        duration: GrassBagMotion.duration(
+                          context,
+                          const Duration(milliseconds: 160),
+                        ),
+                        child: Container(
+                          width: 3,
+                          height: 16,
+                          decoration: BoxDecoration(
+                            color: t.primary,
+                            borderRadius: BorderRadius.circular(99),
+                          ),
+                        ),
                       ),
                     ),
                   ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -2093,6 +2410,10 @@ class _SidebarGroupHeader {
     required this.isExplicitWorkspace,
     this.dirPath,
     required this.collapsed,
+    this.pendingCount = 0,
+    this.runningCount = 0,
+    this.unreadCount = 0,
+    this.hasActiveSession = false,
   });
 
   final String groupKey;
@@ -2102,6 +2423,10 @@ class _SidebarGroupHeader {
   final bool isExplicitWorkspace;
   final String? dirPath;
   final bool collapsed;
+  final int pendingCount;
+  final int runningCount;
+  final int unreadCount;
+  final bool hasActiveSession;
 }
 
 /// Mounts ONLY while the drawer search box has focus so `SessionsSidebar` holds

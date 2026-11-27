@@ -30,6 +30,35 @@ class OfficialWebPage extends ConsumerStatefulWidget {
   final String? hostName;
   final bool? allowBadCertificates;
 
+  /// Extracts host from a `webview_flutter` `PlatformSslAuthError` / `SslAuthError`
+  /// (unwrapping `.platform` first since `url` / `host` live on the platform subclass).
+  @visibleForTesting
+  static String? extractSslErrorHost(Object request) {
+    final candidates = <dynamic>[];
+    final dynamic dyn = request;
+    try {
+      final platform = dyn.platform;
+      if (platform != null) candidates.add(platform);
+    } catch (_) {}
+    candidates.add(dyn);
+    for (final candidate in candidates) {
+      try {
+        final rawUrl = candidate.url;
+        if (rawUrl is String && rawUrl.isNotEmpty) {
+          final uri = Uri.tryParse(rawUrl);
+          if (uri != null && uri.host.isNotEmpty) return uri.host.toLowerCase();
+        }
+      } catch (_) {}
+      try {
+        final rawHost = candidate.host;
+        if (rawHost is String && rawHost.isNotEmpty) {
+          return rawHost.toLowerCase();
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+
   @override
   ConsumerState<OfficialWebPage> createState() => _OfficialWebPageState();
 }
@@ -40,6 +69,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
   WebViewController? _webController;
   late final String _iframeViewType;
   bool _loading = true;
+  int _loadProgress = 0;
   bool _canGoBack = false;
   bool _canGoForward = false;
   bool _desktopMode = false;
@@ -94,23 +124,8 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
     return 'http://127.0.0.1:3080';
   }
 
-  static String? _extractSslErrorHost(Object request) {
-    final dynamic dyn = request;
-    try {
-      final rawUrl = dyn.url;
-      if (rawUrl is String && rawUrl.isNotEmpty) {
-        final uri = Uri.tryParse(rawUrl);
-        if (uri != null && uri.host.isNotEmpty) return uri.host.toLowerCase();
-      }
-    } catch (_) {}
-    try {
-      final rawHost = dyn.host;
-      if (rawHost is String && rawHost.isNotEmpty) {
-        return rawHost.toLowerCase();
-      }
-    } catch (_) {}
-    return null;
-  }
+  static String? _extractSslErrorHost(Object request) =>
+      OfficialWebPage.extractSslErrorHost(request);
 
   @override
   void initState() {
@@ -126,11 +141,17 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
           ..setBackgroundColor(isDarkNow ? const Color(0xFF141B26) : const Color(0xFFF6F9FC))
           ..setNavigationDelegate(
             NavigationDelegate(
+              onProgress: (progress) {
+                if (mounted) {
+                  setState(() => _loadProgress = progress.clamp(0, 100));
+                }
+              },
               onPageStarted: (startedUrl) {
                 if (startedUrl == 'about:blank') return;
                 if (mounted) {
                   setState(() {
                     _loading = true;
+                    _loadProgress = 12;
                     _loadError = null;
                     if (startedUrl.startsWith('http://') || startedUrl.startsWith('https://')) {
                       _resolvedUrl = _stripTokenParam(startedUrl);
@@ -144,6 +165,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                 if (mounted) {
                   setState(() {
                     _loading = false;
+                    _loadProgress = 100;
                     if (finishedUrl.startsWith('http://') || finishedUrl.startsWith('https://')) {
                       _resolvedUrl = _stripTokenParam(finishedUrl);
                     }
@@ -160,6 +182,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                 if (mounted) {
                   setState(() {
                     _loading = false;
+                    _loadProgress = 0;
                     _loadError = _localizeWebError(err.description, err.errorCode);
                   });
                 }
@@ -316,9 +339,13 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
       }
     }
     if (!mounted) return;
-    final opened = openUrlInNewTab(urlToOpen);
+    var opened = openUrlInNewTab(urlToOpen);
+    if (!opened && GrassBagNativeBridge.instance.isAndroidNative) {
+      opened = await GrassBagNativeBridge.instance.openExternalUrl(urlToOpen);
+    }
+    if (!mounted) return;
     ref.read(appProvider.notifier).showToast(
-          opened ? '已在新标签页打开 DSH 官方网页版' : '浏览器拦截了弹窗，请允许新标签页打开',
+          opened ? '已在系统浏览器打开 DSH 官方网页版' : '无法调起外部浏览器，请长按地址复制打开',
           tone: opened ? ToastTone.ok : ToastTone.warn,
         );
   }
@@ -471,6 +498,13 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
           (widget.initialUrl == null || widget.initialUrl!.isEmpty)) {
         setState(() => _forceCrossSiteIframe = false);
         unawaited(_loadWithWebTicket(forceReload: true, clearPrevious: true));
+      }
+    });
+    ref.listen<bool>(appProvider.select((s) => s.isDark), (prev, next) {
+      if (prev != null && prev != next) {
+        _webController?.setBackgroundColor(
+          next ? const Color(0xFF141B26) : const Color(0xFFF6F9FC),
+        );
       }
     });
     ref.listen<ConnectionPhase>(appProvider.select((s) => s.connectionPhase), (prev, next) {
@@ -742,7 +776,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                                           innerWell: true,
                                           interactive: true,
                                           tintColor: _desktopMode ? t.primarySoft : null,
-                                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5.5),
                                           child: Text(
                                             _desktopMode ? '桌面' : '移动',
                                             style: TextStyle(
@@ -754,10 +788,80 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                                         ),
                                       ),
                                     ),
+                                    if (widget.initialUrl == null || widget.initialUrl!.isEmpty) ...[
+                                      const SizedBox(width: 4),
+                                      Tooltip(
+                                        message: '重新签发一次性免登票据',
+                                        child: GrassBagSpringTap(
+                                          onTap: () {
+                                            ref.read(appProvider.notifier).showToast(
+                                                  '正在重新免登…',
+                                                  tone: ToastTone.info,
+                                                );
+                                            unawaited(
+                                              _loadWithWebTicket(
+                                                forceReload: true,
+                                                clearPrevious: true,
+                                              ),
+                                            );
+                                          },
+                                          pressedScale: 0.92,
+                                          enablePointerGlow: false,
+                                          haptic: true,
+                                          child: GrassBagFresnelGlassSurface(
+                                            isCircle: true,
+                                            innerWell: true,
+                                            interactive: true,
+                                            width: 28,
+                                            height: 28,
+                                            alignment: Alignment.center,
+                                            child: Icon(
+                                              CupertinoIcons.person_crop_circle_badge_checkmark,
+                                              size: 13.5,
+                                              color: t.primary,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                    const SizedBox(width: 4),
+                                    Tooltip(
+                                      message: '在系统浏览器打开',
+                                      child: GrassBagSpringTap(
+                                        onTap: _openInExternalNewTab,
+                                        pressedScale: 0.92,
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        child: GrassBagFresnelGlassSurface(
+                                          isCircle: true,
+                                          innerWell: true,
+                                          interactive: true,
+                                          width: 28,
+                                          height: 28,
+                                          alignment: Alignment.center,
+                                          child: Icon(
+                                            CupertinoIcons.arrow_up_right_square,
+                                            size: 13.5,
+                                            color: t.text2,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
                                   ],
                                 ],
                               ),
                             ),
+                            if (_loading)
+                              SizedBox(
+                                height: 2.5,
+                                child: LinearProgressIndicator(
+                                  value: (_loadProgress > 0 && _loadProgress < 100)
+                                      ? _loadProgress / 100.0
+                                      : null,
+                                  backgroundColor: Colors.transparent,
+                                  valueColor: AlwaysStoppedAnimation<Color>(t.primary),
+                                ),
+                              ),
                             Expanded(
                               child: Stack(
                                 children: [
@@ -876,7 +980,7 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
         );
       }
       if (!_forceCrossSiteIframe && _isCrossSiteEmbed(_resolvedUrl)) {
-        final tier = ref.watch(appProvider.select((s) => s.glassTier));
+        final tier = ref.read(appProvider).glassTier;
         return Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 420),
@@ -970,7 +1074,9 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                       tier: tier,
                       insideGlass: true,
                       onTap: () async {
-                        await Clipboard.setData(ClipboardData(text: _resolvedUrl));
+                        await Clipboard.setData(
+                          ClipboardData(text: _stripTokenParam(_resolvedUrl)),
+                        );
                         if (!mounted) return;
                         ref.read(appProvider.notifier).showToast('已复制网页地址', tone: ToastTone.ok);
                       },
@@ -984,9 +1090,14 @@ class _OfficialWebPageState extends ConsumerState<OfficialWebPage> {
                       tier: tier,
                       insideGlass: true,
                       onTap: () async {
-                        final ok = await GrassBagNativeBridge.instance.openExternalUrl(_resolvedUrl);
+                        var ok = await GrassBagNativeBridge.instance.openExternalUrl(_resolvedUrl);
+                        if (!ok) {
+                          ok = openUrlInNewTab(_resolvedUrl);
+                        }
                         if (!ok && mounted) {
-                          await Clipboard.setData(ClipboardData(text: _resolvedUrl));
+                          await Clipboard.setData(
+                            ClipboardData(text: _stripTokenParam(_resolvedUrl)),
+                          );
                           if (!mounted) return;
                           ref.read(appProvider.notifier).showToast('已复制链接，请在浏览器粘贴打开', tone: ToastTone.info);
                         }

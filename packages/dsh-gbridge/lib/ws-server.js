@@ -124,7 +124,12 @@ export class GbridgeWsConnection extends EventEmitter {
     if (this.closed) return;
     const validCode = isValidWireCloseCode(code) ? code : 1000;
     let reasonBuf = Buffer.from(String(reason), 'utf8');
-    if (reasonBuf.length > 123) reasonBuf = reasonBuf.subarray(0, 123);
+    if (reasonBuf.length > 123) {
+      let end = 123;
+      // Walk back across any UTF-8 continuation bytes (10xxxxxx) so close reason stays valid UTF-8.
+      while (end > 0 && (reasonBuf[end] & 0xc0) === 0x80) end -= 1;
+      reasonBuf = reasonBuf.subarray(0, end);
+    }
     const body = Buffer.allocUnsafe(2 + reasonBuf.length);
     body.writeUInt16BE(validCode, 0);
     reasonBuf.copy(body, 2);
@@ -254,13 +259,26 @@ export class GbridgeWsConnection extends EventEmitter {
         this.close(1009, 'message too large');
         return;
       }
-      this._fragChunks.push(payload);
+      if (payload.length > 0) {
+        if (this._fragChunks.length >= 4096) {
+          this.close(1009, 'too many fragments');
+          return;
+        }
+        this._fragChunks.push(payload);
+      } else if (!fin) {
+        this._fragZeroCount = (this._fragZeroCount || 0) + 1;
+        if (this._fragZeroCount > 1024) {
+          this.close(1009, 'too many empty fragments');
+          return;
+        }
+      }
       if (fin) {
         const full = Buffer.concat(this._fragChunks);
         const op = this._fragOpcode;
         this._fragOpcode = null;
         this._fragChunks = [];
         this._fragBytes = 0;
+        this._fragZeroCount = 0;
         this._deliverData(op, full);
       }
       return;

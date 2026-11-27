@@ -101,11 +101,44 @@ class GbridgeHttpTransport {
     try {
       await openCompleter.future.timeout(timeout);
       clearHandshakeHandlers();
-    } catch (_) {
+    } catch (err) {
       clearHandshakeHandlers();
       try {
         ws.callMethod('close'.toJS);
       } catch (_) {}
+      // Browsers mask HTTP 401/403 WS upgrade rejections behind opaque `onerror`.
+      // Probe an authenticated HTTP endpoint so Vanilla Direct Mode surfaces `needsAuth` instead of looping!
+      if (err is GbridgeException && err.status == 0) {
+        try {
+          final probeUri = endpoint.resolveHttpUri('/api/settings/describe');
+          final probeInit = JSObject();
+          probeInit.setProperty('method'.toJS, 'POST'.toJS);
+          probeInit.setProperty('credentials'.toJS, 'include'.toJS);
+          final probeHeaders = JSObject();
+          probeHeaders.setProperty('Content-Type'.toJS, 'application/json'.toJS);
+          for (final e in buildAuthHeaders().entries) {
+            probeHeaders.setProperty(e.key.toJS, e.value.toJS);
+          }
+          probeInit.setProperty('headers'.toJS, probeHeaders);
+          probeInit.setProperty('body'.toJS, '{"type":"client-request","method":"settings/describe","payload":{"args":{}}}'.toJS);
+          final probeFetched = await _fetchWithAbort(
+            probeUri,
+            probeInit,
+            timeoutOverride: const Duration(seconds: 4),
+          );
+          final probeStatus = (probeFetched.response.getProperty<JSNumber>('status'.toJS)).toDartInt;
+          _abortQuietly(probeFetched.abortCtrl);
+          if (probeStatus == 401 || probeStatus == 403) {
+            throw GbridgeException(
+              status: probeStatus,
+              code: 'gbridge/unauthorized',
+              message: 'WebSocket authorization rejected (HTTP $probeStatus)',
+            );
+          }
+        } on GbridgeException {
+          rethrow;
+        } catch (_) {}
+      }
       rethrow;
     }
     return _WebRawWebSocket(ws);
@@ -250,6 +283,14 @@ class GbridgeHttpTransport {
     final response = fetched.response;
     final status = (response.getProperty<JSNumber>('status'.toJS)).toDartInt;
     if (status == 401 && retryAuth && (endpoint.token?.isNotEmpty ?? false)) {
+      String errBody = '';
+      try {
+        errBody = (await response
+                .callMethod<JSPromise<JSString>>('text'.toJS)
+                .toDart
+                .timeout(const Duration(seconds: 3)))
+            .toDart;
+      } catch (_) {}
       _abortQuietly(fetched.abortCtrl);
       final exchanged = await exchangeAuthToken();
       if (exchanged) {
@@ -263,11 +304,7 @@ class GbridgeHttpTransport {
           timeoutOverride: timeoutOverride,
         );
       }
-      throw const GbridgeException(
-        status: 401,
-        code: 'gbridge/unauthorized',
-        message: 'HTTP 401',
-      );
+      _throwTextError(401, errBody);
     }
     String text;
     try {
@@ -366,6 +403,14 @@ class GbridgeHttpTransport {
     final response = fetched.response;
     final status = (response.getProperty<JSNumber>('status'.toJS)).toDartInt;
     if (status == 401 && retryAuth && (endpoint.token?.isNotEmpty ?? false)) {
+      String errBody = '';
+      try {
+        errBody = (await response
+                .callMethod<JSPromise<JSString>>('text'.toJS)
+                .toDart
+                .timeout(const Duration(seconds: 3)))
+            .toDart;
+      } catch (_) {}
       _abortQuietly(fetched.abortCtrl);
       final exchanged = await exchangeAuthToken();
       if (exchanged) {
@@ -379,11 +424,7 @@ class GbridgeHttpTransport {
           reloadRetryAttempt: reloadRetryAttempt,
         );
       }
-      throw const GbridgeException(
-        status: 401,
-        code: 'gbridge/unauthorized',
-        message: 'HTTP 401',
-      );
+      _throwTextError(401, errBody);
     }
     if (status >= 400) {
       String text;
@@ -852,8 +893,10 @@ class GbridgeStreamClient {
       return _vanillaMux!.checkLiveness(timeout: timeout, force: force);
     }
     if (_disposed || _manualDisconnect) return false;
-    // Never abort an in-flight handshake/reconnect!
-    if (_phase == ConnectionPhase.connecting || _phase == ConnectionPhase.reconnecting) {
+    // Never abort an in-flight handshake/reconnect or override an auth-rejected state!
+    if (_phase == ConnectionPhase.connecting ||
+        _phase == ConnectionPhase.reconnecting ||
+        _phase == ConnectionPhase.needsAuth) {
       return false;
     }
     if (_ws == null || _phase != ConnectionPhase.connected) {
@@ -952,12 +995,14 @@ class GbridgeStreamClient {
     _heartbeatTimer?.cancel();
     _pongTimeoutTimer?.cancel();
     final epoch = _connEpoch;
-    final period = Duration(milliseconds: heartbeatMs.clamp(5000, 60000));
+    final periodMs = heartbeatMs.clamp(5000, 60000);
+    final period = Duration(milliseconds: periodMs);
+    final pongTimeoutMs = (periodMs * 0.6).round().clamp(3000, 10000);
     _heartbeatTimer = Timer.periodic(period, (_) {
       if (_phase == ConnectionPhase.connected && epoch == _connEpoch) {
         sendPing();
         _pongTimeoutTimer?.cancel();
-        _pongTimeoutTimer = Timer(const Duration(seconds: 10), () {
+        _pongTimeoutTimer = Timer(Duration(milliseconds: pongTimeoutMs), () {
           if (epoch == _connEpoch && _phase == ConnectionPhase.connected) {
             _handleDisconnect(epoch);
           }

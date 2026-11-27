@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -273,7 +274,9 @@ class GrassBagBridgePlugin(private val activity: Activity) :
 
     private fun sendEvent(type: String, payload: Map<String, Any?>) {
         mainHandler.post {
-            eventSink?.success(mapOf("type" to type, "data" to payload))
+            if (!detached) {
+                runCatching { eventSink?.success(mapOf("type" to type, "data" to payload)) }
+            }
         }
     }
 
@@ -535,6 +538,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             reason = reason,
                             autoReturn = autoReturn
                         )
+                        if (GrassBagEngineService.isServiceActive()) {
+                            GrassBagEngineService.startOrUpdate(
+                                ctx = activity.applicationContext,
+                                heading = "GrassBag 本机引擎运行中",
+                                detail = "手机操控已完成 · 后台待命保活",
+                                releaseWakeLock = true
+                            )
+                        }
                     }
                     replySafe(result) { it.success(shouldFinalize) }
                 }
@@ -543,6 +554,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 runBg(result) {
                     SafetyGate.triggerEmergencyStop()
                     PhoneOverlayController.getInstance(activity.applicationContext).dismissAll()
+                    if (GrassBagEngineService.isServiceActive()) {
+                        GrassBagEngineService.startOrUpdate(
+                            ctx = activity.applicationContext,
+                            heading = "GrassBag 本机引擎运行中",
+                            detail = "手机操控已急停 · 后台待命保活",
+                            releaseWakeLock = true
+                        )
+                    }
                     replySafe(result) { it.success(true) }
                 }
             }
@@ -691,18 +710,123 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                             }
                         }
                         mainHandler.post {
-                            if (!detached) {
-                                runCatching {
-                                    val chooser = Intent.createChooser(intent, "分享内容").apply {
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    activity.startActivity(chooser)
+                            val launched = !detached && runCatching {
+                                val chooser = Intent.createChooser(intent, "分享内容").apply {
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
-                            }
+                                activity.startActivity(chooser)
+                                true
+                            }.getOrDefault(false)
+                            replySafe(result) { it.success(launched) }
                         }
-                        true
-                    }.getOrDefault(false)
-                    replySafe(result) { it.success(ok) }
+                        return@runBg
+                    }.onFailure {
+                        replySafe(result) { it.success(false) }
+                    }
+                }
+            }
+            "device.shareFile" -> {
+                val rawBytes = call.argument<ByteArray>("bytes")
+                val rawText = call.argument<String>("text")
+                val rawName = call.argument<String>("filename")?.trim() ?: "grassbag-file.txt"
+                val mimeType = call.argument<String>("mimeType")?.trim()?.ifEmpty { "application/octet-stream" }
+                    ?: "application/octet-stream"
+                runBg(result) {
+                    runCatching {
+                        val payload = rawBytes ?: rawText?.toByteArray(Charsets.UTF_8) ?: run {
+                            replySafe(result) { it.success(false) }
+                            return@runBg
+                        }
+                        val safeName = rawName
+                            .replace(Regex("""[/\\:*?"<>|\r\n]+"""), "_")
+                            .trim()
+                            .ifEmpty { "grassbag-file.bin" }
+                        val shareDir = File(activity.cacheDir, "share").apply { mkdirs() }
+                        val file = File(shareDir, safeName)
+                        file.writeBytes(payload)
+                        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = mimeType
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            putExtra(Intent.EXTRA_TITLE, safeName)
+                            clipData = ClipData.newRawUri(safeName, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        mainHandler.post {
+                            val launched = !detached && runCatching {
+                                val chooser = Intent.createChooser(intent, "分享 $safeName").apply {
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                activity.startActivity(chooser)
+                                true
+                            }.getOrDefault(false)
+                            replySafe(result) { it.success(launched) }
+                        }
+                        return@runBg
+                    }.onFailure {
+                        replySafe(result) { it.success(false) }
+                    }
+                }
+            }
+            "device.saveImage" -> {
+                val rawBytes = call.argument<ByteArray>("bytes")
+                val rawName = call.argument<String>("filename")?.trim() ?: "grassbag-${System.currentTimeMillis()}.png"
+                val mimeType = call.argument<String>("mimeType")?.trim()?.ifEmpty { "image/png" } ?: "image/png"
+                runBg(result) {
+                    val res = runCatching {
+                        if (rawBytes == null || rawBytes.isEmpty()) {
+                            return@runCatching mapOf("ok" to false, "error" to "图片数据为空")
+                        }
+                        var safeName = rawName
+                            .replace(Regex("""[/\\:*?"<>|\r\n]+"""), "_")
+                            .trim()
+                            .ifEmpty { "grassbag-${System.currentTimeMillis()}.png" }
+                        if (!safeName.contains('.')) {
+                            val ext = when {
+                                mimeType.contains("jpeg") || mimeType.contains("jpg") -> "jpg"
+                                mimeType.contains("webp") -> "webp"
+                                mimeType.contains("gif") -> "gif"
+                                else -> "png"
+                            }
+                            safeName = "$safeName.$ext"
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            val resolver = activity.contentResolver
+                            val values = ContentValues().apply {
+                                put(MediaStore.Images.Media.DISPLAY_NAME, safeName)
+                                put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/GrassBag")
+                                put(MediaStore.Images.Media.IS_PENDING, 1)
+                            }
+                            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                                ?: return@runCatching mapOf("ok" to false, "error" to "无法创建系统相册条目")
+                            try {
+                                resolver.openOutputStream(uri)?.use { out ->
+                                    out.write(rawBytes)
+                                    out.flush()
+                                } ?: return@runCatching mapOf("ok" to false, "error" to "无法写入系统相册")
+                                values.clear()
+                                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                                resolver.update(uri, values, null, null)
+                                mapOf("ok" to true, "location" to "Pictures/GrassBag/$safeName")
+                            } catch (e: Throwable) {
+                                runCatching { resolver.delete(uri, null, null) }
+                                mapOf("ok" to false, "error" to (e.message ?: "保存失败"))
+                            }
+                        } else {
+                            @Suppress("DEPRECATION")
+                            val dir = File(
+                                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                                "GrassBag",
+                            ).apply { mkdirs() }
+                            val target = File(dir, safeName)
+                            target.writeBytes(rawBytes)
+                            mapOf("ok" to true, "location" to target.absolutePath)
+                        }
+                    }.getOrElse { e ->
+                        mapOf("ok" to false, "error" to (e.message ?: "保存失败"))
+                    }
+                    replySafe(result) { it.success(res) }
                 }
             }
             "lan.scan" -> {
@@ -745,11 +869,21 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                         val cm = CookieManager.getInstance()
                         cm.setAcceptCookie(true)
                         val secureSuffix = if (url.startsWith("https://", ignoreCase = true)) "; Secure" else ""
-                        for (part in header.split(";")) {
+                        val ignoredAttrs = setOf("path", "domain", "expires", "max-age", "samesite", "priority")
+                        val pairs = header.split(";").mapNotNull { part ->
                             val trimmed = part.trim()
-                            if (trimmed.contains("=")) {
-                                cm.setCookie(url, "$trimmed; Path=/$secureSuffix")
+                            val eq = trimmed.indexOf('=')
+                            if (eq <= 0) return@mapNotNull null
+                            val key = trimmed.substring(0, eq).trim().lowercase()
+                            if (key in ignoredAttrs) return@mapNotNull null
+                            trimmed
+                        }
+                        if (pairs.isNotEmpty()) {
+                            val latch = java.util.concurrent.CountDownLatch(pairs.size)
+                            for (pair in pairs) {
+                                cm.setCookie(url, "$pair; Path=/$secureSuffix") { latch.countDown() }
                             }
+                            runCatching { latch.await(2500L, java.util.concurrent.TimeUnit.MILLISECONDS) }
                         }
                         cm.flush()
                         true
@@ -926,25 +1060,25 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             if (!alreadyGranted) {
                 openPermissionScreen(target)
             }
-            result.success(mapOf("granted" to alreadyGranted, "permanentlyDenied" to false))
+            replySafe(result) { it.success(mapOf("granted" to alreadyGranted, "permanentlyDenied" to false)) }
             return
         }
         val allGranted = perms.all {
             ContextCompat.checkSelfPermission(activity, it) == PackageManager.PERMISSION_GRANTED
         }
         if (allGranted) {
-            result.success(mapOf("granted" to true, "permanentlyDenied" to false))
+            replySafe(result) { it.success(mapOf("granted" to true, "permanentlyDenied" to false)) }
             return
         }
-        pendingPermResult?.let {
-            runCatching { it.success(mapOf("granted" to false, "permanentlyDenied" to false)) }
+        pendingPermResult?.let { prev ->
+            replySafe(prev) { it.success(mapOf("granted" to false, "permanentlyDenied" to false)) }
         }
         pendingPermResult = result
         runCatching {
             ActivityCompat.requestPermissions(activity, perms, REQ_RUNTIME_PERM)
         }.onFailure {
             pendingPermResult = null
-            result.success(mapOf("granted" to false, "permanentlyDenied" to false))
+            replySafe(result) { it.success(mapOf("granted" to false, "permanentlyDenied" to false)) }
         }
     }
 
@@ -960,7 +1094,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             if (granted) {
                 launchCameraCaptureIntent(res)
             } else {
-                res.success(null)
+                replySafe(res) { it.success(null) }
             }
             return true
         }
@@ -971,7 +1105,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         val permanentlyDenied = !granted && permissions.isNotEmpty() && permissions.any { perm ->
             !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
         }
-        res.success(mapOf("granted" to granted, "permanentlyDenied" to permanentlyDenied))
+        replySafe(res) { it.success(mapOf("granted" to granted, "permanentlyDenied" to permanentlyDenied)) }
         return true
     }
 
@@ -1291,10 +1425,18 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         val maxReadBytes = if (isImage) 24 * 1024 * 1024 else 4 * 1024 * 1024
         val baos = ByteArrayOutputStream()
         var exceeded = false
-        cr.openInputStream(uri)?.use { ins ->
+        val ins = cr.openInputStream(uri)
+        if (ins == null) {
+            return@runCatching mapOf(
+                "name" to displayName,
+                "mimeType" to mime,
+                "error" to "无法读取所选文件（可能是云端虚拟文件或权限已失效）"
+            )
+        }
+        ins.use { stream ->
             val buf = ByteArray(16384)
             while (true) {
-                val n = ins.read(buf)
+                val n = stream.read(buf)
                 if (n <= 0) break
                 if (baos.size() + n > maxReadBytes) {
                     exceeded = true
@@ -1334,7 +1476,13 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             "size" to bytes.size,
             "bytes" to bytes
         )
-    }.getOrNull()
+    }.getOrElse { e ->
+        mapOf(
+            "name" to "附件",
+            "mimeType" to "application/octet-stream",
+            "error" to "读取文件失败：${e.message ?: e.javaClass.simpleName}"
+        )
+    }
 
     /**
      * Collect ALL local IP addresses across EVERY active network interface on this Android device

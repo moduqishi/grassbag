@@ -29,3 +29,5 @@ flutter:
   uses-material-design: true
   assets:
     - assets/brand/
+  shaders:
+    - shaders/kyant_liquid_glass.frag

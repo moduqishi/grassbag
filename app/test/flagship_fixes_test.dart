@@ -18,6 +18,10 @@ import 'package:grassbag/theme/grassbag_theme.dart';
 import 'package:grassbag/ui/chat/chat_empty_state.dart';
 import 'package:grassbag/ui/chat/composer_bar.dart';
 import 'package:grassbag/ui/chat/turn_process_widget.dart';
+import 'package:grassbag/ui/common/file_preview_sheet.dart';
+import 'package:grassbag/ui/common/grassbag_sheets.dart';
+import 'package:grassbag/ui/common/preview_highlight_utils.dart';
+import 'package:grassbag/ui/drawer/sessions_drawer.dart';
 import 'package:grassbag/ui/features/schedules_page.dart';
 import 'package:grassbag/ui/onboarding/launch_splash_overlay.dart';
 import 'package:grassbag/ui/sdui/schemastery_form.dart';
@@ -25,6 +29,7 @@ import 'package:grassbag/ui/sdui/sdui_renderer.dart';
 import 'package:grassbag/ui/settings/model_config_view.dart';
 import 'package:grassbag/ui/settings/settings_page.dart';
 import 'package:grassbag/ui/shell/grassbag_shell.dart';
+import 'package:grassbag/ui/web/official_web_page.dart';
 
 void main() {
   setUpAll(() {
@@ -450,24 +455,21 @@ void main() {
     testWidgets(
       'Model pill NEVER flashes 未连接 during ConnectionPhase.reconnecting & crystal-clear Liquid Glass optics contract holds',
       (tester) async {
-        // 1. Crystal-clear Kyant0-grade translucent Liquid Glass contract (thin-lens spherical optics
-        //    so `isClearIndicator` never trips the dark charcoal ring in Light Mode, controlled glare!)
+        // 1. Faithful Kyant0 AndroidLiquidGlass optical presets contract across Light & Dark modes:
         for (final brightness in [Brightness.light, Brightness.dark]) {
           final tok = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
-          final surf = GrassBagGlassConfig.surfaceSettings(tok, GrassBagGlassTier.liquid);
-          final sheet = GrassBagGlassConfig.sheetSettings(tok, GrassBagGlassTier.liquid);
-          expect(surf.lensModel, GlassLensModel.spherical);
-          expect(surf.thickness, inInclusiveRange(26.0, 34.0));
-          expect(surf.refractiveIndex, inInclusiveRange(1.36, 1.48));
-          expect(surf.chromaticAberration, greaterThan(0.12));
-          expect(surf.blur, inInclusiveRange(1.0, 1.8));
-          expect(surf.glassColor.a, lessThanOrEqualTo(0.06));
-          expect(surf.lightIntensity, inInclusiveRange(0.70, 1.25));
-          expect(sheet.lensModel, GlassLensModel.spherical);
-          expect(sheet.frost, 0.0);
-          expect(sheet.frostOpacity, 0.0);
-          expect(sheet.blur, inInclusiveRange(6.5, 10.0));
-          expect(sheet.glassColor.a, lessThanOrEqualTo(0.30));
+          final surf = KyantLiquidGlassStyle.chrome(tok, GrassBagGlassTier.liquid);
+          final sheet = KyantLiquidGlassStyle.sheet(tok, GrassBagGlassTier.liquid);
+          final btn = KyantLiquidGlassStyle.button(tok, GrassBagGlassTier.liquid, tint: tok.primary);
+          expect(surf.saturation, closeTo(1.5, 0.05));
+          expect(surf.refractionHeight, inInclusiveRange(12.0, 20.0));
+          expect(surf.refractionAmount, inInclusiveRange(20.0, 32.0));
+          expect(surf.chromaticAberration, greaterThan(0.10));
+          expect(surf.blurRadius, inInclusiveRange(3.0, 7.0));
+          expect(sheet.blurRadius, inInclusiveRange(7.0, 14.0));
+          expect(sheet.refractionAmount, greaterThanOrEqualTo(30.0));
+          expect(btn.refractionHeight, closeTo(12.0, 0.5));
+          expect(btn.refractionAmount, closeTo(24.0, 0.5));
         }
 
         // 2. Composer model pill during ConnectionPhase.reconnecting keeps showing cached model
@@ -1553,18 +1555,28 @@ void main() {
         // Live scroll pill shows '有新回复' when scrolled away & new content arrived!
         expect(find.text('有新回复'), findsOneWidget);
 
-        // Typing Chinese prose + `@ma` mid-token before `in.dart` triggers `@` and replaces whole token cleanly!
+        // Typing Chinese prose + `@ma` mid-token before `in.dart` triggers `@` and shows bold basename + parent dir!
         composerCtrl.value = const TextEditingValue(
           text: '帮我看看@main.dart',
           selection: TextSelection.collapsed(offset: 7), // cursor at `帮我看看@ma|in.dart`
         );
         await tester.pump(const Duration(milliseconds: 220));
-        expect(find.text('lib/main_controller.dart'), findsOneWidget);
-        await tester.tap(find.text('lib/main_controller.dart'));
+        expect(find.text('main_controller.dart'), findsOneWidget);
+        expect(find.text('lib'), findsOneWidget);
+        await tester.tap(find.text('main_controller.dart'));
         await tester.pumpAndSettle();
         expect(composerCtrl.text, '帮我看看@lib/main_controller.dart ');
+        // Picked reference chip strip surfaces the selected file cleanly inside composer!
+        expect(find.text('main_controller.dart'), findsOneWidget);
+        // Backspacing/clearing the `@path` token auto-prunes the stale reference chip!
+        composerCtrl.value = const TextEditingValue(
+          text: '帮我看看',
+          selection: TextSelection.collapsed(offset: 4),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('main_controller.dart'), findsNothing);
         // Flush debounced draft persistence timer cleanly before test teardown.
-        await tester.pump(const Duration(milliseconds: 1400));
+        await tester.pump(const Duration(milliseconds: 2000));
         expect(tester.takeException(), isNull);
       },
     );
@@ -1718,8 +1730,8 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(find.textContaining('正在编辑'), findsOneWidget);
-        // While streaming, editing queues at the tail rather than branching before the turn -> shows truthful banner!
-        expect(find.text('生成中 · 发送将末尾排队'), findsOneWidget);
+        // While streaming, editing queues at the tail rather than branching before the turn -> shows concise truthful badge!
+        expect(find.text('生成中·排队'), findsOneWidget);
         // Streaming follow-up mode pill reflects default busyEnter ('排队')
         expect(find.text('排队'), findsOneWidget);
 
@@ -2498,7 +2510,1097 @@ void main() {
         expect(tester.takeException(), isNull);
       },
     );
+
+    testWidgets(
+      'v55 regression: word-bounded error classifier, todo_write exclusion, shell env var & <br> Markdown, non-last Continue gate, Kyant0 Steer/Queue deck, isStopping spinner & collapsible takeover',
+      (tester) async {
+        // 1. Word-bounded HTTP status classification avoids localhost:5000 / 500ms / req_40123 false positives
+        final portErr = GrassBagController.classifyReadableError('Failed to bind localhost:5000');
+        expect(portErr.actionKind, isNull);
+        final msErr = GrassBagController.classifyReadableError('Request aborted after 500ms');
+        expect(msErr.actionKind, isNull);
+        final reqIdErr = GrassBagController.classifyReadableError('Upstream rejected req_40123');
+        expect(reqIdErr.actionKind, isNull);
+        final real503 = GrassBagController.classifyReadableError('HTTP 503 Service Unavailable');
+        expect(real503.title, '模型服务暂时繁忙');
+        final real401 = GrassBagController.classifyReadableError('status: 401 bad token');
+        expect(real401.title, '身份验证失效');
+
+        // 2. TurnView: excludes todo_write from modified-files pill, protects ${HOME}/bin:${PATH},
+        //    converts <br> in paragraphs, and gates "继续" strictly to isLastTurn == true
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        const turnV55 = NormalizedTurn(
+          turnId: 't-v55-turn',
+          status: 'cancelled',
+          userMessage: NormalizedUserMessage(id: 'u-v55', text: '检查路径与任务'),
+          assistantText: '导出路径：\${HOME}/bin:\${PATH}<br>第二行说明',
+          steps: [
+            ToolStep(
+              callId: 'c-todo',
+              name: 'todo_write',
+              title: 'todo_write · todos.json',
+              status: 'ok',
+            ),
+            ToolStep(
+              callId: 'c-write',
+              name: 'write_file',
+              title: 'write_file · lib/demo.dart',
+              status: 'ok',
+            ),
+          ],
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: TurnView(
+                    turn: turnV55,
+                    isLastTurn: false,
+                    animateEntrance: false,
+                    onOpenTerminal: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('已修改 1 个文件'), findsOneWidget);
+        expect(find.textContaining(r'${HOME}/bin:${PATH}', findRichText: true), findsOneWidget);
+        expect(find.textContaining('第二行说明', findRichText: true), findsOneWidget);
+        expect(find.text('继续'), findsNothing);
+
+        // 3. ChatComposerDock: native Kyant0 Steer/Queue/Interrupt mode deck + isStopping spinner + collapsible takeover
+        final compCtrl = TextEditingController(text: '顺便帮我查下日志');
+        final focus = FocusNode();
+        addTearDown(compCtrl.dispose);
+        addTearDown(focus.dispose);
+
+        final ctrl = container.read(appProvider.notifier);
+        ctrl.state = ctrl.state.copyWith(
+          activeSessionId: 'sess-v55-stream',
+          isStreaming: true,
+          isStopping: false,
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ChatComposerDock(
+                    controller: compCtrl,
+                    focusNode: focus,
+                    onOpenTerminal: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        // Tap streaming mode pill ('排队') to open native Kyant0 floating mode deck
+        await tester.tap(find.text('排队'));
+        await tester.pumpAndSettle();
+        expect(find.text('插话引导'), findsOneWidget);
+        expect(find.text('本轮后排队'), findsOneWidget);
+        expect(find.text('打断并改问'), findsOneWidget);
+        // Pick Steer ('插话引导') and verify deck closes & mode updates
+        await tester.tap(find.text('插话引导'));
+        await tester.pumpAndSettle();
+        expect(find.text('本轮后排队'), findsNothing);
+
+        // Transition to isStopping == true -> spinner shown cleanly
+        ctrl.state = ctrl.state.copyWith(isStopping: true);
+        await tester.pump();
+        expect(find.byType(CupertinoActivityIndicator), findsOneWidget);
+
+        // Collapsible Ask-User takeover card: collapse to reminder pill & expand back
+        ctrl.state = ctrl.state.copyWith(
+          isStreaming: false,
+          isStopping: false,
+          activeQuestion: const ActiveUserQuestion(
+            interactionId: 'q-v55-collapse',
+            title: '请确认部署目标',
+            prompt: '请选择需要发布的环境',
+            options: ['Staging', 'Production'],
+            allowFreeText: false,
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('请确认部署目标'), findsOneWidget);
+        expect(find.text('收起查看对话'), findsOneWidget);
+        await tester.tap(find.text('收起查看对话'));
+        await tester.pumpAndSettle();
+        expect(find.text('请确认部署目标'), findsNothing);
+        expect(find.text('助手在等待你回答 · 点击展开'), findsOneWidget);
+        await tester.tap(find.text('助手在等待你回答 · 点击展开'));
+        await tester.pumpAndSettle();
+        expect(find.text('请确认部署目标'), findsOneWidget);
+        await tester.pump(const Duration(seconds: 5));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v56 regression: TurnStreamReducer snapshot anti-regression & photo bytes preservation, Plan Mode reset & CTA, takeover phone-keyboard fit, inline subagent card, expandable disambiguated files & dedented list code',
+      (tester) async {
+        // 1. TurnStreamReducer preserves live streamed text & local photo bytes across `turn.snapshot`
+        final reducer = TurnStreamReducer();
+        final fakePng = Uint8List.fromList([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]);
+        reducer.replaceAll([
+          NormalizedTurn(
+            turnId: 't-live',
+            status: 'streaming',
+            assistantText: '正在输出的关键分析内容已经流了一半',
+            userMessage: NormalizedUserMessage(
+              id: 'u-opt-1',
+              text: '看看这张图',
+              attachments: [
+                {'name': 'photo.png', 'mimeType': 'image/png', 'bytes': fakePng},
+              ],
+            ),
+          ),
+        ]);
+        reducer.apply(
+          StreamFrame(
+            op: 'event',
+            channel: 'session:s1',
+            type: 'turn.snapshot',
+            seq: 10,
+            data: {
+              'turns': [
+                {
+                  'turnId': 't-live',
+                  'status': 'completed',
+                  'assistantText': '',
+                  'userMessage': {
+                    'id': 'u-srv-1',
+                    'text': '看看这张图',
+                    'attachments': [
+                      {'attachmentId': 'att-99', 'name': 'photo.png', 'mediaType': 'image/png', 'bytes': 8},
+                    ],
+                  },
+                },
+              ],
+            },
+          ),
+        );
+        expect(reducer.turns.single.status, 'streaming');
+        expect(reducer.turns.single.assistantText, '正在输出的关键分析内容已经流了一半');
+        expect(reducer.turns.single.userMessage?.attachments.single['previewBytes'], fakePng);
+
+        // 2. Plan Mode resets on New Chat / session switch; subagent back-stack pushes & pops cleanly
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        final ctrl = container.read(appProvider.notifier);
+        ctrl.state = ctrl.state.copyWith(
+          activeSessionId: 'sess-main',
+          planMode: true,
+          queuedMessages: const [
+            QueuedMessageItem(id: 'q1', text: '留存的排队消息', mode: 'queue'),
+          ],
+          sessions: const [
+            ChatSessionItem(id: 'sess-main', title: '主架构讨论', group: '今天'),
+          ],
+          turns: const [
+            NormalizedTurn(turnId: 't1', status: 'completed', assistantText: '方案如下'),
+          ],
+        );
+        ctrl.openSubagentSession('sub-1', childTitle: '子代理排查');
+        expect(ctrl.state.activeSessionId, 'sub-1');
+        expect(ctrl.state.parentSessionId, 'sess-main');
+        expect(ctrl.state.parentSessionTitle, '主架构讨论');
+        expect(ctrl.state.planMode, isFalse);
+        ctrl.returnToParentSession();
+        expect(ctrl.state.activeSessionId, 'sess-main');
+        expect(ctrl.state.parentSessionId, isNull);
+        expect(ctrl.state.queuedMessages.length, 1);
+        expect(ctrl.state.queuedMessages.first.text, '留存的排队消息');
+
+        // 3. ComposerDock: phone-with-keyboard 340dp Ask-User takeover fits with ZERO 42px overflow,
+        //    Plan Mode shows '计划模式 · 批准并执行' + Compaction shows '正在精简上下文…'
+        final compCtrl = TextEditingController();
+        final focus = FocusNode();
+        addTearDown(compCtrl.dispose);
+        addTearDown(focus.dispose);
+        ctrl.state = ctrl.state.copyWith(
+          activeQuestion: const ActiveUserQuestion(
+            interactionId: 'q-v56-fit',
+            title: '多选项确认',
+            prompt: '请选择需要执行的优化模块',
+            options: ['流式同步', '输入框与接管卡', 'Markdown 排版', '子代理导航'],
+            allowFreeText: true,
+          ),
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 340, maxWidth: 390),
+                    child: ChatComposerDock(
+                      controller: compCtrl,
+                      focusNode: focus,
+                      onOpenTerminal: () {},
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('收起查看对话'), findsOneWidget);
+        expect(find.text('多选项确认'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+
+        ctrl.state = ctrl.state.copyWith(
+          clearActiveQuestion: true,
+          planMode: true,
+          isCompactingContext: true,
+        );
+        await tester.pump();
+        expect(find.text('计划模式 · 批准并执行'), findsOneWidget);
+        expect(find.text('正在精简上下文…'), findsOneWidget);
+
+        // 4. TurnView: inline subagent card ('查看过程'), expandable '+2 更多' modified files
+        //    with disambiguated `a/index.ts` & `b/index.ts`, and dedented fenced code inside list!
+        const richTurn = NormalizedTurn(
+          turnId: 't-v56-rich',
+          status: 'completed',
+          assistantText: '1. 示例代码：\n   ```python\n   def ok():\n       return 1\n   ```',
+          steps: [
+            ToolStep(
+              callId: 'sub-call-1',
+              name: 'subagent',
+              title: '排查测试失败',
+              status: 'ok',
+              subagentSessionId: 'sub-sess-42',
+            ),
+            ToolStep(callId: 'f1', name: 'edit_file', title: 'edit_file · a/index.ts', status: 'ok'),
+            ToolStep(callId: 'f2', name: 'edit_file', title: 'edit_file · b/index.ts', status: 'ok'),
+            ToolStep(callId: 'f3', name: 'edit_file', title: 'edit_file · lib/c.dart', status: 'ok'),
+            ToolStep(callId: 'f4', name: 'edit_file', title: 'edit_file · lib/d.dart', status: 'ok'),
+            ToolStep(callId: 'f5', name: 'edit_file', title: 'edit_file · lib/e.dart', status: 'ok'),
+            ToolStep(callId: 'f6', name: 'edit_file', title: 'edit_file · lib/f.dart', status: 'ok'),
+            ToolStep(callId: 'f7', name: 'edit_file', title: 'edit_file · lib/g.dart', status: 'ok'),
+          ],
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: TurnView(
+                    turn: richTurn,
+                    animateEntrance: false,
+                    onOpenTerminal: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('排查测试失败'), findsOneWidget);
+        expect(find.text('查看过程'), findsOneWidget);
+        expect(find.text('a/index.ts'), findsOneWidget);
+        expect(find.text('b/index.ts'), findsOneWidget);
+        expect(find.text('+2 更多'), findsOneWidget);
+        await tester.tap(find.text('+2 更多'));
+        await tester.pumpAndSettle();
+        expect(find.text('+2 更多'), findsNothing);
+        expect(find.text('g.dart'), findsOneWidget);
+        expect(find.textContaining('def ok():', findRichText: true), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    test('v57 preview utils: SVG classification, #L anchor, ANSI strip, intra-line diff & CSV', () {
+      expect(classifyPreviewFile('icon.svg', mimeType: 'image/svg+xml'), PreviewFileKind.svg);
+      expect(classifyPreviewFile('photo.png', mimeType: 'image/png'), PreviewFileKind.rasterImage);
+      expect(classifyPreviewFile('README.md'), PreviewFileKind.markdown);
+      expect(classifyPreviewFile('data.json'), PreviewFileKind.json);
+      expect(classifyPreviewFile('report.csv'), PreviewFileKind.csv);
+      expect(classifyPreviewFile('archive.zip'), PreviewFileKind.binary);
+
+      final anchor = parseFilePathAnchor('lib/main.dart#L42-L58');
+      expect(anchor.path, 'lib/main.dart');
+      expect(anchor.startLine, 42);
+      expect(anchor.endLine, 58);
+
+      final colonAnchor = parseFilePathAnchor('src/app.ts:17');
+      expect(colonAnchor.path, 'src/app.ts');
+      expect(colonAnchor.startLine, 17);
+      expect(colonAnchor.endLine, 17);
+
+      final stripped = stripAnsiAndControl(
+        'loading 10%\rloading 100%\n\x1B[31mError:\x1B[0m boom\x1B]0;title\x07',
+      );
+      expect(stripped, 'loading 100%\nError: boom');
+      expect(isErrorLogLine('Error: boom'), isTrue);
+      expect(isErrorLogLine('all checks passed'), isFalse);
+
+      final intra = computeIntraLineDiffSpans(
+        oldText: 'final x = foo(bar, 12);',
+        newText: 'final x = foo(baz, 12);',
+        oldBaseStyle: const TextStyle(),
+        newBaseStyle: const TextStyle(),
+        oldEmphBg: const Color(0x40FF0000),
+        newEmphBg: const Color(0x4000FF00),
+      );
+      expect(intra.oldSpan.toPlainText(), 'final x = foo(bar, 12);');
+      expect(intra.newSpan.toPlainText(), 'final x = foo(baz, 12);');
+      expect((intra.oldSpan.children ?? const []).length, greaterThanOrEqualTo(3));
+
+      final rows = parseDelimitedTable(
+        'name,note\n"Alice, A","says ""hi"""\nBob,ok',
+        delimiter: ',',
+      );
+      expect(rows.length, 3);
+      expect(rows[1][0], 'Alice, A');
+      expect(rows[1][1], 'says "hi"');
+
+      final hl = highlightCodeLineIncremental(
+        'select * from users where id = 42;',
+        'sql',
+        isDark: true,
+        fontSize: 12,
+      );
+      expect(hl.span.toPlainText(), 'select * from users where id = 42;');
+      expect((hl.span.children ?? const []).length, greaterThan(2));
+    });
+
+    testWidgets(
+      'v57 unified previewer, multi-image lightbox, diff sheet & ANSI command output work cleanly',
+      (tester) async {
+        tester.view.physicalSize = const Size(412, 915);
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(() {
+          tester.view.resetPhysicalSize();
+          tester.view.resetDevicePixelRatio();
+        });
+
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        final ctrl = container.read(appProvider.notifier);
+
+        const diffA = WorkspaceDiffRecord(
+          path: 'lib/demo.dart',
+          summary: '已修改',
+          added: 2,
+          removed: 1,
+          unifiedDiff: '@@ -1,3 +1,4 @@\n final a = 1;\n-final b = oldVal;\n+final b = newVal;\n+final c = 3;\n@@ -10,2 +11,2 @@\n-oldTail\n+newTail',
+        );
+        const diffB = WorkspaceDiffRecord(
+          path: 'README.md',
+          summary: '新增',
+          added: 1,
+          removed: 0,
+          unifiedDiff: '@@ -0,0 +1,1 @@\n+# GrassBag',
+        );
+        ctrl.state = ctrl.state.copyWith(
+          workspaceDiffs: const [diffA, diffB],
+        );
+
+        late BuildContext hostCtx;
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              navigatorKey: grassBagNavigatorKey,
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: Builder(
+                  builder: (ctx) {
+                    hostCtx = ctx;
+                    return const SizedBox.expand();
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // 1. Unified File Previewer: Markdown rich <-> source toggle + search + @path insert
+        showWorkspaceFilePreviewSheet(
+          hostCtx,
+          path: 'lib/demo.dart',
+          inlineContent: 'final a = 1;\nfinal b = newVal;\nfinal c = 3;\n',
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('demo.dart'), findsOneWidget);
+        expect(find.text('Diff +2 -1'), findsOneWidget);
+        expect(find.text('查找'), findsOneWidget);
+        expect(find.text('引用'), findsOneWidget);
+
+        // Toggle in-place Diff inside the unified sheet without popping!
+        await tester.tap(find.text('Diff +2 -1'));
+        await tester.pumpAndSettle();
+        expect(find.text('完整文件'), findsOneWidget);
+
+        // Insert @path reference into composer draft
+        await tester.tap(find.text('引用'));
+        await tester.pumpAndSettle();
+        expect(ctrl.getComposerDraftForActiveHost(), contains('@lib/demo.dart'));
+
+        // Close sheet
+        await tester.tap(find.byIcon(CupertinoIcons.xmark));
+        await tester.pumpAndSettle();
+
+        // 2. Unified File Previewer: JSON pretty <-> raw + CSV table <-> raw
+        showMemoryFilePreviewSheet(
+          hostCtx,
+          name: 'config.json',
+          bytes: Uint8List.fromList(utf8.encode('{"ok":true,"count":3}')),
+          mimeType: 'application/json',
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('config.json'), findsOneWidget);
+        expect(find.text('原始'), findsOneWidget);
+        await tester.tap(find.byIcon(CupertinoIcons.xmark));
+        await tester.pumpAndSettle();
+
+        // 3. Multi-Image Lightbox: gallery counter 1 / 2, surface toggle & clean close
+        final png1x1 = base64Decode(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==',
+        );
+        showImagePreviewDialog(
+          hostCtx,
+          items: [
+            GrassBagImagePreviewItem(bytes: png1x1, title: 'first.png', mimeType: 'image/png'),
+            GrassBagImagePreviewItem(bytes: png1x1, title: 'second.png', mimeType: 'image/png'),
+          ],
+          initialIndex: 0,
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('1 / 2'), findsOneWidget);
+        expect(find.text('first.png'), findsOneWidget);
+        expect(find.text('深色底'), findsOneWidget);
+        await tester.tap(find.text('深色底'));
+        await tester.pumpAndSettle();
+        expect(find.text('透明格'), findsOneWidget);
+        await tester.tap(find.byIcon(CupertinoIcons.xmark));
+        await tester.pumpAndSettle();
+
+        // 4. Git Diff Sheet: file switcher 1/2, hunk switcher 1/2 处, Copy without auto-pop
+        showDiffSheet(hostCtx, diffA.path, record: diffA);
+        await tester.pumpAndSettle();
+        expect(find.text('1/2'), findsOneWidget);
+        expect(find.text('1/2 处'), findsOneWidget);
+        expect(find.text('复制 Diff'), findsOneWidget);
+        await tester.tap(find.text('复制 Diff'));
+        await tester.pump();
+        expect(find.text('已复制'), findsOneWidget);
+        await tester.tap(find.byIcon(CupertinoIcons.xmark));
+        await tester.pumpAndSettle();
+
+        // 5. Command Output Sheet: ANSI stripping + error-only filter toggle
+        showCommandOutputSheet(
+          hostCtx,
+          command: 'flutter test',
+          failed: true,
+          outputText: '\x1B[32mPASS ok_test.dart\x1B[0m\n\x1B[31mError: assertion failed at lib/a.dart:12\x1B[0m',
+          onOpenTerminal: () {},
+        );
+        await tester.pumpAndSettle();
+        expect(find.textContaining('仅看错误 (1)'), findsOneWidget);
+        expect(find.textContaining('\x1B[', findRichText: true), findsNothing);
+        await tester.tap(find.textContaining('仅看错误 (1)'));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('1 / 2 错误行'), findsOneWidget);
+        await tester.tap(find.byIcon(CupertinoIcons.xmark));
+        await tester.pumpAndSettle();
+        // Flush GrassBagController.showToast auto-dismiss timer cleanly.
+        await tester.pump(const Duration(seconds: 3));
+
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v58 conversation UX regression: Direct-Mode session approval, question draft persistence across collapse, child-expanded process lock, local failed turn dismiss, streaming markdown/LaTeX & drawer multi-select fold preserve',
+      (tester) async {
+        // 1. Streaming Markdown stabilization & expanded LaTeX formatting
+        expect(stabilizeStreamingMarkdownForTest('hello\n```da'), 'hello');
+        expect(stabilizeStreamingMarkdownForTest('hello *world'), 'hello *world*');
+        final prettyLatex = formatReadableLatexForTest(
+          r'\mathcal{O}(n \log n) \implies \binom{n}{2}',
+        );
+        expect(prettyLatex, contains('𝒪'));
+        expect(prettyLatex, contains('log'));
+        expect(prettyLatex, contains('⇒'));
+        expect(prettyLatex, contains('C(n, 2)'));
+
+        // 2. Direct Mode approval still offers '本会话允许' & question collapse preserves answers
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        final ctrl = container.read(appProvider.notifier);
+        final directHost = ctrl.state.activeHost.copyWith(directMode: true);
+        final failedLocalTurn = const NormalizedTurn(
+          turnId: 'client-turn-v58-err',
+          stableKey: 'client-turn-v58-err',
+          seqStart: 1,
+          seqEnd: 1,
+          status: 'error',
+          errorMessage: '网络超时，未能发出请求',
+          userMessage: NormalizedUserMessage(id: 'u-v58', text: '测试重试与移除'),
+          steps: [
+            ReasoningStep(
+              id: 'r-v58-keep',
+              text: 'Detailed analysis step',
+              collapsedPreview: 'Detailed analysis step',
+            ),
+          ],
+        );
+        ctrl.state = ctrl.state.copyWith(
+          hosts: [directHost],
+          activeHostId: directHost.id,
+          activeSessionId: 's-v58',
+          turns: [failedLocalTurn],
+          autoFoldSteps: true,
+          expandedStepIds: const {'r-v58-keep'},
+          pendingApprovalInteractionId: 'appr-v58',
+          pendingApprovalCommand: 'git status',
+          pendingApprovalToolName: 'bash',
+          activePendingInteractionCount: 2,
+          activePendingInteractionIndex: 0,
+        );
+
+        final composerCtrl = TextEditingController();
+        final composerFocus = FocusNode();
+        addTearDown(() {
+          composerCtrl.dispose();
+          composerFocus.dispose();
+        });
+
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: Column(
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        child: TurnView(
+                          turn: failedLocalTurn,
+                          onOpenTerminal: () {},
+                        ),
+                      ),
+                    ),
+                    ChatComposerDock(
+                      controller: composerCtrl,
+                      focusNode: composerFocus,
+                      onOpenTerminal: () {},
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 280));
+
+        // Direct Mode approval must NOT hide '本会话允许', and shows interactive '1 / 2' switcher!
+        expect(find.text('本会话允许'), findsOneWidget);
+        expect(find.text('1 / 2'), findsOneWidget);
+        // TurnView with expanded child step keeps process open despite autoFoldSteps == true!
+        expect(find.text('Detailed analysis step'), findsWidgets);
+        // Local failed turn shows '移除' button and dismissLocalFailedTurn removes it cleanly!
+        expect(find.text('移除'), findsOneWidget);
+        ctrl.dismissLocalFailedTurn('client-turn-v58-err');
+        expect(ctrl.state.turns, isEmpty);
+
+        // 3. Question Takeover preserves selected option across '收起查看对话' collapse & expand,
+        //    and single-select option tap symmetrically clears custom text!
+        ctrl.state = ctrl.state.copyWith(
+          clearPendingApproval: true,
+          activePendingInteractionCount: 1,
+          activeQuestion: const ActiveUserQuestion(
+            interactionId: 'q-v58',
+            title: '选择方案',
+            prompt: '请选择一项或补充说明',
+            options: ['方案 A', '方案 B'],
+            allowFreeText: true,
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 350));
+        expect(find.text('方案 A'), findsOneWidget);
+        final questionEditable = find.descendant(
+          of: find.byType(GrassBagTextField).first,
+          matching: find.byType(EditableText),
+        );
+        await tester.enterText(find.byType(GrassBagTextField).first, '自定义补充');
+        await tester.pump();
+        expect(
+          tester.widget<EditableText>(questionEditable).controller.text,
+          '自定义补充',
+        );
+        // Tapping single-select chip '方案 A' must clear custom text symmetrically!
+        await tester.tap(find.text('方案 A'));
+        await tester.pump();
+        expect(
+          tester.widget<EditableText>(questionEditable).controller.text,
+          isEmpty,
+        );
+        // Collapse Takeover ('收起查看对话') and re-expand -> '方案 A' selection must survive!
+        await tester.tap(find.text('收起查看对话'));
+        await tester.pump(const Duration(milliseconds: 280));
+        expect(find.text('助手在等待你回答 · 点击展开'), findsOneWidget);
+        await tester.tap(find.text('助手在等待你回答 · 点击展开'));
+        await tester.pump(const Duration(milliseconds: 280));
+        expect(find.text('提交选择'), findsOneWidget);
+
+        // 4. SessionsSidebar preserves collapsed workspace group across multi-select toggle
+        //    and displays 2nd-line relative updatedAt!
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        ctrl.state = ctrl.state.copyWith(
+          activeSessionId: null,
+          sessions: [
+            ChatSessionItem(
+              id: 's-drawer-1',
+              title: '对话甲',
+              group: '今天',
+              workspaceId: 'ws-a',
+              workspaceName: 'AlphaRepo',
+              updatedAt: nowMs - 120000,
+              pendingApproval: true,
+            ),
+            ChatSessionItem(
+              id: 's-drawer-2',
+              title: '对话乙',
+              group: '今天',
+              workspaceId: 'ws-b',
+              workspaceName: 'BetaRepo',
+              updatedAt: nowMs - 3600000,
+            ),
+          ],
+          workspaces: const [
+            WorkspaceItem(id: 'ws-a', name: 'AlphaRepo', path: '/tmp/alpha'),
+            WorkspaceItem(id: 'ws-b', name: 'BetaRepo', path: '/tmp/beta'),
+          ],
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: SessionsSidebar(
+                  isTabletDocked: true,
+                  onOpenTerminal: () {},
+                  onOpenFeatures: () {},
+                  onOpenSettings: () {},
+                  onOpenHostsSettings: () {},
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 200));
+        expect(find.text('2分钟前'), findsOneWidget);
+        // Collapse AlphaRepo group
+        await tester.tap(find.text('AlphaRepo'));
+        await tester.pump();
+        expect(find.text('对话甲'), findsNothing);
+        // Enter multi-select -> temporarily expands; exit multi-select -> restores collapse!
+        await tester.tap(find.byTooltip('批量多选'));
+        await tester.pump();
+        expect(find.text('对话甲'), findsOneWidget);
+        await tester.tap(find.byTooltip('退出多选'));
+        await tester.pump();
+        expect(find.text('对话甲'), findsNothing);
+
+        await tester.pump(const Duration(seconds: 3));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v59 motion regression: shader tree stability across press/visibility/highlight, segmented drag survival & Reduce Motion',
+      (tester) async {
+        final lightTheme = GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme();
+
+        // 1. KyantInteractiveGlassButton keeps identical child State across press, release, and enabled toggle
+        final btnProbeKey = GlobalKey<_StateIdentityProbeState>();
+        var btnEnabled = true;
+        late StateSetter setBtnState;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: lightTheme,
+            home: Scaffold(
+              body: Center(
+                child: StatefulBuilder(
+                  builder: (_, setState) {
+                    setBtnState = setState;
+                    return KyantInteractiveGlassButton(
+                      style: const KyantLiquidGlassStyle(),
+                      borderRadius: BorderRadius.circular(18),
+                      enabled: btnEnabled,
+                      onTap: () {},
+                      child: SizedBox(
+                        width: 120,
+                        height: 44,
+                        child: _StateIdentityProbe(key: btnProbeKey),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final btnInitialState = btnProbeKey.currentState!;
+        final btnCenter = tester.getCenter(find.byKey(btnProbeKey));
+        final btnGesture = await tester.startGesture(btnCenter);
+        await tester.pump(const Duration(milliseconds: 50));
+        expect(identical(btnProbeKey.currentState, btnInitialState), isTrue);
+        await btnGesture.up();
+        await tester.pump(const Duration(milliseconds: 80));
+        expect(identical(btnProbeKey.currentState, btnInitialState), isTrue);
+        setBtnState(() => btnEnabled = false);
+        await tester.pump();
+        expect(identical(btnProbeKey.currentState, btnInitialState), isTrue);
+        setBtnState(() => btnEnabled = true);
+        await tester.pumpAndSettle();
+        expect(identical(btnProbeKey.currentState, btnInitialState), isTrue);
+
+        // 2. KyantLiquidGlass keeps identical child State across visibility 0 -> 1 -> 0
+        final visProbeKey = GlobalKey<_StateIdentityProbeState>();
+        var vis = 0.0;
+        late StateSetter setVisState;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: lightTheme,
+            home: Scaffold(
+              body: Center(
+                child: StatefulBuilder(
+                  builder: (_, setState) {
+                    setVisState = setState;
+                    return KyantLiquidGlass(
+                      visibility: vis,
+                      style: const KyantLiquidGlassStyle(),
+                      borderRadius: BorderRadius.circular(20),
+                      child: SizedBox(
+                        width: 120,
+                        height: 48,
+                        child: _StateIdentityProbe(key: visProbeKey),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        final visInitialState = visProbeKey.currentState!;
+        setVisState(() => vis = 1.0);
+        await tester.pump();
+        expect(identical(visProbeKey.currentState, visInitialState), isTrue);
+        setVisState(() => vis = 0.0);
+        await tester.pump();
+        expect(identical(visProbeKey.currentState, visInitialState), isTrue);
+
+        // 3. GrassBagInteractiveHighlight keeps identical child State across initial pointer down
+        final hlProbeKey = GlobalKey<_StateIdentityProbeState>();
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: lightTheme,
+            home: Scaffold(
+              body: Center(
+                child: GrassBagInteractiveHighlight(
+                  borderRadius: 16,
+                  child: SizedBox(
+                    width: 120,
+                    height: 44,
+                    child: _StateIdentityProbe(key: hlProbeKey),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        final hlInitialState = hlProbeKey.currentState!;
+        final hlGesture = await tester.startGesture(tester.getCenter(find.byKey(hlProbeKey)));
+        await tester.pump(const Duration(milliseconds: 40));
+        expect(identical(hlProbeKey.currentState, hlInitialState), isTrue);
+        await hlGesture.up();
+        await tester.pumpAndSettle();
+        expect(identical(hlProbeKey.currentState, hlInitialState), isTrue);
+
+        // 4. GrassBagSegmentedControl survives continuous horizontal drag past pixel-1 without cancellation
+        var segIdx = 0;
+        late StateSetter setSegState;
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: lightTheme,
+            home: Scaffold(
+              body: Center(
+                child: SizedBox(
+                  width: 300,
+                  child: StatefulBuilder(
+                    builder: (_, setState) {
+                      setSegState = setState;
+                      return GrassBagSegmentedControl(
+                        labels: const ['液态', '磨砂', '实体'],
+                        selectedIndex: segIdx,
+                        tier: GrassBagGlassTier.liquid,
+                        onSelected: (v) => setSegState(() => segIdx = v),
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final segRect = tester.getRect(find.byType(GrassBagSegmentedControl));
+        final segDrag = await tester.startGesture(
+          Offset(segRect.left + segRect.width * 0.16, segRect.center.dy),
+        );
+        await tester.pump(const Duration(milliseconds: 24));
+        for (var step = 0; step < 8; step++) {
+          await segDrag.moveBy(Offset(segRect.width * 0.09, 0));
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        await segDrag.up();
+        await tester.pumpAndSettle();
+        expect(segIdx, 2);
+
+        // 5. GrassBagMotion & GrassBagSmoothDisclosure strictly obey OS Reduce Motion
+        var disclosed = false;
+        Duration? resolvedDur;
+        bool? reducedFlag;
+        late StateSetter setDiscState;
+        await tester.pumpWidget(
+          MediaQuery(
+            data: const MediaQueryData(disableAnimations: true),
+            child: MaterialApp(
+              theme: lightTheme,
+              home: Scaffold(
+                body: StatefulBuilder(
+                  builder: (ctx, setState) {
+                    setDiscState = setState;
+                    resolvedDur = GrassBagMotion.duration(ctx, GrassBagMotion.standardDuration);
+                    reducedFlag = GrassBagMotion.reduceMotion(ctx);
+                    return GrassBagSmoothDisclosure(
+                      expanded: disclosed,
+                      child: const SizedBox(height: 60, child: Text('折叠内容')),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(reducedFlag, isTrue);
+        expect(resolvedDur, Duration.zero);
+        expect(find.text('折叠内容'), findsNothing);
+        setDiscState(() => disclosed = true);
+        await tester.pump();
+        // Under Reduce Motion, disclosure snaps to full height on the very first frame (no 230ms wait)
+        expect(find.text('折叠内容'), findsOneWidget);
+        expect(tester.getSize(find.byType(GrassBagSmoothDisclosure)).height, 60.0);
+
+        // 6. Solid-tier GrassBagGlassPillButton hugs its content width (matches Liquid tier, never stretches!)
+        final solidPillKey = GlobalKey();
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: lightTheme,
+            home: Scaffold(
+              body: SizedBox(
+                width: 360,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: GrassBagGlassPillButton(
+                        key: solidPillKey,
+                        tier: GrassBagGlassTier.solid,
+                        onTap: () {},
+                        child: const Text('本机'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(tester.getSize(find.byKey(solidPillKey)).width, lessThan(180.0));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'v60 regression: OfficialWebPage SSL host extraction unwraps .platform, model deep equality holds, and duplicate Markdown image URLs across turns have zero Hero collision',
+      (WidgetTester tester) async {
+        // 1. OfficialWebPage.extractSslErrorHost unwraps request.platform first
+        final androidStyle = _FakeSslWrapper(_FakePlatformUrl('https://Local-Box.LAN:3080/login'));
+        expect(OfficialWebPage.extractSslErrorHost(androidStyle), 'local-box.lan');
+        final iosStyle = _FakeSslWrapper(_FakePlatformHost('My-Mac.Local'));
+        expect(OfficialWebPage.extractSslErrorHost(iosStyle), 'my-mac.local');
+
+        // 2. Deep value equality on ActiveUserQuestion / UserQuestionItem and SessionTelemetry / ModelUsageGroup
+        const q1 = ActiveUserQuestion(
+          interactionId: 'iq-1',
+          title: 'Choice',
+          prompt: 'Pick one?',
+          options: ['Yes', 'No'],
+          questions: [
+            UserQuestionItem(id: 'a', title: 'Q1', prompt: 'Pick one?', options: ['Yes', 'No']),
+          ],
+        );
+        const q2 = ActiveUserQuestion(
+          interactionId: 'iq-1',
+          title: 'Choice',
+          prompt: 'Pick one?',
+          options: ['Yes', 'No'],
+          questions: [
+            UserQuestionItem(id: 'a', title: 'Q1', prompt: 'Pick one?', options: ['Yes', 'No']),
+          ],
+        );
+        const q3 = ActiveUserQuestion(
+          interactionId: 'iq-1',
+          title: 'Choice',
+          prompt: 'Pick one?',
+          options: ['Yes', 'No'],
+          questions: [
+            UserQuestionItem(id: 'a', title: 'Q1', prompt: 'Pick two?', options: ['Yes', 'No']),
+          ],
+        );
+        expect(q1, equals(q2));
+        expect(q1.hashCode, equals(q2.hashCode));
+        expect(q1 == q3, isFalse);
+
+        const t1 = SessionTelemetry(
+          modelGroups: [
+            ModelUsageGroup(
+              provider: 'deepseek',
+              model: 'deepseek-chat',
+              uncachedInputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            ),
+          ],
+        );
+        const t2 = SessionTelemetry(
+          modelGroups: [
+            ModelUsageGroup(
+              provider: 'deepseek',
+              model: 'deepseek-chat',
+              uncachedInputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            ),
+          ],
+        );
+        const t3 = SessionTelemetry(
+          modelGroups: [
+            ModelUsageGroup(
+              provider: 'deepseek',
+              model: 'deepseek-reasoner',
+              uncachedInputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            ),
+          ],
+        );
+        expect(t1, equals(t2));
+        expect(t1.hashCode, equals(t2.hashCode));
+        expect(t1 == t3, isFalse);
+
+        // 3. Duplicate Markdown image URLs across multiple turns produce distinct Hero tags (no crash)
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+        const dupTurnA = NormalizedTurn(
+          turnId: 't-dup-img-a',
+          status: 'completed',
+          userMessage: NormalizedUserMessage(id: 'u-a', text: '图 1'),
+          assistantText: '![same](https://example.com/shared.png)\n\n![same2](https://example.com/shared.png)',
+        );
+        const dupTurnB = NormalizedTurn(
+          turnId: 't-dup-img-b',
+          status: 'completed',
+          userMessage: NormalizedUserMessage(id: 'u-b', text: '图 2'),
+          assistantText: '![same3](https://example.com/shared.png)',
+        );
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              theme: GrassBagTokens.resolve(GrassBagAccent.teal, Brightness.light).toMaterialTheme(),
+              home: Scaffold(
+                body: ListView(
+                  children: [
+                    TurnView(turn: dupTurnA, onOpenTerminal: () {}),
+                    TurnView(turn: dupTurnB, onOpenTerminal: () {}),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        final heroes = tester.widgetList<Hero>(find.byType(Hero)).toList();
+        expect(heroes.length, 3);
+        expect(heroes.map((h) => h.tag).toSet().length, 3);
+        expect(tester.takeException(), isNull);
+      },
+    );
   });
+}
+
+class _FakePlatformUrl {
+  const _FakePlatformUrl(this.url);
+  final String url;
+}
+
+class _FakePlatformHost {
+  const _FakePlatformHost(this.host);
+  final String host;
+}
+
+class _FakeSslWrapper {
+  const _FakeSslWrapper(this.platform);
+  final Object platform;
+}
+
+class _StateIdentityProbe extends StatefulWidget {
+  const _StateIdentityProbe({super.key});
+
+  @override
+  State<_StateIdentityProbe> createState() => _StateIdentityProbeState();
+}
+
+class _StateIdentityProbeState extends State<_StateIdentityProbe> {
+  @override
+  Widget build(BuildContext context) => const SizedBox.expand();
 }
 
 class _CountingToolDetailController extends GrassBagController {

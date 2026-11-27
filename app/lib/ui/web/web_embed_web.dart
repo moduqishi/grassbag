@@ -239,3 +239,55 @@ bool downloadWebTextFile(String filename, String content) {
     return false;
   }
 }
+
+/// Real browser binary download for images, attachments, and source files.
+bool downloadWebBytes(
+  String filename,
+  Uint8List bytes, {
+  String mimeType = 'application/octet-stream',
+}) {
+  if (bytes.isEmpty) return false;
+  try {
+    final blobCtor = _window.getProperty<JSFunction>('Blob'.toJS);
+    final parts = <JSAny>[bytes.toJS].toJS;
+    final opts = JSObject()..setProperty('type'.toJS, mimeType.toJS);
+    final blob = blobCtor.callAsConstructor<JSObject>(parts, opts);
+    final urlApi = _window.getProperty<JSObject>('URL'.toJS);
+    final href = urlApi.callMethod<JSString>('createObjectURL'.toJS, blob);
+    final a = _document.callMethod<JSObject>('createElement'.toJS, 'a'.toJS);
+    a.setProperty('href'.toJS, href);
+    a.setProperty('download'.toJS, filename.toJS);
+    a.callMethod<JSAny?>('click'.toJS);
+    Timer(const Duration(seconds: 5), () {
+      try {
+        urlApi.callMethod<JSAny?>('revokeObjectURL'.toJS, href);
+      } catch (_) {}
+    });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Fetches remote URL bytes on web via `window.fetch` when CORS permits.
+Future<Uint8List?> fetchRemoteBytes(
+  String url, {
+  int maxBytes = 24 * 1024 * 1024,
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  try {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) return null;
+    final respPromise = _window.callMethod<JSPromise<JSObject>>('fetch'.toJS, uri.toString().toJS);
+    final resp = await respPromise.toDart.timeout(timeout);
+    final ok = resp.getProperty<JSBoolean?>('ok'.toJS)?.toDart ?? false;
+    if (!ok) return null;
+    final bufPromise = resp.callMethod<JSPromise<JSArrayBuffer>>('arrayBuffer'.toJS);
+    final buf = await bufPromise.toDart.timeout(timeout);
+    final bytes = buf.toDart.asUint8List();
+    if (bytes.length > maxBytes) return null;
+    return bytes;
+  } catch (_) {
+    return null;
+  }
+}

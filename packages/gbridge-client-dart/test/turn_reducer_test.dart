@@ -1037,5 +1037,193 @@ void main() {
       expect(afterReason.durationMs, beforeReason.durationMs);
       expect(afterTool.durationMs, beforeTool.durationMs);
     });
+
+    test('v58 regression: preserves ReasoningStep.id across snapshots, deduplicates [附件: ...] suffix & settles authoritative no-usage turns', () {
+      final reducer = TurnStreamReducer();
+      // 1. Optimistic user turn with attachment whose server echo appends `\n[附件: design.png]`
+      reducer.replaceAll([
+        const NormalizedTurn(
+          turnId: 'client-turn-v58',
+          stableKey: 'client-turn-v58',
+          seqStart: 0,
+          seqEnd: 0,
+          status: 'streaming',
+          userMessage: NormalizedUserMessage(
+            id: 'u-opt-v58',
+            text: '帮我分析这张图',
+          ),
+        ),
+      ]);
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 10,
+        type: 'turn.snapshot',
+        data: {
+          'turns': [
+            {
+              'turnId': 'srv-turn-v58',
+              'seqStart': 1,
+              'seqEnd': 10,
+              'status': 'streaming',
+              'userMessage': {
+                'id': 'u-srv-v58',
+                'text': '帮我分析这张图\n[附件: design.png]',
+              },
+              'steps': [
+                {
+                  'kind': 'reasoning',
+                  'id': 'reason-srv-turn-v58-0',
+                  'text': 'Step 1: inspect layout',
+                  'collapsedPreview': 'Step 1: inspect layout',
+                  'durationMs': 420,
+                  'translatedText': '步骤 1：检查布局',
+                },
+              ],
+              'assistantText': '正在分析',
+            },
+          ],
+        },
+      ));
+      // Optimistic turn must be reconciled (not duplicated!) with preserved stableKey.
+      expect(reducer.turns.length, 1);
+      expect(reducer.turns.single.turnId, 'srv-turn-v58');
+      expect(reducer.turns.single.stableKey, 'client-turn-v58');
+
+      // 2. Subsequent authoritative snapshot with a different ReasoningStep.id (`reason-seq-12`)
+      //    and no `usage` (custom model) + `sessionRunning: false` must preserve the original
+      //    ReasoningStep.id, durationMs, translatedText AND settle status to `completed`!
+      reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 12,
+        type: 'turn.snapshot',
+        data: {
+          'sessionRunning': false,
+          'turns': [
+            {
+              'turnId': 'srv-turn-v58',
+              'seqStart': 1,
+              'seqEnd': 12,
+              'status': 'completed',
+              'userMessage': {
+                'id': 'u-srv-v58',
+                'text': '帮我分析这张图\n[附件: design.png]',
+              },
+              'steps': [
+                {
+                  'kind': 'reasoning',
+                  'id': 'reason-seq-12',
+                  'text': 'Step 1: inspect layout and typography',
+                  'collapsedPreview': 'Step 1: inspect layout and typography',
+                },
+              ],
+              'assistantText': '正在分析，已完成检查。',
+            },
+          ],
+        },
+      ));
+      final settled = reducer.turns.single;
+      expect(settled.status, 'completed');
+      expect(settled.isStreaming, isFalse);
+      final reason = settled.steps.whereType<ReasoningStep>().single;
+      expect(reason.id, 'reason-srv-turn-v58-0');
+      expect(reason.durationMs, 420);
+      expect(reason.translatedText, '步骤 1：检查布局');
+    });
+
+    test('v60 regression: turn.snapshot updates metadata/ActionCard sdui, assistant-stream/abandoned drops only uncommitted reasoning, and address_parser strips userinfo', () {
+      final reducer = TurnStreamReducer([
+        const NormalizedTurn(
+          turnId: 't-v60',
+          status: 'completed',
+          seqStart: 1,
+          seqEnd: 4,
+          assistantText: '完成',
+          steps: [
+            ActionCardStep(id: 'ac-1', sdui: {'type': 'card', 'title': 'Draft'}),
+          ],
+        ),
+      ]);
+
+      // Snapshot with identical step count & text but updated assistantMessageId, usage, seqEnd & ActionCard.sdui MUST apply!
+      final changed = reducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 10,
+        type: 'turn.snapshot',
+        data: {
+          'turns': [
+            {
+              'turnId': 't-v60',
+              'status': 'completed',
+              'seqStart': 1,
+              'seqEnd': 9,
+              'assistantMessageId': 'msg-assistant-9',
+              'assistantText': '完成',
+              'usage': {'inputTokens': 320, 'outputTokens': 64},
+              'steps': [
+                {
+                  'kind': 'action_card',
+                  'id': 'ac-1',
+                  'sdui': {'type': 'card', 'title': 'Confirmed'},
+                },
+              ],
+            },
+          ],
+        },
+      ));
+      expect(changed, isTrue);
+      expect(reducer.turns.single.assistantMessageId, 'msg-assistant-9');
+      expect(reducer.turns.single.seqEnd, 9);
+      expect(reducer.turns.single.usage?.outputTokens, 64);
+      expect((reducer.turns.single.steps.single as ActionCardStep).sdui['title'], 'Confirmed');
+
+      // assistant-stream/abandoned drops uncommitted reasoning without creating phantom turns
+      final abReducer = TurnStreamReducer();
+      final phantomChanged = abReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 1,
+        type: 'turn.delta',
+        data: {
+          'turnId': 'ghost',
+          'chunk': {'type': 'assistant-stream/abandoned'},
+        },
+      ));
+      expect(phantomChanged, isFalse);
+      expect(abReducer.turns, isEmpty);
+
+      abReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 2,
+        type: 'turn.start',
+        data: {'turnId': 't-ab'},
+      ));
+      abReducer.apply(const StreamFrame(
+        op: 'delta',
+        seq: 3,
+        type: 'turn.delta',
+        data: {
+          'turnId': 't-ab',
+          'chunk': {'type': 'reasoning-delta', 'id': 'r-draft', 'delta': 'draft thought'},
+        },
+      ));
+      expect(abReducer.turns.single.steps.whereType<ReasoningStep>(), hasLength(1));
+      abReducer.apply(const StreamFrame(
+        op: 'event',
+        seq: 4,
+        type: 'turn.delta',
+        data: {
+          'turnId': 't-ab',
+          'chunk': {'type': 'assistant-stream/abandoned'},
+        },
+      ));
+      expect(abReducer.turns.single.steps.whereType<ReasoningStep>(), isEmpty);
+
+      // address_parser strips user:pass@ before IPv6/port extraction
+      final parsedAuth = parseRemoteHostInput('admin:secret@10.0.0.12:3081');
+      expect(parsedAuth, isNotNull);
+      expect(parsedAuth!.address, 'http://admin:secret@10.0.0.12:3081');
+      final parsedHostNoPort = parseRemoteHostInput('alice:secret@my.server.dev');
+      expect(parsedHostNoPort, isNotNull);
+      expect(parsedHostNoPort!.address, 'https://alice:secret@my.server.dev');
+    });
   });
 }

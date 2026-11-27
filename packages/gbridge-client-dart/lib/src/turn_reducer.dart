@@ -26,6 +26,7 @@ class TurnStreamReducer {
   // stamp accurate `durationMs` when transitioning to tools/answer/completion.
   final Map<String, int> _reasoningStartedAtMs = <String, int>{};
   final Map<String, int> _toolStartedAtMs = <String, int>{};
+  String? _uncommittedReasoningId;
 
   /// Zero-flush O(1) check for whether the tail streaming turn already has buffered
   /// or committed assistant text or steps (avoids triggering full `turns` flush per WS delta!).
@@ -210,6 +211,7 @@ class TurnStreamReducer {
         stepId,
         () => DateTime.now().millisecondsSinceEpoch,
       );
+      _uncommittedReasoningId = stepId;
       steps.add(ReasoningStep(
         id: stepId,
         text: delta,
@@ -230,6 +232,7 @@ class TurnStreamReducer {
   }
 
   void replaceAll(List<NormalizedTurn> turns) {
+    _uncommittedReasoningId = null;
     _activeTextBuf = null;
     _activeTextTurnIdx = -1;
     _activeTextMaxSeq = 0;
@@ -485,6 +488,9 @@ class TurnStreamReducer {
                   _turns.last.turnId.startsWith('client-turn-')
               ? _turns.last
               : null;
+          final snapshotNotRunning =
+              data['sessionRunning'] == false || data['running'] == false;
+          final isAuthoritative = data['authoritative'] == true;
           final parsed = (data['turns'] as List<dynamic>)
               .whereType<Map<String, dynamic>>()
               .map((raw) {
@@ -492,16 +498,69 @@ class TurnStreamReducer {
                 final prev = prevById[t.turnId];
                 if (prev != null) {
                   final enrichedSteps = _preserveStepDurations(prev.steps, t.steps);
+                  if (prev.isStreaming) {
+                    final snapshotSettled = (snapshotNotRunning || isAuthoritative) &&
+                        t.status == 'completed' &&
+                        !t.isStreaming &&
+                        !enrichedSteps.any((s) => s is ToolStep && s.status == 'running') &&
+                        t.assistantText.length >= prev.assistantText.length &&
+                        (t.assistantText.isNotEmpty ||
+                            enrichedSteps.length >= prev.steps.length);
+                    final hasTerminal = t.usage != null ||
+                        t.deliverables.isNotEmpty ||
+                        (t.errorMessage?.isNotEmpty == true) ||
+                        t.status == 'cancelled' ||
+                        t.status == 'interrupted' ||
+                        t.status == 'error' ||
+                        snapshotSettled;
+                    final mergedText = (!hasTerminal && prev.assistantText.length > t.assistantText.length)
+                        ? prev.assistantText
+                        : t.assistantText;
+                    final mergedSteps = (!hasTerminal && prev.steps.length > enrichedSteps.length)
+                        ? prev.steps
+                        : enrichedSteps;
+                    final mergedStatus = (!hasTerminal && !t.isStreaming && (mergedText.isNotEmpty || mergedSteps.isNotEmpty))
+                        ? 'streaming'
+                        : t.status;
+                    final mergedUser = _mergeUserMessages(prev.userMessage, t.userMessage);
+                    if (prev.status == mergedStatus &&
+                        prev.assistantText == mergedText &&
+                        prev.assistantMessageId == t.assistantMessageId &&
+                        prev.seqStart == t.seqStart &&
+                        prev.seqEnd == t.seqEnd &&
+                        prev.errorCode == t.errorCode &&
+                        _usageEquivalent(prev.usage, t.usage) &&
+                        _stepsEquivalent(prev.steps, mergedSteps) &&
+                        prev.errorMessage == t.errorMessage &&
+                        _deliverablesEquivalent(prev.deliverables, t.deliverables) &&
+                        identical(prev.userMessage, mergedUser)) {
+                      return prev;
+                    }
+                    return t.copyWith(
+                      stableKey: prev.stableKey,
+                      status: mergedStatus,
+                      assistantText: mergedText,
+                      userMessage: mergedUser,
+                      steps: mergedSteps,
+                    );
+                  }
+                  final mergedUser = _mergeUserMessages(prev.userMessage, t.userMessage);
                   if (prev.status == t.status &&
                       prev.assistantText == t.assistantText &&
+                      prev.assistantMessageId == t.assistantMessageId &&
+                      prev.seqStart == t.seqStart &&
+                      prev.seqEnd == t.seqEnd &&
+                      prev.errorCode == t.errorCode &&
+                      _usageEquivalent(prev.usage, t.usage) &&
                       _stepsEquivalent(prev.steps, enrichedSteps) &&
                       prev.errorMessage == t.errorMessage &&
-                      prev.deliverables.length == t.deliverables.length &&
-                      (prev.userMessage?.text ?? '') == (t.userMessage?.text ?? '')) {
+                      _deliverablesEquivalent(prev.deliverables, t.deliverables) &&
+                      identical(prev.userMessage, mergedUser)) {
                     return prev;
                   }
                   return t.copyWith(
                     stableKey: prev.stableKey,
+                    userMessage: mergedUser,
                     steps: enrichedSteps,
                   );
                 }
@@ -531,16 +590,19 @@ class TurnStreamReducer {
           }
           // Preserve older turns previously prepended by `loadOlderTurns()` so live
           // `turn.snapshot` updates never wipe paginated chat history!
+          // Skip reconciled optimistic `client-turn-*` shells (seqEnd == 0 / matching stableKey).
           if (_turns.isNotEmpty && parsed.isNotEmpty) {
             final snapIds = <String>{for (final t in parsed) t.turnId};
+            final snapStableKeys = <String>{for (final t in parsed) t.stableKey};
             final minSnapSeq = parsed
                 .map((t) => t.seqStart)
                 .where((s) => s > 0)
                 .fold<int>(0x7fffffff, (a, b) => a < b ? a : b);
             final olderPrefix = <NormalizedTurn>[];
             for (final t in _turns) {
-              if (snapIds.contains(t.turnId)) break;
-              if (minSnapSeq > 0 && minSnapSeq < 0x7fffffff && t.seqEnd >= 0 && t.seqEnd < minSnapSeq) {
+              if (snapIds.contains(t.turnId) || snapStableKeys.contains(t.stableKey)) break;
+              if (t.turnId.startsWith('client-turn-')) continue;
+              if (minSnapSeq > 0 && minSnapSeq < 0x7fffffff && t.seqEnd > 0 && t.seqEnd < minSnapSeq) {
                 olderPrefix.add(t);
               }
             }
@@ -635,19 +697,32 @@ class TurnStreamReducer {
             ? rawObj['data'] as Map<String, dynamic>
             : data;
         final endTurnId = (data['turnId'] ?? rawData['turnId'])?.toString();
-        if (endTurnId != null &&
-            endTurnId.isNotEmpty &&
-            _turns.isNotEmpty &&
-            _turns.last.isStreaming &&
-            _turns.last.turnId != endTurnId) {
+        final rawReasonPre = rawData['reason'] ?? data['reason'] ?? data['status'] ?? 'completed';
+        final reasonPre = rawReasonPre is Map<String, dynamic>
+            ? (rawReasonPre['kind'] ?? rawReasonPre['status'] ?? 'completed').toString()
+            : rawReasonPre.toString();
+        final hasErrPayloadPre = reasonPre == 'error' ||
+            reasonPre == 'interrupted' ||
+            (data['errorMessage']?.toString().isNotEmpty ?? false) ||
+            data['error'] != null ||
+            rawData['error'] != null;
+        if (endTurnId != null && endTurnId.isNotEmpty) {
           final matchedIdx = _turns.indexWhere((t) => t.turnId == endTurnId);
-          // Ignore stale completion for an unknown older turn OR an already-cancelled
-          // interrupted turn while a newer streaming/interrupt turn is active at the tail!
-          if ((matchedIdx < 0 && !_turns.last.turnId.startsWith('client-turn-')) ||
-              (matchedIdx >= 0 && matchedIdx < _turns.length - 1 && !_turns[matchedIdx].isStreaming)) {
+          if (_turns.isNotEmpty && _turns.last.isStreaming && _turns.last.turnId != endTurnId) {
+            // Ignore stale completion for an unknown older turn OR an already-cancelled
+            // interrupted turn while a newer streaming/interrupt turn is active at the tail!
+            if ((matchedIdx < 0 && !_turns.last.turnId.startsWith('client-turn-')) ||
+                (matchedIdx >= 0 && matchedIdx < _turns.length - 1 && !_turns[matchedIdx].isStreaming)) {
+              return false;
+            }
+          } else if (matchedIdx < 0 &&
+              !hasErrPayloadPre &&
+              (_turns.isEmpty || !_turns.last.isStreaming)) {
+            // Stale completion for an unknown turn when nothing is streaming -> never spawn a blank phantom turn!
             return false;
           }
         }
+        _uncommittedReasoningId = null;
         final idx = _ensureActiveTurnIndex(
           endTurnId,
           eventSeq,
@@ -791,14 +866,22 @@ class TurnStreamReducer {
       final text = _extractChunkText(rawChunk);
       if (cType == 'assistant-stream/abandoned') {
         _flushBuffers();
-        final idx = _ensureActiveTurnIndex(data['turnId']?.toString(), eventSeq);
+        final reqTurnId = data['turnId']?.toString();
+        var idx = (reqTurnId != null && reqTurnId.isNotEmpty)
+            ? _turns.indexWhere((t) => t.turnId == reqTurnId)
+            : -1;
+        if (idx < 0 && _turns.isNotEmpty && _turns.last.isStreaming) {
+          idx = _turns.length - 1;
+        }
+        if (idx < 0) continue;
         final cur = _turns[idx];
         var nextSteps = cur.steps;
         var droppedReason = false;
         if (cur.steps.isNotEmpty && cur.steps.last is ReasoningStep) {
           final lastReason = cur.steps.last as ReasoningStep;
-          if (_reasoningStartedAtMs.containsKey(lastReason.id)) {
+          if (_reasoningStartedAtMs.containsKey(lastReason.id) || _uncommittedReasoningId == lastReason.id) {
             _reasoningStartedAtMs.remove(lastReason.id);
+            if (_uncommittedReasoningId == lastReason.id) _uncommittedReasoningId = null;
             nextSteps = List<NormalizedStep>.unmodifiable(
               cur.steps.sublist(0, cur.steps.length - 1),
             );
@@ -907,14 +990,24 @@ class TurnStreamReducer {
           ));
           nextAssistantText = '';
         }
-        final effId = callId.isEmpty ? 'call-$fallbackIdSeq' : callId;
+        final resolvedName = name.isEmpty ? 'tool' : name;
+        String effId = callId;
+        if (effId.isEmpty) {
+          if (steps.isNotEmpty && steps.last is ToolStep) {
+            final tail = steps.last as ToolStep;
+            if (tail.status == 'running' && tail.name == resolvedName) {
+              effId = tail.callId;
+            }
+          }
+          if (effId.isEmpty) effId = 'call-$fallbackIdSeq';
+        }
         _toolStartedAtMs.putIfAbsent(effId, () => DateTime.now().millisecondsSinceEpoch);
         final existIdx = steps.indexWhere((s) => s is ToolStep && s.callId == effId);
         if (existIdx < 0) {
           steps.add(ToolStep(
             callId: effId,
-            name: name.isEmpty ? 'tool' : name,
-            title: name.isEmpty ? 'tool' : name,
+            name: resolvedName,
+            title: resolvedName,
             status: 'running',
           ));
           _turns[idx] = cur.copyWith(
@@ -954,8 +1047,19 @@ class TurnStreamReducer {
         final ri = _findMatchingReasoningIndex(target, s);
         if (ri >= 0) {
           final prev = target[ri] as ReasoningStep;
-          target[ri] = (s.durationMs == null && prev.durationMs != null)
-              ? s.copyWith(durationMs: prev.durationMs)
+          final keepId = prev.id.isNotEmpty ? prev.id : s.id;
+          final keepDuration = s.durationMs ?? prev.durationMs;
+          final keepTranslation = s.translatedText ?? prev.translatedText;
+          target[ri] = (keepId != s.id ||
+                  keepDuration != s.durationMs ||
+                  keepTranslation != s.translatedText)
+              ? ReasoningStep(
+                  id: keepId,
+                  text: s.text,
+                  collapsedPreview: s.collapsedPreview,
+                  translatedText: keepTranslation,
+                  durationMs: keepDuration,
+                )
               : s;
         } else {
           target.add(s);
@@ -1009,14 +1113,29 @@ class TurnStreamReducer {
     return -1;
   }
 
+  static final RegExp _trailingAttachmentTagRe = RegExp(
+    r'(?:\s*\[(?:附件|Attachment|附件已上传)\s*[:：][^\]]*\])+\s*$',
+    caseSensitive: false,
+  );
+
+  static String _stripTrailingAttachmentTags(String s) =>
+      s.replaceFirst(_trailingAttachmentTagRe, '').trim();
+
   static bool _userTextsMatch(String optTrim, String snapTrim) {
     if (optTrim == snapTrim) return true;
     if (optTrim.isEmpty || snapTrim.isEmpty) return false;
-    // Server may prepend `[引用文件: ...]` / `[引用会话: ...]` / `@file:...` / `@session:...` lines.
-    if (snapTrim.endsWith(optTrim) || optTrim.endsWith(snapTrim)) return true;
-    final normOpt = optTrim.replaceAll(RegExp(r'\s+'), ' ');
-    final normSnap = snapTrim.replaceAll(RegExp(r'\s+'), ' ');
-    return normSnap == normOpt || normSnap.endsWith(normOpt);
+    final cleanOpt = _stripTrailingAttachmentTags(optTrim);
+    final cleanSnap = _stripTrailingAttachmentTags(snapTrim);
+    if (cleanOpt.isEmpty || cleanSnap.isEmpty) return false;
+    if (cleanOpt == cleanSnap) return true;
+    // Server may prepend `[引用文件: ...]` / `[引用会话: ...]` / `@file:...` / `@session:...` lines
+    // or append `\n[附件: ...]` descriptors.
+    if (cleanSnap.endsWith(cleanOpt) || cleanOpt.endsWith(cleanSnap)) return true;
+    final normOpt = cleanOpt.replaceAll(RegExp(r'\s+'), ' ');
+    final normSnap = cleanSnap.replaceAll(RegExp(r'\s+'), ' ');
+    return normSnap == normOpt ||
+        normSnap.endsWith(normOpt) ||
+        normOpt.endsWith(normSnap);
   }
 
   static bool _shouldClearPromotedNarration(NormalizedTurn cur, NormalizedTurn snap) {
@@ -1167,9 +1286,7 @@ class TurnStreamReducer {
     final mergedRefs = server.references.isNotEmpty
         ? server.references
         : local.references;
-    final mergedAtts = server.attachments.isNotEmpty
-        ? server.attachments
-        : local.attachments;
+    final mergedAtts = _mergeAttachmentLists(local.attachments, server.attachments);
     final mergedText = server.text.isNotEmpty ? server.text : local.text;
     final mergedId = server.id.isNotEmpty ? server.id : local.id;
     final mergedCreatedAt = server.createdAt ?? local.createdAt;
@@ -1189,6 +1306,57 @@ class TurnStreamReducer {
       maskedRanges: mergedMasks,
       createdAt: mergedCreatedAt,
     );
+  }
+
+  /// Preserve local live image/file preview bytes when the server echoes back
+  /// persisted attachment metadata `{ attachmentId, mediaType, bytes: <size> }`.
+  static List<Map<String, dynamic>> _mergeAttachmentLists(
+    List<Map<String, dynamic>> local,
+    List<Map<String, dynamic>> server,
+  ) {
+    if (server.isEmpty) return local;
+    if (local.isEmpty) return server;
+    final out = <Map<String, dynamic>>[];
+    for (var i = 0; i < server.length; i++) {
+      final srv = server[i];
+      if (srv['bytes'] is List<int> || srv['previewBytes'] is List<int>) {
+        out.add(srv);
+        continue;
+      }
+      final srvId = (srv['attachmentId'] ?? srv['receiptId'] ?? srv['id'] ?? '').toString();
+      final srvName = (srv['name'] ?? srv['filename'] ?? '').toString();
+      Map<String, dynamic>? match;
+      for (final loc in local) {
+        final locId = (loc['attachmentId'] ?? loc['receiptId'] ?? loc['id'] ?? '').toString();
+        final locName = (loc['name'] ?? loc['filename'] ?? '').toString();
+        if (srvId.isNotEmpty && locId == srvId) {
+          match = loc;
+          break;
+        }
+        if (srvName.isNotEmpty && locName == srvName) {
+          match = loc;
+          break;
+        }
+      }
+      if (match == null && i < local.length && server.length == local.length) {
+        match = local[i];
+      }
+      final locBytes = match?['bytes'];
+      final locPreview = match?['previewBytes'];
+      final locData = match?['data'] ?? match?['base64'];
+      if (locBytes is List<int> || locPreview is List<int> || (locData is String && locData.isNotEmpty)) {
+        out.add({
+          ...srv,
+          if (srv['size'] == null && srv['bytes'] is num) 'size': srv['bytes'],
+          if (locBytes is List<int>) 'previewBytes': locBytes,
+          if (locPreview is List<int>) 'previewBytes': locPreview,
+          if (locData is String && locData.isNotEmpty && srv['data'] == null) 'data': locData,
+        });
+      } else {
+        out.add(srv);
+      }
+    }
+    return List.unmodifiable(out);
   }
 
   int _findOptimisticStreamingTurnIndex() {
@@ -1252,10 +1420,54 @@ class TurnStreamReducer {
       } else if (x is NoticeStep && y is NoticeStep) {
         if (x.level != y.level || x.text != y.text) return false;
       } else if (x is ActionCardStep && y is ActionCardStep) {
-        if (x.id != y.id || x.viewId != y.viewId || x.sdui.length != y.sdui.length) return false;
+        if (x.id != y.id || x.viewId != y.viewId || !_deepValueEquals(x.sdui, y.sdui)) return false;
       }
     }
     return true;
+  }
+
+  static bool _usageEquivalent(TurnUsage? a, TurnUsage? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    return a.inputTokens == b.inputTokens &&
+        a.outputTokens == b.outputTokens &&
+        a.cacheReadTokens == b.cacheReadTokens &&
+        a.cacheWriteTokens == b.cacheWriteTokens &&
+        a.cost == b.cost &&
+        a.durationMs == b.durationMs;
+  }
+
+  static bool _deliverablesEquivalent(
+    List<Map<String, dynamic>> a,
+    List<Map<String, dynamic>> b,
+  ) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (!_deepValueEquals(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  static bool _deepValueEquals(Object? a, Object? b) {
+    if (identical(a, b)) return true;
+    if (a is Map && b is Map) {
+      if (a.length != b.length) return false;
+      for (final entry in a.entries) {
+        if (!b.containsKey(entry.key) || !_deepValueEquals(entry.value, b[entry.key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (a is List && b is List) {
+      if (a.length != b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (!_deepValueEquals(a[i], b[i])) return false;
+      }
+      return true;
+    }
+    return a == b;
   }
 
   static List<NormalizedStep> _preserveStepDurations(
@@ -1266,13 +1478,24 @@ class TurnStreamReducer {
     List<NormalizedStep>? out;
     for (var i = 0; i < nextSteps.length; i++) {
       final s = nextSteps[i];
-      if (s is ReasoningStep && s.durationMs == null) {
+      if (s is ReasoningStep) {
         final matchIdx = _findMatchingReasoningIndex(prevSteps, s);
         if (matchIdx >= 0) {
           final prev = prevSteps[matchIdx] as ReasoningStep;
-          if (prev.durationMs != null) {
+          final keepId = prev.id.isNotEmpty ? prev.id : s.id;
+          final keepDuration = s.durationMs ?? prev.durationMs;
+          final keepTranslation = s.translatedText ?? prev.translatedText;
+          if (keepId != s.id ||
+              keepDuration != s.durationMs ||
+              keepTranslation != s.translatedText) {
             out ??= List<NormalizedStep>.of(nextSteps);
-            out[i] = s.copyWith(durationMs: prev.durationMs);
+            out[i] = ReasoningStep(
+              id: keepId,
+              text: s.text,
+              collapsedPreview: s.collapsedPreview,
+              translatedText: keepTranslation,
+              durationMs: keepDuration,
+            );
           }
         }
       } else if (s is ToolStep && s.durationMs == null) {

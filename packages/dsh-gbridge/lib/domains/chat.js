@@ -283,7 +283,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       ? {
           address: { kind: 'session', sessionId: params.id },
           maxMessages: limit,
-          ...(before && Number.isFinite(Number(before)) ? { beforeSeq: Number(before) } : {}),
+          ...(before
+            ? (Number.isFinite(Number(before)) ? { beforeSeq: Number(before) } : { cursor: before })
+            : {}),
         }
       : { sessionId: params.id, limit, ...(before ? { before } : {}) };
     const wantProj = searchParams.get('withProjections') !== 'false' && gateway.has('session/projections');
@@ -304,7 +306,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       }
       return null;
     })();
-    const oldestSeq = turns.length > 0 && turns[0].seqStart != null ? turns[0].seqStart : rawOldestSeq;
+    const oldestSeq = turns.length > 0 && typeof turns[0].seqStart === 'number' && turns[0].seqStart > 0
+      ? turns[0].seqStart
+      : rawOldestSeq;
     sendJson(res, 200, {
       v: 1,
       sessionId: params.id,
@@ -790,7 +794,10 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
 
   router.get('/attachments/:id', async (_req, res, { params, searchParams, peer }) => {
     const sessionId = searchParams.get('sessionId') || '';
-    const mediaType = searchParams.get('mediaType') || 'application/octet-stream';
+    const rawMediaType = (searchParams.get('mediaType') || '').split(';')[0].trim().toLowerCase();
+    const mediaType = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(rawMediaType)
+      ? rawMediaType
+      : 'application/octet-stream';
     const bytes = Number(searchParams.get('bytes') || 0);
     const width = Number(searchParams.get('width') || 0);
     const height = Number(searchParams.get('height') || 0);
@@ -885,7 +892,7 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       sendJson(res, 200, { v: 1, goal: goal ?? null });
     } catch (err) {
       const msg = String(err?.message || '');
-      const code = String(err?.code || '');
+      const code = String(err?.details?.upstreamCode || err?.code || '');
       if (msg.includes('Unknown agent preset') || msg.includes('resume failed')) {
         sendJson(res, 200, { v: 1, goal: null, unavailablePreset: true });
         return;

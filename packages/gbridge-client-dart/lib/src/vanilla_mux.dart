@@ -116,10 +116,13 @@ class VanillaDshMuxEngine {
         .toList(growable: false);
   }
 
+  final Set<String> _settlingInteractionIds = <String>{};
+
   ({String? clientId, String eventId, String kind, String? sessionId, Map<String, dynamic> payload})?
       takePendingInteraction(String id) {
     final item = _pendingInteractions[id];
-    if (item == null) return null;
+    if (item == null || _settlingInteractionIds.contains(id)) return null;
+    _settlingInteractionIds.add(id);
     return (
       clientId: item.gatewayClientId ?? _eventsClientId,
       eventId: item.eventId,
@@ -129,7 +132,12 @@ class VanillaDshMuxEngine {
     );
   }
 
+  void releasePendingInteraction(String id) {
+    _settlingInteractionIds.remove(id);
+  }
+
   void markInteractionResolved(String id, {String reason = 'responded'}) {
+    _settlingInteractionIds.remove(id);
     _cancelledAutoApproveIds.remove(id);
     final removed = _pendingInteractions.remove(id);
     if (removed != null) {
@@ -182,7 +190,11 @@ class VanillaDshMuxEngine {
       _wsSub = ws.messages.listen(
         (raw) {
           _lastInboundAtMs = DateTime.now().millisecondsSinceEpoch;
-          if (epoch == _connEpoch) _onTextMessage(raw, epoch);
+          if (epoch == _connEpoch) {
+            try {
+              _onTextMessage(raw, epoch);
+            } catch (_) {}
+          }
         },
         onError: (Object _) => _handleDisconnect(epoch),
         onDone: () => _handleDisconnect(epoch),
@@ -462,8 +474,10 @@ class VanillaDshMuxEngine {
     bool force = false,
   }) async {
     if (_disposed || _manualDisconnect) return false;
-    // Never abort an in-flight handshake/reconnect!
-    if (_phase == ConnectionPhase.connecting || _phase == ConnectionPhase.reconnecting) {
+    // Never abort an in-flight handshake/reconnect or override an auth-rejected state!
+    if (_phase == ConnectionPhase.connecting ||
+        _phase == ConnectionPhase.reconnecting ||
+        _phase == ConnectionPhase.needsAuth) {
       return false;
     }
     if (_ws == null || _phase != ConnectionPhase.connected) {
@@ -616,8 +630,19 @@ class VanillaDshMuxEngine {
         if (pending != null && !pending.isCompleted) {
           _finishHandshake(epoch, pending);
         } else if (epoch == _connEpoch && _phase == ConnectionPhase.connected && !_disposed && !_manualDisconnect) {
-          // `$events` closed unexpectedly while WS stays alive — reopen so approvals/questions keep arriving.
+          // `$events` closed unexpectedly while WS stays alive — clear stale interactions bound
+          // to the dead clientId and reopen so approvals/questions keep arriving cleanly.
+          final deadClientId = _eventsClientId;
           _eventsClientId = null;
+          if (deadClientId != null && _pendingInteractions.isNotEmpty) {
+            final staleIds = <String>[
+              for (final entry in _pendingInteractions.entries)
+                if (entry.value.kind != 'cordis_run' && entry.value.gatewayClientId == deadClientId) entry.key,
+            ];
+            for (final sid in staleIds) {
+              markInteractionResolved(sid, reason: 'events_stream_closed');
+            }
+          }
           _eventsReopenTimer?.cancel();
           if (_eventsReopenAttempts < 4) {
             final delayMs = 600 * (1 << _eventsReopenAttempts);
@@ -929,7 +954,8 @@ class VanillaDshMuxEngine {
     }
 
     if (kind == 'snapshot') {
-      final rawRecords = (item['records'] ?? item['events'] ?? item['history']) as List? ?? const [];
+      final rawCandidate = item['records'] ?? item['events'] ?? item['history'];
+      final rawRecords = rawCandidate is List ? rawCandidate : const <dynamic>[];
       final turns = normalizer.normalizeEvents(targetId, rawRecords);
       if (turns.isNotEmpty && turns.last['status'] == 'streaming') {
         final tid = turns.last['turnId']?.toString();
@@ -995,6 +1021,44 @@ class VanillaDshMuxEngine {
         if (eventSeq != null) 'eventSeq': eventSeq,
         'raw': ev,
         if (deltaTurns.isNotEmpty) 'normalizedTurn': deltaTurns.first,
+      });
+      return;
+    }
+
+    if (kind == 'turn/start' || kind == 'turn_start') {
+      final evData = item['data'] is Map ? _asStringMap(item['data'] as Map) : item;
+      final eventSeq = item['seq'] is num ? (item['seq'] as num).toInt() : null;
+      final turnId = evData['turnId']?.toString() ??
+          (evData['turn'] != null
+              ? 'turn-${evData['turn']}'
+              : (item['id']?.toString().isNotEmpty == true
+                  ? item['id'].toString()
+                  : 'turn-${eventSeq ?? DateTime.now().millisecondsSinceEpoch}'));
+      _activeTurns[targetId] = turnId;
+      _publish(channel, 'turn.start', {
+        'sessionId': targetId,
+        'turnId': turnId,
+        if (eventSeq != null) 'eventSeq': eventSeq,
+        'raw': item,
+      });
+      return;
+    }
+
+    if (kind == 'turn/end' || kind == 'turn_end') {
+      final evData = item['data'] is Map ? _asStringMap(item['data'] as Map) : item;
+      final eventSeq = item['seq'] is num ? (item['seq'] as num).toInt() : null;
+      final turnId = evData['turnId']?.toString() ??
+          (evData['turn'] != null ? 'turn-${evData['turn']}' : _activeTurns[targetId]);
+      _activeTurns.remove(targetId);
+      normalizer.clearSessionStat(targetId);
+      final fail = VanillaDshNormalizer.extractFailureInfo(evData['reason'], evData);
+      _publish(channel, 'turn.completed', {
+        'sessionId': targetId,
+        if (turnId != null) 'turnId': turnId,
+        if (eventSeq != null) 'eventSeq': eventSeq,
+        'raw': item,
+        if (fail != null) 'errorMessage': fail.message,
+        if (fail?.code != null) 'errorCode': fail!.code,
       });
       return;
     }
@@ -1174,6 +1238,7 @@ class VanillaDshMuxEngine {
     _activeChannelStreams.clear();
     _streamIdToChannel.clear();
     _eventsClientId = null;
+    _settlingInteractionIds.clear();
     if (_pendingInteractions.isNotEmpty) {
       final staleIds = _pendingInteractions.keys.toList(growable: false);
       for (final id in staleIds) {

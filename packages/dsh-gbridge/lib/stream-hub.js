@@ -116,6 +116,7 @@ export class StreamHub {
     this.seq = 0;
     this.ring = []; // { seq, bytes, frame }
     this.ringHead = 0;
+    this.ringEvictedSeq = 0;
     this.durableRing = []; // { seq, bytes, frame } (bounded non-delta events protected from high-rate delta eviction)
     this.durableRingHead = 0;
     this.latestSnapshots = new Map(); // channel -> latest snapshot frame for late-joining subscribers
@@ -255,19 +256,21 @@ export class StreamHub {
         if (sid) this.sessionAlwaysAllowed.delete(String(sid));
       }
       const mapped = mapHostEmitEvent(ev, args);
-      if (mapped.type === 'session.status' && Array.isArray(args) && args.length >= 2 && args[1] === false) {
-        const finishedSid = args[0] != null ? String(args[0]) : null;
-        if (finishedSid) {
-          this._clearPendingTurnEndTimer(finishedSid);
+      if (mapped.type === 'session.status' && Array.isArray(args) && args.length >= 2) {
+        const statusSid = args[0] != null ? String(args[0]) : null;
+        if (statusSid && args[1] === true) {
+          this._clearPendingTurnEndTimer(statusSid);
+        } else if (statusSid && args[1] === false) {
+          this._clearPendingTurnEndTimer(statusSid);
           // Defer fallback turn-end notification briefly so the authoritative `turn/end` event
           // (carrying error/abort/completed reason) wins first and is never overwritten as 'completed'.
           const fallbackTimer = setTimeout(() => {
-            this.pendingTurnEndTimers.delete(finishedSid);
+            this.pendingTurnEndTimers.delete(statusSid);
             if (this._disposed) return;
-            try { this._onTurnCompleted?.({ sessionId: finishedSid, reason: 'completed' }); } catch {}
+            try { this._onTurnCompleted?.({ sessionId: statusSid, reason: 'completed' }); } catch {}
           }, 250);
           fallbackTimer.unref?.();
-          this.pendingTurnEndTimers.set(finishedSid, fallbackTimer);
+          this.pendingTurnEndTimers.set(statusSid, fallbackTimer);
         }
       }
       this.publish(mapped.channel, mapped.type, mapped.data);
@@ -292,19 +295,27 @@ export class StreamHub {
         payload: frame.request ?? frame.payload ?? frame,
         createdAt: Date.now(),
       };
-      // Honor prior session-wide "本次均允许" (`always`) for the exact same session & tool!
-      // NEVER auto-approve `phone_*` tools across turns — SafetyGate enforces strict per-turn user confirmation!
+      // Honor prior session-wide "本次均允许" (`always`) for the exact same session & concrete tool!
+      // NEVER record/match wildcard '*' or auto-approve `phone_*` tools across turns.
       if (kind === 'approval' && item.sessionId && item.gatewayClientId) {
-        const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
-        const allowedTools = this.sessionAlwaysAllowed.get(item.sessionId);
-        if (!toolKey.startsWith('phone_') && allowedTools && (allowedTools.has(toolKey) || allowedTools.has('*'))) {
+        const sidKey = String(item.sessionId);
+        const toolKey = String(
+          item.payload?.toolName ?? item.payload?.tool ?? item.payload?.name ?? item.payload?.kind ?? '',
+        ).trim().toLowerCase();
+        const allowedTools = this.sessionAlwaysAllowed.get(sidKey);
+        if (toolKey && toolKey !== '*' && !toolKey.startsWith('phone_') && allowedTools && allowedTools.has(toolKey)) {
           this.gateway.respondRemoteEvent(
             item.gatewayClientId,
             item.eventId,
             { kind: 'result', value: 'allowed-once' },
             undefined,
             item.gatewayPeer,
-          ).catch(() => {});
+          ).catch(() => {
+            if (!this._disposed && this._eventsClientId === item.gatewayClientId && !this.pendingInteractions.has(eventId)) {
+              this.pendingInteractions.set(eventId, item);
+              this.publish('host', 'interaction.requested', sanitizeInteraction(item));
+            }
+          });
           return;
         }
       }
@@ -365,16 +376,19 @@ export class StreamHub {
           } else if (item.kind === 'approval') {
             const d = String(decision || '').toLowerCase();
             if (d === 'always' && item.sessionId) {
-              const toolKey = String(item.payload?.toolName ?? item.payload?.tool ?? '*').toLowerCase();
-              if (!toolKey.startsWith('phone_')) {
-                let set = this.sessionAlwaysAllowed.get(item.sessionId);
+              const sidKey = String(item.sessionId);
+              const toolKey = String(
+                item.payload?.toolName ?? item.payload?.tool ?? item.payload?.name ?? item.payload?.kind ?? '',
+              ).trim().toLowerCase();
+              if (toolKey && toolKey !== '*' && !toolKey.startsWith('phone_')) {
+                let set = this.sessionAlwaysAllowed.get(sidKey);
                 if (!set) {
                   if (this.sessionAlwaysAllowed.size >= 256) {
                     const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
                     if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
                   }
                   set = new Set();
-                  this.sessionAlwaysAllowed.set(item.sessionId, set);
+                  this.sessionAlwaysAllowed.set(sidKey, set);
                 }
                 set.add(toolKey);
               }
@@ -471,6 +485,9 @@ export class StreamHub {
       this.ring[this.ringHead] = undefined;
       this.ringHead += 1;
       this.ringBytes -= dropped.bytes;
+      if (dropped && typeof dropped.seq === 'number' && dropped.seq > this.ringEvictedSeq) {
+        this.ringEvictedSeq = dropped.seq;
+      }
     }
     if (this.ringHead >= 256 && this.ringHead * 2 >= this.ring.length) {
       this.ring = this.ring.slice(this.ringHead);
@@ -628,32 +645,38 @@ export class StreamHub {
           ? this.durableRing[this.durableRingHead].seq
           : oldestRingSeq;
         let requiresContiguousRing = false;
+        let hasStreamChannel = false;
         let hasTornDownChannel = false;
         for (const ch of replayChannelSet) {
           if (this.tornDownChannels.has(ch)) {
             hasTornDownChannel = true;
           }
           if (ch.startsWith('session:')) {
+            hasStreamChannel = true;
             const sid = ch.slice('session:'.length);
             if (this.activeTurns.has(sid)) {
               requiresContiguousRing = true;
             }
           } else if (ch.startsWith('terminal:') || ch.startsWith('job:')) {
+            hasStreamChannel = true;
             requiresContiguousRing = true;
           }
         }
         // When an active streaming turn or terminal/job delta channel is subscribed, ephemeral
-        // delta frames only live in `this.ring`; require `resumeFromSeq` to stay within
-        // `oldestRingSeq - 1` so evicted deltas return `resumed: false` and trigger a clean resync.
-        // Also force `resumed: false` when a requested channel was torn down during disconnect.
+        // delta frames only live in `this.ring`; also require `resumeFromSeq >= this.ringEvictedSeq`
+        // for any stream channel so completed turns whose deltas/snapshots were evicted from `ring`
+        // during disconnect cleanly return `resumed: false` and trigger a full resync.
         const oldestSeq = requiresContiguousRing
           ? oldestRingSeq
           : Math.min(oldestRingSeq, oldestDurableSeq);
+        const minResumeSeq = hasStreamChannel
+          ? Math.max(oldestSeq - 1, this.ringEvictedSeq)
+          : oldestSeq - 1;
         const canResume = !hasTornDownChannel &&
           msg.lastBootId === this.bootId &&
           typeof msg.resumeFromSeq === 'number' &&
           Number.isInteger(msg.resumeFromSeq) &&
-          msg.resumeFromSeq >= oldestSeq - 1 &&
+          msg.resumeFromSeq >= minResumeSeq &&
           msg.resumeFromSeq <= this.seq;
 
         let replayFrames = [];
@@ -744,9 +767,15 @@ export class StreamHub {
         break;
       }
       case 'term.resize': {
-        if (typeof msg.terminalId === 'string' && typeof msg.cols === 'number' && typeof msg.rows === 'number') {
-          const cols = Math.max(1, Math.round(msg.cols));
-          const rows = Math.max(1, Math.round(msg.rows));
+        if (
+          typeof msg.terminalId === 'string' &&
+          typeof msg.cols === 'number' &&
+          typeof msg.rows === 'number' &&
+          Number.isFinite(msg.cols) &&
+          Number.isFinite(msg.rows)
+        ) {
+          const cols = Math.max(1, Math.min(500, Math.round(msg.cols)));
+          const rows = Math.max(1, Math.min(200, Math.round(msg.rows)));
           const entry = this._findTerminalUpstream(msg.terminalId);
           if (entry?.uplink) {
             entry.uplinkSeq = (entry.uplinkSeq || 0) + 1;
@@ -857,6 +886,7 @@ export class StreamHub {
       return;
     }
 
+    this.latestSnapshots.delete(channel);
     entry = { subscribers: new Set([clientId]), abort, uplink, uplinkSeq: 0, terminalId: effectiveTermId };
     this.upstreamStreams.set(channel, entry);
 
@@ -886,6 +916,7 @@ export class StreamHub {
         uplink?.close?.();
         if (this.upstreamStreams.get(channel) === entry) {
           this.upstreamStreams.delete(channel);
+          this.latestSnapshots.delete(channel);
           if (channel.startsWith('session:')) {
             const sid = channel.slice(8);
             this.activeTurns.delete(sid);
@@ -1118,7 +1149,7 @@ export class StreamHub {
   _enqueueDelta(client, frame) {
     const key = `${frame.channel}:${frame.type}`;
     const existing = client.pendingDeltas.get(key);
-    const chunkBytes = estimateDeltaBytes(frame);
+    const chunkBytes = estimateDeltaBytes(frame.data);
     if (!existing) {
       client.pendingDeltas.set(key, { ...frame, batch: [frame.data] });
     } else {

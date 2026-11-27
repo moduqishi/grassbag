@@ -110,12 +110,36 @@ export function sendJson(res, status, payload, extraHeaders = {}) {
   res.end(body);
 }
 
+const SAFE_MIME_RE = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i;
+const ACTIVE_WEB_MIMES = new Set([
+  'text/html',
+  'application/xhtml+xml',
+  'image/svg+xml',
+  'text/javascript',
+  'application/javascript',
+  'application/x-javascript',
+  'text/xml',
+  'application/xml',
+]);
+
+export function sanitizeBinaryContentType(raw) {
+  if (typeof raw !== 'string') return 'application/octet-stream';
+  const base = raw.split(';')[0].trim().toLowerCase();
+  if (!SAFE_MIME_RE.test(base) || ACTIVE_WEB_MIMES.has(base)) {
+    return 'application/octet-stream';
+  }
+  return base;
+}
+
 export function sendBinary(res, status, buffer, contentType = 'application/octet-stream', extraHeaders = {}) {
   if (res.writableEnded) return;
   const data = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const safeType = sanitizeBinaryContentType(contentType);
   res.writeHead(status, securityHeaders({
-    'content-type': contentType,
+    'content-type': safeType,
     'content-length': data.length,
+    'content-disposition': 'attachment',
+    'content-security-policy': "default-src 'none'; sandbox",
     ...extraHeaders,
   }));
   res.end(data);

@@ -350,7 +350,8 @@ object TarGzExtractor {
     }
 
     private fun sanitizeRelativePath(raw: String): String? {
-        var s = raw.trim().replace('\\', '/')
+        if (raw.indexOf('\u0000') >= 0) return null
+        var s = raw
         while (s.startsWith("./")) s = s.substring(2)
         while (s.startsWith("/")) s = s.substring(1)
         if (s.isEmpty() || s == ".") return null
@@ -367,8 +368,9 @@ object TarGzExtractor {
             while (sp < bytes.size && bytes[sp] != ' '.code.toByte()) sp++
             if (sp >= bytes.size) break
             val recLen = String(bytes, idx, sp - idx, Charsets.UTF_8).toIntOrNull() ?: break
-            if (recLen <= 0 || idx + recLen > bytes.size) break
-            val body = String(bytes, sp + 1, (idx + recLen) - (sp + 1), Charsets.UTF_8).trimEnd('\n')
+            val bodyLen = (idx + recLen) - (sp + 1)
+            if (recLen <= 0 || bodyLen <= 0 || idx + recLen > bytes.size) break
+            val body = String(bytes, sp + 1, bodyLen, Charsets.UTF_8).trimEnd('\n')
             val eq = body.indexOf('=')
             if (eq > 0) {
                 map[body.substring(0, eq)] = body.substring(eq + 1)

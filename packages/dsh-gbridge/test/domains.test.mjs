@@ -1115,3 +1115,173 @@ test('v35 regression: StreamHub ascending coalesced seq, slow-consumer 1013 disc
   gw.browserPeer = { id: 'browser-dead', signal: abortedCtrl.signal };
   assert.equal(gw.resolvePeer(), livePeer);
 });
+
+test('v60 regression: discover SSRF/credential guard, attachment sandbox headers, ..foo workspace path, StreamHub wildcard/eviction & cyclic errors', async (t) => {
+  const { writeFileSync } = await import('node:fs');
+  const { StreamHub } = await import('../lib/stream-hub.js');
+
+  const wsRoot = mkdtempSync(join(tmpdir(), 'gbridge-v60-ws-'));
+  writeFileSync(join(wsRoot, '..foo.txt'), 'legit double-dot filename\n', 'utf8');
+  t.after(() => rmSync(wsRoot, { recursive: true, force: true }));
+
+  const supported = new Set([
+    'settings/read',
+    'credentials/read',
+    'session/attachment',
+    'workspace/list',
+  ]);
+  const gw = {
+    claimsEndpoint: (ep) => supported.has(ep),
+    collectSrcClaims: () => [...supported],
+    operatorPeer: () => ({ id: 'op' }),
+    async dispatchRpc(ep, payload) {
+      if (ep === 'settings/read') {
+        return {
+          ok: true,
+          value: {
+            value: {
+              providers: {
+                trusted: {
+                  baseURL: 'https://api.trusted.example/v1',
+                  apiKeyEnv: 'TRUSTED_API_KEY',
+                },
+              },
+            },
+          },
+        };
+      }
+      if (ep === 'credentials/read') {
+        return { ok: true, value: { value: 'sk-super-secret' } };
+      }
+      if (ep === 'session/attachment') {
+        return {
+          ok: true,
+          value: {
+            data: Buffer.from('<script>alert(1)</script>').toString('base64'),
+            attachment: { mediaType: 'text/html' },
+          },
+        };
+      }
+      if (ep === 'workspace/list') {
+        return { ok: true, value: [{ id: 'w-v60', path: wsRoot }] };
+      }
+      return { ok: true, value: {} };
+    },
+  };
+  const core = createGbridgeCore({
+    get: (k) => ({
+      typertGateway: gw,
+      workspaceRegistry: {
+        list: () => [{ id: 'w-v60', path: wsRoot, title: 'v60', sessionIds: [] }],
+      },
+      typert: { local: { list: () => [] } },
+      connection: { admit: () => ({ peer: { id: 'op' } }) },
+      webServer: { host: '127.0.0.1', port: 3080 },
+    })[k],
+    logger: { warn: () => {} },
+  }, { bootId: 'boot-v60' });
+  const srv = createServer((req, res) => core.handleHttp(req, res, { mode: 'webServer' }));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const { port } = srv.address();
+  t.after(() => { core.dispose(); srv.closeAllConnections?.(); srv.close(); });
+
+  // 1. POST /providers/discover refuses exfiltrating a saved apiKeyEnv to an arbitrary baseURL (403)
+  const exfilRes = await jsonReq(port, '/providers/discover', {
+    method: 'POST',
+    body: {
+      baseURL: 'https://attacker.example/v1',
+      apiKeyEnv: 'TRUSTED_API_KEY',
+    },
+  });
+  assert.equal(exfilRes.status, 403);
+
+  // Rejects non-http(s) scheme
+  const badScheme = await jsonReq(port, '/providers/discover', {
+    method: 'POST',
+    body: { baseURL: 'file:///etc/passwd' },
+  });
+  assert.equal(badScheme.status, 400);
+
+  // 2. GET /attachments/:id downgrades active HTML MIME + sets attachment & sandbox CSP
+  const attRes = await new Promise((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      path: `${PREFIX}/attachments/att-xss?mediaType=${encodeURIComponent('text/html')}`,
+      method: 'GET',
+      headers: { cookie: 'dsh-auth=ok' },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(attRes.status, 200);
+  assert.equal(attRes.headers['content-type'], 'application/octet-stream');
+  assert.equal(attRes.headers['content-disposition'], 'attachment');
+  assert.equal(attRes.headers['content-security-policy'], "default-src 'none'; sandbox");
+
+  // 3. Legitimate `..foo.txt` inside workspace is readable while `../` escape is rejected
+  const dotDotFile = await jsonReq(port, '/workspaces/w-v60/files/read?path=..foo.txt');
+  assert.equal(dotDotFile.status, 200);
+  assert.ok(String(dotDotFile.json.file?.text || '').includes('legit double-dot filename'));
+
+  const traversalFile = await jsonReq(port, '/workspaces/w-v60/files/read?path=../etc/passwd');
+  assert.equal(traversalFile.status, 403);
+
+  // 4. StreamHub never auto-approves unknown/empty tool names via wildcard '*' and detects ring eviction
+  const norm = new SessionNormalizer();
+  const hub = new StreamHub({
+    bootId: 'boot-v60-hub',
+    logger: { info() {}, warn() {}, debug() {} },
+    normalizer: norm,
+    gateway: {
+      has: () => false,
+      respondRemoteEvent: async () => {},
+    },
+  });
+  hub._eventsClientId = 'cli-v60';
+  hub.sessionAlwaysAllowed.set('s-wild', new Set(['*']));
+  hub._handleHostEventFrame({
+    type: 'waterfall',
+    event: 'approval/request',
+    eventId: 'ev-empty-tool',
+    agentId: 's-wild',
+    request: { sessionId: 's-wild' },
+  });
+  assert.equal(hub.pendingInteractions.has('ev-empty-tool'), true);
+
+  // Ring eviction watermark forces resumed: false when client resumeFromSeq fell behind evicted frames
+  hub.replayCapacity = 3;
+  for (let i = 0; i < 6; i++) {
+    hub.publish('session:s-evict', 'turn.event', { n: i });
+  }
+  assert.ok(hub.ringEvictedSeq >= 3);
+  const frames = [];
+  const ws = {
+    on() {},
+    sendJson(o) { frames.push(o); },
+    sendText(s) { frames.push(JSON.parse(s)); },
+    close() {},
+  };
+  const cid = hub.attachClient(ws);
+  hub._onClientMessage(hub.clients.get(cid), {
+    op: 'hello',
+    channels: ['session:s-evict'],
+    resumeFromSeq: 1,
+  });
+  const welcome = frames.find((f) => f.op === 'welcome');
+  assert.equal(welcome?.resumed, false);
+  hub.dispose();
+
+  // 5. Normalizer survives cyclic error payloads without throwing
+  const cyclic = { message: 'boom' };
+  cyclic.self = cyclic;
+  const cyclicTurns = norm.normalizeEvents('s-cyc', [
+    { seq: 1, type: 'turn/start', turnId: 't-cyc', data: { turnId: 't-cyc' } },
+    { seq: 2, type: 'turn/end', turnId: 't-cyc', data: { turnId: 't-cyc', reason: { kind: 'error', error: cyclic } } },
+  ]);
+  assert.equal(cyclicTurns.length, 1);
+  assert.equal(cyclicTurns[0].status, 'error');
+});

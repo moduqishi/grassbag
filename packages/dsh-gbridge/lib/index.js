@@ -288,6 +288,7 @@ export function startLanBridgeListener(core, {
       clearTimeout(existing.closeTimer);
       existing.closeTimer = null;
     }
+    existing.disposed = false;
     existing.gen = myGen;
     existing.core = core;
     existing.bearerToken = bearerToken;
@@ -308,6 +309,17 @@ export function startLanBridgeListener(core, {
       ready: Promise.resolve({ host, port: boundPort, conflictAvoided: Boolean(existing.conflictAvoided) }),
       dispose: (opts) => scheduleLanTeardown(listenKey, myGen, opts),
     };
+  }
+  if (existing) {
+    // Supersede any pending non-listening startup so its async onBound never leaks an untracked server!
+    existing.disposed = true;
+    if (existing.closeTimer) {
+      clearTimeout(existing.closeTimer);
+      existing.closeTimer = null;
+    }
+    try { existing.server?.closeAllConnections?.(); } catch {}
+    try { existing.server?.close?.(); } catch {}
+    activeLanListeners.delete(listenKey);
   }
 
   const entry = {
@@ -662,7 +674,13 @@ export function createGbridgeCore(ctx, options = {}) {
     }
     const action = String(body?.action || '').trim();
     const deferStop = reqMode === 'lan' && action === 'setLanEnabled' && !Boolean(body?.enabled);
-    const next = await pairingController.applyAction(body, { deferLanStop: deferStop });
+    const deferPrevDispose = reqMode === 'lan' && action === 'setLanPort';
+    let deferredDisposePrev = null;
+    const next = await pairingController.applyAction(body, {
+      deferLanStop: deferStop,
+      deferPrevDispose,
+      onDeferredDispose: (fn) => { deferredDisposePrev = fn; },
+    });
     if (reqMode === 'lan' && action === 'rotateToken' && next?.token && reqLanPort) {
       const cookieName = lanCookieNameForPort(reqLanPort);
       const cookieVal = signLanCookieValue(next.token);
@@ -671,10 +689,11 @@ export function createGbridgeCore(ctx, options = {}) {
         `${cookieName}=${cookieVal}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
       );
     }
-    if (deferStop) {
+    if (deferStop || deferredDisposePrev) {
       res.once('finish', () => {
         const t = setTimeout(() => {
-          try { pairingController.stopLanIfDisabled?.(true); } catch {}
+          try { if (deferStop) pairingController.stopLanIfDisabled?.(true); } catch {}
+          try { deferredDisposePrev?.(); } catch {}
         }, 150);
         t.unref?.();
       });
@@ -968,17 +987,24 @@ export function createPairingController(ctx, core, config = {}) {
     }
   });
 
-  const startLan = (portOverride) => runLanOp(async () => {
+  const startLan = (portOverride, { deferPrevDispose = false, onDeferredDispose } = {}) => runLanOp(async () => {
     if (udsPath || disposed) return;
     if (portOverride !== undefined) preferredPort = portOverride;
     const wsInfo = inspectWebServerBinding(ctx);
     const avoidPorts = wsInfo.port ? [wsInfo.port] : [];
     const prev = lanHandle;
+    const prevPort = prev?.address?.()?.port;
+    const canDeferPrev = Boolean(deferPrevDispose && prev && prevPort && prevPort !== preferredPort);
     lanHandle = null;
-    if (prev) {
+    if (prev && !canDeferPrev) {
       try { await prev.dispose({ immediate: true }); } catch {}
     }
-    if (disposed) return;
+    if (disposed) {
+      if (canDeferPrev) {
+        try { await prev.dispose({ immediate: true }); } catch {}
+      }
+      return;
+    }
     lanWanted = true;
     const nextHandle = startLanBridgeListener(core, {
       host: lanHost,
@@ -991,10 +1017,22 @@ export function createPairingController(ctx, core, config = {}) {
     });
     if (disposed) {
       try { await nextHandle.dispose({ immediate: true }); } catch {}
+      if (canDeferPrev) {
+        try { await prev.dispose({ immediate: true }); } catch {}
+      }
       return;
     }
     lanHandle = nextHandle;
     await nextHandle.ready;
+    if (canDeferPrev) {
+      if (typeof onDeferredDispose === 'function') {
+        onDeferredDispose(() => {
+          try { prev.dispose({ immediate: true }); } catch {}
+        });
+      } else {
+        try { await prev.dispose({ immediate: true }); } catch {}
+      }
+    }
     if (disposed) {
       lanHandle = null;
       try { await nextHandle.dispose({ immediate: true }); } catch {}
@@ -1111,7 +1149,7 @@ export function createPairingController(ctx, core, config = {}) {
     };
   };
 
-  const applyAction = async (body = {}, { deferLanStop = false } = {}) => {
+  const applyAction = async (body = {}, { deferLanStop = false, deferPrevDispose = false, onDeferredDispose } = {}) => {
     const action = String(body?.action || '').trim();
     if (action === 'rotateToken') {
       lanToken = persistRotatedLanToken();
@@ -1156,7 +1194,10 @@ export function createPairingController(ctx, core, config = {}) {
       if (!Number.isInteger(nextPort) || nextPort < 0 || nextPort > 65535) {
         throw new GbridgeError(400, 'gbridge/invalid_port', 'port must be an integer between 0 and 65535');
       }
-      await startLan(nextPort);
+      await startLan(nextPort, {
+        deferPrevDispose: Boolean(deferPrevDispose),
+        onDeferredDispose,
+      });
       return getSnapshot();
     }
     throw new GbridgeError(400, 'gbridge/unknown_action', `unsupported pairing action: ${action || '(empty)'}`);

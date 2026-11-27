@@ -16,7 +16,7 @@ import dns from 'node:dns';
 import fs from 'node:fs';
 import * as nodeModule from 'node:module';
 import os from 'node:os';
-import { resolve as pathResolve } from 'node:path';
+import { basename as pathBasename, dirname as pathDirname, join as pathJoin, resolve as pathResolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread } from 'node:worker_threads';
 
@@ -83,14 +83,30 @@ if (isMainThread) {
   dnsTimer.unref?.();
 }
 
-// 2. Patch fs.promises.rename, fs.rename & fs.renameSync to fall back cleanly on EXDEV across bind mounts.
+// 2. Patch fs.promises.rename, fs.rename & fs.renameSync to fall back cleanly & atomically on EXDEV across bind mounts.
+let exdevNonce = 0;
+function makeExdevTempSibling(newPath) {
+  const target = typeof newPath === 'string' ? newPath : fileURLToPath(newPath);
+  const dir = pathDirname(target);
+  const base = pathBasename(target);
+  exdevNonce = (exdevNonce + 1) & 0x7fffffff;
+  return pathJoin(dir, `.${base}.gb-exdev-${process.pid}-${exdevNonce}.tmp`);
+}
+
 const origRenameAsync = fs.promises.rename.bind(fs.promises);
 fs.promises.rename = async function grassbagSafeRename(oldPath, newPath) {
   try {
     return await origRenameAsync(oldPath, newPath);
   } catch (err) {
     if (err && err.code === 'EXDEV') {
-      await fs.promises.cp(oldPath, newPath, { recursive: true, force: true, verbatimSymlinks: true });
+      const tmp = makeExdevTempSibling(newPath);
+      try {
+        await fs.promises.cp(oldPath, tmp, { recursive: true, force: true, verbatimSymlinks: true });
+        await origRenameAsync(tmp, newPath);
+      } catch (copyErr) {
+        try { await fs.promises.rm(tmp, { recursive: true, force: true }); } catch {}
+        throw copyErr;
+      }
       await fs.promises.rm(oldPath, { recursive: true, force: true });
       return;
     }
@@ -103,8 +119,7 @@ fs.rename = function grassbagSafeRenameCb(oldPath, newPath, callback) {
   origRenameCb(oldPath, newPath, (err) => {
     if (err && err.code === 'EXDEV') {
       fs.promises
-        .cp(oldPath, newPath, { recursive: true, force: true, verbatimSymlinks: true })
-        .then(() => fs.promises.rm(oldPath, { recursive: true, force: true }))
+        .rename(oldPath, newPath)
         .then(() => callback(null), (e) => callback(e));
       return;
     }
@@ -118,7 +133,14 @@ fs.renameSync = function grassbagSafeRenameSync(oldPath, newPath) {
     return origRenameSync(oldPath, newPath);
   } catch (err) {
     if (err && err.code === 'EXDEV') {
-      fs.cpSync(oldPath, newPath, { recursive: true, force: true, verbatimSymlinks: true });
+      const tmp = makeExdevTempSibling(newPath);
+      try {
+        fs.cpSync(oldPath, tmp, { recursive: true, force: true, verbatimSymlinks: true });
+        origRenameSync(tmp, newPath);
+      } catch (copyErr) {
+        try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+        throw copyErr;
+      }
       fs.rmSync(oldPath, { recursive: true, force: true });
       return;
     }
@@ -212,16 +234,19 @@ if (isDshBoot && process.env.GBRIDGE_BOOT_CACHE !== '0') {
         components.set(slotReal, slotReal);
         const nmDir = `${slotReal}/node_modules`;
         components.set(nmDir, nmDir);
-        const topEntries = fs.readdirSync(nmDir);
-        const topSet = new Set(topEntries);
-        for (const name of topEntries) {
-          if (name.startsWith('.')) continue;
+        const topEntries = fs.readdirSync(nmDir, { withFileTypes: true });
+        const topSet = new Set(topEntries.map((e) => e.name));
+        for (const entry of topEntries) {
+          const name = entry.name;
+          if (name.startsWith('.') || entry.isSymbolicLink()) continue;
           const full = `${nmDir}/${name}`;
           if (name.startsWith('@')) {
             components.set(full, full);
             try {
-              for (const sub of fs.readdirSync(full)) {
-                components.set(`${full}/${sub}`, `${full}/${sub}`);
+              for (const sub of fs.readdirSync(full, { withFileTypes: true })) {
+                if (!sub.isSymbolicLink()) {
+                  components.set(`${full}/${sub.name}`, `${full}/${sub.name}`);
+                }
               }
             } catch {}
           } else {
@@ -444,6 +469,7 @@ if (isDshBoot && process.env.GBRIDGE_BOOT_CACHE !== '0') {
 
     function watchStdout(chunk, ...rest) {
       const res = Reflect.apply(origStdoutWrite, this, [chunk, ...rest]);
+      if (!active) return res;
       const text =
         typeof chunk === 'string'
           ? chunk

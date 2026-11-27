@@ -24,6 +24,7 @@ class ChatEmptyState extends ConsumerWidget {
   const ChatEmptyState({
     super.key,
     required this.onSuggestionTap,
+    this.onPrefillSuggestion,
     this.onOpenModelSettings,
     this.onOpenHostSettings,
     this.onOpenDiagnostics,
@@ -35,6 +36,7 @@ class ChatEmptyState extends ConsumerWidget {
   });
 
   final ValueChanged<String> onSuggestionTap;
+  final ValueChanged<String>? onPrefillSuggestion;
   final VoidCallback? onOpenModelSettings;
   final VoidCallback? onOpenHostSettings;
   final VoidCallback? onOpenDiagnostics;
@@ -127,6 +129,7 @@ class ChatEmptyState extends ConsumerWidget {
         state.routableProvidersCount == 0;
 
     final isDesktopHost = state.isActiveHostDesktop;
+    final isConnectingOrHydrating = isHostTransientConnecting || state.hydratingDomains;
     final suggestions = [
       (
         CupertinoIcons.folder_fill,
@@ -134,6 +137,7 @@ class ChatEmptyState extends ConsumerWidget {
         '查看目录结构与改动',
         t.ok,
         '帮我查看当前工作区的目录结构与最近文件改动概览',
+        false,
       ),
       (
         CupertinoIcons.chevron_left_slash_chevron_right,
@@ -141,6 +145,7 @@ class ChatEmptyState extends ConsumerWidget {
         '定位并修复失败项',
         t.dusk,
         '运行当前项目的测试或静态检查，定位问题并给出修复方案',
+        false,
       ),
       if (isDesktopHost || !isAndroidNative)
         (
@@ -149,6 +154,7 @@ class ChatEmptyState extends ConsumerWidget {
           '总结未提交变更风险',
           t.warn,
           '检查当前工作区的 git 状态与最近提交，总结核心变更与潜在风险',
+          false,
         )
       else
         (
@@ -157,14 +163,16 @@ class ChatEmptyState extends ConsumerWidget {
           '归类或清理下载目录',
           t.warn,
           '帮我查看手机下载目录的大文件，并按类型给出清理或压缩建议',
+          false,
         ),
       if (isAndroidNative && state.hostIsLocal)
         (
           CupertinoIcons.device_phone_portrait,
           '操控手机',
-          '自然语言操控应用',
+          '填入指令按需修改',
           t.isDark ? const Color(0xFF56B0EE) : const Color(0xFF1F5F87),
           '帮我打开系统设置，查看当前网络与电量状态后返回 GrassBag',
+          true,
         )
       else
         (
@@ -173,8 +181,17 @@ class ChatEmptyState extends ConsumerWidget {
           '梳理架构与接口说明',
           t.primary,
           '阅读当前项目核心模块并整理一份清晰的架构与使用说明文档',
+          false,
         ),
     ];
+    void handleStarterTap(int i) {
+      final item = suggestions[i];
+      if (item.$6 && onPrefillSuggestion != null) {
+        onPrefillSuggestion!(item.$5);
+      } else {
+        onSuggestionTap(item.$5);
+      }
+    }
 
     final fallbackProgress =
         (keyboardOpen ? 1.0 : keyboardProgress).clamp(0.0, 1.0);
@@ -242,78 +259,44 @@ class ChatEmptyState extends ConsumerWidget {
     final staticWorkspaceAndSetup = Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        GrassBagSpringTap(
-          pressedScale: 0.96,
-          enablePointerGlow: false,
-          haptic: true,
+        GrassBagGlassPillButton(
+          tier: state.glassTier,
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 15),
           onTap: () => (state.activeWorkspace.isEmpty &&
                   (isHostTransientConnecting || state.hydratingDomains))
               ? showHostQuickSheet(context, ref)
               : showWorkspaceSheet(context, ref),
-          child: Container(
-            height: 38,
-            padding: const EdgeInsets.symmetric(horizontal: 15),
-            decoration: ShapeDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: t.isDark
-                    ? [
-                        Colors.white.withValues(alpha: 0.12),
-                        Colors.white.withValues(alpha: 0.06),
-                      ]
-                    : [
-                        Colors.white.withValues(alpha: 0.72),
-                        Colors.white.withValues(alpha: 0.52),
-                      ],
-              ),
-              shape: StadiumBorder(
-                side: BorderSide(
-                  color: t.isDark
-                      ? Colors.white.withValues(alpha: 0.20)
-                      : Colors.white.withValues(alpha: 0.92),
-                  width: 0.8,
-                ),
-              ),
-              shadows: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: t.isDark ? 0.22 : 0.055),
-                  blurRadius: 14,
-                  offset: const Offset(0, 4),
-                ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (isHostTransientConnecting && state.activeWorkspace.isNotEmpty) ...[
+                GrassBagStatusDot(color: t.primary, pulsing: true, size: 7),
+                const SizedBox(width: 7),
+              ] else ...[
+                Icon(CupertinoIcons.folder_fill, size: 15, color: t.primary),
+                const SizedBox(width: 7),
               ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (isHostTransientConnecting && state.activeWorkspace.isNotEmpty) ...[
-                  GrassBagStatusDot(color: t.primary, pulsing: true, size: 7),
-                  const SizedBox(width: 7),
-                ] else ...[
-                  Icon(CupertinoIcons.folder_fill, size: 15, color: t.primary),
-                  const SizedBox(width: 7),
-                ],
-                Flexible(
-                  child: Text(
-                    state.activeWorkspace.isEmpty
-                        ? ((isHostTransientConnecting || state.hydratingDomains)
-                            ? (state.hostIsLocal ? '正在连接本机 DSH…' : '正在连接「${state.hostName}」…')
-                            : '选择工作区')
-                        : '在「${state.activeWorkspace}」中${state.hostIsLocal ? '' : ' · ${state.hostName}'}',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                      letterSpacing: -0.1,
-                      color: t.text,
-                    ),
+              Flexible(
+                child: Text(
+                  state.activeWorkspace.isEmpty
+                      ? ((isHostTransientConnecting || state.hydratingDomains)
+                          ? (state.hostIsLocal ? '正在连接本机 DSH…' : '正在连接「${state.hostName}」…')
+                          : '选择工作区')
+                      : '在「${state.activeWorkspace}」中${state.hostIsLocal ? '' : ' · ${state.hostName}'}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                    letterSpacing: -0.1,
+                    color: t.text,
                   ),
                 ),
-                const SizedBox(width: 4),
-                Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.text3),
-              ],
-            ),
+              ),
+              const SizedBox(width: 4),
+              Icon(CupertinoIcons.chevron_down, size: 11.5, color: t.text3),
+            ],
           ),
         ),
         const SizedBox(height: 9),
@@ -548,6 +531,17 @@ class ChatEmptyState extends ConsumerWidget {
                 ],
               ),
             ),
+            // Hide dead-end starter cards & tips whenever a blocking setup/connection banner
+            // is displayed so onboarding stays calm, centered, and completely above the fold!
+            if (showLocalContainerBanner ||
+                showRemoteStatusBanner ||
+                showLocalDesktopErrorBanner ||
+                showNoModelOnboarding)
+              _MeasureBoxHeight(
+                onHeightChanged: onDeckHeightChanged,
+                child: const SizedBox.shrink(),
+              )
+            else
             // Build only the active suggestion layout branch inside LayoutBuilder and isolate
             // each staggered slice in a RepaintBoundary so 120Hz IME springs composite cached layers!
             () {
@@ -615,7 +609,7 @@ class ChatEmptyState extends ConsumerWidget {
                                     title: suggestions[i].$2,
                                     subtitle: suggestions[i].$3,
                                     accent: suggestions[i].$4,
-                                    onTap: () => onSuggestionTap(suggestions[i].$5),
+                                    onTap: () => handleStarterTap(i),
                                   ),
                                 ),
                               ),
@@ -630,7 +624,7 @@ class ChatEmptyState extends ConsumerWidget {
                                     title: suggestions[0].$2,
                                     subtitle: suggestions[0].$3,
                                     accent: suggestions[0].$4,
-                                    onTap: () => onSuggestionTap(suggestions[0].$5),
+                                    onTap: () => handleStarterTap(0),
                                   ),
                                 ),
                                 const SizedBox(width: 10),
@@ -640,7 +634,7 @@ class ChatEmptyState extends ConsumerWidget {
                                     title: suggestions[1].$2,
                                     subtitle: suggestions[1].$3,
                                     accent: suggestions[1].$4,
-                                    onTap: () => onSuggestionTap(suggestions[1].$5),
+                                    onTap: () => handleStarterTap(1),
                                   ),
                                 ),
                               ],
@@ -657,7 +651,7 @@ class ChatEmptyState extends ConsumerWidget {
                                     title: suggestions[2].$2,
                                     subtitle: suggestions[2].$3,
                                     accent: suggestions[2].$4,
-                                    onTap: () => onSuggestionTap(suggestions[2].$5),
+                                    onTap: () => handleStarterTap(2),
                                   ),
                                 ),
                                 const SizedBox(width: 10),
@@ -667,7 +661,7 @@ class ChatEmptyState extends ConsumerWidget {
                                     title: suggestions[3].$2,
                                     subtitle: suggestions[3].$3,
                                     accent: suggestions[3].$4,
-                                    onTap: () => onSuggestionTap(suggestions[3].$5),
+                                    onTap: () => handleStarterTap(3),
                                   ),
                                 ),
                               ],
@@ -680,55 +674,69 @@ class ChatEmptyState extends ConsumerWidget {
                       builder: (_, p, __) {
                         return IgnorePointer(
                           ignoring: p > 0.08,
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const SizedBox(height: 22),
-                              if (!twoCol)
-                                Column(
-                                  children: [
-                                    for (var i = 0; i < singleColTiles!.length; i++)
+                          child: AnimatedOpacity(
+                            opacity: isConnectingOrHydrating ? 0.64 : 1.0,
+                            duration: const Duration(milliseconds: 180),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const SizedBox(height: 22),
+                                if (!twoCol)
+                                  Column(
+                                    children: [
+                                      for (var i = 0; i < singleColTiles!.length; i++)
+                                        _StaggeredDeckSlice(
+                                          progress: p,
+                                          start: 0.02 + 0.03 * (singleColTiles.length - 1 - i),
+                                          end: 0.54 + 0.06 * (singleColTiles.length - 1 - i),
+                                          dy: 14.0 + 3.0 * i,
+                                          minScale: 0.93,
+                                          child: singleColTiles[i],
+                                        ),
+                                    ],
+                                  )
+                                else
+                                  Column(
+                                    children: [
                                       _StaggeredDeckSlice(
                                         progress: p,
-                                        start: 0.02 + 0.03 * (singleColTiles.length - 1 - i),
-                                        end: 0.54 + 0.06 * (singleColTiles.length - 1 - i),
-                                        dy: 14.0 + 3.0 * i,
-                                        minScale: 0.93,
-                                        child: singleColTiles[i],
+                                        start: 0.08,
+                                        end: 0.72,
+                                        dy: 16.0,
+                                        minScale: 0.94,
+                                        child: twoColRow1!,
                                       ),
-                                  ],
-                                )
-                              else
-                                Column(
-                                  children: [
-                                    _StaggeredDeckSlice(
-                                      progress: p,
-                                      start: 0.08,
-                                      end: 0.72,
-                                      dy: 16.0,
-                                      minScale: 0.94,
-                                      child: twoColRow1!,
-                                    ),
-                                    const SizedBox(height: 10),
-                                    _StaggeredDeckSlice(
-                                      progress: p,
-                                      start: 0.02,
-                                      end: 0.58,
-                                      dy: 22.0,
-                                      minScale: 0.92,
-                                      child: twoColRow2!,
-                                    ),
-                                  ],
+                                      const SizedBox(height: 10),
+                                      _StaggeredDeckSlice(
+                                        progress: p,
+                                        start: 0.02,
+                                        end: 0.58,
+                                        dy: 22.0,
+                                        minScale: 0.92,
+                                        child: twoColRow2!,
+                                      ),
+                                    ],
+                                  ),
+                                _StaggeredDeckSlice(
+                                  progress: p,
+                                  start: 0.01,
+                                  end: 0.48,
+                                  dy: 14.0,
+                                  minScale: 0.95,
+                                  child: const RepaintBoundary(
+                                    child: _RecentSessionsResumeStrip(),
+                                  ),
                                 ),
-                              _StaggeredDeckSlice(
-                                progress: p,
-                                start: 0.0,
-                                end: 0.42,
-                                dy: 12.0,
-                                minScale: 0.96,
-                                child: tipRowContent,
-                              ),
-                            ],
+                                _StaggeredDeckSlice(
+                                  progress: p,
+                                  start: 0.0,
+                                  end: 0.42,
+                                  dy: 12.0,
+                                  minScale: 0.96,
+                                  child: tipRowContent,
+                                ),
+                              ],
+                            ),
                           ),
                         );
                       },
@@ -927,12 +935,91 @@ class _RenderMeasureBoxHeight extends RenderProxyBox {
     final cb = onHeightChanged;
     if (cb == null || !hasSize) return;
     final h = size.height;
-    if (h > 0 && (h - _lastReported).abs() > 0.5) {
+    if (h >= 0 && (h - _lastReported).abs() > 0.5) {
       _lastReported = h;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         cb(h);
       });
     }
+  }
+}
+
+/// Isolated leaf widget surfacing 1-2 recent sessions on New Chat so returning users
+/// can jump back into an active or recent thread in 1 tap without opening the drawer.
+class _RecentSessionsResumeStrip extends ConsumerWidget {
+  const _RecentSessionsResumeStrip();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final recentSig = ref.watch(
+      appProvider.select((s) {
+        final items = s.sessions.where((x) => !x.archived).take(2);
+        return items
+            .map((x) => '${x.id}|${x.title}|${x.running ? 1 : 0}|${x.pendingApproval ? 1 : 0}')
+            .join('\u0000');
+      }),
+    );
+    if (recentSig.isEmpty) return const SizedBox.shrink();
+    final recent = ref
+        .read(appProvider)
+        .sessions
+        .where((x) => !x.archived)
+        .take(2)
+        .toList(growable: false);
+    if (recent.isEmpty) return const SizedBox.shrink();
+    final t = GrassBagTokens.of(context);
+    final ctrl = ref.read(appProvider.notifier);
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Wrap(
+        alignment: WrapAlignment.center,
+        spacing: 8,
+        runSpacing: 6,
+        children: [
+          for (final sess in recent)
+            GrassBagSpringTap(
+              onTap: () => ctrl.selectSession(sess.id),
+              pressedScale: 0.95,
+              haptic: true,
+              child: GrassBagFresnelGlassSurface(
+                isPill: true,
+                innerWell: true,
+                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 230),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (sess.pendingApproval) ...[
+                        GrassBagStatusDot(color: t.warn, pulsing: true, size: 6.5),
+                        const SizedBox(width: 6),
+                      ] else if (sess.running) ...[
+                        GrassBagStatusDot(color: t.primary, pulsing: true, size: 6.5),
+                        const SizedBox(width: 6),
+                      ] else ...[
+                        Icon(CupertinoIcons.clock, size: 12, color: t.text3),
+                        const SizedBox(width: 5),
+                      ],
+                      Flexible(
+                        child: Text(
+                          '继续 · ${sess.title}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w500,
+                            color: t.text2,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -1334,7 +1421,7 @@ class _SuggestionTileState extends State<_SuggestionTile> {
                       const SizedBox(height: 2),
                       Text(
                         widget.subtitle,
-                        maxLines: 1,
+                        maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           fontSize: 11.5,
@@ -1367,6 +1454,7 @@ class _FloatingMascot extends StatefulWidget {
 class _FloatingMascotState extends State<_FloatingMascot>
     with SingleTickerProviderStateMixin {
   late final SingleSpringController _spring;
+  bool _started = false;
 
   @override
   void initState() {
@@ -1375,7 +1463,20 @@ class _FloatingMascotState extends State<_FloatingMascot>
       vsync: this,
       spring: GlassSpring.bouncy(duration: const Duration(milliseconds: 520)),
       initialValue: 0.0,
-    )..animateTo(1.0);
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_started) {
+      _started = true;
+      if (MediaQuery.disableAnimationsOf(context)) {
+        _spring.setValue(1.0);
+      } else {
+        _spring.animateTo(1.0);
+      }
+    }
   }
 
   @override
@@ -1392,10 +1493,8 @@ class _FloatingMascotState extends State<_FloatingMascot>
       builder: (_, child) {
         final v = _spring.value;
         final clamped = v.clamp(0.0, 1.0);
-        // Keep FadeTransition permanently mounted so tree depth NEVER changes mid-spring;
-        // RenderAnimatedOpacity automatically skips OpacityLayer when opacity == 1.0!
-        return FadeTransition(
-          opacity: AlwaysStoppedAnimation<double>(clamped >= 0.995 ? 1.0 : clamped),
+        return GrassBagControlledOpacity(
+          opacity: clamped >= 0.995 ? 1.0 : clamped,
           child: Transform.translate(
             offset: Offset(0, (1.0 - v) * 10.0),
             child: Transform.scale(

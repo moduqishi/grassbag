@@ -106,11 +106,12 @@ class AllFeaturesPage extends ConsumerWidget {
         !state.nativePermissions.accessibilityNeedsRetoggle;
 
     void pushOrCall(VoidCallback? cb, WidgetBuilder builder) {
-      navigator.pop();
       if (cb != null) {
+        navigator.pop();
         cb();
       } else {
-        navigator.push(GrassBagPageRoute<void>(builder: builder));
+        // Replace cleanly in one route transition (zero overlapping pop + push double-flash!).
+        navigator.pushReplacement(GrassBagPageRoute<void>(builder: builder));
       }
     }
 

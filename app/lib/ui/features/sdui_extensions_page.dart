@@ -130,14 +130,24 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                           ),
                           const SizedBox(height: 12),
                         ],
-                        if (_loading && activeView != null) ...[
-                          GrassBagProgressBar(
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: SizedBox(
                             height: 2.5,
-                            color: t.primary,
-                            trackColor: t.fill1,
+                            child: AnimatedOpacity(
+                              opacity: (_loading && activeView != null) ? 1.0 : 0.0,
+                              duration: GrassBagMotion.duration(
+                                context,
+                                const Duration(milliseconds: 160),
+                              ),
+                              child: GrassBagProgressBar(
+                                height: 2.5,
+                                color: t.primary,
+                                trackColor: t.fill1,
+                              ),
+                            ),
                           ),
-                          const SizedBox(height: 10),
-                        ],
+                        ),
                       if (surfaces.isNotEmpty) ...[
                         SizedBox(
                           height: 46,
@@ -189,25 +199,31 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                         direction: _tabDirection,
                         duration: const Duration(milliseconds: 170),
                         child: KeyedSubtree(
-                          key: ValueKey('sdui-$_activeViewId-${activeView != null}-${_loading && activeView == null}'),
-                          child: (_loading && activeView == null)
-                              ? GrassBagCard(
-                                  padding: const EdgeInsets.symmetric(vertical: 36),
-                                  child: Center(
-                                    child: GrassBagActivityIndicator(color: t.primary),
-                                  ),
-                                )
-                              : (activeView != null
-                                  ? SduiNodeRenderer(
-                                      key: ValueKey(_activeViewId),
-                                      node: activeView.root,
-                                      tier: state.glassTier,
-                                      onAction: (actionId, payload) async {
-                                        final navigator = Navigator.of(context);
-                                        final prevSid = ref.read(appProvider).activeSessionId;
-                                        final err = await ctrl.invokeSduiAction(_activeViewId, actionId, payload);
-                                        if (mounted && ref.read(appProvider).activeSessionId != prevSid) {
-                                          navigator.pop();
+                          key: ValueKey('sdui-$_activeViewId'),
+                          child: AnimatedSwitcher(
+                            duration: GrassBagMotion.duration(
+                              context,
+                              const Duration(milliseconds: 170),
+                            ),
+                            child: (_loading && activeView == null)
+                                ? GrassBagCard(
+                                    key: const ValueKey('sdui-loading'),
+                                    padding: const EdgeInsets.symmetric(vertical: 36),
+                                    child: Center(
+                                      child: GrassBagActivityIndicator(color: t.primary),
+                                    ),
+                                  )
+                                : (activeView != null
+                                    ? SduiNodeRenderer(
+                                        key: ValueKey('sdui-view-$_activeViewId'),
+                                        node: activeView.root,
+                                        tier: state.glassTier,
+                                        onAction: (actionId, payload) async {
+                                          final navigator = Navigator.of(context);
+                                          final prevSid = ref.read(appProvider).activeSessionId;
+                                          final err = await ctrl.invokeSduiAction(_activeViewId, actionId, payload);
+                                          if (mounted && ref.read(appProvider).activeSessionId != prevSid) {
+                                            navigator.pop();
                                         }
                                         return err;
                                       },
@@ -243,6 +259,7 @@ class _SduiExtensionsPageState extends ConsumerState<SduiExtensionsPage> {
                                         ],
                                       ),
                                     )),
+                          ),
                         ),
                       ),
                     ],

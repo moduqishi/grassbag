@@ -85,6 +85,7 @@ class VanillaDshAdapter {
             method != 'llm/listProviders' &&
             method != 'llm/listConfigurableProviders') ||
         method.startsWith('credentials/') ||
+        method.startsWith('account/') ||
         method.startsWith('deepseek') ||
         method.startsWith('plugin') ||
         method == 'agentPresets/select') {
@@ -139,33 +140,37 @@ class VanillaDshAdapter {
   /// Invoke a stock DSH unary Typert RPC (`POST /api/<namespace>/<method>`).
   Future<dynamic> rpc(String method, [Map<String, dynamic> args = const {}]) async {
     _invalidateCachesForMutation(method);
-    final res = await transport.requestJson(
-      'POST',
-      '/api/$method',
-      body: {
-        'type': 'client-request',
-        'rpcId': 'gb-dir-${DateTime.now().microsecondsSinceEpoch}-${++_rpcSeq}',
-        'method': method,
-        'payload': {'args': args},
-      },
-    );
-    final result = res['result'];
-    if (result is Map<String, dynamic>) {
-      if (result['ok'] == false) {
-        final err = result['error'];
-        final code = (err is Map ? err['code']?.toString() : null) ?? 'dsh/rpc_error';
-        final msg = (err is Map ? err['message']?.toString() : err?.toString()) ?? 'RPC $method failed';
-        final details = err is Map ? err['details'] : null;
-        throw GbridgeException(
-          status: _mapCodeToStatus(code),
-          code: code,
-          message: msg,
-          details: details,
-        );
+    try {
+      final res = await transport.requestJson(
+        'POST',
+        '/api/$method',
+        body: {
+          'type': 'client-request',
+          'rpcId': 'gb-dir-${DateTime.now().microsecondsSinceEpoch}-${++_rpcSeq}',
+          'method': method,
+          'payload': {'args': args},
+        },
+      );
+      final result = res['result'];
+      if (result is Map<String, dynamic>) {
+        if (result['ok'] == false) {
+          final err = result['error'];
+          final code = (err is Map ? err['code']?.toString() : null) ?? 'dsh/rpc_error';
+          final msg = (err is Map ? err['message']?.toString() : err?.toString()) ?? 'RPC $method failed';
+          final details = err is Map ? err['details'] : null;
+          throw GbridgeException(
+            status: _mapCodeToStatus(code),
+            code: code,
+            message: msg,
+            details: details,
+          );
+        }
+        return result['value'];
       }
-      return result['value'];
+      return res;
+    } finally {
+      _invalidateCachesForMutation(method);
     }
-    return res;
   }
 
   static int _mapCodeToStatus(String code) {
@@ -622,10 +627,16 @@ class VanillaDshAdapter {
       'request': {
         'sessionId': sessionId,
         if (atSeq != null) 'atSeq': atSeq,
-        if (title != null) 'title': title,
       },
     });
-    return {'v': 1, 'session': res, ..._asMap(res)};
+    final mapped = _asMap(res);
+    final forkedId = (mapped['sessionId'] ?? mapped['id'])?.toString() ?? '';
+    if (title != null && title.trim().isNotEmpty && forkedId.isNotEmpty) {
+      await rpc('session/rename', {
+        'request': {'sessionId': forkedId, 'title': title.trim()},
+      }).catchError((_) => null);
+    }
+    return {'v': 1, 'session': res, ...mapped};
   }
 
   Future<Map<String, dynamic>> getSessionProjections(String sessionId) async {
@@ -838,119 +849,129 @@ class VanillaDshAdapter {
   }) async {
     final pending = mux.takePendingInteraction(interactionId);
     if (pending == null) return const {'v': 1, 'ok': false};
-
-    if (pending.kind == 'cordis_run') {
-      final d = decision?.toString().toLowerCase() ?? 'deny';
-      final isAllow = d == 'allow' || d == 'approve' || d == 'allowed-once' || d == 'always';
-      Map<String, dynamic> resolution;
-      if (isAllow) {
-        String? pluginRunId;
-        final p = pending.payload;
-        if (p['pluginId'] != null && p['packageId'] != null) {
-          final runRes = _asMap(await rpc('dynamicCordisRunner/runHostHalf', {
-            'agentId': pending.sessionId ?? p['agentId'],
-            'pluginId': p['pluginId'],
-            'packageId': p['packageId'],
-            'mode': p['mode'] ?? 'host',
-            'requestId': interactionId,
-            'approveFutureVersions': d == 'always',
-          }));
-          pluginRunId = (runRes['pluginRunId'] ?? runRes['id'])?.toString();
+    var resolved = false;
+    try {
+      if (pending.kind == 'cordis_run') {
+        final d = decision?.toString().toLowerCase() ?? 'deny';
+        final isAllow = d == 'allow' || d == 'approve' || d == 'allowed-once' || d == 'always';
+        Map<String, dynamic> resolution;
+        if (isAllow) {
+          String? pluginRunId;
+          final p = pending.payload;
+          if (p['pluginId'] != null && p['packageId'] != null) {
+            final runRes = _asMap(await rpc('dynamicCordisRunner/runHostHalf', {
+              'agentId': pending.sessionId ?? p['agentId'],
+              'pluginId': p['pluginId'],
+              'packageId': p['packageId'],
+              'mode': p['mode'] ?? 'host',
+              'requestId': interactionId,
+              'approveFutureVersions': d == 'always',
+            }));
+            pluginRunId = (runRes['pluginRunId'] ?? runRes['id'])?.toString();
+          }
+          resolution = pluginRunId != null && pluginRunId.isNotEmpty
+              ? {'ok': true, 'pluginRunId': pluginRunId}
+              : {'ok': true, 'approved': true};
+        } else {
+          resolution = {'ok': false, 'reason': 'rejected'};
         }
-        resolution = pluginRunId != null && pluginRunId.isNotEmpty
-            ? {'ok': true, 'pluginRunId': pluginRunId}
-            : {'ok': true, 'approved': true};
-      } else {
-        resolution = {'ok': false, 'reason': 'rejected'};
+        await rpc('dynamicCordisRunner/resolveRequestRun', {
+          'requestId': interactionId,
+          'resolution': resolution,
+        });
+        mux.markInteractionResolved(interactionId);
+        resolved = true;
+        return {'v': 1, 'ok': true};
       }
-      await rpc('dynamicCordisRunner/resolveRequestRun', {
-        'requestId': interactionId,
-        'resolution': resolution,
-      });
-      mux.markInteractionResolved(interactionId);
-      return {'v': 1, 'ok': true};
-    }
 
-    final clientId = pending.clientId ?? mux.eventsClientId;
-    if (clientId == null || clientId.isEmpty) {
-      throw const GbridgeException(
-        status: 409,
-        code: 'dsh/events_not_ready',
-        message: 'DSH host event stream clientId unavailable',
-      );
-    }
+      final clientId = pending.clientId ?? mux.eventsClientId;
+      if (clientId == null || clientId.isEmpty) {
+        throw const GbridgeException(
+          status: 409,
+          code: 'dsh/events_not_ready',
+          message: 'DSH host event stream clientId unavailable',
+        );
+      }
 
-    var rememberAlways = false;
-    Map<String, dynamic> effectiveOutcome;
-    if (outcome != null) {
-      effectiveOutcome = outcome;
-    } else if (pending.kind == 'user_questions') {
-      final dLow = decision?.toString().trim().toLowerCase() ?? '';
-      if (answers == null &&
-          (dLow == 'cancel' || dLow == 'cancelled' || dLow == 'dismiss' || dLow == 'skip')) {
+      var rememberAlways = false;
+      Map<String, dynamic> effectiveOutcome;
+      if (outcome != null) {
+        effectiveOutcome = outcome;
+      } else if (decision?.toString().trim().toLowerCase() == 'pass') {
         effectiveOutcome = const {'kind': 'next'};
-      } else {
-        final rawVal = answers ?? decision;
-        final qs = pending.payload['questions'] is List
-            ? pending.payload['questions'] as List
-            : const <dynamic>[];
-        final firstQId = qs.isNotEmpty && qs.first is Map && (qs.first as Map)['id'] != null
-            ? (qs.first as Map)['id'].toString()
-            : 'q-0';
-        Object? formattedVal = rawVal;
-        if (rawVal is List) {
-          final structured = rawVal.every((a) => a is Map && a['id'] is String);
-          formattedVal = {
-            'answers': structured
-                ? rawVal
-                : [
-                    {'id': firstQId, 'selected': rawVal.map((e) => e.toString()).toList()},
-                  ],
-          };
-        } else if (rawVal is String) {
-          formattedVal = {
-            'answers': [
-              {'id': firstQId, 'selected': [rawVal], 'custom': rawVal},
-            ],
-          };
-        } else if (rawVal is Map && !rawVal.containsKey('answers')) {
-          formattedVal = {
-            'answers': [
-              for (final entry in rawVal.entries)
-                {
-                  'id': entry.key.toString(),
-                  'selected': entry.value is List
-                      ? (entry.value as List).map((e) => e.toString()).toList()
-                      : [entry.value.toString()],
-                },
-            ],
-          };
+      } else if (pending.kind == 'user_questions') {
+        final dLow = decision?.toString().trim().toLowerCase() ?? '';
+        if (answers == null &&
+            (dLow == 'cancel' || dLow == 'cancelled' || dLow == 'dismiss' || dLow == 'skip')) {
+          effectiveOutcome = const {'kind': 'next'};
+        } else {
+          final rawVal = answers ?? decision;
+          final qs = pending.payload['questions'] is List
+              ? pending.payload['questions'] as List
+              : const <dynamic>[];
+          final firstQId = qs.isNotEmpty && qs.first is Map && (qs.first as Map)['id'] != null
+              ? (qs.first as Map)['id'].toString()
+              : 'q-0';
+          Object? formattedVal = rawVal;
+          if (rawVal is List) {
+            final structured = rawVal.every((a) => a is Map && a['id'] is String);
+            formattedVal = {
+              'answers': structured
+                  ? rawVal
+                  : [
+                      {'id': firstQId, 'selected': rawVal.map((e) => e.toString()).toList()},
+                    ],
+            };
+          } else if (rawVal is String) {
+            formattedVal = {
+              'answers': [
+                {'id': firstQId, 'selected': [rawVal], 'custom': rawVal},
+              ],
+            };
+          } else if (rawVal is Map && !rawVal.containsKey('answers')) {
+            formattedVal = {
+              'answers': [
+                for (final entry in rawVal.entries)
+                  {
+                    'id': entry.key.toString(),
+                    'selected': entry.value is List
+                        ? (entry.value as List).map((e) => e.toString()).toList()
+                        : [entry.value.toString()],
+                  },
+              ],
+            };
+          }
+          effectiveOutcome = {'kind': 'result', 'value': formattedVal};
         }
-        effectiveOutcome = {'kind': 'result', 'value': formattedVal};
+      } else if (pending.kind == 'approval') {
+        final d = decision?.toString().toLowerCase() ?? 'deny';
+        final mapped = (d == 'allow' || d == 'approve' || d == 'allowed-once' || d == 'always')
+            ? 'allowed-once'
+            : (d == 'cancel' || d == 'cancelled')
+                ? 'cancelled'
+                : 'rejected';
+        rememberAlways = d == 'always';
+        effectiveOutcome = {'kind': 'result', 'value': mapped};
+      } else {
+        effectiveOutcome = {'kind': 'result', 'value': decision ?? answers};
       }
-    } else if (pending.kind == 'approval') {
-      final d = decision?.toString().toLowerCase() ?? 'deny';
-      final mapped = (d == 'allow' || d == 'approve' || d == 'allowed-once' || d == 'always')
-          ? 'allowed-once'
-          : (d == 'cancel' || d == 'cancelled')
-              ? 'cancelled'
-              : 'rejected';
-      rememberAlways = d == 'always';
-      effectiveOutcome = {'kind': 'result', 'value': mapped};
-    } else {
-      effectiveOutcome = {'kind': 'result', 'value': decision ?? answers};
-    }
 
-    await rpc(r'$events/result', {
-      'clientId': clientId,
-      'eventId': pending.eventId,
-      'outcome': effectiveOutcome,
-    });
-    if (rememberAlways) {
-      mux.rememberSessionAlwaysAllowed(pending.sessionId, pending.payload);
+      await rpc(r'$events/result', {
+        'clientId': clientId,
+        'eventId': pending.eventId,
+        'outcome': effectiveOutcome,
+      });
+      if (rememberAlways) {
+        mux.rememberSessionAlwaysAllowed(pending.sessionId, pending.payload);
+      }
+      mux.markInteractionResolved(interactionId);
+      resolved = true;
+      return {'v': 1, 'ok': true};
+    } finally {
+      if (!resolved) {
+        mux.releasePendingInteraction(interactionId);
+      }
     }
-    mux.markInteractionResolved(interactionId);
-    return {'v': 1, 'ok': true};
   }
 
   Future<Map<String, dynamic>> getPermissionsCatalog() async {
@@ -965,11 +986,11 @@ class VanillaDshAdapter {
   // Workspaces, FS, Files, Diffs, Uploads
   // ---------------------------------------------------------------------------
   Future<({List<Map<String, dynamic>> workspaces, Set<String> archivedIds, Set<String> pinnedIds})>
-      _readWorkspaceSnapshot() {
-    return _cachedRead(
-      'workspace/follow',
-      () async {
-        try {
+      _readWorkspaceSnapshot() async {
+    try {
+      return await _cachedRead(
+        'workspace/follow',
+        () async {
           final frame = await mux.readFirstStreamItem('workspace/follow', const {});
           final m = _asMap(frame);
           final val = m['value'] is Map ? _asMap(m['value']) : m;
@@ -999,11 +1020,11 @@ class VanillaDshAdapter {
           final archived = _asList(val['archivedSessionIds']).map((e) => e.toString()).toSet();
           final pinned = _asList(val['pinnedSessionIds']).map((e) => e.toString()).toSet();
           return (workspaces: workspaces, archivedIds: archived, pinnedIds: pinned);
-        } catch (_) {
-          return (workspaces: const <Map<String, dynamic>>[], archivedIds: const <String>{}, pinnedIds: const <String>{});
-        }
-      },
-    );
+        },
+      );
+    } catch (_) {
+      return (workspaces: const <Map<String, dynamic>>[], archivedIds: const <String>{}, pinnedIds: const <String>{});
+    }
   }
 
   Future<Map<String, dynamic>> listWorkspaces() async {
@@ -1095,7 +1116,7 @@ class VanillaDshAdapter {
     String? sessionId,
   }) async {
     final res = await rpc('workspaceFiles/read', {
-      'workspaceFileScopeId': sessionId ?? workspaceId,
+      'workspaceFileScopeId': (sessionId != null && sessionId.isNotEmpty) ? sessionId : workspaceId,
       'path': path,
       'range': {
         'offset': offset ?? 1,
@@ -1284,7 +1305,9 @@ class VanillaDshAdapter {
   // ---------------------------------------------------------------------------
   Future<Map<String, dynamic>> getModels({String? sessionId}) async {
     final results = await Future.wait<dynamic>([
-      rpc('session/modelCatalog', const {}),
+      rpc('session/modelCatalog', {
+        if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+      }),
       _cachedRead<dynamic>('llm/listProviders', () => rpc('llm/listProviders', const {}))
           .catchError((_) => const <dynamic>[]),
       _cachedRead<dynamic>(
@@ -2132,7 +2155,13 @@ class VanillaDshAdapter {
         clean = clean.substring(commaIdx + 1);
       }
       clean = clean.replaceAll(RegExp(r'\s+'), '');
-      if (clean.isNotEmpty) return base64Decode(clean);
+      if (clean.isNotEmpty) {
+        try {
+          return base64Decode(base64.normalize(clean));
+        } on FormatException {
+          return Uint8List(0);
+        }
+      }
     }
     return Uint8List(0);
   }

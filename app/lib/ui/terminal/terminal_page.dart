@@ -1209,14 +1209,26 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
             final needsReattach = item.backend == _TermBackend.simulated ||
                 (item.backend == _TermBackend.remoteWs &&
                     !item.attaching &&
-                    !identical(item.ownerClient, live));
+                    (!identical(item.ownerClient, live) || item.exited));
             if (needsReattach) {
               if (ti == _activeIndex) {
                 _restartActiveTab();
               } else if (!item.closed) {
-                if (item.wsChannel != null && item.ownerClient != null) {
-                  item.ownerClient!.stream.unsubscribe(item.wsChannel!);
+                final prevTermId = item.remoteTermId;
+                final prevSid = item.remoteSessionId;
+                final prevOwner = item.ownerClient;
+                if (item.wsChannel != null && prevOwner != null) {
+                  prevOwner.stream.unsubscribe(item.wsChannel!);
                   item.wsChannel = null;
+                }
+                if (prevTermId != null && prevTermId.isNotEmpty) {
+                  item.remoteTermId = null;
+                  item.remoteSessionId = null;
+                  unawaited(
+                    live
+                        .closeTerminal(prevTermId, sessionId: prevSid)
+                        .catchError((_) => <String, dynamic>{}),
+                  );
                 }
                 item.ownerClient = live;
                 item.exited = false;

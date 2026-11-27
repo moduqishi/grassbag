@@ -31,6 +31,21 @@ void main() {
           prerelease: 'rc.1',
         ),
       );
+      final betaPrefixed = parseAppVersion('beta-v0.1.2+5');
+      expect(
+        betaPrefixed,
+        const ParsedAppVersion(
+          major: 0,
+          minor: 1,
+          patch: 2,
+          buildNumber: 5,
+          prerelease: 'beta',
+        ),
+      );
+      expect(
+        compareAppVersions(parseAppVersion('v0.1.2+5')!, betaPrefixed!),
+        greaterThan(0),
+      );
       expect(parseAppVersion('not-a-version'), isNull);
     });
 

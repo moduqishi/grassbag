@@ -650,7 +650,7 @@ class SduiNodeRenderer extends StatelessWidget {
                       haptic: true,
                       onTap: () {
                         Clipboard.setData(ClipboardData(text: diff));
-                        onCopied?.call(diff);
+                        onCopied?.call('已复制 Diff · $path');
                       },
                       child: GrassBagFresnelGlassSurface(
                         isPill: true,
@@ -688,41 +688,43 @@ class SduiNodeRenderer extends StatelessWidget {
                   colors: [Colors.white, Colors.white, Colors.transparent],
                   stops: [0.0, 0.94, 1.0],
                 ).createShader(bounds),
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  physics: const BouncingScrollPhysics(),
-                  padding: const EdgeInsets.only(right: 16),
-                  child: SizedBox(
-                    width: contentWidth,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        for (final line in lines)
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                            color: line.startsWith('+') && !line.startsWith('+++')
-                                ? t.ok.withValues(alpha: t.isDark ? 0.16 : 0.13)
-                                : (line.startsWith('-') && !line.startsWith('---')
-                                    ? t.err.withValues(alpha: t.isDark ? 0.16 : 0.12)
-                                    : null),
-                            child: Text(
-                              line,
-                              softWrap: false,
-                              overflow: TextOverflow.visible,
-                              style: TextStyle(
-                                fontFamily: 'monospace',
-                                fontSize: 11.5,
-                                color: line.startsWith('+') && !line.startsWith('+++')
-                                    ? (t.isDark ? const Color(0xFF6EE7B7) : const Color(0xFF0D7A4F))
-                                    : (line.startsWith('-') && !line.startsWith('---')
-                                        ? (t.isDark ? const Color(0xFFFCA5A5) : const Color(0xFFC42B2B))
-                                        : (line.startsWith('@@')
-                                            ? (t.isDark ? const Color(0xFF93C5FD) : const Color(0xFF2563EB))
-                                            : t.codeFg)),
+                child: SelectionArea(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.only(right: 16),
+                    child: SizedBox(
+                      width: contentWidth,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (final line in lines)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
+                              color: line.startsWith('+') && !line.startsWith('+++')
+                                  ? t.ok.withValues(alpha: t.isDark ? 0.16 : 0.13)
+                                  : (line.startsWith('-') && !line.startsWith('---')
+                                      ? t.err.withValues(alpha: t.isDark ? 0.16 : 0.12)
+                                      : null),
+                              child: Text(
+                                line,
+                                softWrap: false,
+                                overflow: TextOverflow.visible,
+                                style: TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 11.5,
+                                  color: line.startsWith('+') && !line.startsWith('+++')
+                                      ? (t.isDark ? const Color(0xFF6EE7B7) : const Color(0xFF0D7A4F))
+                                      : (line.startsWith('-') && !line.startsWith('---')
+                                          ? (t.isDark ? const Color(0xFFFCA5A5) : const Color(0xFFC42B2B))
+                                          : (line.startsWith('@@')
+                                              ? (t.isDark ? const Color(0xFF93C5FD) : const Color(0xFF2563EB))
+                                              : t.codeFg)),
+                                ),
                               ),
                             ),
-                          ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),

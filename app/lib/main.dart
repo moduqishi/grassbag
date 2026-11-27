@@ -86,9 +86,14 @@ Future<void> main() async {
     GrassBagController.preloadedInitialHosts = preloadedHosts;
   }
 
-  // Warm up ONLY GrassBag's unified single-pass Kyant0 GLSL engine (skipping unused third-party
-  // multi-pass shaders to cut cold-start GPU pipeline compilation & memory usage).
-  unawaited(KyantLiquidGlassEngine.warmUp());
+  // Warm up liquid_glass_widgets 1.19.0 Impeller shaders off the Frame-0 critical path
+  // so genuine iOS 27 optical glass renders smoothly on first appearance without startup jank.
+  unawaited(
+    LiquidGlassWidgets.initialize(
+      warmUpMode: GlassWarmUpMode.auto,
+      enablePerformanceMonitor: false,
+    ),
+  );
 
   runApp(
     const ProviderScope(

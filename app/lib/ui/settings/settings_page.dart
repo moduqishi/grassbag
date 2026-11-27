@@ -2242,16 +2242,15 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
     final isSolid = widget.glassTier == GrassBagGlassTier.solid;
     final isLiquid = widget.glassTier == GrassBagGlassTier.liquid;
 
-    // Draggable Kyant0 7-band chromatic-aberration crystal lens capsule
-    final prismStyle = KyantLiquidGlassStyle.prismShowcase(
-      t,
-      widget.glassTier,
-      blurRadius: isLiquid ? 0.0 : 8.0,
-      refractionHeight: 10.0 + 18.0 * _refractionScale,
-      refractionAmount: 16.0 + 30.0 * _refractionScale,
-      chromaticAberration: isLiquid ? (0.35 + 0.65 * _refractionScale) : 0.0,
-      depthEffect: true,
-    );
+    // Draggable genuine liquid_glass_widgets 1.19.0 iOS 27 crystal prism lens capsule
+    final prismBase = GrassBagGlassConfig.prismLensSettings(t, widget.glassTier);
+    final prismSettings = isLiquid
+        ? prismBase.copyWith(
+            thickness: 20.0 + 18.0 * _refractionScale,
+            refractiveIndex: 1.24 + 0.20 * _refractionScale,
+            chromaticAberration: 0.08 + 0.16 * _refractionScale,
+          )
+        : prismBase;
 
     final draggableLensCard = RawGestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -2303,9 +2302,11 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
                   ],
                 ),
               )
-            : KyantLiquidGlass(
-                style: prismStyle,
-                borderRadius: BorderRadius.circular(22),
+            : AdaptiveGlass(
+                useOwnLayer: true,
+                quality: GrassBagGlassConfig.chromeQualityFor(widget.glassTier),
+                settings: prismSettings,
+                shape: const LiquidRoundedSuperellipse(borderRadius: 22),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
                   child: Row(

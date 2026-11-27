@@ -2412,7 +2412,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   ),
 
                   // Smooth height + Liquid Glass transition between Approval/Question/Cordis
-                  // Takeover Cards & Floating Composer (direct-SDF KyantLiquidGlass has zero toImageSync!).
+                  // Takeover Cards & Floating Composer (genuine liquid_glass_widgets iOS 27 glass).
                   AnimatedSize(
                     duration: GrassBagMotion.duration(context, const Duration(milliseconds: 230)),
                     curve: Curves.easeOutCubic,
@@ -2536,7 +2536,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               borderRadius: 28,
                               elevated: true,
                               interactiveGlow: false,
-                              padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
+                              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
                               child: AnimatedSize(
                                 duration: GrassBagMotion.duration(
                                   context,
@@ -3164,7 +3164,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                         }
                                       },
                                       child: Padding(
-                                        padding: const EdgeInsets.fromLTRB(8, 2, 8, 6),
+                                        padding: const EdgeInsets.fromLTRB(8, 2, 8, 4),
                                         child: Column(
                                           mainAxisSize: MainAxisSize.min,
                                           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3257,7 +3257,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                 ),
                                                 isDense: true,
                                                   contentPadding:
-                                                      const EdgeInsets.symmetric(vertical: 6),
+                                                      const EdgeInsets.symmetric(vertical: 4),
                                                   border: InputBorder.none,
                                                 ),
                                               ),
@@ -3304,10 +3304,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   !veryTightRow && !(tightRow && hasExtraStreamActions);
                               return Row(
                             children: [
-                              // Crisp spring-animated '+' Liquid Glass orb (rotates 45° into '×')
+                              // Clean borderless Apple iOS 27 concentric '+' orb inside the floating glass composer
+                              // (ZERO nested wireframe rings — rotates 45° into accented '×' when open!)
                               () {
                                 final effectiveTier =
                                     resolveEffectiveGlassTier(context, state.glassTier);
+                                final isSolid = effectiveTier == GrassBagGlassTier.solid;
                                 final plusIcon = AnimatedRotation(
                                   turns: _plusOpen ? 0.125 : 0.0,
                                   duration: GrassBagMotion.duration(
@@ -3318,60 +3320,39 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   child: Icon(
                                     CupertinoIcons.plus,
                                     size: 19,
-                                    color: _plusOpen
-                                        ? (effectiveTier == GrassBagGlassTier.solid
-                                            ? t.primary
-                                            : t.onPrimary)
-                                        : t.text2,
+                                    color: _plusOpen ? t.primary : t.text2,
                                   ),
                                 );
-                                final Widget plusBtn = effectiveTier == GrassBagGlassTier.solid
-                                    ? GrassBagSpringTap(
-                                        key: const ValueKey('composer-plus-btn'),
-                                        onTap: _togglePlus,
-                                        pressedScale: 0.88,
-                                        enablePointerGlow: false,
-                                        child: AnimatedContainer(
-                                          duration: const Duration(milliseconds: 220),
-                                          curve: Curves.easeOutCubic,
-                                          width: 36,
-                                          height: 36,
-                                          decoration: BoxDecoration(
-                                            color: _plusOpen
-                                                ? t.primary.withValues(alpha: t.isDark ? 0.28 : 0.16)
-                                                : (t.isDark
-                                                    ? Colors.white.withValues(alpha: 0.11)
-                                                    : Colors.black.withValues(alpha: 0.06)),
-                                            shape: BoxShape.circle,
-                                            border: Border.all(
+                                final plusBtn = GrassBagSpringTap(
+                                  key: const ValueKey('composer-plus-btn'),
+                                  onTap: _togglePlus,
+                                  pressedScale: 0.88,
+                                  enablePointerGlow: false,
+                                  haptic: true,
+                                  child: AnimatedContainer(
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      color: _plusOpen
+                                          ? t.primary.withValues(alpha: t.isDark ? 0.26 : 0.16)
+                                          : (t.isDark
+                                              ? Colors.white.withValues(alpha: 0.10)
+                                              : Colors.black.withValues(alpha: 0.055)),
+                                      shape: BoxShape.circle,
+                                      border: isSolid
+                                          ? Border.all(
                                               color: _plusOpen
-                                                  ? t.primary.withValues(alpha: t.isDark ? 0.46 : 0.32)
-                                                  : t.sepStrong,
+                                                  ? t.primary.withValues(alpha: t.isDark ? 0.42 : 0.28)
+                                                  : t.sep,
                                               width: 0.65,
-                                            ),
-                                          ),
-                                          child: plusIcon,
-                                        ),
-                                      )
-                                    : KyantInteractiveGlassButton(
-                                        key: const ValueKey('composer-plus-btn'),
-                                        onTap: _togglePlus,
-                                        isCircle: true,
-                                        isCapsule: false,
-                                        width: 36,
-                                        height: 36,
-                                        style: KyantLiquidGlassStyle.nestedControl(
-                                          t,
-                                          effectiveTier,
-                                          tint: _plusOpen ? t.primary : null,
-                                          surfaceColor: _plusOpen
-                                              ? null
-                                              : (t.isDark
-                                                  ? Colors.white.withValues(alpha: 0.10)
-                                                  : Colors.white.withValues(alpha: 0.28)),
-                                        ),
-                                        child: plusIcon,
-                                      );
+                                            )
+                                          : null,
+                                    ),
+                                    child: plusIcon,
+                                  ),
+                                );
                                 return Tooltip(
                                   message: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
                                   excludeFromSemantics: true,
@@ -3533,41 +3514,30 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
                                         ],
                                       );
-                                      if (effectiveTier == GrassBagGlassTier.solid) {
-                                        return GrassBagSpringTap(
-                                          onTap: () {
-                                            if (_plusOpen) _setPlusOpen(false);
-                                            pillTap();
-                                          },
-                                          pressedScale: 0.94,
-                                          enablePointerGlow: false,
-                                          haptic: true,
-                                          child: GrassBagFresnelGlassSurface(
-                                            isPill: true,
-                                            innerWell: true,
-                                            interactive: true,
-                                            height: 36,
-                                            padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                            child: modelRow,
-                                          ),
-                                        );
-                                      }
-                                      return KyantInteractiveGlassButton(
+                                      final isSolid = effectiveTier == GrassBagGlassTier.solid;
+                                      return GrassBagSpringTap(
                                         onTap: () {
                                           if (_plusOpen) _setPlusOpen(false);
                                           pillTap();
                                         },
-                                        isCapsule: true,
-                                        height: 36,
-                                        padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                        style: KyantLiquidGlassStyle.nestedControl(
-                                          t,
-                                          effectiveTier,
-                                          surfaceColor: t.isDark
-                                              ? Colors.white.withValues(alpha: 0.09)
-                                              : Colors.white.withValues(alpha: 0.28),
+                                        pressedScale: 0.94,
+                                        enablePointerGlow: false,
+                                        haptic: true,
+                                        child: Container(
+                                          height: 36,
+                                          padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
+                                          decoration: ShapeDecoration(
+                                            color: t.isDark
+                                                ? Colors.white.withValues(alpha: 0.09)
+                                                : Colors.black.withValues(alpha: 0.055),
+                                            shape: StadiumBorder(
+                                              side: isSolid
+                                                  ? BorderSide(color: t.sep, width: 0.65)
+                                                  : BorderSide.none,
+                                            ),
+                                          ),
+                                          child: modelRow,
                                         ),
-                                        child: modelRow,
                                       );
                                   }(),
                                 ),
@@ -3784,40 +3754,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                     _openVoiceInput();
                                   }
                                 }
-                                if (effectiveTier != GrassBagGlassTier.solid) {
-                                  return Tooltip(
-                                    message: orbTooltip,
-                                    child: KyantInteractiveGlassButton(
-                                      key: const ValueKey('composer-action-btn'),
-                                      enabled: orbEnabled,
-                                      onTap: orbEnabled ? handleOrbTap : null,
-                                      isCircle: true,
-                                      isCapsule: false,
-                                      width: 36,
-                                      height: 36,
-                                      style: KyantLiquidGlassStyle.nestedControl(
-                                        t,
-                                        effectiveTier,
-                                        tint: primaryActive ? t.primary : null,
-                                        surfaceColor: primaryActive
-                                            ? null
-                                            : (isStopOrb
-                                                ? t.err.withValues(alpha: t.isDark ? 0.26 : 0.16)
-                                                : (t.isDark
-                                                    ? Colors.white.withValues(alpha: 0.10)
-                                                    : Colors.white.withValues(alpha: 0.28))),
-                                      ),
-                                      child: orbChild,
-                                    ),
-                                  );
-                                }
+                                final isSolid = effectiveTier == GrassBagGlassTier.solid;
                                 return Tooltip(
                                   message: orbTooltip,
                                   child: GrassBagSpringTap(
                                     key: const ValueKey('composer-action-btn'),
                                     enabled: orbEnabled,
-                                    enablePointerGlow: orbInteractive,
-                                    pressedScale: orbInteractive ? 0.86 : 1.0,
+                                    enablePointerGlow: false,
+                                    pressedScale: orbInteractive ? 0.88 : 1.0,
                                     onTap: handleOrbTap,
                                     child: AnimatedContainer(
                                       duration: const Duration(milliseconds: 220),
@@ -3830,37 +3774,34 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           end: Alignment.bottomRight,
                                           colors: primaryActive
                                               ? [
-                                                  Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.12 : 0.16)!,
+                                                  Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.10 : 0.14)!,
                                                   t.primary,
                                                 ]
                                               : (isStopOrb
-                                                  ? [
-                                                      Color.lerp(t.errSoft, Colors.white, t.isDark ? 0.06 : 0.20)!,
-                                                      t.errSoft,
-                                                    ]
+                                                  ? [t.errSoft, t.errSoft]
                                                   : (t.isDark
                                                       ? [
-                                                          Colors.white.withValues(alpha: 0.13),
+                                                          Colors.white.withValues(alpha: 0.11),
                                                           Colors.white.withValues(alpha: 0.09),
                                                         ]
                                                       : [
-                                                          Colors.black.withValues(alpha: 0.07),
+                                                          Colors.black.withValues(alpha: 0.06),
                                                           Colors.black.withValues(alpha: 0.05),
                                                         ])),
                                         ),
                                         shape: BoxShape.circle,
-                                        border: Border.all(
-                                          color: isStopOrb
-                                              ? t.err.withValues(alpha: 0.34)
-                                              : (primaryActive
-                                                  ? Colors.white.withValues(alpha: 0.24)
-                                                  : t.sepStrong),
-                                          width: 0.65,
-                                        ),
+                                        border: isSolid && !primaryActive
+                                            ? Border.all(
+                                                color: isStopOrb
+                                                    ? t.err.withValues(alpha: 0.30)
+                                                    : t.sep,
+                                                width: 0.65,
+                                              )
+                                            : null,
                                         boxShadow: primaryActive
                                             ? [
                                                 BoxShadow(
-                                                  color: t.primary.withValues(alpha: t.isDark ? 0.38 : 0.30),
+                                                  color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.26),
                                                   blurRadius: 10,
                                                   offset: const Offset(0, 3),
                                                 ),

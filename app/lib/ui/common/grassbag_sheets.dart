@@ -645,8 +645,14 @@ class _ToastPositionedHostState extends State<_ToastPositionedHost>
   }
 }
 
-/// Sculpted Apple iOS 26 centered Liquid Glass confirmation dialog with crystal readability
-/// and unmistakable button visual hierarchy (subtle secondary Cancel vs accented/destructive Confirm).
+/// Authentic Apple iOS 27 centered Liquid Glass confirmation dialog modeled directly on
+/// `UIAlertController` / `GlassAlertPlatter`:
+/// - `320pt` crystal continuous superellipse (`borderRadius: 34`) with real Impeller spherical
+///   refraction & airy bokeh translucency (ZERO milky white slab, ZERO fat white wireframe outline!)
+/// - Clean leading-aligned SF-calibrated typography (`17.5pt w600` title + subtle inline glyph +
+///   `14.5pt` secondary message) with native `24pt` horizontal & `22pt` top breathing room
+/// - Native `48pt` flat borderless iOS 27 filled capsule buttons (`_UIAlertControllerFilledBackgroundView`),
+///   automatically stacking vertically when labels exceed a single side-by-side line.
 Future<bool> showGrassBagConfirmDialog(
   BuildContext context, {
   required String title,
@@ -674,7 +680,8 @@ Future<bool> showGrassBagConfirmDialog(
       context: context,
       barrierDismissible: true,
       barrierLabel: cancelLabel,
-      barrierColor: t.isDark ? const Color(0x88080C12) : const Color(0x3D142233),
+      // Measured iOS 26 / iOS 27 native UIAlertController barrier dimming
+      barrierColor: t.isDark ? const Color(0x77000000) : const Color(0x35000000),
       transitionDuration: GrassBagMotion.duration(
         context,
         const Duration(milliseconds: 220),
@@ -682,18 +689,79 @@ Future<bool> showGrassBagConfirmDialog(
       ),
       pageBuilder: (dialogCtx, animation, secondaryAnimation) {
         final dt = GrassBagTokens.of(dialogCtx);
-        final dialogBadgeColor = isDestructive ? dt.err : dt.primary;
+        final effectiveTier = resolveEffectiveGlassTier(dialogCtx, tier);
+        final isSolid = effectiveTier == GrassBagGlassTier.solid;
+        final dialogBadgeColor = isDestructive
+            ? (dt.isDark ? const Color(0xFFFF5C56) : const Color(0xFFFF3B30))
+            : dt.primary;
         final kbBottom = MediaQuery.viewInsetsOf(dialogCtx).bottom;
         final availH = math.max(200.0, MediaQuery.sizeOf(dialogCtx).height - kbBottom);
         final maxDialogH = (availH * 0.78).clamp(200.0, 560.0);
         final reduceMotion = MediaQuery.disableAnimationsOf(dialogCtx);
+
+        Widget buildActionCapsule({
+          required String label,
+          required Color background,
+          required Color foreground,
+          required FontWeight fontWeight,
+          required VoidCallback onTap,
+        }) {
+          return Semantics(
+            button: true,
+            label: label,
+            child: GrassBagSpringTap(
+              onTap: () {
+                HapticFeedback.selectionClick();
+                onTap();
+              },
+              pressedScale: 0.965,
+              enablePointerGlow: false,
+              child: Container(
+                constraints: const BoxConstraints(minHeight: 48),
+                alignment: Alignment.center,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: ShapeDecoration(
+                  color: background,
+                  shape: const StadiumBorder(),
+                ),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: fontWeight,
+                    letterSpacing: -0.2,
+                    color: foreground,
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        final cancelFill = isSolid
+            ? (dt.isDark
+                ? Colors.white.withValues(alpha: 0.12)
+                : Colors.black.withValues(alpha: 0.07))
+            : (dt.isDark
+                ? Colors.white.withValues(alpha: 0.12)
+                : Colors.black.withValues(alpha: 0.08));
+        final confirmFill = isDestructive
+            ? (dt.isDark
+                ? const Color(0xFFE54842).withValues(alpha: isSolid ? 1.0 : 0.92)
+                : const Color(0xFFFF3B30).withValues(alpha: isSolid ? 1.0 : 0.92))
+            : dt.primary.withValues(alpha: isSolid ? 1.0 : 0.92);
+        final confirmFg = isDestructive ? Colors.white : dt.onPrimary;
+
         return Padding(
           padding: EdgeInsets.only(bottom: kbBottom),
           child: Center(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 26),
+              padding: const EdgeInsets.symmetric(horizontal: 24),
               child: ConstrainedBox(
-                constraints: BoxConstraints(maxWidth: 344, maxHeight: maxDialogH),
+                constraints: BoxConstraints(maxWidth: 320, maxHeight: maxDialogH),
                 child: AnimatedBuilder(
                   animation: animation,
                   builder: (_, child) {
@@ -703,112 +771,151 @@ Future<bool> showGrassBagConfirmDialog(
                             ? Curves.easeInCubic
                             : Curves.easeOutCubic)
                         .transform(animation.value);
-                    // Asymmetric iOS 26 UIAlertController scale: settles in 1.07 -> 1.0,
-                    // recedes gracefully 1.0 -> 0.94 on dismiss (never looms outward!).
+                    // Native iOS 27 UIAlertController scale: settles inward 1.06 -> 1.0 on enter,
+                    // holds steady on exit while GlassMaterializeTransition dissolves cleanly.
                     final scale = isReversing
-                        ? (0.94 + 0.06 * curved)
-                        : (tier == GrassBagGlassTier.solid
-                            ? (0.92 + 0.08 * curved)
-                            : (1.07 - 0.07 * curved));
+                        ? 1.0
+                        : (isSolid ? (0.94 + 0.06 * curved) : (1.06 - 0.06 * curved));
                     return Transform.scale(scale: scale, child: child);
                   },
                   child: GrassBagMaterializeTransition(
                     animation: animation,
-                    tier: tier,
+                    tier: effectiveTier,
                     scaleFrom: 1.0,
-                    contentSigma: 6.0,
+                    contentSigma: 4.0,
                     child: Material(
-                  type: MaterialType.transparency,
-                  child: GrassBagGlass(
-                    tier: tier,
-                    borderRadius: 34,
-                    elevated: true,
-                    interactiveGlow: false,
-                    useSheetSettings: true,
-                    isDialog: true,
-                    clipBehavior: Clip.antiAlias,
-                    padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.center,
+                      type: MaterialType.transparency,
+                      child: GrassBagGlass(
+                        tier: effectiveTier,
+                        borderRadius: 34,
+                        elevated: true,
+                        interactiveGlow: false,
+                        useSheetSettings: true,
+                        isDialog: true,
+                        clipBehavior: Clip.antiAlias,
+                        padding: EdgeInsets.zero,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            GrassBagSquircleIcon(
-                              icon: badgeIcon,
-                              color: dialogBadgeColor,
-                              size: 38,
-                              iconSize: 18,
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                title,
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w700,
-                                  letterSpacing: -0.35,
-                                  color: dt.text,
+                            Flexible(
+                              child: SingleChildScrollView(
+                                physics: const BouncingScrollPhysics(),
+                                padding: const EdgeInsets.fromLTRB(24, 22, 24, 4),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      crossAxisAlignment: CrossAxisAlignment.center,
+                                      children: [
+                                        Icon(
+                                          badgeIcon,
+                                          size: 19,
+                                          color: dialogBadgeColor,
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Text(
+                                            title,
+                                            style: TextStyle(
+                                              fontSize: 17.5,
+                                              fontWeight: FontWeight.w600,
+                                              letterSpacing: -0.35,
+                                              height: 1.25,
+                                              color: dt.text,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    if (message.trim().isNotEmpty) ...[
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        message,
+                                        style: TextStyle(
+                                          fontSize: 14.5,
+                                          height: 1.48,
+                                          color: dt.text2,
+                                        ),
+                                      ),
+                                    ],
+                                  ],
                                 ),
+                              ),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+                              child: LayoutBuilder(
+                                builder: (btnCtx, constraints) {
+                                  final labelMaxW = (constraints.maxWidth - 8) / 2 - 32;
+                                  final scaler = MediaQuery.textScalerOf(btnCtx);
+                                  final dir = Directionality.of(btnCtx);
+                                  bool fits(String txt, FontWeight w) {
+                                    final tp = TextPainter(
+                                      text: TextSpan(
+                                        text: txt,
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: w,
+                                          letterSpacing: -0.2,
+                                        ),
+                                      ),
+                                      maxLines: 1,
+                                      textDirection: dir,
+                                      textScaler: scaler,
+                                    )..layout();
+                                    final ok = tp.width <= labelMaxW;
+                                    tp.dispose();
+                                    return ok;
+                                  }
+
+                                  final sideBySide = fits(cancelLabel, FontWeight.w500) &&
+                                      fits(confirmLabel, FontWeight.w600);
+                                  final cancelBtn = buildActionCapsule(
+                                    label: cancelLabel,
+                                    background: cancelFill,
+                                    foreground: dt.text,
+                                    fontWeight: FontWeight.w500,
+                                    onTap: () => Navigator.of(dialogCtx).pop(false),
+                                  );
+                                  final confirmBtn = buildActionCapsule(
+                                    label: confirmLabel,
+                                    background: confirmFill,
+                                    foreground: confirmFg,
+                                    fontWeight: FontWeight.w600,
+                                    onTap: () => Navigator.of(dialogCtx).pop(true),
+                                  );
+                                  if (sideBySide) {
+                                    return Row(
+                                      children: [
+                                        Expanded(child: cancelBtn),
+                                        const SizedBox(width: 8),
+                                        Expanded(child: confirmBtn),
+                                      ],
+                                    );
+                                  }
+                                  return Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    children: [
+                                      confirmBtn,
+                                      const SizedBox(height: 8),
+                                      cancelBtn,
+                                    ],
+                                  );
+                                },
                               ),
                             ),
                           ],
                         ),
-                        if (message.trim().isNotEmpty) ...[
-                          const SizedBox(height: 12),
-                          Flexible(
-                            child: SingleChildScrollView(
-                              physics: const BouncingScrollPhysics(),
-                              child: Text(
-                                message,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  height: 1.54,
-                                  color: dt.text2,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
-                        const SizedBox(height: 20),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: GrassBagSecondaryGlassButton(
-                                label: cancelLabel,
-                                height: 48,
-                                tier: tier,
-                                insideGlass: true,
-                                onTap: () => Navigator.of(dialogCtx).pop(false),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: GrassBagPrimaryGlassButton(
-                                label: confirmLabel,
-                                height: 48,
-                                tier: tier,
-                                insideGlass: true,
-                                // Deep crimson glass in Dark mode keeps WCAG AA (>5.2:1) contrast with crisp white label!
-                                color: isDestructive
-                                    ? (dt.isDark ? const Color(0xFFD93835) : dt.err)
-                                    : dt.primary,
-                                foregroundColor: isDestructive ? Colors.white : dt.onPrimary,
-                                onTap: () => Navigator.of(dialogCtx).pop(true),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
           ),
-        ),
-        ),
         );
       },
       transitionBuilder: (_, __, ___, child) => child,

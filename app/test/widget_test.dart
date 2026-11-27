@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gbridge_client/gbridge_client.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 import 'package:grassbag/main.dart';
 import 'package:grassbag/services/native_bridge.dart';
 import 'package:grassbag/state/app_state.dart';
@@ -2057,36 +2058,38 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Crystal-clear single-pass Kyant0 AndroidLiquidGlass optical presets across Light & Dark:
-      //    vivid saturation (>= 1.55), single-pass micro-bokeh (<= 3.2dp -> 0 extra blur readback!),
-      //    translucent low-haze surface alpha, inward curved refraction, directional specular rims,
-      //    3D meniscus sheen, and full 7-band rainbow dispersion on prism showcase!
+      // 3) Crystal-clear Apple iOS 27 Liquid Glass optical calibration via liquid_glass_widgets 1.19.0:
+      //    spherical refraction, low-haze crystal clarity (frost == 0, low glassColor alpha),
+      //    subtle chromatic dispersion, zero flat dark rimShade outlines, and crisp prism showcase!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
           dark ? Brightness.dark : Brightness.light,
         );
-        final chrome = KyantLiquidGlassStyle.chrome(tokens, GrassBagGlassTier.liquid);
-        final sheet = KyantLiquidGlassStyle.sheet(tokens, GrassBagGlassTier.liquid);
-        final dialog = KyantLiquidGlassStyle.sheet(tokens, GrassBagGlassTier.liquid, isDialog: true);
-        final button = KyantLiquidGlassStyle.button(tokens, GrassBagGlassTier.liquid, tint: tokens.primary);
-        final prism = KyantLiquidGlassStyle.prismShowcase(tokens, GrassBagGlassTier.liquid);
-        expect(chrome.saturation, greaterThanOrEqualTo(1.55));
-        expect(chrome.refractionHeight, greaterThanOrEqualTo(12.0));
-        expect(chrome.refractionAmount, greaterThanOrEqualTo(20.0));
-        expect(chrome.chromaticAberration, greaterThan(0.0));
-        expect(chrome.highlightKind, KyantHighlightKind.defaultSpecular);
-        expect(chrome.blurRadius, inInclusiveRange(0.8, 3.2));
-        expect(chrome.surfaceColor.a, lessThanOrEqualTo(dark ? 0.14 : 0.32));
-        expect(chrome.specularSheen, greaterThan(0.40));
-        expect(sheet.highlightKind, KyantHighlightKind.defaultSpecular);
-        expect(sheet.refractionAmount, greaterThanOrEqualTo(32.0));
-        expect(sheet.blurRadius, inInclusiveRange(4.0, 6.5));
-        expect(sheet.surfaceColor.a, lessThanOrEqualTo(dark ? 0.38 : 0.48));
-        expect(dialog.depthEffect, isTrue);
-        expect(button.blurRadius, lessThanOrEqualTo(2.0));
-        expect(button.tintColor.a, inInclusiveRange(0.60, 0.78));
-        expect(prism.chromaticAberration, closeTo(1.0, 0.05));
+        final chrome = GrassBagGlassConfig.surfaceSettings(tokens, GrassBagGlassTier.liquid);
+        final sheet = GrassBagGlassConfig.sheetSettings(tokens, GrassBagGlassTier.liquid);
+        final prism = GrassBagGlassConfig.prismLensSettings(tokens, GrassBagGlassTier.liquid);
+        expect(chrome.lensModel, GlassLensModel.spherical);
+        expect(chrome.frost, 0.0);
+        expect(chrome.frostOpacity, 0.0);
+        expect(chrome.blur, inInclusiveRange(0.8, 2.2));
+        expect(chrome.thickness, greaterThanOrEqualTo(28.0));
+        expect(chrome.refractiveIndex, greaterThanOrEqualTo(1.30));
+        expect(chrome.chromaticAberration, greaterThan(0.08));
+        expect(chrome.saturation, greaterThanOrEqualTo(1.50));
+        expect(chrome.glassColor.a, lessThanOrEqualTo(dark ? 0.10 : 0.16));
+        expect(chrome.rimShade, 0.0);
+        expect(sheet.frost, 0.0);
+        expect(sheet.blur, inInclusiveRange(5.0, 9.0));
+        expect(sheet.thickness, greaterThanOrEqualTo(30.0));
+        expect(sheet.glassColor.a, lessThanOrEqualTo(dark ? 0.16 : 0.42));
+        final dialog = GrassBagGlassConfig.sheetSettings(tokens, GrassBagGlassTier.liquid, isDialog: true);
+        expect(dialog.frost, 0.0);
+        expect(dialog.blur, inInclusiveRange(8.0, 11.0));
+        expect(dialog.glassColor.a, lessThanOrEqualTo(dark ? 0.18 : 0.50));
+        expect(prism.blur, lessThanOrEqualTo(1.2));
+        expect(prism.refractiveIndex, greaterThanOrEqualTo(1.32));
+        expect(prism.chromaticAberration, greaterThanOrEqualTo(0.15));
       }
 
       // 4) RemoteHostConnectCard shows Desktop GUI (免命令) 1-click prompt + concrete-IP CLI tab (zero 0.0.0.0)
@@ -2337,29 +2340,29 @@ void main() {
   testWidgets(
     'v12 regression: Liquid Glass optics calibration, nested italic+bold, streaming code stability, fractional slider & Cron weekdays',
     (tester) async {
-      // 1) Faithful Kyant0 AndroidLiquidGlass & iOS 27 optical calibration across tiers:
-      //    zero blinding lightIntensity/fresnel neon rings on frosted/liquid, crisp Kyant0
-      //    lens refraction & dispersion on liquid, pure blur on frosted, zero shaders on solid!
+      // 1) Genuine liquid_glass_widgets 1.19.0 iOS 27 optical calibration across tiers:
+      //    crystal spherical refraction & chromatic dispersion on liquid, pure soft blur on frosted,
+      //    zero shaders on solid!
       for (final brightness in Brightness.values) {
         final t = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
-        final norm = KyantLiquidGlassStyle.chrome(t, GrassBagGlassTier.liquid, elevated: false);
-        final elev = KyantLiquidGlassStyle.chrome(t, GrassBagGlassTier.liquid, elevated: true);
-        final sheet = KyantLiquidGlassStyle.sheet(t, GrassBagGlassTier.liquid);
-        final frosted = KyantLiquidGlassStyle.chrome(t, GrassBagGlassTier.frosted);
+        final norm = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: false);
+        final elev = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.liquid, elevated: true);
+        final sheet = GrassBagGlassConfig.sheetSettings(t, GrassBagGlassTier.liquid);
         final frostedCfg = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.frosted);
-        expect(norm.refractionHeight, greaterThanOrEqualTo(12.0));
-        expect(elev.refractionHeight, greaterThanOrEqualTo(14.0));
-        expect(sheet.refractionAmount, greaterThanOrEqualTo(30.0));
+        final solidCfg = GrassBagGlassConfig.surfaceSettings(t, GrassBagGlassTier.solid);
+        expect(norm.thickness, greaterThanOrEqualTo(28.0));
+        expect(elev.thickness, greaterThanOrEqualTo(28.0));
+        expect(sheet.thickness, greaterThanOrEqualTo(30.0));
         expect(norm.chromaticAberration, greaterThan(0.0));
         expect(elev.chromaticAberration, greaterThan(0.0));
         expect(sheet.chromaticAberration, greaterThan(0.0));
-        expect(frosted.refractionAmount, 0.0);
-        expect(frosted.chromaticAberration, 0.0);
-        expect(frosted.blurRadius, greaterThanOrEqualTo(10.0));
+        expect(frostedCfg.refractiveIndex, closeTo(1.01, 0.02));
+        expect(frostedCfg.chromaticAberration, 0.0);
+        expect(frostedCfg.blur, greaterThanOrEqualTo(8.0));
         expect(frostedCfg.lightIntensity, 0.0);
         expect(frostedCfg.rimShade, 0.0);
-        expect(norm.highlightWidth, inInclusiveRange(0.6, 1.15));
-        expect(sheet.highlightKind, KyantHighlightKind.defaultSpecular);
+        expect(solidCfg.blur, 0.0);
+        expect(solidCfg.thickness, 0.0);
       }
 
       // 2) Named weekday/month Cron validation

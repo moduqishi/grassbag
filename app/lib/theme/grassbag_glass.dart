@@ -9,7 +9,6 @@ import 'package:flutter/services.dart';
 import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
 
 import 'grassbag_theme.dart';
-import 'kyant_liquid_glass.dart';
 
 export 'kyant_liquid_glass.dart'
     show
@@ -141,69 +140,70 @@ abstract final class GrassBagGlassConfig {
 
     if (t.isDark) {
       return LiquidGlassSettings(
-        glassColor: Colors.white.withValues(alpha: elevated ? 0.15 : 0.12),
-        saturation: 1.45,
-        blur: 0.6,
-        blurWeight: 2.5,
-        frost: 12.0,
-        frostOpacity: elevated ? 0.86 : 0.84,
-        frostClamp: -0.45,
-        frostWeight: 0.5,
+        glassColor: Colors.white.withValues(alpha: elevated ? 0.08 : 0.055),
+        blur: 1.4,
+        frost: 0.0,
+        frostOpacity: 0.0,
         thickness: 30.0,
-        refractiveIndex: 1.24,
-        lensModel: GlassLensModel.paraxial,
-        chromaticAberration: 0.0,
-        lightAngle: -math.pi / 2,
-        lightIntensity: 0.0,
-        ambientStrength: 0.0,
+        refractiveIndex: 1.34,
+        lensModel: GlassLensModel.spherical,
+        chromaticAberration: 0.14,
+        saturation: 1.58,
+        lightAngle: 0.75 * math.pi,
+        lightIntensity: 0.70,
+        ambientStrength: 0.12,
         ambientRim: 0.0,
-        fresnelStrength: 0.0,
-        edgeAbsorption: 0.035,
-        rimShade: 0.48,
-        rimShadeEnds: 0.0,
-        rimLight: 0.92,
-        bodyShade: elevated ? 0.30 : 0.26,
+        fresnelStrength: 0.95,
+        edgeAbsorption: 0.032,
+        rimShade: 0.0,
+        rimLight: 0.86,
+        bodyShade: elevated ? 0.06 : 0.03,
+        specularSharpness: GlassSpecularSharpness.sharp,
         shadow: const [],
       );
     }
 
     return LiquidGlassSettings(
-      glassColor: const Color(0xFFF8FAFD).withValues(alpha: elevated ? 0.60 : 0.54),
-      saturation: 1.95,
-      blur: 0.6,
-      blurWeight: 0.8,
-      frost: 12.0,
-      frostOpacity: elevated ? 0.78 : 0.73,
-      frostClamp: 0.40,
-      frostWeight: 2.0,
+      glassColor: Colors.white.withValues(alpha: elevated ? 0.14 : 0.08),
+      blur: 1.4,
+      frost: 0.0,
+      frostOpacity: 0.0,
       thickness: 30.0,
-      refractiveIndex: 1.24,
-      lensModel: GlassLensModel.paraxial,
-      chromaticAberration: 0.0,
-      lightAngle: math.pi / 2,
-      lightIntensity: 0.0,
-      ambientStrength: 0.0,
+      refractiveIndex: 1.32,
+      lensModel: GlassLensModel.spherical,
+      chromaticAberration: 0.12,
+      saturation: 1.80,
+      lightAngle: 0.75 * math.pi,
+      lightIntensity: 0.72,
+      ambientStrength: 0.10,
       ambientRim: 0.0,
-      fresnelStrength: 0.0,
-      edgeAbsorption: 0.030,
-      rimShade: 0.45,
-      rimShadeEnds: 0.20,
-      rimLight: 1.0,
+      fresnelStrength: 0.96,
+      whitenStrength: 0.0,
+      whitenGated: true,
+      edgeAbsorption: 0.025,
+      rimShade: 0.0,
+      rimLight: 0.88,
       bodyShade: 0.0,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: [
         BoxShadow(
-          color: const Color(0x0D0E1F33),
-          blurRadius: elevated ? 18 : 13,
-          offset: Offset(0, elevated ? 6 : 4.5),
+          color: const Color(0x120E1F33),
+          blurRadius: elevated ? 20 : 14,
+          offset: Offset(0, elevated ? 7 : 4),
         ),
       ],
     );
   }
 
-  /// Calibrated Apple iOS 27 modal sheet, '+' deck, alert platter, context menu & drawer glass:
-  /// deeper `16dp` frost cloud (`frostOpacity: 0.84` Light / `0.88` Dark) keeps dense sheet content
-  /// effortlessly readable over busy screens while retaining the folded paraxial rim & whisper speculars.
-  static LiquidGlassSettings sheetSettings(GrassBagTokens t, GrassBagGlassTier tier) {
+  /// Crystal-clear Apple iOS 27 modal sheet, '+' deck, alert platter, context menu & drawer glass:
+  /// silky optical bokeh (`7.2dp` sheets / `9.5dp` centered dialogs, zero milky opaque frost wall!)
+  /// + spherical curved edge refraction (`thickness: 32, n: 1.28`) + razor-clean specular rim so
+  /// underlying colors glow through luminously while foreground labels & buttons stay effortlessly crisp.
+  static LiquidGlassSettings sheetSettings(
+    GrassBagTokens t,
+    GrassBagGlassTier tier, {
+    bool isDialog = false,
+  }) {
     final base = surfaceSettings(t, tier, elevated: true);
     if (tier == GrassBagGlassTier.solid) {
       return base;
@@ -211,9 +211,9 @@ abstract final class GrassBagGlassConfig {
     if (tier != GrassBagGlassTier.liquid || kIsWeb) {
       return base.copyWith(
         glassColor: t.isDark
-            ? Colors.white.withValues(alpha: 0.15)
-            : Colors.white.withValues(alpha: 0.66),
-        blur: kIsWeb ? 10.0 : 11.0,
+            ? Colors.white.withValues(alpha: isDialog ? 0.16 : 0.14)
+            : Colors.white.withValues(alpha: isDialog ? 0.64 : 0.56),
+        blur: kIsWeb ? 9.5 : (isDialog ? 10.5 : 8.5),
         frost: 0.0,
         frostOpacity: 0.0,
         thickness: 1.0,
@@ -221,76 +221,74 @@ abstract final class GrassBagGlassConfig {
         lensModel: GlassLensModel.spherical,
         saturation: 1.0,
         lightIntensity: 0.0,
-        rimLight: t.isDark ? 0.34 : 0.40,
+        rimLight: t.isDark ? 0.34 : 0.42,
         rimShade: 0.0,
         ambientRim: 0.0,
         chromaticAberration: 0.0,
-        bodyShade: t.isDark ? 0.22 : 0.0,
+        bodyShade: t.isDark ? 0.18 : 0.0,
       );
     }
     return base.copyWith(
       glassColor: t.isDark
-          ? Colors.white.withValues(alpha: 0.18)
-          : const Color(0xFFF8FAFD).withValues(alpha: 0.72),
-      blur: 0.6,
-      blurWeight: t.isDark ? 2.5 : 0.8,
-      frost: 16.0,
-      frostOpacity: t.isDark ? 0.88 : 0.84,
-      frostClamp: t.isDark ? -0.45 : 0.40,
-      frostWeight: t.isDark ? 0.5 : 2.0,
+          ? Colors.white.withValues(alpha: isDialog ? 0.13 : 0.11)
+          : Colors.white.withValues(alpha: isDialog ? 0.46 : 0.36),
+      blur: isDialog ? (t.isDark ? 9.0 : 10.0) : 7.2,
+      frost: 0.0,
+      frostOpacity: 0.0,
       thickness: 32.0,
-      refractiveIndex: 1.24,
-      lensModel: GlassLensModel.paraxial,
-      chromaticAberration: 0.0,
-      saturation: t.isDark ? 1.40 : 1.75,
-      bodyShade: t.isDark ? 0.36 : 0.0,
-      lightAngle: t.isDark ? -math.pi / 2 : math.pi / 2,
-      lightIntensity: 0.0,
-      ambientStrength: 0.0,
+      refractiveIndex: 1.28,
+      lensModel: GlassLensModel.spherical,
+      chromaticAberration: 0.09,
+      saturation: t.isDark ? 1.52 : 1.72,
+      bodyShade: t.isDark ? (isDialog ? 0.16 : 0.12) : 0.0,
+      whitenStrength: t.isDark ? 0.0 : (isDialog ? 0.06 : 0.04),
+      whitenGated: true,
+      lightAngle: 0.75 * math.pi,
+      lightIntensity: 0.68,
+      ambientStrength: t.isDark ? 0.12 : 0.10,
       ambientRim: 0.0,
-      fresnelStrength: 0.0,
-      edgeAbsorption: t.isDark ? 0.032 : 0.026,
-      rimLight: t.isDark ? 0.86 : 0.96,
-      rimShade: t.isDark ? 0.42 : 0.38,
-      rimShadeEnds: t.isDark ? 0.0 : 0.20,
+      fresnelStrength: t.isDark ? 0.92 : 0.90,
+      edgeAbsorption: t.isDark ? 0.028 : 0.024,
+      rimLight: 0.84,
+      rimShade: 0.0,
+      specularSharpness: GlassSpecularSharpness.sharp,
       shadow: t.isDark
           ? const []
           : const [
               BoxShadow(
-                color: Color(0x140E1F33),
-                blurRadius: 24,
+                color: Color(0x180E1F33),
+                blurRadius: 22,
                 offset: Offset(0, 8),
               ),
             ],
     );
   }
 
-  /// Clear Kyant0-inspired crystal prism lens preset for interactive optical showcases
-  /// (Appearance Studio draggable lens capsule) — crisp curved refraction + chromatic dispersion
-  /// without Dark-mode neon ring blow-out.
+  /// Pure optical crystal prism lens preset for interactive optical showcases
+  /// (Appearance Studio draggable lens capsule) — crisp spherical refraction + chromatic dispersion.
   static LiquidGlassSettings prismLensSettings(GrassBagTokens t, GrassBagGlassTier tier) {
     if (tier != GrassBagGlassTier.liquid || kIsWeb) {
       return surfaceSettings(t, tier);
     }
     return LiquidGlassSettings(
-      glassColor: Colors.white.withValues(alpha: t.isDark ? 0.08 : 0.16),
-      blur: 1.2,
+      glassColor: Colors.white.withValues(alpha: t.isDark ? 0.06 : 0.10),
+      blur: 0.8,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 26.0,
-      refractiveIndex: 1.32,
+      thickness: 28.0,
+      refractiveIndex: 1.36,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.16,
-      saturation: t.isDark ? 1.50 : 1.70,
+      chromaticAberration: 0.18,
+      saturation: t.isDark ? 1.55 : 1.75,
       lightAngle: 0.75 * math.pi,
-      lightIntensity: t.isDark ? 0.22 : 0.18,
-      ambientStrength: 0.04,
+      lightIntensity: 0.78,
+      ambientStrength: 0.10,
       ambientRim: 0.0,
-      fresnelStrength: t.isDark ? 0.22 : 0.18,
+      fresnelStrength: 1.05,
       edgeAbsorption: 0.024,
       rimShade: 0.0,
-      rimLight: t.isDark ? 0.78 : 0.85,
-      bodyShade: t.isDark ? 0.10 : 0.0,
+      rimLight: 0.92,
+      bodyShade: t.isDark ? 0.04 : 0.0,
       specularSharpness: GlassSpecularSharpness.sharp,
       shadow: const [],
     );
@@ -318,17 +316,12 @@ abstract final class GrassBagGlassConfig {
     final indicatorTheme = isFrosted
         ? null
         : const GlassThemeSettings(
-            lensModel: GlassLensModel.paraxial,
-            thickness: 28.0,
-            refractiveIndex: 1.24,
+            refractiveIndex: 1.32,
             chromaticAberration: 0.14,
-            lightAngle: math.pi / 2,
-            lightIntensity: 0.0,
-            ambientStrength: 0.0,
-            fresnelStrength: 0.0,
+            lightIntensity: 0.55,
+            ambientStrength: 0.10,
+            fresnelStrength: 0.85,
             rimLight: 1.0,
-            rimShade: 0.65,
-            rimShadeEnds: 0.50,
           );
 
     return GlassThemeData(
@@ -578,14 +571,13 @@ class GrassBagFresnelRimPainter extends CustomPainter {
     final halfSw = sw * 0.5;
     final insetRect = rect.deflate(halfSw);
 
-    // 0. Tight Kyant0-style top curved meniscus glint with pure vertical fade to 0.0 at sheenHeight
-    //    so wide shallow surfaces NEVER hard-clip along y = sheenHeight; disabled on concave innerWells!
+    // 0. Whisper-subtle top specular kiss on translucent Layer-1 content cards (zero garish stripe!)
     if (paintTopSheen && !frosted && !innerWell) {
       final clipPath = _cachedOuterPath(size, rect, 0.0);
       final sheenAlpha = tinted
-          ? (isDark ? 0.12 : 0.20)
-          : (isDark ? 0.05 : 0.18);
-      final sheenHeight = math.min(size.height * 0.20, 18.0);
+          ? (isDark ? 0.08 : 0.14)
+          : (isDark ? 0.024 : 0.09);
+      final sheenHeight = math.min(size.height * 0.16, 14.0);
       final sheenRect = Rect.fromLTWH(0, 0, size.width, sheenHeight);
       canvas.save();
       canvas.clipPath(clipPath);
@@ -598,7 +590,7 @@ class GrassBagFresnelRimPainter extends CustomPainter {
             end: Alignment.bottomCenter,
             colors: [
               Colors.white.withValues(alpha: sheenAlpha),
-              Colors.white.withValues(alpha: sheenAlpha * 0.22),
+              Colors.white.withValues(alpha: sheenAlpha * 0.20),
               Colors.transparent,
             ],
             stops: const [0.0, 0.42, 1.0],
@@ -607,9 +599,7 @@ class GrassBagFresnelRimPainter extends CustomPainter {
       canvas.restore();
     }
 
-    // Clean single-pass 135° Apple iOS 26 luminous hairline rim:
-    // ZERO muddy black outer contours, ZERO double-stroke inner dark rings, and ZERO
-    // inverted dark top bevels on Light-mode innerWells!
+    // Whisper-fine 135° Apple iOS 27 optical specular rim (zero thick white wireframe outlines!):
     final rawAccent = accent ?? Colors.white;
     final hsl = HSLColor.fromColor(rawAccent);
     final isMonochrome = hsl.saturation < 0.08;
@@ -622,36 +612,36 @@ class GrassBagFresnelRimPainter extends CustomPainter {
     if (tinted) {
       rimBlend = isDark ? BlendMode.plus : BlendMode.screen;
       rimColors = [
-        Colors.white.withValues(alpha: isDark ? 0.44 : 0.62),
-        Color.lerp(Colors.white, prismAccent, 0.25)!.withValues(alpha: isDark ? 0.18 : 0.26),
-        Colors.white.withValues(alpha: 0.02),
-        Colors.white.withValues(alpha: 0.03),
-        Color.lerp(Colors.white, counterPrism, 0.22)!.withValues(alpha: isDark ? 0.12 : 0.16),
-        Colors.white.withValues(alpha: isDark ? 0.24 : 0.32),
+        Colors.white.withValues(alpha: isDark ? 0.28 : 0.46),
+        Color.lerp(Colors.white, prismAccent, 0.25)!.withValues(alpha: isDark ? 0.12 : 0.18),
+        Colors.white.withValues(alpha: 0.01),
+        Colors.white.withValues(alpha: 0.015),
+        Color.lerp(Colors.white, counterPrism, 0.22)!.withValues(alpha: isDark ? 0.08 : 0.12),
+        Colors.white.withValues(alpha: isDark ? 0.16 : 0.24),
       ];
     } else if (isDark) {
       rimBlend = BlendMode.plus;
-      final peak = frosted ? 0.15 : (innerWell ? 0.16 : 0.22);
-      final bounce = frosted ? 0.06 : (innerWell ? 0.07 : 0.11);
+      final peak = frosted ? 0.10 : (innerWell ? 0.10 : 0.13);
+      final bounce = frosted ? 0.04 : (innerWell ? 0.04 : 0.065);
       rimColors = [
         Colors.white.withValues(alpha: peak),
-        Color.lerp(Colors.white, prismAccent, 0.32)!.withValues(alpha: frosted ? 0.06 : 0.11),
-        Colors.white.withValues(alpha: 0.02),
-        Colors.white.withValues(alpha: 0.025),
-        Color.lerp(Colors.white, counterPrism, 0.28)!.withValues(alpha: frosted ? 0.04 : 0.07),
+        Color.lerp(Colors.white, prismAccent, 0.28)!.withValues(alpha: frosted ? 0.04 : 0.065),
+        Colors.white.withValues(alpha: 0.012),
+        Colors.white.withValues(alpha: 0.015),
+        Color.lerp(Colors.white, counterPrism, 0.24)!.withValues(alpha: frosted ? 0.025 : 0.045),
         Colors.white.withValues(alpha: bounce),
       ];
     } else {
       rimBlend = BlendMode.srcOver;
-      final peak = frosted ? 0.84 : (innerWell ? 0.76 : 0.96);
-      final bounce = frosted ? 0.56 : (innerWell ? 0.52 : 0.78);
-      final waist = innerWell ? const Color(0x07162E42) : const Color(0x09162E42);
+      final peak = frosted ? 0.68 : (innerWell ? 0.58 : 0.78);
+      final bounce = frosted ? 0.42 : (innerWell ? 0.36 : 0.56);
+      final waist = innerWell ? const Color(0x05162E42) : const Color(0x07162E42);
       rimColors = [
         Colors.white.withValues(alpha: peak),
-        Colors.white.withValues(alpha: frosted ? 0.54 : (innerWell ? 0.42 : 0.68)),
+        Colors.white.withValues(alpha: frosted ? 0.42 : (innerWell ? 0.30 : 0.52)),
         waist,
         waist,
-        Colors.white.withValues(alpha: frosted ? 0.44 : (innerWell ? 0.34 : 0.56)),
+        Colors.white.withValues(alpha: frosted ? 0.32 : (innerWell ? 0.24 : 0.42)),
         Colors.white.withValues(alpha: bounce),
       ];
     }
@@ -661,7 +651,7 @@ class GrassBagFresnelRimPainter extends CustomPainter {
       rimPath,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = strokeWidth ?? (innerWell ? 0.7 : 0.85)
+        ..strokeWidth = strokeWidth ?? (innerWell ? 0.55 : 0.65)
         ..blendMode = rimBlend
         ..shader = LinearGradient(
           begin: Alignment.topLeft,
@@ -1164,9 +1154,9 @@ class GrassBagGlassPage extends StatelessWidget {
   }
 }
 
-/// Semantic bar scope for floating navigation pill rows.
-/// With GrassBag's single-pass direct-SDF [KyantLiquidGlass] engine, sibling pills render
-/// directly with zero `toImageSync` geometry rasterization stalls or shared-clip clipping!
+/// Shared Impeller `AdaptiveLiquidGlassLayer` (SwiftUI `GlassEffectContainer` equivalent)
+/// that batches sibling floating pills in a navigation bar into ONE single SDF geometry
+/// matte + ONE single refraction pass (cutting header GPU passes by up to 67%!).
 class GrassBagGlassBarLayer extends StatelessWidget {
   const GrassBagGlassBarLayer({
     super.key,
@@ -1180,7 +1170,20 @@ class GrassBagGlassBarLayer extends StatelessWidget {
   final bool platformViewBackdrop;
 
   @override
-  Widget build(BuildContext context) => child;
+  Widget build(BuildContext context) {
+    final effectiveTier = resolveEffectiveGlassTier(context, tier);
+    if (effectiveTier == GrassBagGlassTier.solid || platformViewBackdrop) {
+      return child;
+    }
+    final t = GrassBagTokens.of(context);
+    return AdaptiveLiquidGlassLayer(
+      settings: GrassBagGlassConfig.surfaceSettings(t, effectiveTier),
+      quality: GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+      blendAmount: 0.0,
+      clipExpansion: const EdgeInsets.all(12),
+      child: child,
+    );
+  }
 }
 
 /// Public-API materialization progress scope propagated by [GrassBagMaterializeTransition]
@@ -1308,30 +1311,28 @@ class _GrassBagMaterializeTransitionState
         ),
       );
     }
-    // Propagate curved materialization progress via [GrassBagMaterializeScope] WITHOUT
-    // wrapping [KyantLiquidGlass] (`BackdropFilterLayer`) in an outer `FadeTransition`
-    // (`OpacityLayer`), eliminating Impeller offscreen `saveLayer` backdrop pops and `t²`
-    // double-fading! Glass containers fade their own optics via `visibility` and their
-    // inner content via zero-layer-at-rest [GrassBagControlledOpacity].
+    // Delegate optical defogging directly to `GlassMaterializeTransition` (driving shader
+    // `visibility` without ever wrapping `BackdropFilterLayer` in an outer `OpacityLayer`),
+    // while synchronizing externalized elevation shadows via [GrassBagMaterializeScope]!
     return GrassBagMaterializeScope(
-      animation: _fadeCurve,
-      child: reduceMotion
-          ? widget.child
-          : ScaleTransition(
-              alignment: widget.alignment,
-              scale: _scaleAnim,
-              child: widget.child,
-            ),
+      animation: widget.animation,
+      child: GlassMaterializeTransition(
+        animation: widget.animation,
+        alignment: widget.alignment,
+        scaleFrom: reduceMotion ? 1.0 : widget.scaleFrom,
+        contentSigma: reduceMotion ? 0.0 : widget.contentSigma,
+        child: widget.child,
+      ),
     );
   }
 }
 
-/// Unified Liquid Glass floating container powered by GrassBag's faithful Kyant0
-/// `AndroidLiquidGlass` GLSL engine ([KyantLiquidGlass]).
+/// Unified Apple iOS 27 Liquid Glass floating container powered by genuine `liquid_glass_widgets`
+/// 1.19.0 ([GlassContainer] / `liquid_glass_render.frag` spherical crystal refraction).
 ///
-/// Delivers exact Kyant0 `vibrancy() -> blur -> lens(refractionHeight, refractionAmount,
-/// depthEffect, chromaticAberration) -> surfaceColor -> Highlight.Default/Plain -> Shadow`
-/// optics with zero `toImageSync` stalls and full nested-glass support!
+/// Use ONLY on floating chrome (composer, approval card, '+' panel, steer popover,
+/// remote banner, bottom-centered Toast, floating phone drawer, dialogs, sheets).
+/// Never nest refractive glass inside refractive glass!
 class GrassBagGlass extends StatelessWidget {
   const GrassBagGlass({
     super.key,
@@ -1378,19 +1379,17 @@ class GrassBagGlass extends StatelessWidget {
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
     final highContrast = MediaQuery.highContrastOf(context);
     final materializeAnim = GrassBagMaterializeScope.animationOf(context);
-    final isPill = !isOval && borderRadius >= 900;
-
-    final innerChild = (padding != null || alignment != null || width != null || height != null)
-        ? Container(
-            width: width,
-            height: height,
-            padding: padding,
-            alignment: alignment,
-            child: child,
-          )
-        : child;
 
     if (effectiveTier == GrassBagGlassTier.solid) {
+      final innerChild = (padding != null || alignment != null || width != null || height != null)
+          ? Container(
+              width: width,
+              height: height,
+              padding: padding,
+              alignment: alignment,
+              child: child,
+            )
+          : child;
       Widget buildSolid(double materialize) {
         final baseFill = tintColor ?? t.cardSolid;
         final solidFill = materialize >= 0.999
@@ -1402,7 +1401,7 @@ class GrassBagGlass extends StatelessWidget {
         final strokeW = highContrast ? 1.15 : 0.6;
         final solidShape = isOval
             ? CircleBorder(side: BorderSide(color: solidBorder, width: strokeW))
-            : RoundedRectangleBorder(
+            : RoundedSuperellipseBorder(
                 borderRadius: BorderRadius.circular(borderRadius),
                 side: BorderSide(color: solidBorder, width: strokeW),
               );
@@ -1410,7 +1409,7 @@ class GrassBagGlass extends StatelessWidget {
             ? innerChild
             : (isOval
                 ? ClipOval(clipBehavior: clipBehavior, child: innerChild)
-                : ClipRRect(
+                : ClipRSuperellipse(
                     borderRadius: BorderRadius.circular(borderRadius),
                     clipBehavior: clipBehavior,
                     child: innerChild,
@@ -1446,108 +1445,110 @@ class GrassBagGlass extends StatelessWidget {
       return buildSolid(GrassBagMaterializeScope.progressOf(context));
     }
 
-    // PlatformView (WebView / Camera) safe translucent frosted veil (no BackdropFilter over SurfaceView)
-    if (platformViewBackdrop) {
-      final darkPv = tintColor != null ? tintColor!.computeLuminance() < 0.35 : t.isDark;
-      final fill = tintColor ??
-          (darkPv
-              ? const Color(0xFF141820).withValues(alpha: 0.78)
-              : const Color(0xFFFAFAFA).withValues(alpha: 0.84));
-      final shape = isOval
-          ? CircleBorder(
-              side: BorderSide(
-                color: Colors.white.withValues(alpha: darkPv ? 0.18 : 0.80),
-                width: 0.65,
-              ),
-            )
-          : RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(borderRadius),
-              side: BorderSide(
-                color: Colors.white.withValues(alpha: darkPv ? 0.18 : 0.80),
-                width: 0.65,
-              ),
-            );
-      final clipped = clipBehavior == Clip.none
-          ? innerChild
-          : (isOval
-              ? ClipOval(clipBehavior: clipBehavior, child: innerChild)
-              : ClipRRect(
-                  borderRadius: BorderRadius.circular(borderRadius),
-                  clipBehavior: clipBehavior,
-                  child: innerChild,
-                ));
-      return DecoratedBox(
-        decoration: ShapeDecoration(
-          color: fill,
-          shape: shape,
-          shadows: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: darkPv ? 0.30 : 0.10),
-              blurRadius: 14,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: clipped,
-      );
-    }
+    final isOverlayPlatter = useSheetSettings || isDialog;
+    final effectiveOwnLayer = useOwnLayer || tintColor != null || isOverlayPlatter;
+    final baseSettings = isOverlayPlatter
+        ? GrassBagGlassConfig.sheetSettings(t, effectiveTier, isDialog: isDialog)
+        : GrassBagGlassConfig.surfaceSettings(t, effectiveTier, elevated: elevated);
+    final rawBaseShadows = baseSettings.shadow ?? const <BoxShadow>[];
+    // Externalize standalone shadows via `BlurStyle.outer` so `LiquidGlassLayer._bakeShadows()`
+    // NEVER calls synchronous `picture.toImageSync()` on sheets, drawers, dialogs, or cards!
+    final externalizeLightShadow = !t.isDark && effectiveOwnLayer && rawBaseShadows.isNotEmpty;
+    final externalizeDarkShadow = t.isDark && effectiveOwnLayer && (isOverlayPlatter || elevated);
+    final rawSettings =
+        tintColor != null ? baseSettings.copyWith(glassColor: tintColor) : baseSettings;
+    final resolvedSettings =
+        externalizeLightShadow ? rawSettings.copyWith(shadow: const []) : rawSettings;
 
-    final style = useSheetSettings || isDialog
-        ? KyantLiquidGlassStyle.sheet(
-            t,
-            effectiveTier,
-            isDialog: isDialog,
-            tintColor: tintColor,
+    final Widget glassWidget = GlassContainer(
+      useOwnLayer: effectiveOwnLayer,
+      platformViewBackdrop: platformViewBackdrop,
+      quality: useCardQuality
+          ? GrassBagGlassConfig.cardQualityFor(effectiveTier)
+          : GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+      width: width,
+      height: height,
+      padding: padding,
+      alignment: alignment,
+      clipBehavior: clipBehavior,
+      shape: isOval
+          ? const LiquidOval()
+          : LiquidRoundedSuperellipse(borderRadius: borderRadius),
+      settings: effectiveOwnLayer ? resolvedSettings : null,
+      child: child,
+    );
+
+    final Widget interactiveGlass = interactiveGlow
+        ? GrassBagInteractiveHighlight(
+            borderRadius: borderRadius,
+            isPill: !isOval && borderRadius >= 900,
+            isCircle: isOval,
+            accent: tintColor ?? t.primaryHi,
+            child: glassWidget,
           )
-        : (useCardQuality && effectiveTier == GrassBagGlassTier.liquid
-            ? KyantLiquidGlassStyle.chrome(
-                t,
-                GrassBagGlassTier.frosted,
-                elevated: elevated,
-                tintColor: tintColor,
-              )
-            : KyantLiquidGlassStyle.chrome(
-                t,
-                effectiveTier,
-                elevated: elevated,
-                tintColor: tintColor,
-              ));
+        : glassWidget;
 
-    Widget buildKyant(double visibility) {
-      final fadedContent = visibility >= 0.999
-          ? innerChild
-          : GrassBagControlledOpacity(opacity: visibility, child: innerChild);
-      final glass = KyantLiquidGlass(
-        style: style,
-        borderRadius: BorderRadius.circular(borderRadius),
-        isCapsule: isPill,
-        isCircle: isOval,
-        visibility: visibility,
-        clipBehavior: clipBehavior,
-        child: fadedContent,
-      );
-      if (!interactiveGlow) return glass;
-      return GrassBagInteractiveHighlight(
-        borderRadius: borderRadius,
-        isPill: isPill,
-        isCircle: isOval,
-        accent: tintColor ?? t.primaryHi,
-        child: glass,
-      );
-    }
+    if (externalizeDarkShadow || externalizeLightShadow) {
+      final outerShape = isOval
+          ? const CircleBorder()
+          : RoundedSuperellipseBorder(borderRadius: BorderRadius.circular(borderRadius));
+      final baseShadows = externalizeDarkShadow
+          ? [
+              BoxShadow(
+                color: Colors.black
+                    .withValues(alpha: isDialog ? 0.42 : (useSheetSettings ? 0.38 : 0.26)),
+                blurRadius: isOverlayPlatter ? 28 : 18,
+                offset: Offset(0, isOverlayPlatter ? 10 : 6),
+                blurStyle: BlurStyle.outer,
+              ),
+            ]
+          : [
+              for (final s in rawBaseShadows)
+                BoxShadow(
+                  color: s.color,
+                  blurRadius: s.blurRadius,
+                  spreadRadius: s.spreadRadius,
+                  offset: s.offset,
+                  blurStyle: BlurStyle.outer,
+                ),
+            ];
+      Widget wrapOuterShadow(double materialize, Widget inner) {
+        return DecoratedBox(
+          decoration: ShapeDecoration(
+            shape: outerShape,
+            shadows: materialize <= 0.01
+                ? const []
+                : [
+                    for (final s in baseShadows)
+                      BoxShadow(
+                        color: s.color.withValues(alpha: s.color.a * materialize),
+                        blurRadius: s.blurRadius,
+                        spreadRadius: s.spreadRadius,
+                        offset: s.offset,
+                        blurStyle: BlurStyle.outer,
+                      ),
+                  ],
+          ),
+          child: inner,
+        );
+      }
 
-    if (materializeAnim != null) {
-      return AnimatedBuilder(
-        animation: materializeAnim,
-        builder: (_, __) => buildKyant(materializeAnim.value.clamp(0.0, 1.0)),
-      );
+      if (materializeAnim != null) {
+        return AnimatedBuilder(
+          animation: materializeAnim,
+          child: interactiveGlass,
+          builder: (_, inner) =>
+              wrapOuterShadow(materializeAnim.value.clamp(0.0, 1.0), inner!),
+        );
+      }
+      return wrapOuterShadow(GrassBagMaterializeScope.progressOf(context), interactiveGlass);
     }
-    return buildKyant(GrassBagMaterializeScope.progressOf(context));
+    return interactiveGlass;
   }
 }
 
-/// 44×44 symmetrical circular Kyant0 Liquid Glass icon button with authentic curved refraction,
-/// 0.65dp opposite-corner specular rim, touch-following glow, and `tanh` elastic stretch!
+/// 44×44 symmetrical circular Apple iOS 27 Liquid Glass chrome icon button backed by real
+/// [GlassButton.custom] with authentic optical refraction, LiquidStretch, and centered icon.
 class GrassBagGlassCircleButton extends StatelessWidget {
   const GrassBagGlassCircleButton({
     super.key,
@@ -1582,16 +1583,7 @@ class GrassBagGlassCircleButton extends StatelessWidget {
     final isSolid = effectiveTier == GrassBagGlassTier.solid;
     final iconWidget = Icon(icon, size: iconSize, color: iconColor ?? t.text);
 
-    if (isSolid || platformViewBackdrop) {
-      final darkPv = tintColor != null
-          ? tintColor!.computeLuminance() < 0.35
-          : (t.isDark || (iconColor != null && iconColor!.computeLuminance() > 0.72));
-      final fill = isSolid
-          ? (tintColor ?? t.cardSolid)
-          : (tintColor ??
-              (darkPv
-                  ? const Color(0xFF141820).withValues(alpha: 0.78)
-                  : const Color(0xFFFAFAFA).withValues(alpha: 0.84)));
+    if (isSolid) {
       final solidBtn = Semantics(
         button: true,
         label: tooltip,
@@ -1605,18 +1597,16 @@ class GrassBagGlassCircleButton extends StatelessWidget {
             width: size,
             height: size,
             decoration: ShapeDecoration(
-              color: fill,
+              color: tintColor ?? t.cardSolid,
               shape: CircleBorder(
                 side: BorderSide(
-                  color: isSolid
-                      ? t.sepStrong
-                      : Colors.white.withValues(alpha: darkPv ? 0.20 : 0.82),
+                  color: t.sepStrong,
                   width: highContrast ? 1.15 : 0.65,
                 ),
               ),
               shadows: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: (isSolid ? t.isDark : darkPv) ? 0.24 : 0.08),
+                  color: Colors.black.withValues(alpha: t.isDark ? 0.24 : 0.08),
                   blurRadius: 10,
                   offset: const Offset(0, 3),
                 ),
@@ -1631,21 +1621,30 @@ class GrassBagGlassCircleButton extends StatelessWidget {
           : solidBtn;
     }
 
-    final materializeAnim = GrassBagMaterializeScope.animationOf(context);
-    final style = tintColor != null
-        ? KyantLiquidGlassStyle.button(t, effectiveTier, tint: tintColor)
-        : KyantLiquidGlassStyle.chrome(t, effectiveTier);
+    final effectiveOwnLayer = useOwnLayer || platformViewBackdrop || tintColor != null;
     final btn = Semantics(
       button: true,
       label: tooltip,
-      child: KyantInteractiveGlassButton(
-        onTap: onTap,
-        style: style,
-        isCircle: true,
-        isCapsule: false,
+      child: GlassButton.custom(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          onTap();
+        },
         width: size,
         height: size,
-        materializeAnimation: materializeAnim,
+        shape: const LiquidOval(),
+        useOwnLayer: effectiveOwnLayer,
+        quality: GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+        surfaceStyle: GlassSurfaceStyle.glass,
+        tintColor: tintColor,
+        platformViewBackdrop: platformViewBackdrop,
+        settings: !effectiveOwnLayer
+            ? null
+            : GrassBagGlassConfig.surfaceSettings(t, effectiveTier),
+        interactionScale: 1.07,
+        stretch: effectiveOwnLayer ? 0.35 : 0.16,
+        anchorStretch: true,
+        glowColor: (tintColor ?? t.primaryHi).withValues(alpha: t.isDark ? 0.30 : 0.20),
         child: iconWidget,
       ),
     );
@@ -1655,8 +1654,8 @@ class GrassBagGlassCircleButton extends StatelessWidget {
   }
 }
 
-/// Interactive stadium-shaped Kyant0 Liquid Glass pill button (floating chat title pill,
-/// secondary page title pills, prominent tinted glass pills, and action badges).
+/// Interactive stadium-shaped Apple iOS 27 Liquid Glass pill button backed by [GlassButton.custom]
+/// (floating chat title pill, secondary page title pills, prominent tinted glass pills, and action badges).
 class GrassBagGlassPillButton extends StatelessWidget {
   const GrassBagGlassPillButton({
     super.key,
@@ -1689,18 +1688,9 @@ class GrassBagGlassPillButton extends StatelessWidget {
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
     final highContrast = MediaQuery.highContrastOf(context);
     final isSolid = effectiveTier == GrassBagGlassTier.solid;
-    final isPill = borderRadius >= 900;
 
-    if (isSolid || platformViewBackdrop) {
-      final darkPv = tintColor != null ? tintColor!.computeLuminance() < 0.35 : t.isDark;
-      final fill = isSolid
-          ? (prominent ? (tintColor ?? t.primary) : (tintColor ?? t.cardSolid))
-          : (prominent
-              ? (tintColor ?? t.primary).withValues(alpha: 0.88)
-              : (tintColor ??
-                  (darkPv
-                      ? const Color(0xFF141820).withValues(alpha: 0.78)
-                      : const Color(0xFFFAFAFA).withValues(alpha: 0.84))));
+    if (isSolid) {
+      final fill = prominent ? (tintColor ?? t.primary) : (tintColor ?? t.cardSolid);
       return Semantics(
         button: true,
         child: GrassBagSpringTap(
@@ -1714,14 +1704,10 @@ class GrassBagGlassPillButton extends StatelessWidget {
             child: DecoratedBox(
               decoration: ShapeDecoration(
                 color: fill,
-                shape: RoundedRectangleBorder(
+                shape: RoundedSuperellipseBorder(
                   borderRadius: BorderRadius.circular(borderRadius),
                   side: BorderSide(
-                    color: prominent
-                        ? Colors.white.withValues(alpha: 0.24)
-                        : (isSolid
-                            ? t.sepStrong
-                            : Colors.white.withValues(alpha: darkPv ? 0.20 : 0.82)),
+                    color: prominent ? Colors.transparent : t.sepStrong,
                     width: highContrast ? 1.15 : 0.65,
                   ),
                 ),
@@ -1748,28 +1734,47 @@ class GrassBagGlassPillButton extends StatelessWidget {
       );
     }
 
-    final style = prominent
-        ? KyantLiquidGlassStyle.button(
-            t,
-            effectiveTier,
-            tint: tintColor ?? t.primary,
-          )
-        : (tintColor != null
-            ? KyantLiquidGlassStyle.chrome(t, effectiveTier, tintColor: tintColor)
-            : KyantLiquidGlassStyle.chrome(t, effectiveTier));
+    final effectiveOwnLayer = useOwnLayer || platformViewBackdrop || prominent || tintColor != null;
+    final baseSettings = GrassBagGlassConfig.surfaceSettings(t, effectiveTier);
+    final isLiquid = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb;
+    final resolvedSettings = !effectiveOwnLayer
+        ? null
+        : (prominent
+            ? baseSettings.copyWith(
+                bodyMode: GlassBodyMode.clear,
+                glassColor: (tintColor ?? t.primary).withValues(alpha: t.isDark ? 0.80 : 0.88),
+                thickness: isLiquid ? 22.0 : 1.0,
+                refractiveIndex: isLiquid ? 1.28 : 1.01,
+                lensModel: GlassLensModel.spherical,
+                chromaticAberration: isLiquid ? 0.08 : 0.0,
+                rimLight: isLiquid ? 0.86 : 0.36,
+              )
+            : baseSettings);
 
-    final materializeAnim = GrassBagMaterializeScope.animationOf(context);
     return Semantics(
       button: true,
-      child: KyantInteractiveGlassButton(
-        onTap: onTap,
-        style: style,
-        isCapsule: isPill,
-        borderRadius: BorderRadius.circular(borderRadius),
+      child: GlassButton.custom(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          onTap();
+        },
         height: height,
-        padding: padding,
-        materializeAnimation: materializeAnim,
-        child: child,
+        shape: LiquidRoundedSuperellipse(borderRadius: borderRadius),
+        useOwnLayer: effectiveOwnLayer,
+        platformViewBackdrop: platformViewBackdrop,
+        quality: GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+        surfaceStyle: GlassSurfaceStyle.glass,
+        style: GlassButtonStyle.filled,
+        tintColor: prominent ? null : tintColor,
+        settings: resolvedSettings,
+        interactionScale: 1.04,
+        stretch: effectiveOwnLayer ? 0.28 : 0.14,
+        anchorStretch: true,
+        glowColor: (tintColor ?? t.primaryHi).withValues(alpha: t.isDark ? 0.28 : 0.20),
+        child: Padding(
+          padding: padding,
+          child: child,
+        ),
       ),
     );
   }
@@ -1914,21 +1919,17 @@ class _GrassBagGlassSearchBarState extends State<GrassBagGlassSearchBar> {
       ),
     );
     if (!isSolid) {
-      // Inside a floating glass drawer or sheet (`insideGlass == true`), run genuine
-      // single-pass zero-blur `KyantLiquidGlass` (`saturation: 1.06`) so the search capsule
-      // delivers authentic curved edge refraction & specular sheen with ZERO cyan double-saturation!
+      // Inside a floating glass drawer or sheet (`insideGlass == true`), follow Apple iOS 27
+      // Rule 2 (zero nested refractive glass, zero fat white plastic borders!): render a calm,
+      // borderless translucent recessed capsule (`tertiarySystemFill`).
       if (widget.insideGlass) {
-        return KyantLiquidGlass(
-          style: KyantLiquidGlassStyle.nestedControl(
-            t,
-            effectiveTier,
-            surfaceColor: t.isDark
-                ? Colors.white.withValues(alpha: 0.075)
-                : Colors.white.withValues(alpha: 0.28),
-            subtleShadow: false,
+        return DecoratedBox(
+          decoration: ShapeDecoration(
+            color: t.isDark
+                ? Colors.white.withValues(alpha: 0.095)
+                : Colors.black.withValues(alpha: 0.055),
+            shape: const StadiumBorder(),
           ),
-          isCapsule: true,
-          clipBehavior: Clip.antiAlias,
           child: field,
         );
       }
@@ -1956,15 +1957,74 @@ class _GrassBagGlassSearchBarState extends State<GrassBagGlassSearchBar> {
   }
 }
 
-/// Faithful 1:1 Flutter replica of Kyant0 `LiquidToggle.kt`:
-/// - `64×28dp` capsule track (`#34C759` Light / `#30D158` Dark active; `0x33787878` / `0x5C787880` inactive)
-/// - `40×24dp` elongated capsule thumb with `20dp` exact runway
-/// - Driven by [KyantDampedDragController] (`1.5×` pressed expansion + velocity squash/stretch!)
-/// - At rest (`pressProgress == 0`): crisp pure-white elevated pill (ZERO GPU shaders at rest!)
-/// - On press, drag, or toggle glide: swells `1.5×` (`60×36dp`) as white fades (`1 - progress`)
-///   into a live 7-band chromatic-aberration [KyantLiquidGlass] water-droplet lens refracting
-///   the colored track directly underneath!
-class GrassBagGlassSwitch extends StatefulWidget {
+/// Re-enables genuine 3D GPU paraxial/spherical lens refraction for transient lifted-lens
+/// controls (`GlassSwitch`, `GlassSegmentedControl`, `GlassSlider`) even when hosted inside a
+/// floating `GrassBagGlass` sheet or `+` deck. Mirrors `GlassModalSheet`'s own
+/// `InheritedLiquidGlass(avoidsRefraction: false)` + `GlassIsolationScope` pattern while keeping
+/// ZERO shader layers mounted at rest!
+class _GrassBagLensScope extends StatelessWidget {
+  const _GrassBagLensScope({
+    required this.tier,
+    required this.child,
+  });
+
+  final GrassBagGlassTier tier;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (tier == GrassBagGlassTier.solid) return child;
+    final lensQuality = tier == GrassBagGlassTier.liquid && !kIsWeb
+        ? GlassQuality.premium
+        : GlassQuality.standard;
+    final inherited =
+        context.dependOnInheritedWidgetOfExactType<InheritedLiquidGlass>();
+    if (inherited == null || !inherited.avoidsRefraction) return child;
+    return InheritedLiquidGlass(
+      settings: inherited.settings,
+      quality: lensQuality,
+      isBlurProvidedByAncestor: inherited.isBlurProvidedByAncestor,
+      avoidsRefraction: false,
+      hasExplicitSettings: inherited.hasExplicitSettings,
+      hasExplicitQuality: true,
+      child: GlassIsolationScope(
+        isolated: true,
+        defaultQuality: lensQuality,
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Calibrated Apple iOS 27 `_UILiquidLensView` optical settings for interactive switch,
+/// slider, and segmented-control thumbs (0 shaders at rest; full 3D GPU droplet lens on press/drag).
+LiquidGlassSettings _interactiveLensSettings(
+  GrassBagGlassTier tier, {
+  double refractiveIndex = 1.38,
+  double chromaticAberration = 0.15,
+}) {
+  if (tier != GrassBagGlassTier.liquid || kIsWeb) {
+    return LiquidGlassSettings.ios27Indicator.copyWith(
+      refractiveIndex: 1.18,
+      chromaticAberration: 0.0,
+    );
+  }
+  return LiquidGlassSettings.ios27Indicator.copyWith(
+    refractiveIndex: refractiveIndex,
+    chromaticAberration: chromaticAberration,
+    lightIntensity: 0.55,
+    ambientStrength: 0.10,
+    fresnelStrength: 0.85,
+    rimLight: 1.0,
+    rimShade: 0.85,
+  );
+}
+
+/// Authentic Apple iOS 27 [GlassSwitch]:
+/// - Calibrated `60×28` capsule proportions (`37×24` elongated pill thumb)
+/// - Zero GPU shaders at rest; elastically lifts into a real 3D `_UILiquidLensView` crystal
+///   water-droplet lens with chromatic rim dispersion and spring jump on press/drag!
+class GrassBagGlassSwitch extends StatelessWidget {
   const GrassBagGlassSwitch({
     super.key,
     required this.value,
@@ -1979,217 +2039,163 @@ class GrassBagGlassSwitch extends StatefulWidget {
   final Color? activeColor;
 
   @override
-  State<GrassBagGlassSwitch> createState() => _GrassBagGlassSwitchState();
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final effectiveTier = resolveEffectiveGlassTier(context, tier);
+    final isSolid = effectiveTier == GrassBagGlassTier.solid;
+    final resolvedActive = activeColor ??
+        (t.isDark ? const Color(0xFF30D158) : const Color(0xFF34C759));
+    final resolvedInactive =
+        t.isDark ? const Color(0x4DEBEBF5) : const Color(0x363C3C43);
+
+    if (isSolid) {
+      return _GrassBagSolidSpringSwitch(
+        value: value,
+        onChanged: onChanged,
+        activeColor: resolvedActive,
+        inactiveColor: resolvedInactive,
+      );
+    }
+
+    final lensQuality = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb
+        ? GlassQuality.premium
+        : GlassQuality.standard;
+    return _GrassBagLensScope(
+      tier: effectiveTier,
+      child: GlassSwitch(
+        value: value,
+        onChanged: onChanged,
+        activeColor: resolvedActive,
+        inactiveColor: resolvedInactive,
+        width: 60.0,
+        height: 28.0,
+        useOwnLayer: false,
+        quality: lensQuality,
+        settings: _interactiveLensSettings(
+          effectiveTier,
+          refractiveIndex: 1.40,
+          chromaticAberration: 0.16,
+        ),
+        enableHaptics: true,
+      ),
+    );
+  }
 }
 
-class _GrassBagGlassSwitchState extends State<GrassBagGlassSwitch>
-    with TickerProviderStateMixin {
-  static const double _trackW = 64.0;
-  static const double _trackH = 28.0;
-  static const double _thumbW = 40.0;
+/// Spring-driven 1:1 draggable solid switch for `GrassBagGlassTier.solid`.
+class _GrassBagSolidSpringSwitch extends StatefulWidget {
+  const _GrassBagSolidSpringSwitch({
+    required this.value,
+    required this.onChanged,
+    required this.activeColor,
+    required this.inactiveColor,
+  });
+
+  final bool value;
+  final ValueChanged<bool>? onChanged;
+  final Color activeColor;
+  final Color inactiveColor;
+
+  @override
+  State<_GrassBagSolidSpringSwitch> createState() =>
+      _GrassBagSolidSpringSwitchState();
+}
+
+class _GrassBagSolidSpringSwitchState extends State<_GrassBagSolidSpringSwitch>
+    with SingleTickerProviderStateMixin {
+  static const double _width = 60.0;
+  static const double _height = 28.0;
+  static const double _thumbW = 36.0;
   static const double _thumbH = 24.0;
   static const double _pad = 2.0;
-  static const double _dragWidth = 20.0; // _trackW - _pad * 2 - _thumbW
+  static const double _runway = _width - _pad * 2 - _thumbW;
 
-  late final KyantDampedDragController _drag;
-  bool _didDrag = false;
-  bool _dragging = false;
-  double _fraction = 0.0;
+  late final SingleSpringController _spring;
+  double? _dragPos;
 
   @override
   void initState() {
     super.initState();
-    _fraction = widget.value ? 1.0 : 0.0;
-    _drag = KyantDampedDragController(
+    _spring = SingleSpringController(
       vsync: this,
-      initialValue: _fraction,
-      minValue: 0.0,
-      maxValue: 1.0,
-      initialScale: 1.0,
-      pressedScale: 1.5,
+      spring: GlassSpring.snappy(duration: const Duration(milliseconds: 240)),
+      initialValue: widget.value ? 1.0 : 0.0,
     );
   }
 
   @override
-  void didUpdateWidget(covariant GrassBagGlassSwitch oldWidget) {
+  void didUpdateWidget(covariant _GrassBagSolidSpringSwitch oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.onChanged != null && widget.onChanged == null) {
-      _dragging = false;
-      _didDrag = false;
-      _fraction = widget.value ? 1.0 : 0.0;
-      _drag.release(reduceMotion: true);
-      _drag.updateValue(_fraction, reduceMotion: true, trackVelocity: false);
-    } else if (!_dragging && oldWidget.value != widget.value) {
-      final target = widget.value ? 1.0 : 0.0;
-      _fraction = target;
-      final reduceMotion = mounted && MediaQuery.disableAnimationsOf(context);
-      _drag.animateToValue(target, reduceMotion: reduceMotion);
+    if (oldWidget.value != widget.value && _dragPos == null) {
+      if (mounted && MediaQuery.disableAnimationsOf(context)) {
+        _spring.setValue(widget.value ? 1.0 : 0.0);
+      } else {
+        _spring.animateTo(widget.value ? 1.0 : 0.0);
+      }
     }
   }
 
   @override
   void dispose() {
-    _drag.dispose();
+    _spring.dispose();
     super.dispose();
   }
 
-  void _commitValue(bool next, {double? flingVelocity}) {
+  void _toggle(bool next) {
     final cb = widget.onChanged;
     if (cb == null) return;
     HapticFeedback.selectionClick();
-    final target = next ? 1.0 : 0.0;
-    _fraction = target;
-    final reduceMotion = mounted && MediaQuery.disableAnimationsOf(context);
-    if (flingVelocity != null) {
-      final normVel = (isLtrDir ? flingVelocity : -flingVelocity) / _dragWidth;
-      _drag.settleTo(target, normalizedVelocity: normVel, reduceMotion: reduceMotion);
-      if (next == widget.value) return;
-      cb(next);
-    } else {
-      if (next == widget.value) {
-        _drag.updateValue(target, reduceMotion: reduceMotion, trackVelocity: false);
-        return;
-      }
-      _drag.animateToValue(target, reduceMotion: reduceMotion);
-      cb(next);
+    if (next == widget.value) {
+      _spring.animateTo(widget.value ? 1.0 : 0.0);
+      return;
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _dragging) return;
-      final expected = widget.value ? 1.0 : 0.0;
-      if ((_drag.targetValue - expected).abs() > 0.01) {
-        _fraction = expected;
-        _drag.updateValue(
-          expected,
-          reduceMotion: MediaQuery.disableAnimationsOf(context),
-          trackVelocity: false,
-        );
-      }
-    });
+    cb(next);
   }
-
-  bool get isLtrDir => !mounted || Directionality.of(context) == TextDirection.ltr;
 
   @override
   Widget build(BuildContext context) {
-    final t = GrassBagTokens.of(context);
-    final effectiveTier = resolveEffectiveGlassTier(context, widget.tier);
-    final isSolid = effectiveTier == GrassBagGlassTier.solid;
-    final isLiquid = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb;
     final enabled = widget.onChanged != null;
-    final isLtr = Directionality.of(context) == TextDirection.ltr;
-    final reduceMotion = MediaQuery.disableAnimationsOf(context);
-
-    final accentColor = widget.activeColor ??
-        (t.isDark ? const Color(0xFF30D158) : const Color(0xFF34C759));
-    final trackColor = t.isDark
-        ? const Color(0xFF787880).withValues(alpha: 0.36)
-        : const Color(0xFF787878).withValues(alpha: 0.22);
-
-    final control = RepaintBoundary(
-      child: ListenableBuilder(
-        listenable: _drag,
-        builder: (context, _) {
-          final frac = _drag.value.clamp(0.0, 1.0);
-          final press = reduceMotion ? 0.0 : _drag.pressProgress;
-          final vel = (_drag.velocity / 50.0).clamp(-0.26, 0.26);
-          final rawScaleX = _drag.scaleX / (1.0 - (vel * 0.75).clamp(-0.2, 0.2));
-          final rawScaleY = _drag.scaleY * (1.0 - (vel * 0.25).clamp(-0.2, 0.2));
-          final effScaleX = isSolid ? (1.0 + 0.14 * press) : rawScaleX.clamp(0.85, 1.72);
-          final effScaleY = isSolid ? (1.0 + 0.05 * press) : rawScaleY.clamp(0.85, 1.65);
-
-          final curThumbW = _thumbW * effScaleX;
-          final curThumbH = _thumbH * effScaleY;
-          final centerX = isLtr
-              ? (_pad + _thumbW * 0.5) + _dragWidth * frac
-              : (_trackW - _pad - _thumbW * 0.5) - _dragWidth * frac;
-          final centerY = _trackH * 0.5;
-          final left = centerX - curThumbW * 0.5;
-          final top = centerY - curThumbH * 0.5;
-
-          final resolvedTrack = Color.lerp(trackColor, accentColor, frac)!;
-          final useLens = !isSolid && press > 0.015;
-
-          final Widget thumbWidget;
-          if (!useLens) {
-            thumbWidget = Container(
-              width: curThumbW,
-              height: curThumbH,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(curThumbH * 0.5),
-                border: Border.all(
-                  color: Colors.black.withValues(alpha: t.isDark ? 0.08 : 0.04),
-                  width: 0.5,
-                ),
-                boxShadow: const [
-                  BoxShadow(
-                    color: Color(0x1F000000),
-                    blurRadius: 5.0,
-                    offset: Offset(0, 1.5),
-                  ),
-                ],
-              ),
-            );
-          } else {
-            // Exact Kyant0 LiquidToggle.kt:158-198 clear optical crystal lens morph
-            // (`blurRadius: 0.0` in liquid mode avoids per-frame ImageFilter reallocation
-            // and the 0.05 `clampToBox` threshold pop at peak press!).
-            final lensStyle = KyantLiquidGlassStyle(
-              blurRadius: isLiquid ? 0.0 : 4.0,
-              refractionHeight: isLiquid ? 5.0 * press : 0.0,
-              refractionAmount: isLiquid ? 10.0 * press : 0.0,
-              depthEffect: false,
-              chromaticAberration: isLiquid ? 1.0 * press : 0.0,
-              saturation: 1.35,
-              surfaceColor: Colors.white.withValues(alpha: (1.0 - press).clamp(0.0, 1.0)),
-              highlightKind: KyantHighlightKind.ambient,
-              highlightAlpha: (t.isDark ? 0.56 : 0.46) * press,
-              highlightAngleDeg: 45.0,
-              highlightFalloff: 1.0,
-              highlightWidth: 0.50,
-              highlightBlur: 0.22,
-              innerShadowRadius: 4.0 * press,
-              innerShadowAlpha: (t.isDark ? 0.65 : 1.0) * press,
-              shadows: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.08 + 0.05 * press),
-                  blurRadius: 6.0 + 4.0 * press,
-                  offset: const Offset(0, 2.0),
-                ),
-              ],
-            );
-            thumbWidget = KyantLiquidGlass(
-              style: lensStyle,
-              isCapsule: true,
-              child: SizedBox(width: curThumbW, height: curThumbH),
-            );
-          }
-
-          return SizedBox(
-            width: _trackW,
-            height: _trackH,
+    final body = ListenableBuilder(
+      listenable: _spring,
+      builder: (context, thumb) {
+        final t = (_dragPos ?? _spring.value).clamp(0.0, 1.0);
+        final trackColor = Color.lerp(widget.inactiveColor, widget.activeColor, t)!;
+        final dx = _pad + _runway * (_dragPos ?? _spring.value).clamp(-0.08, 1.08);
+        return SizedBox(
+          width: _width,
+          height: _height,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: trackColor,
+              borderRadius: BorderRadius.circular(_height / 2),
+            ),
             child: Stack(
               clipBehavior: Clip.none,
               children: [
-                Positioned.fill(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: resolvedTrack,
-                      borderRadius: BorderRadius.circular(_trackH * 0.5),
-                    ),
-                  ),
-                ),
                 Positioned(
-                  left: left,
-                  top: top,
-                  width: curThumbW,
-                  height: curThumbH,
-                  child: thumbWidget,
+                  left: dx,
+                  top: _pad,
+                  child: thumb!,
                 ),
               ],
             ),
-          );
-        },
+          ),
+        );
+      },
+      child: Container(
+        width: _thumbW,
+        height: _thumbH,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(_thumbH / 2),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x28000000),
+              blurRadius: 5,
+              offset: Offset(0, 1.5),
+            ),
+          ],
+        ),
       ),
     );
 
@@ -2198,81 +2204,54 @@ class _GrassBagGlassSwitchState extends State<GrassBagGlassSwitch>
       enabled: enabled,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTapDown: enabled
-            ? (_) {
-                if (!reduceMotion) _drag.press();
-              }
-            : null,
-        onTapCancel: enabled
-            ? () {
-                if (!_dragging) _drag.release(reduceMotion: reduceMotion);
-              }
-            : null,
-        onTap: enabled ? () => _commitValue(!widget.value) : null,
+        onTap: enabled ? () => _toggle(!widget.value) : null,
         onHorizontalDragStart: enabled
             ? (_) {
-                _dragging = true;
-                _didDrag = false;
-                _fraction = _drag.value.clamp(0.0, 1.0);
-                _drag.press(reduceMotion: reduceMotion);
+                _dragPos = _spring.value.clamp(0.0, 1.0);
               }
             : null,
         onHorizontalDragUpdate: enabled
             ? (details) {
-                if (details.delta.dx != 0) _didDrag = true;
-                final delta = details.delta.dx / _dragWidth;
-                _fraction = (isLtr ? _fraction + delta : _fraction - delta).clamp(0.0, 1.0);
-                _drag.updateValue(_fraction, reduceMotion: reduceMotion);
+                final cur = (_dragPos ?? (widget.value ? 1.0 : 0.0)) +
+                    details.delta.dx / _runway;
+                _dragPos = cur.clamp(0.0, 1.0);
+                _spring.setValue(_dragPos!);
               }
             : null,
         onHorizontalDragEnd: enabled
             ? (details) {
                 final vx = details.primaryVelocity ?? 0.0;
-                _dragging = false;
+                final pos = _dragPos ?? _spring.value;
+                _dragPos = null;
                 final bool next;
-                if (_didDrag) {
-                  if (vx.abs() > 140) {
-                    next = isLtr ? vx > 0 : vx < 0;
-                  } else {
-                    next = _fraction >= 0.5;
-                  }
+                if (vx > 90) {
+                  next = true;
+                } else if (vx < -90) {
+                  next = false;
                 } else {
-                  next = !widget.value;
+                  next = pos >= 0.5;
                 }
-                _didDrag = false;
-                _commitValue(next, flingVelocity: vx);
+                _toggle(next);
               }
             : null,
         onHorizontalDragCancel: enabled
             ? () {
-                _dragging = false;
-                _didDrag = false;
-                _drag.release(reduceMotion: reduceMotion);
-                _drag.updateValue(
-                  widget.value ? 1.0 : 0.0,
-                  reduceMotion: reduceMotion,
-                  trackVelocity: false,
-                );
+                _dragPos = null;
+                _spring.animateTo(widget.value ? 1.0 : 0.0);
               }
             : null,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4.0),
-          child: enabled ? control : Opacity(opacity: 0.45, child: control),
-        ),
+        child: enabled ? body : Opacity(opacity: 0.45, child: body),
       ),
     );
   }
 }
 
-/// Faithful 1:1 Kyant0 `LiquidBottomTabs` / `LiquidSegmentedControl`:
-/// - Real translucent [KyantLiquidGlass] capsule track (`KyantLiquidGlassStyle.segmentedTrack`)
-///   with subtle ±4dp elastic panel follow when dragged past edges!
-/// - Sliding capsule indicator driven by [KyantDampedDragController] (`1.24×` press swell +
-///   velocity squash & stretch): crisp high-contrast pill at rest (zero extra shader), lifting
-///   above the labels into a live 7-band chromatic-aberration [KyantLiquidGlass] refracting lens
-///   (`lens(10, 14, chromaticAberration: true)` + `Highlight.Default` + `InnerShadow`) on drag/tap!
-/// - Supports both equal-width (`2..5` items) and scrollable (`>= 6` items) + safe `1`-item mode.
-class GrassBagSegmentedControl extends StatefulWidget {
+/// Authentic Apple iOS 27 [GlassSegmentedControl]:
+/// - Genuine swipe/drag-to-select across segments with velocity-driven jelly squash & stretch
+/// - Real 3D GPU refractive crystal lens (`ios27Indicator` + chromatic dispersion + concave pinch)
+///   that physically magnifies & refracts segment labels on touch, tap, and drag
+/// - Automatically uses [GlassSegmentedControl.scrollable] for `> 6` options and handles `1` option safely.
+class GrassBagSegmentedControl extends StatelessWidget {
   const GrassBagSegmentedControl({
     super.key,
     required this.labels,
@@ -2289,527 +2268,286 @@ class GrassBagSegmentedControl extends StatefulWidget {
   final double height;
 
   @override
-  State<GrassBagSegmentedControl> createState() => _GrassBagSegmentedControlState();
-}
-
-class _GrassBagSegmentedControlState extends State<GrassBagSegmentedControl>
-    with TickerProviderStateMixin {
-  late final KyantDampedDragController _drag;
-  late final SingleSpringController _panelOffsetSpring;
-  late final Listenable _merged;
-  final ScrollController _scrollCtrl = ScrollController();
-  List<GlobalKey> _itemKeys = const [];
-  bool _dragging = false;
-  int _lastHapticIdx = -1;
-
-  double get _maxIdx => math.max(0.0, (widget.labels.length - 1).toDouble());
-
-  void _syncItemKeys() {
-    if (widget.labels.length >= 6) {
-      if (_itemKeys.length != widget.labels.length) {
-        _itemKeys = List.generate(widget.labels.length, (_) => GlobalKey());
-      }
-    } else if (_itemKeys.isNotEmpty) {
-      _itemKeys = const [];
-    }
-  }
-
-  void _scrollSelectedIntoView({bool animate = true}) {
-    if (widget.labels.length < 6 || _itemKeys.isEmpty) return;
-    final safeIdx = widget.selectedIndex.clamp(0, _itemKeys.length - 1);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || safeIdx >= _itemKeys.length) return;
-      final ctx = _itemKeys[safeIdx].currentContext;
-      if (ctx == null) return;
-      final reduceMotion = MediaQuery.disableAnimationsOf(context);
-      Scrollable.ensureVisible(
-        ctx,
-        alignment: 0.5,
-        duration: (!animate || reduceMotion)
-            ? Duration.zero
-            : const Duration(milliseconds: 220),
-        curve: Curves.easeOutCubic,
-      );
-    });
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    final safeIdx = widget.labels.isEmpty
-        ? 0
-        : widget.selectedIndex.clamp(0, widget.labels.length - 1);
-    _lastHapticIdx = safeIdx;
-    _syncItemKeys();
-    _drag = KyantDampedDragController(
-      vsync: this,
-      initialValue: safeIdx.toDouble(),
-      minValue: 0.0,
-      maxValue: _maxIdx,
-      initialScale: 1.0,
-      pressedScale: 1.24,
-    );
-    _panelOffsetSpring = SingleSpringController(
-      vsync: this,
-      spring: GlassSpring.snappy(duration: const Duration(milliseconds: 280)),
-      initialValue: 0.0,
-    );
-    _merged = Listenable.merge([_drag, _panelOffsetSpring]);
-    _scrollSelectedIntoView(animate: false);
-  }
-
-  @override
-  void didUpdateWidget(covariant GrassBagSegmentedControl oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    _syncItemKeys();
-    if (widget.labels.isEmpty) return;
-    final safeIdx = widget.selectedIndex.clamp(0, widget.labels.length - 1);
-    final reduceMotion = mounted && MediaQuery.disableAnimationsOf(context);
-    if (oldWidget.labels.length != widget.labels.length) {
-      _drag.updateRange(0.0, _maxIdx, safeIdx.toDouble(), reduceMotion: true);
-      _lastHapticIdx = safeIdx;
-    } else if (!_dragging && oldWidget.selectedIndex != widget.selectedIndex) {
-      _drag.animateToValue(safeIdx.toDouble(), reduceMotion: reduceMotion);
-      _lastHapticIdx = safeIdx;
-      _scrollSelectedIntoView(animate: true);
-    }
-  }
-
-  @override
-  void dispose() {
-    _scrollCtrl.dispose();
-    _drag.dispose();
-    _panelOffsetSpring.dispose();
-    super.dispose();
-  }
-
-  void _select(int i) {
-    if (widget.labels.isEmpty) return;
-    final safe = i.clamp(0, widget.labels.length - 1);
-    if (safe == widget.selectedIndex.clamp(0, widget.labels.length - 1)) return;
-    HapticFeedback.selectionClick();
-    _lastHapticIdx = safe;
-    final reduceMotion = mounted && MediaQuery.disableAnimationsOf(context);
-    _drag.animateToValue(safe.toDouble(), reduceMotion: reduceMotion);
-    widget.onSelected(safe);
-  }
-
-  Widget _buildRestingThumb(
-    GrassBagTokens t, {
-    required GrassBagGlassTier effectiveTier,
-    required double radius,
-    required double opacity,
-  }) {
-    if (opacity <= 0.01) return const SizedBox.shrink();
-    final isSolid = effectiveTier == GrassBagGlassTier.solid;
-    final color = isSolid
-        ? (t.isDark ? Color.lerp(t.cardSolid, Colors.white, 0.14)! : Colors.white)
-        : (t.isDark
-            ? Colors.white.withValues(alpha: 0.17 * opacity)
-            : Colors.white.withValues(alpha: 0.94 * opacity));
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: isSolid ? color : color,
-        borderRadius: BorderRadius.circular(radius),
-        border: Border.all(
-          color: t.isDark
-              ? Colors.white.withValues(alpha: (isSolid ? 0.16 : 0.22) * opacity)
-              : Colors.white.withValues(alpha: 0.92 * opacity),
-          width: 0.65,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: (t.isDark ? 0.22 : 0.075) * opacity),
-            blurRadius: 7.0,
-            offset: const Offset(0, 1.5),
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final labels = widget.labels;
     if (labels.isEmpty) return const SizedBox.shrink();
     final t = GrassBagTokens.of(context);
-    final effectiveTier = resolveEffectiveGlassTier(context, widget.tier);
-    final reduceMotion = MediaQuery.disableAnimationsOf(context);
-    final textScale = MediaQuery.textScalerOf(context).scale(1.0).clamp(1.0, 1.35);
-    final safeIdx = widget.selectedIndex.clamp(0, labels.length - 1);
-    final isSolid = effectiveTier == GrassBagGlassTier.solid;
-    final isLiquid = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb;
-    final h = widget.height * textScale;
-    final innerR = (h - 6.0) * 0.5;
-
+    final effectiveTier = resolveEffectiveGlassTier(context, tier);
+    final safeIdx = selectedIndex.clamp(0, labels.length - 1);
+    final bg = t.isDark ? const Color(0x38787880) : const Color(0x1B767680);
+    final indicator = t.isDark ? const Color(0x36FFFFFF) : const Color(0xFFFFFFFF);
+    final solidIndicator = t.isDark ? const Color(0xFF363E4F) : Colors.white;
     final selectedStyle = TextStyle(
-      fontSize: widget.height <= 34 ? 12.5 : 13.0,
+      fontSize: height <= 34 ? 12.5 : 13.0,
       fontWeight: FontWeight.w600,
       letterSpacing: -0.15,
       color: t.isDark ? Colors.white : t.text,
     );
     final unselectedStyle = TextStyle(
-      fontSize: widget.height <= 34 ? 12.5 : 13.0,
+      fontSize: height <= 34 ? 12.5 : 13.0,
       fontWeight: FontWeight.w500,
       letterSpacing: -0.1,
       color: t.text2,
     );
 
-    Widget wrapTrack(Widget inner) {
-      if (isSolid) {
+    if (labels.length == 1) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Container(
+          height: height,
+          padding: const EdgeInsets.all(2.5),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(height / 2),
+          ),
+          child: Container(
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: effectiveTier == GrassBagGlassTier.solid ? solidIndicator : indicator,
+              borderRadius: BorderRadius.circular((height - 5) / 2),
+              boxShadow: t.isDark
+                  ? null
+                  : const [
+                      BoxShadow(
+                        color: Color(0x14000000),
+                        blurRadius: 6,
+                        offset: Offset(0, 1.5),
+                      ),
+                    ],
+            ),
+            child: Text(
+              labels.first,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: selectedStyle,
+            ),
+          ),
+        ),
+      );
+    }
+
+    final isSolid = effectiveTier == GrassBagGlassTier.solid;
+    void handleSelect(int i) {
+      if (i == safeIdx) return;
+      HapticFeedback.selectionClick();
+      onSelected(i);
+    }
+
+    if (isSolid) {
+      if (labels.length >= 6) {
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Container(
-            height: h,
-            padding: const EdgeInsets.all(3.0),
+            height: height,
+            padding: const EdgeInsets.all(2.5),
             decoration: BoxDecoration(
-              color: t.isDark
-                  ? Colors.white.withValues(alpha: 0.08)
-                  : Colors.black.withValues(alpha: 0.06),
-              borderRadius: BorderRadius.circular(h * 0.5),
+              color: bg,
+              borderRadius: BorderRadius.circular(height / 2),
             ),
-            child: inner,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              child: Row(
+                children: [
+                  for (var i = 0; i < labels.length; i++)
+                    Semantics(
+                      button: true,
+                      selected: i == safeIdx,
+                      label: labels[i],
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => handleSelect(i),
+                        child: AnimatedContainer(
+                          duration: GrassBagMotion.duration(
+                            context,
+                            const Duration(milliseconds: 180),
+                          ),
+                          curve: Curves.easeOutCubic,
+                          padding: const EdgeInsets.symmetric(horizontal: 14),
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: i == safeIdx ? solidIndicator : Colors.transparent,
+                            borderRadius: BorderRadius.circular((height - 5) / 2),
+                            boxShadow: i == safeIdx && !t.isDark
+                                ? const [
+                                    BoxShadow(
+                                      color: Color(0x14000000),
+                                      blurRadius: 6,
+                                      offset: Offset(0, 1.5),
+                                    ),
+                                  ]
+                                : null,
+                          ),
+                          child: Text(
+                            labels[i],
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: i == safeIdx ? selectedStyle : unselectedStyle,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ),
         );
       }
+
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
-        child: KyantLiquidGlass(
-          style: KyantLiquidGlassStyle.segmentedTrack(t, effectiveTier),
-          isCapsule: true,
-          child: Container(
-            height: h,
-            padding: const EdgeInsets.all(3.0),
-            child: inner,
+        child: Container(
+          height: height,
+          padding: const EdgeInsets.all(2.5),
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(height / 2),
           ),
-        ),
-      );
-    }
-
-    if (labels.length == 1) {
-      return wrapTrack(
-        Stack(
-          fit: StackFit.expand,
-          children: [
-            _buildRestingThumb(t, effectiveTier: effectiveTier, radius: innerR, opacity: 1.0),
-            Center(
-              child: Text(
-                labels.first,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: selectedStyle,
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    if (labels.length >= 6) {
-      return wrapTrack(
-        ClipRRect(
-          borderRadius: BorderRadius.circular(innerR),
-          child: SingleChildScrollView(
-            controller: _scrollCtrl,
-            scrollDirection: Axis.horizontal,
-            physics: const BouncingScrollPhysics(),
-            child: Row(
-              children: [
-                for (var i = 0; i < labels.length; i++)
-                  Semantics(
-                    key: i < _itemKeys.length ? _itemKeys[i] : null,
-                    button: true,
-                    selected: i == safeIdx,
-                    label: labels[i],
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => _select(i),
-                      child: Stack(
-                        alignment: Alignment.center,
-                        children: [
-                          Positioned.fill(
-                            child: AnimatedOpacity(
-                              opacity: i == safeIdx ? 1.0 : 0.0,
-                              duration: reduceMotion
-                                  ? Duration.zero
-                                  : const Duration(milliseconds: 170),
-                              curve: Curves.easeOutCubic,
-                              child: _buildRestingThumb(
-                                t,
-                                effectiveTier: effectiveTier,
-                                radius: innerR,
-                                opacity: 1.0,
-                              ),
-                            ),
-                          ),
-                          Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 14),
-                            child: AnimatedDefaultTextStyle(
-                              duration: reduceMotion
-                                  ? Duration.zero
-                                  : const Duration(milliseconds: 160),
-                              curve: Curves.easeOutCubic,
-                              style: i == safeIdx ? selectedStyle : unselectedStyle,
-                              child: Text(
-                                labels[i],
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          ),
-                        ],
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final segW = constraints.maxWidth / labels.length;
+              void selectAtDx(double dx) {
+                if (segW <= 0) return;
+                final idx = (dx / segW).floor().clamp(0, labels.length - 1);
+                handleSelect(idx);
+              }
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onHorizontalDragUpdate: (details) => selectAtDx(details.localPosition.dx),
+                child: Stack(
+                  children: [
+                    AnimatedPositioned(
+                      duration: GrassBagMotion.duration(
+                        context,
+                        const Duration(milliseconds: 220),
+                      ),
+                      curve: Curves.easeOutCubic,
+                      left: segW * safeIdx,
+                      top: 0,
+                      bottom: 0,
+                      width: segW,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: solidIndicator,
+                          borderRadius: BorderRadius.circular((height - 5) / 2),
+                          border: t.isDark
+                              ? Border.all(
+                                  color: Colors.white.withValues(alpha: 0.12),
+                                  width: 0.6,
+                                )
+                              : null,
+                          boxShadow: t.isDark
+                              ? const [
+                                  BoxShadow(
+                                    color: Color(0x28000000),
+                                    blurRadius: 6,
+                                    offset: Offset(0, 1.5),
+                                  ),
+                                ]
+                              : const [
+                                  BoxShadow(
+                                    color: Color(0x16000000),
+                                    blurRadius: 6,
+                                    offset: Offset(0, 1.5),
+                                  ),
+                                ],
+                        ),
                       ),
                     ),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
-    return RepaintBoundary(
-      child: ListenableBuilder(
-        listenable: _panelOffsetSpring,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final innerW = math.max(1.0, constraints.maxWidth - 6.0);
-            final segW = innerW / labels.length;
-            final innerH = h - 6.0;
-            final isLtr = Directionality.of(context) == TextDirection.ltr;
-
-            double overdragRubber(double excess) {
-              final e2x = math.exp(2.0 * (excess * 0.045).clamp(-5.0, 5.0));
-              return 4.5 * ((e2x - 1.0) / (e2x + 1.0));
-            }
-
-            void handleDragUpdate(double localDx, double deltaDx) {
-              if (segW <= 0) return;
-              final unclampedNext =
-                  _drag.targetValue + (deltaDx / segW) * (isLtr ? 1.0 : -1.0);
-              final nextVal = unclampedNext.clamp(0.0, _maxIdx);
-              _drag.updateValue(nextVal, reduceMotion: reduceMotion);
-              // Elastic panel nudge ONLY when pushing past the left/right edges!
-              if (unclampedNext < 0.0) {
-                final overscrollPx = (unclampedNext * segW) * (isLtr ? 1.0 : -1.0);
-                _panelOffsetSpring.setValue(
-                  overdragRubber(_panelOffsetSpring.value * 4.0 + overscrollPx),
-                );
-              } else if (unclampedNext > _maxIdx) {
-                final overscrollPx =
-                    ((unclampedNext - _maxIdx) * segW) * (isLtr ? 1.0 : -1.0);
-                _panelOffsetSpring.setValue(
-                  overdragRubber(_panelOffsetSpring.value * 4.0 + overscrollPx),
-                );
-              } else if (_panelOffsetSpring.value.abs() > 0.01) {
-                _panelOffsetSpring.setValue(_panelOffsetSpring.value * 0.72);
-              }
-              final snapped = nextVal.round().clamp(0, labels.length - 1);
-              if (snapped != _lastHapticIdx) {
-                _lastHapticIdx = snapped;
-                HapticFeedback.selectionClick();
-              }
-            }
-
-            void handleDragEnd({double primaryVelocity = 0.0}) {
-              _dragging = false;
-              final velIdxPerSec =
-                  (primaryVelocity / math.max(segW, 1.0)) * (isLtr ? 1.0 : -1.0);
-              final projected = _drag.targetValue + (velIdxPerSec * 0.08).clamp(-0.65, 0.65);
-              final target = projected.round().clamp(0, labels.length - 1);
-              final span = math.max(_maxIdx, 1.0);
-              _drag.settleTo(
-                target.toDouble(),
-                normalizedVelocity: velIdxPerSec / span,
-                reduceMotion: reduceMotion,
-              );
-              _panelOffsetSpring.animateTo(
-                0.0,
-                fromVelocity: (primaryVelocity * 0.05).clamp(-120.0, 120.0),
-              );
-              if (target != safeIdx) {
-                widget.onSelected(target);
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (!mounted || _dragging || widget.labels.isEmpty) return;
-                  final curSafe = widget.selectedIndex.clamp(0, widget.labels.length - 1);
-                  if (curSafe != target) {
-                    _drag.updateValue(
-                      curSafe.toDouble(),
-                      reduceMotion: MediaQuery.disableAnimationsOf(context),
-                      trackVelocity: false,
-                    );
-                    _lastHapticIdx = curSafe;
-                  }
-                });
-              }
-            }
-
-            return GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: (_) {
-                if (!reduceMotion) _drag.press();
-              },
-              onTapCancel: () {
-                if (!_dragging) _drag.release(reduceMotion: reduceMotion);
-              },
-              onHorizontalDragStart: (details) {
-                _dragging = true;
-                _drag.press(reduceMotion: reduceMotion);
-                final rawIdx =
-                    ((details.localPosition.dx - 3.0) / segW - 0.5).clamp(0.0, _maxIdx);
-                _drag.updateValue(
-                  isLtr ? rawIdx : _maxIdx - rawIdx,
-                  reduceMotion: reduceMotion,
-                  trackVelocity: false,
-                );
-              },
-              onHorizontalDragUpdate: (details) =>
-                  handleDragUpdate(details.localPosition.dx, details.delta.dx),
-              onHorizontalDragEnd: (details) =>
-                  handleDragEnd(primaryVelocity: details.primaryVelocity ?? 0.0),
-              onHorizontalDragCancel: () => handleDragEnd(),
-              child: wrapTrack(
-                ListenableBuilder(
-                  listenable: _merged,
-                  builder: (context, _) {
-                    final pos = _drag.value.clamp(0.0, _maxIdx);
-                    final press = reduceMotion ? 0.0 : _drag.pressProgress;
-                    final vel = (_drag.velocity / 12.0).clamp(-0.24, 0.24);
-                    final effScaleX = (isSolid
-                            ? (1.0 + 0.04 * press)
-                            : (_drag.scaleX / (1.0 - (vel * 0.75).clamp(-0.2, 0.2))))
-                        .clamp(0.92, 1.38);
-                    final effScaleY = (isSolid
-                            ? (1.0 + 0.04 * press)
-                            : (_drag.scaleY * (1.0 - (vel * 0.25).clamp(-0.2, 0.2))))
-                        .clamp(0.92, 1.32);
-
-                    final visualPos = isLtr ? pos : (_maxIdx - pos);
-                    final restLeft = segW * visualPos;
-                    final lensW = segW * effScaleX;
-                    final lensH = innerH * effScaleY;
-                    final lensLeft = (restLeft + segW * 0.5) - lensW * 0.5;
-                    final lensTop = (innerH * 0.5) - lensH * 0.5;
-                    final showCrystalLens = !isSolid && press > 0.02;
-
-                    return Stack(
-                      clipBehavior: Clip.none,
+                    Row(
                       children: [
-                        // 1. Resting luminous sculpted capsule BEHIND labels (fades out as lens lifts)
-                        if (1.0 - press > 0.01)
-                          Positioned(
-                            left: restLeft,
-                            top: 0,
-                            bottom: 0,
-                            width: segW,
-                            child: _buildRestingThumb(
-                              t,
-                              effectiveTier: effectiveTier,
-                              radius: innerR,
-                              opacity: (1.0 - press).clamp(0.0, 1.0),
-                            ),
-                          ),
-                        // 2. Segment labels with continuous color interpolation as the lens glides over!
-                        Row(
-                          children: [
-                            for (var i = 0; i < labels.length; i++)
-                              Expanded(
-                                child: Semantics(
-                                  button: true,
-                                  selected: i == safeIdx,
-                                  label: labels[i],
-                                  child: GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () => _select(i),
-                                    child: Center(
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(horizontal: 4),
-                                        child: Text(
-                                          labels[i],
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: TextStyle.lerp(
-                                            unselectedStyle,
-                                            selectedStyle,
-                                            (1.0 - (pos - i).abs()).clamp(0.0, 1.0),
-                                          ),
-                                        ),
-                                      ),
+                        for (var i = 0; i < labels.length; i++)
+                          Expanded(
+                            child: Semantics(
+                              button: true,
+                              selected: i == safeIdx,
+                              label: labels[i],
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTap: () => handleSelect(i),
+                                child: Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                                    child: Text(
+                                      labels[i],
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: i == safeIdx ? selectedStyle : unselectedStyle,
                                     ),
                                   ),
                                 ),
                               ),
-                          ],
-                        ),
-                        // 3. Lifted Kyant0 7-band chromatic refracting lens OVER labels during drag/tap!
-                        if (showCrystalLens)
-                          Positioned(
-                            left: lensLeft,
-                            top: lensTop,
-                            width: lensW,
-                            height: lensH,
-                            child: IgnorePointer(
-                              child: KyantLiquidGlass(
-                                style: KyantLiquidGlassStyle(
-                                  blurRadius: 0.0,
-                                  refractionHeight: isLiquid ? 10.0 * press : 0.0,
-                                  refractionAmount: isLiquid ? 14.0 * press : 0.0,
-                                  depthEffect: false,
-                                  chromaticAberration: isLiquid ? 1.0 * press : 0.0,
-                                  saturation: 1.45,
-                                  surfaceColor: t.isDark
-                                      ? Colors.white.withValues(alpha: 0.05 * press)
-                                      : Colors.black.withValues(alpha: 0.03 * press),
-                                  highlightKind: KyantHighlightKind.defaultSpecular,
-                                  highlightAlpha: 0.58 * press,
-                                  highlightAngleDeg: 45.0,
-                                  highlightFalloff: 1.2,
-                                  highlightWidth: 0.65,
-                                  highlightBlur: 0.25,
-                                  innerShadowRadius: 6.0 * press,
-                                  innerShadowAlpha: press,
-                                  shadows: [
-                                    BoxShadow(
-                                      color: Colors.black.withValues(alpha: 0.14 * press),
-                                      blurRadius: 14.0,
-                                      offset: const Offset(0, 4.0),
-                                    ),
-                                  ],
-                                ),
-                                isCapsule: true,
-                                child: const SizedBox.expand(),
-                              ),
                             ),
                           ),
                       ],
-                    );
-                  },
+                    ),
+                  ],
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
-        builder: (_, child) {
-          // ALWAYS keep Transform.translate in the tree so starting a horizontal drag
-          // NEVER changes widget tree depth and cancels GestureDetector!
-          final ox = reduceMotion ? 0.0 : _panelOffsetSpring.value;
-          return Transform.translate(offset: Offset(ox, 0), child: child);
-        },
+      );
+    }
+
+    final segments = [for (final label in labels) GlassSegment(label: label)];
+    final lensQuality = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb
+        ? GlassQuality.premium
+        : GlassQuality.standard;
+    final lensSettings = _interactiveLensSettings(
+      effectiveTier,
+      refractiveIndex: 1.32,
+      chromaticAberration: 0.14,
+    );
+
+    final control = labels.length > 6
+        ? GlassSegmentedControl.scrollable(
+            segments: segments,
+            selectedIndex: safeIdx,
+            onSegmentSelected: handleSelect,
+            height: height,
+            borderRadius: GlassDefaults.capsuleRadius,
+            useOwnLayer: false,
+            quality: lensQuality,
+            backgroundColor: bg,
+            indicatorColor: indicator,
+            indicatorSettings: lensSettings,
+            indicatorPinchStrength: 0.45,
+            indicatorExpansion: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            selectedTextStyle: selectedStyle,
+            unselectedTextStyle: unselectedStyle,
+          )
+        : GlassSegmentedControl(
+            segments: segments,
+            selectedIndex: safeIdx,
+            onSegmentSelected: handleSelect,
+            height: height,
+            borderRadius: GlassDefaults.capsuleRadius,
+            useOwnLayer: false,
+            quality: lensQuality,
+            backgroundColor: bg,
+            indicatorColor: indicator,
+            indicatorSettings: lensSettings,
+            indicatorPinchStrength: 0.45,
+            indicatorExpansion: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            selectedTextStyle: selectedStyle,
+            unselectedTextStyle: unselectedStyle,
+            glowColor: t.primaryHi.withValues(alpha: 0.22),
+          );
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: _GrassBagLensScope(
+        tier: effectiveTier,
+        child: control,
       ),
     );
   }
 }
 
-/// Faithful 1:1 Flutter replica of Kyant0 `LiquidSlider.kt`:
-/// - `6dp` capsule track (`0x33787878` Light / `0x5C787880` Dark) + accent filled track
-/// - `40×24dp` elongated capsule thumb driven by [KyantDampedDragController] (`1.5×` pressed
-///   expansion + velocity squash/stretch `scaleX /= 1 - v*0.75`, `scaleY *= 1 - v*0.25`)
-/// - At rest (`pressProgress == 0`): crisp pure-white `40×24dp` capsule (ZERO shaders at rest!)
-/// - On press, drag, or tap-to-seek: swells `1.5×` (`60×36dp`) as white fades (`1 - progress`)
-///   into a live 7-band chromatic-aberration [KyantLiquidGlass] water-droplet lens
-///   (`lens(10, 14, chromaticAberration: true)` + `Highlight.Ambient` + `InnerShadow(4dp)`)
-///   magnifying & refracting the colored track right underneath!
-class GrassBagGlassSlider extends StatefulWidget {
+/// Authentic Apple iOS 27 [GlassSlider]:
+/// - `6dp` capsule track + elongated pill thumb that lifts into a live 3D GPU `_UILiquidLensView`
+///   crystal lens with velocity-driven jelly squash & stretch and prismatic edge dispersion!
+class GrassBagGlassSlider extends StatelessWidget {
   const GrassBagGlassSlider({
     super.key,
     required this.value,
@@ -2830,296 +2568,120 @@ class GrassBagGlassSlider extends StatefulWidget {
   final GrassBagGlassTier? tier;
 
   @override
-  State<GrassBagGlassSlider> createState() => _GrassBagGlassSliderState();
-}
-
-class _GrassBagGlassSliderState extends State<GrassBagGlassSlider>
-    with TickerProviderStateMixin {
-  static const double _trackH = 6.0;
-  static const double _thumbW = 40.0;
-  static const double _thumbH = 24.0;
-  static const double _hitHeight = 40.0;
-
-  late final KyantDampedDragController _drag;
-  bool _dragging = false;
-  int? _lastDivisionTick;
-
-  double get _safeMax => widget.max > widget.min ? widget.max : widget.min + 1.0;
-  double get _clampedValue => widget.value.clamp(widget.min, _safeMax);
-
-  double _quantize(double raw) {
-    final clamped = raw.clamp(widget.min, _safeMax);
-    final div = widget.divisions;
-    if (div == null || div <= 0) return clamped;
-    final step = (_safeMax - widget.min) / div;
-    final idx = ((clamped - widget.min) / step).round();
-    if (_lastDivisionTick != idx) {
-      _lastDivisionTick = idx;
-      HapticFeedback.selectionClick();
-    }
-    return (widget.min + idx * step).clamp(widget.min, _safeMax);
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _drag = KyantDampedDragController(
-      vsync: this,
-      initialValue: _clampedValue,
-      minValue: widget.min,
-      maxValue: _safeMax,
-      initialScale: 1.0,
-      pressedScale: 1.5,
-    );
-  }
-
-  @override
-  void didUpdateWidget(covariant GrassBagGlassSlider oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    final reduceMotion = mounted && MediaQuery.disableAnimationsOf(context);
-    if (oldWidget.min != widget.min || oldWidget.max != widget.max) {
-      _drag.updateRange(widget.min, _safeMax, _clampedValue, reduceMotion: true);
-    } else if (!_dragging && (oldWidget.value - widget.value).abs() > 1e-5) {
-      _drag.updateValue(_clampedValue, reduceMotion: reduceMotion, trackVelocity: false);
-    }
-  }
-
-  @override
-  void dispose() {
-    _drag.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    final resolvedTier =
-        resolveEffectiveGlassTier(context, widget.tier ?? resolveAmbientGlassTier(context));
-    final enabled = widget.onChanged != null;
+    final resolvedTier = resolveEffectiveGlassTier(
+      context,
+      tier ?? resolveAmbientGlassTier(context),
+    );
+    final enabled = onChanged != null;
     final isSolid = resolvedTier == GrassBagGlassTier.solid;
-    final isLiquid = resolvedTier == GrassBagGlassTier.liquid && !kIsWeb;
-    final reduceMotion = MediaQuery.disableAnimationsOf(context);
-    final isLtr = Directionality.of(context) == TextDirection.ltr;
-
-    final rawActive = widget.activeColor ?? t.primary;
+    final safeMax = max > min ? max : min + 1.0;
+    final clampedVal = value.clamp(min, safeMax);
+    final rawActive = activeColor ?? t.primary;
     final resolvedActive = (t.isDark && rawActive.computeLuminance() > 0.65)
         ? Color.lerp(rawActive, t.cardSolid, 0.30)!
         : rawActive;
-    final resolvedInactive = t.isDark
-        ? const Color(0xFF787880).withValues(alpha: 0.36)
-        : const Color(0xFF787878).withValues(alpha: 0.22);
+    final resolvedInactive =
+        t.isDark ? const Color(0x38FFFFFF) : const Color(0x200F172A);
 
-    final sliderBody = LayoutBuilder(
-      builder: (context, constraints) {
-        final trackW = constraints.hasBoundedWidth && constraints.maxWidth > 0
-            ? constraints.maxWidth
-            : 240.0;
+    if (isSolid) {
+      final solidSlider = SliderTheme(
+        data: SliderTheme.of(context).copyWith(
+          trackHeight: 6.0,
+          activeTrackColor: resolvedActive,
+          inactiveTrackColor: resolvedInactive,
+          thumbColor: Colors.white,
+          overlayColor: resolvedActive.withValues(alpha: 0.16),
+          thumbShape: const _GrassBagSolidPillSliderThumbShape(),
+          overlayShape: const RoundSliderOverlayShape(overlayRadius: 20.0),
+          tickMarkShape: SliderTickMarkShape.noTickMark,
+        ),
+        child: Slider(
+          value: clampedVal,
+          min: min,
+          max: safeMax,
+          divisions: divisions,
+          onChanged: onChanged,
+        ),
+      );
+      if (enabled) return solidSlider;
+      return IgnorePointer(
+        child: Opacity(opacity: 0.45, child: solidSlider),
+      );
+    }
 
-        double valueAtDx(double dx) {
-          final frac = (dx / trackW).clamp(0.0, 1.0);
-          final dirFrac = isLtr ? frac : (1.0 - frac);
-          return _quantize(widget.min + dirFrac * (_safeMax - widget.min));
-        }
-
-        final visual = RepaintBoundary(
-          child: ListenableBuilder(
-            listenable: _drag,
-            builder: (context, _) {
-              final prog = _drag.progress.clamp(0.0, 1.0);
-              final press = reduceMotion ? 0.0 : _drag.pressProgress;
-              final vel = (_drag.velocity / 10.0).clamp(-0.26, 0.26);
-              final rawScaleX = _drag.scaleX / (1.0 - (vel * 0.75).clamp(-0.2, 0.2));
-              final rawScaleY = _drag.scaleY * (1.0 - (vel * 0.25).clamp(-0.2, 0.2));
-              final effScaleX = isSolid ? (1.0 + 0.14 * press) : rawScaleX.clamp(0.85, 1.72);
-              final effScaleY = isSolid ? (1.0 + 0.08 * press) : rawScaleY.clamp(0.85, 1.65);
-
-              final curThumbW = _thumbW * effScaleX;
-              final curThumbH = _thumbH * effScaleY;
-              final curTrackH = _trackH + 2.2 * press;
-              // Exact Kyant0 LiquidSlider.kt:149-151 horizontal thumb positioning
-              final minCenter = _thumbW * 0.25;
-              final maxCenter = math.max(minCenter, trackW - _thumbW * 0.25);
-              final rawCenter = isLtr ? (trackW * prog) : (trackW * (1.0 - prog));
-              final thumbCenterX = rawCenter.clamp(minCenter, maxCenter);
-              final thumbLeft = thumbCenterX - curThumbW * 0.5;
-              final thumbTop = (_hitHeight - curThumbH) * 0.5;
-
-              final useLens = !isSolid && press > 0.015;
-              final Widget thumbWidget;
-              if (!useLens) {
-                thumbWidget = Container(
-                  width: curThumbW,
-                  height: curThumbH,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(curThumbH * 0.5),
-                    border: Border.all(
-                      color: Colors.black.withValues(alpha: t.isDark ? 0.10 : 0.06),
-                      width: 0.5,
-                    ),
-                    boxShadow: const [
-                      BoxShadow(
-                        color: Color(0x22000000),
-                        blurRadius: 6.0,
-                        offset: Offset(0, 2.0),
-                      ),
-                    ],
-                  ),
-                );
-              } else {
-                // Exact Kyant0 LiquidSlider.kt:167-207 clear crystal lens morph
-                // (`blurRadius: 0.0` in liquid mode eliminates the 0.05 threshold pop!)
-                final lensStyle = KyantLiquidGlassStyle(
-                  blurRadius: isLiquid ? 0.0 : 4.0,
-                  refractionHeight: isLiquid ? 10.0 * press : 0.0,
-                  refractionAmount: isLiquid ? 14.0 * press : 0.0,
-                  depthEffect: false,
-                  chromaticAberration: isLiquid ? 1.0 * press : 0.0,
-                  saturation: 1.40,
-                  surfaceColor: Colors.white.withValues(alpha: (1.0 - press).clamp(0.0, 1.0)),
-                  highlightKind: KyantHighlightKind.ambient,
-                  highlightAlpha: (t.isDark ? 0.56 : 0.46) * press,
-                  highlightAngleDeg: 45.0,
-                  highlightFalloff: 1.0,
-                  highlightWidth: 0.50,
-                  highlightBlur: 0.22,
-                  innerShadowRadius: 4.0 * press,
-                  innerShadowAlpha: (t.isDark ? 0.65 : 1.0) * press,
-                  shadows: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.08 + 0.06 * press),
-                      blurRadius: 8.0 + 4.0 * press,
-                      offset: const Offset(0, 2.0),
-                    ),
-                  ],
-                );
-                thumbWidget = KyantLiquidGlass(
-                  style: lensStyle,
-                  isCapsule: true,
-                  child: SizedBox(width: curThumbW, height: curThumbH),
-                );
-              }
-
-              final fillW = (trackW * prog).clamp(0.0, trackW);
-              return SizedBox(
-                width: trackW,
-                height: _hitHeight,
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  alignment: Alignment.centerLeft,
-                  children: [
-                    // Tactile swelling capsule background track (6dp -> 8.2dp on press!)
-                    Positioned(
-                      left: 0,
-                      right: 0,
-                      top: (_hitHeight - curTrackH) * 0.5,
-                      height: curTrackH,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: resolvedInactive,
-                          borderRadius: BorderRadius.circular(curTrackH * 0.5),
-                        ),
-                      ),
-                    ),
-                    // Tactile swelling capsule accent fill track
-                    Positioned(
-                      left: isLtr ? 0 : (trackW - fillW),
-                      top: (_hitHeight - curTrackH) * 0.5,
-                      width: fillW,
-                      height: curTrackH,
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: resolvedActive,
-                          borderRadius: BorderRadius.circular(curTrackH * 0.5),
-                        ),
-                      ),
-                    ),
-                    // 40×24dp Kyant0 Liquid Glass capsule thumb
-                    Positioned(
-                      left: thumbLeft,
-                      top: thumbTop,
-                      width: curThumbW,
-                      height: curThumbH,
-                      child: thumbWidget,
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
-        );
-
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTapDown: enabled
-              ? (_) {
-                  if (!reduceMotion) _drag.press();
-                }
-              : null,
-          onTapCancel: enabled
-              ? () {
-                  if (!_dragging) _drag.release(reduceMotion: reduceMotion);
-                }
-              : null,
-          onTapUp: enabled
-              ? (details) {
-                  final next = valueAtDx(details.localPosition.dx);
-                  _drag.animateToValue(next, reduceMotion: reduceMotion);
-                  HapticFeedback.selectionClick();
-                  widget.onChanged?.call(next);
-                }
-              : null,
-          onHorizontalDragStart: enabled
-              ? (details) {
-                  _dragging = true;
-                  _lastDivisionTick = null;
-                  _drag.press(reduceMotion: reduceMotion);
-                  final next = valueAtDx(details.localPosition.dx);
-                  // Avoid violent 1-frame squash spike on tap-far-from-thumb drag start!
-                  _drag.updateValue(next, reduceMotion: reduceMotion, trackVelocity: false);
-                  widget.onChanged?.call(next);
-                }
-              : null,
-          onHorizontalDragUpdate: enabled
-              ? (details) {
-                  final next = valueAtDx(details.localPosition.dx);
-                  _drag.updateValue(next, reduceMotion: reduceMotion);
-                  widget.onChanged?.call(next);
-                }
-              : null,
-          onHorizontalDragEnd: enabled
-              ? (details) {
-                  _dragging = false;
-                  final vx = details.primaryVelocity ?? 0.0;
-                  final normVel = ((isLtr ? vx : -vx) / math.max(trackW, 1.0)) * 0.35;
-                  final target = _quantize(_drag.targetValue);
-                  _drag.settleTo(
-                    target,
-                    normalizedVelocity: normVel,
-                    reduceMotion: reduceMotion,
-                  );
-                  widget.onChanged?.call(target);
-                }
-              : null,
-          onHorizontalDragCancel: enabled
-              ? () {
-                  _dragging = false;
-                  _drag.release(reduceMotion: reduceMotion);
-                }
-              : null,
-          child: visual,
-        );
-      },
+    final lensQuality = resolvedTier == GrassBagGlassTier.liquid && !kIsWeb
+        ? GlassQuality.premium
+        : GlassQuality.standard;
+    final slider = _GrassBagLensScope(
+      tier: resolvedTier,
+      child: GlassSlider(
+        value: clampedVal,
+        min: min,
+        max: safeMax,
+        divisions: divisions,
+        onChanged: onChanged,
+        activeColor: resolvedActive,
+        inactiveColor: resolvedInactive,
+        trackHeight: 6.0,
+        thumbRadius: 14.0,
+        useOwnLayer: false,
+        quality: lensQuality,
+        settings: _interactiveLensSettings(
+          resolvedTier,
+          refractiveIndex: 1.38,
+          chromaticAberration: 0.16,
+        ),
+      ),
     );
-
-    final semantic = Semantics(
-      slider: true,
-      enabled: enabled,
-      value: _clampedValue.toStringAsFixed(2),
-      child: sliderBody,
+    if (enabled) return slider;
+    return IgnorePointer(
+      child: Opacity(opacity: 0.45, child: slider),
     );
-    if (enabled) return semantic;
-    return IgnorePointer(child: Opacity(opacity: 0.45, child: semantic));
+  }
+}
+
+class _GrassBagSolidPillSliderThumbShape extends SliderComponentShape {
+  const _GrassBagSolidPillSliderThumbShape();
+
+  static const double _width = 30.0;
+  static const double _height = 20.0;
+
+  @override
+  Size getPreferredSize(bool isEnabled, bool isDiscrete) => const Size(_width, _height);
+
+  @override
+  void paint(
+    PaintingContext context,
+    Offset center, {
+    required Animation<double> activationAnimation,
+    required Animation<double> enableAnimation,
+    required bool isDiscrete,
+    required TextPainter labelPainter,
+    required RenderBox parentBox,
+    required SliderThemeData sliderTheme,
+    required TextDirection textDirection,
+    required double value,
+    required double textScaleFactor,
+    required Size sizeWithOverflow,
+  }) {
+    final canvas = context.canvas;
+    final rect = Rect.fromCenter(center: center, width: _width, height: _height);
+    final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(_height / 2));
+    final shadowPath = Path()..addRRect(rrect);
+    canvas.drawShadow(shadowPath, const Color(0x40000000), 3.0, true);
+    canvas.drawRRect(
+      rrect,
+      Paint()..color = sliderTheme.thumbColor ?? Colors.white,
+    );
+    canvas.drawRRect(
+      rrect,
+      Paint()
+        ..color = const Color(0x1A000000)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.6,
+    );
   }
 }
 
@@ -3935,10 +3497,9 @@ class _KyantPointerGlowPainter extends CustomPainter {
       old.borderRadius != borderRadius;
 }
 
-/// Prominent Kyant0 `LiquidButton` tinted Liquid Glass CTA capsule:
-/// - Faithful `vibrancy() -> blur(2.5dp) -> lens(12dp, 24dp) -> BlendMode.hue + tint.alpha ->
-///   Highlight.Default` optical rendering on EVERY surface (canvas, cards, sheets, dialogs!)
-/// - Full Kyant0 `InteractiveHighlight` touch-following glow + `tanh` magnetic elastic stretch!
+/// Prominent Apple iOS 27 tinted Liquid Glass capsule CTA button powered by [GlassButton.custom]:
+/// - Full 3D GPU optical refraction (`GlassBodyMode.clear`) + [LiquidStretch] + [GlassGlow] on canvas
+/// - Clean borderless luminous capsule inside floating glass sheets/dialogs (zero double-glass wireframes!)
 class GrassBagPrimaryGlassButton extends StatelessWidget {
   const GrassBagPrimaryGlassButton({
     super.key,
@@ -3973,6 +3534,13 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
     final fg = foregroundColor ?? t.onPrimary;
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
     final isSolid = effectiveTier == GrassBagGlassTier.solid;
+    final inRefractiveGlass =
+        context.dependOnInheritedWidgetOfExactType<InheritedLiquidGlass>()?.avoidsRefraction ??
+            false;
+    final inSolidCard =
+        InheritedGlassSurfaceStyle.maybeOf(context) == GlassSurfaceStyle.solid;
+    final renderAsSolidCapsule = isSolid || insideGlass || inSolidCard;
+    final useOwn = !renderAsSolidCapsule && !inRefractiveGlass;
 
     final compact = height <= 34;
     final clampedScaler = compact
@@ -4006,72 +3574,72 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
       ),
     );
 
-    final content = ConstrainedBox(
-      constraints: BoxConstraints(minHeight: height, maxHeight: height),
-      child: Center(
-        widthFactor: 1.0,
-        child: labelRow,
-      ),
-    );
+    final isFrosted = effectiveTier == GrassBagGlassTier.frosted || kIsWeb;
+    final glassSettings = renderAsSolidCapsule
+        ? null
+        : LiquidGlassSettings(
+            bodyMode: GlassBodyMode.clear,
+            glassColor: bg.withValues(
+              alpha: inRefractiveGlass
+                  ? (t.isDark ? 0.84 : 0.88)
+                  : (t.isDark ? 0.78 : 0.84),
+            ),
+            blur: isFrosted ? 6.0 : 1.8,
+            frost: 0.0,
+            frostOpacity: 0.0,
+            thickness: isFrosted ? 1.0 : 22.0,
+            refractiveIndex: isFrosted ? 1.01 : 1.28,
+            lensModel: GlassLensModel.spherical,
+            chromaticAberration: isFrosted ? 0.0 : 0.08,
+            saturation: isFrosted ? 1.0 : 1.45,
+            lightAngle: 0.75 * math.pi,
+            lightIntensity: isFrosted ? 0.16 : 0.65,
+            ambientStrength: isFrosted ? 0.06 : 0.10,
+            fresnelStrength: isFrosted ? 0.20 : 0.85,
+            edgeAbsorption: 0.02,
+            rimLight: isFrosted ? 0.36 : 0.82,
+            rimShade: 0.0,
+            bodyShade: 0.0,
+            specularSharpness:
+                isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
+            shadow: [
+              BoxShadow(
+                color: bg.withValues(alpha: t.isDark ? 0.30 : 0.22),
+                blurRadius: 12,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          );
 
-    if (isSolid) {
-      final solidPill = DecoratedBox(
-        decoration: ShapeDecoration(
-          color: bg,
-          shape: StadiumBorder(
-            side: BorderSide(color: Colors.white.withValues(alpha: 0.16), width: 0.65),
-          ),
-        ),
-        child: content,
-      );
-      if (!active) {
-        return IgnorePointer(child: Opacity(opacity: 0.45, child: solidPill));
-      }
-      return Semantics(
-        button: true,
-        label: label,
-        child: GrassBagSpringTap(
-          onTap: () {
-            HapticFeedback.lightImpact();
-            onTap!();
-          },
-          pressedScale: 0.96,
-          enablePointerGlow: false,
-          child: solidPill,
-        ),
-      );
-    }
-
-    // Genuine single-pass Kyant0 LiquidButton tinted refractive glass everywhere
-    // (0 extra blur BackdropFilter + frame-accurate `_KyantBackdropFilterLayer`!).
-    final style = KyantLiquidGlassStyle.button(
-      t,
-      effectiveTier,
-      tint: bg,
-      insideGlass: insideGlass,
-    );
-    final materializeAnim = GrassBagMaterializeScope.animationOf(context);
-    return Semantics(
-      button: true,
-      label: label,
+    return GlassButton.custom(
+      onTap: () {
+        if (!active) return;
+        HapticFeedback.lightImpact();
+        onTap!();
+      },
       enabled: active,
-      child: KyantInteractiveGlassButton(
-        onTap: active ? onTap : null,
-        enabled: active,
-        style: style,
-        isCapsule: true,
-        height: height,
-        materializeAnimation: materializeAnim,
-        child: labelRow,
-      ),
+      height: height,
+      shape: const LiquidRoundedSuperellipse(borderRadius: 999),
+      useOwnLayer: useOwn,
+      quality: renderAsSolidCapsule ? null : GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+      surfaceStyle: renderAsSolidCapsule ? GlassSurfaceStyle.solid : GlassSurfaceStyle.glass,
+      style: GlassButtonStyle.filled,
+      color: renderAsSolidCapsule ? bg.withValues(alpha: insideGlass && !isSolid ? 0.92 : 1.0) : null,
+      settings: glassSettings,
+      interactionScale: 1.035,
+      stretch: useOwn ? 0.26 : 0.18,
+      anchorStretch: true,
+      glowColor: Colors.white.withValues(alpha: 0.28),
+      glowRadius: 1.35,
+      child: labelRow,
     );
   }
 }
 
-/// Secondary Kyant0 `LiquidButton` crystal translucent glass capsule:
-/// - Faithful `vibrancy() -> blur(2.5dp) -> lens(12dp, 24dp) -> Highlight.Default` crystal glass
-///   on cards, sheets, dialogs, and canvas (or softly tinted red/accent glass!)
-/// - Full Kyant0 `InteractiveHighlight` touch glow + `tanh` magnetic elastic stretch!
+/// Secondary Apple iOS 27 crystal translucent glass capsule button powered by [GlassButton.custom]:
+/// - Full 3D GPU optical refraction (`GlassBodyMode.clear`) on canvas
+/// - Clean borderless iOS 27 translucent filled capsule (`_UIAlertControllerFilledBackgroundView`)
+///   inside floating glass sheets, drawers, and dialogs (ZERO fat white wireframe outlines!)
 class GrassBagSecondaryGlassButton extends StatelessWidget {
   const GrassBagSecondaryGlassButton({
     super.key,
@@ -4107,6 +3675,40 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
         : (accentForeground ? (t.isDark ? t.primaryHi : t.primary) : t.text);
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
     final isSolid = effectiveTier == GrassBagGlassTier.solid;
+    final inRefractiveGlass =
+        context.dependOnInheritedWidgetOfExactType<InheritedLiquidGlass>()?.avoidsRefraction ??
+            false;
+    final inSolidCard =
+        InheritedGlassSurfaceStyle.maybeOf(context) == GlassSurfaceStyle.solid;
+    final renderAsSolidCapsule = isSolid || insideGlass || inSolidCard;
+    final useOwn = !renderAsSolidCapsule && !inRefractiveGlass;
+
+    final Color solidBg = destructive
+        ? t.errSoft
+        : (accentForeground
+            ? (insideGlass && !isSolid
+                ? t.primary.withValues(alpha: t.isDark ? 0.22 : 0.13)
+                : t.primarySoft)
+            : (insideGlass && !isSolid
+                ? (t.isDark
+                    ? Colors.white.withValues(alpha: 0.12)
+                    : Colors.black.withValues(alpha: 0.075))
+                : (t.isDark
+                    ? Colors.white.withValues(alpha: 0.10)
+                    : const Color(0x12162E42))));
+
+    final Color glassTint;
+    if (destructive) {
+      glassTint = t.err.withValues(alpha: t.isDark ? 0.22 : 0.12);
+    } else if (accentForeground) {
+      glassTint = t.isDark
+          ? t.primary.withValues(alpha: 0.20)
+          : Color.lerp(Colors.white, t.primary, 0.14)!.withValues(alpha: 0.42);
+    } else if (t.isDark) {
+      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.12 : 0.08);
+    } else {
+      glassTint = Colors.white.withValues(alpha: inRefractiveGlass ? 0.48 : 0.32);
+    }
 
     final compact = height <= 34;
     final clampedScaler = compact
@@ -4140,83 +3742,62 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
       ),
     );
 
-    final content = ConstrainedBox(
-      constraints: BoxConstraints(minHeight: height, maxHeight: height),
-      child: Center(
-        widthFactor: 1.0,
-        child: labelRow,
-      ),
-    );
+    final isFrosted = effectiveTier == GrassBagGlassTier.frosted || kIsWeb;
+    final glassSettings = renderAsSolidCapsule
+        ? null
+        : LiquidGlassSettings(
+            bodyMode: GlassBodyMode.clear,
+            glassColor: glassTint,
+            blur: isFrosted ? 6.5 : 1.8,
+            frost: 0.0,
+            frostOpacity: 0.0,
+            thickness: isFrosted ? 1.0 : 22.0,
+            refractiveIndex: isFrosted ? 1.01 : 1.28,
+            lensModel: GlassLensModel.spherical,
+            chromaticAberration: isFrosted ? 0.0 : 0.08,
+            saturation: isFrosted ? 1.0 : 1.58,
+            lightAngle: 0.75 * math.pi,
+            lightIntensity: isFrosted ? 0.14 : 0.68,
+            ambientStrength: isFrosted ? 0.06 : 0.10,
+            fresnelStrength: isFrosted ? 0.18 : 0.90,
+            edgeAbsorption: 0.02,
+            rimLight: isFrosted ? 0.36 : 0.84,
+            rimShade: 0.0,
+            bodyShade: 0.0,
+            specularSharpness:
+                isFrosted ? GlassSpecularSharpness.medium : GlassSpecularSharpness.sharp,
+            shadow: t.isDark
+                ? const []
+                : const [
+                    BoxShadow(
+                      color: Color(0x0E000000),
+                      blurRadius: 12,
+                      offset: Offset(0, 3),
+                    ),
+                  ],
+          );
 
-    if (isSolid) {
-      final solidBg = destructive
-          ? t.errSoft
-          : (accentForeground
-              ? t.primarySoft
-              : (t.isDark
-                  ? Colors.white.withValues(alpha: 0.11)
-                  : Color.lerp(t.fill1, Colors.white, 0.76)!));
-      final solidBorder = destructive
-          ? t.err.withValues(alpha: t.isDark ? 0.34 : 0.24)
-          : (accentForeground
-              ? t.primary.withValues(alpha: t.isDark ? 0.32 : 0.24)
-              : (t.isDark ? Colors.white.withValues(alpha: 0.16) : t.sepStrong));
-      final solidPill = DecoratedBox(
-        decoration: ShapeDecoration(
-          color: solidBg,
-          shape: StadiumBorder(side: BorderSide(color: solidBorder, width: 0.65)),
-        ),
-        child: content,
-      );
-      if (!active) {
-        return IgnorePointer(child: Opacity(opacity: 0.45, child: solidPill));
-      }
-      return Semantics(
-        button: true,
-        label: label,
-        child: GrassBagSpringTap(
-          onTap: () {
-            HapticFeedback.selectionClick();
-            onTap?.call();
-          },
-          pressedScale: 0.96,
-          enablePointerGlow: false,
-          child: solidPill,
-        ),
-      );
-    }
-
-    // Genuine single-pass Kyant0 LiquidButton crystal / subtly tinted refractive glass!
-    final Color surfaceColor;
-    if (destructive) {
-      surfaceColor = t.err.withValues(alpha: t.isDark ? 0.22 : 0.13);
-    } else if (accentForeground) {
-      surfaceColor = t.primary.withValues(alpha: t.isDark ? 0.20 : 0.12);
-    } else {
-      surfaceColor = t.isDark
-          ? Colors.white.withValues(alpha: insideGlass ? 0.10 : 0.10)
-          : Colors.white.withValues(alpha: insideGlass ? 0.26 : 0.24);
-    }
-    final style = KyantLiquidGlassStyle.button(
-      t,
-      effectiveTier,
-      surfaceColor: surfaceColor,
-      insideGlass: insideGlass,
-    );
-    final materializeAnim = GrassBagMaterializeScope.animationOf(context);
-    return Semantics(
-      button: true,
-      label: label,
+    return GlassButton.custom(
+      onTap: () {
+        if (!active) return;
+        HapticFeedback.selectionClick();
+        onTap?.call();
+      },
       enabled: active,
-      child: KyantInteractiveGlassButton(
-        onTap: active ? onTap : null,
-        enabled: active,
-        style: style,
-        isCapsule: true,
-        height: height,
-        materializeAnimation: materializeAnim,
-        child: labelRow,
-      ),
+      height: height,
+      shape: const LiquidRoundedSuperellipse(borderRadius: 999),
+      useOwnLayer: useOwn,
+      quality: renderAsSolidCapsule ? null : GrassBagGlassConfig.chromeQualityFor(effectiveTier),
+      surfaceStyle: renderAsSolidCapsule ? GlassSurfaceStyle.solid : GlassSurfaceStyle.glass,
+      style: GlassButtonStyle.filled,
+      color: renderAsSolidCapsule ? solidBg : null,
+      settings: glassSettings,
+      interactionScale: 1.035,
+      stretch: useOwn ? 0.24 : 0.16,
+      anchorStretch: true,
+      glowColor: (destructive ? t.err : t.primaryHi).withValues(alpha: 0.24),
+      glowRadius: 1.35,
+      child: labelRow,
     );
   }
 }
@@ -5436,18 +5017,6 @@ class GrassBagFilterChip extends StatelessWidget {
         ),
       ),
     );
-    if (!isSolid && selected) {
-      return KyantInteractiveGlassButton(
-        onTap: onTap,
-        style: KyantLiquidGlassStyle.nestedControl(
-          t,
-          ambientTier,
-          tint: t.primary,
-        ),
-        isCapsule: true,
-        child: chipContent,
-      );
-    }
     final pillBody = AnimatedContainer(
       duration: animDur,
       curve: Curves.easeOutCubic,
@@ -5456,16 +5025,14 @@ class GrassBagFilterChip extends StatelessWidget {
             ? t.primary
             : (t.isDark
                 ? Colors.white.withValues(alpha: isSolid ? 0.09 : 0.085)
-                : (isSolid ? const Color(0x11162E42) : Colors.white.withValues(alpha: 0.34))),
+                : (isSolid ? const Color(0x11162E42) : Colors.black.withValues(alpha: 0.055))),
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: isSolid
-              ? (selected ? t.primary : t.sep)
-              : (t.isDark
-                  ? Colors.white.withValues(alpha: 0.14)
-                  : Colors.white.withValues(alpha: 0.72)),
-          width: 0.65,
-        ),
+        border: isSolid
+            ? Border.all(
+                color: selected ? t.primary : t.sep,
+                width: 0.65,
+              )
+            : null,
       ),
       child: chipContent,
     );

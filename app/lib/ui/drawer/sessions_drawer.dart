@@ -2344,37 +2344,26 @@ class _FooterIconButton extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final ambientTier = resolveAmbientGlassTier(context);
     final isSolid = ambientTier == GrassBagGlassTier.solid;
-    final Widget orb = isSolid
-        ? GrassBagSpringTap(
-            onTap: onTap,
-            pressedScale: 0.90,
-            enablePointerGlow: false,
-            haptic: true,
-            child: GrassBagFresnelGlassSurface(
-              isCircle: true,
-              innerWell: true,
-              interactive: true,
-              width: 36,
-              height: 36,
-              alignment: Alignment.center,
-              child: Icon(icon, size: 18, color: t.text2),
-            ),
-          )
-        : KyantInteractiveGlassButton(
-            onTap: onTap,
-            isCircle: true,
-            isCapsule: false,
-            width: 36,
-            height: 36,
-            style: KyantLiquidGlassStyle.nestedControl(
-              t,
-              ambientTier,
-              surfaceColor: t.isDark
-                  ? Colors.white.withValues(alpha: 0.09)
-                  : Colors.white.withValues(alpha: 0.30),
-            ),
-            child: Icon(icon, size: 18, color: t.text2),
-          );
+    final Widget orb = GrassBagSpringTap(
+      onTap: onTap,
+      pressedScale: 0.90,
+      enablePointerGlow: false,
+      haptic: true,
+      child: Container(
+        width: 36,
+        height: 36,
+        alignment: Alignment.center,
+        decoration: ShapeDecoration(
+          color: t.isDark
+              ? Colors.white.withValues(alpha: isSolid ? 0.10 : 0.10)
+              : (isSolid ? const Color(0x11162E42) : Colors.black.withValues(alpha: 0.055)),
+          shape: CircleBorder(
+            side: isSolid ? BorderSide(color: t.sep, width: 0.65) : BorderSide.none,
+          ),
+        ),
+        child: Icon(icon, size: 18, color: t.text2),
+      ),
+    );
     return Tooltip(
       message: tooltip,
       child: Stack(

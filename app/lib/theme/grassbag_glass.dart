@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -1036,34 +1035,33 @@ class GrassBagFresnelGlassSurface extends StatelessWidget {
     final isSolid = ambientTier == GrassBagGlassTier.solid;
     final highContrast = MediaQuery.highContrastOf(context);
 
-    // Calm iOS 27 surface fills:
-    // - Content cards (`!innerWell`, no tint): crisp luminous white in Light Mode, softly lifted
-    //   elevated slate in Dark Mode — unmistakable figure-ground separation with ZERO wireframe glare!
-    // - Recessed wells (`innerWell`, no tint): iOS 27 `tertiarySystemFill` — quiet borderless well
-    //   that nests effortlessly inside both white/dark cards and floating Liquid Glass sheets.
+    // Luminous translucent iOS 26/27 Layer-1 cards (zero BackdropFilter cost, 120Hz scroll-safe!)
+    // - Content cards (`!innerWell`, no tint): crystal translucent white in Light Mode & luminous
+    //   obsidian glass in Dark Mode with crisp 135° Fresnel specular edge highlights so Home cards
+    //   and Settings platters feel cohesive & airy next to the floating refractive Liquid Glass chrome!
+    // - Recessed wells (`innerWell`, no tint): quiet borderless tonal well that nests effortlessly
+    //   inside both cards and floating translucent Liquid Glass sheets.
     final Color surfaceColor;
     if (tintColor != null) {
       surfaceColor = tintColor!;
     } else if (innerWell) {
       surfaceColor = t.isDark
-          ? Colors.white.withValues(alpha: isSolid ? 0.095 : 0.085)
-          : const Color(0x11162E42);
+          ? Colors.white.withValues(alpha: isSolid ? 0.095 : 0.075)
+          : const Color(0x0E162E42);
     } else {
       surfaceColor = t.isDark
-          ? Color.lerp(t.cardSolid, Colors.white, 0.055)!
-              .withValues(alpha: isSolid ? 1.0 : 0.90)
-          : Colors.white.withValues(alpha: isSolid ? 1.0 : 0.92);
+          ? Color.lerp(t.cardSolid, Colors.white, 0.075)!
+              .withValues(alpha: isSolid ? 1.0 : 0.64)
+          : Colors.white.withValues(alpha: isSolid ? 1.0 : 0.72);
     }
 
-    // Only paint a border for High Contrast accessibility, Solid tier cards, or a whisper-quiet
-    // 0.5px separation hairline on Dark Mode content cards (NEVER glowing neon wireframes!).
+    // Only paint a crisp border for High Contrast accessibility or Solid tier cards;
+    // liquid/frosted cards get a luminous zero-shader 135° Fresnel specular rim below!
     final BorderSide side;
     if (highContrast) {
       side = BorderSide(color: t.sepStrong, width: 1.1);
     } else if (isSolid && !innerWell && tintColor == null) {
       side = BorderSide(color: t.sep, width: 0.65);
-    } else if (!innerWell && tintColor == null && t.isDark) {
-      side = BorderSide(color: Colors.white.withValues(alpha: 0.075), width: 0.5);
     } else {
       side = BorderSide.none;
     }
@@ -1082,8 +1080,8 @@ class GrassBagFresnelGlassSurface extends StatelessWidget {
         : [
             BoxShadow(
               color: t.isDark
-                  ? Colors.black.withValues(alpha: isSolid ? 0.22 : 0.26)
-                  : const Color(0x0A0E243B),
+                  ? Colors.black.withValues(alpha: isSolid ? 0.22 : 0.22)
+                  : const Color(0x090E243B),
               blurRadius: isSolid ? 12 : 16,
               offset: const Offset(0, 4),
             ),
@@ -1109,13 +1107,27 @@ class GrassBagFresnelGlassSurface extends StatelessWidget {
             );
     }
 
-    final decorated = DecoratedBox(
+    final useFresnelRim = !isSolid && !highContrast && !innerWell && tintColor == null;
+    final Widget decorated = DecoratedBox(
       decoration: ShapeDecoration(
         color: surfaceColor,
         shape: baseShape,
         shadows: shadows,
       ),
-      child: body,
+      child: useFresnelRim
+          ? CustomPaint(
+              foregroundPainter: GrassBagFresnelRimPainter(
+                isDark: t.isDark,
+                borderRadius: borderRadius,
+                isPill: isPill,
+                isCircle: isCircle,
+                accent: t.primaryHi,
+                frosted: ambientTier == GrassBagGlassTier.frosted,
+                paintTopSheen: paintTopSheen,
+              ),
+              child: body,
+            )
+          : body,
     );
 
     if (isSolid || !interactive) return decorated;
@@ -1902,17 +1914,30 @@ class _GrassBagGlassSearchBarState extends State<GrassBagGlassSearchBar> {
       ),
     );
     if (!isSolid) {
+      // Inside a floating glass drawer or sheet (`insideGlass == true`), run genuine
+      // single-pass zero-blur `KyantLiquidGlass` (`saturation: 1.06`) so the search capsule
+      // delivers authentic curved edge refraction & specular sheen with ZERO cyan double-saturation!
+      if (widget.insideGlass) {
+        return KyantLiquidGlass(
+          style: KyantLiquidGlassStyle.nestedControl(
+            t,
+            effectiveTier,
+            surfaceColor: t.isDark
+                ? Colors.white.withValues(alpha: 0.075)
+                : Colors.white.withValues(alpha: 0.28),
+            subtleShadow: false,
+          ),
+          isCapsule: true,
+          clipBehavior: Clip.antiAlias,
+          child: field,
+        );
+      }
       return GrassBagGlass(
         tier: effectiveTier,
         borderRadius: 999,
         useOwnLayer: true,
         interactiveGlow: false,
         clipBehavior: Clip.antiAlias,
-        tintColor: widget.insideGlass
-            ? (t.isDark
-                ? Colors.white.withValues(alpha: 0.09)
-                : const Color(0xFFF2F5F9).withValues(alpha: 0.62))
-            : null,
         child: field,
       );
     }
@@ -4017,11 +4042,13 @@ class GrassBagPrimaryGlassButton extends StatelessWidget {
       );
     }
 
-    // Genuine Kyant0 LiquidButton tinted refractive glass everywhere!
+    // Genuine single-pass Kyant0 LiquidButton tinted refractive glass everywhere
+    // (0 extra blur BackdropFilter + frame-accurate `_KyantBackdropFilterLayer`!).
     final style = KyantLiquidGlassStyle.button(
       t,
       effectiveTier,
       tint: bg,
+      insideGlass: insideGlass,
     );
     final materializeAnim = GrassBagMaterializeScope.animationOf(context);
     return Semantics(
@@ -4159,21 +4186,22 @@ class GrassBagSecondaryGlassButton extends StatelessWidget {
       );
     }
 
-    // Real Kyant0 LiquidButton crystal / subtly tinted refractive glass!
+    // Genuine single-pass Kyant0 LiquidButton crystal / subtly tinted refractive glass!
     final Color surfaceColor;
     if (destructive) {
-      surfaceColor = t.err.withValues(alpha: t.isDark ? 0.22 : 0.12);
+      surfaceColor = t.err.withValues(alpha: t.isDark ? 0.22 : 0.13);
     } else if (accentForeground) {
-      surfaceColor = t.primary.withValues(alpha: t.isDark ? 0.20 : 0.11);
+      surfaceColor = t.primary.withValues(alpha: t.isDark ? 0.20 : 0.12);
     } else {
       surfaceColor = t.isDark
-          ? Colors.white.withValues(alpha: insideGlass ? 0.11 : 0.12)
-          : const Color(0xFFFAFAFA).withValues(alpha: insideGlass ? 0.50 : 0.56);
+          ? Colors.white.withValues(alpha: insideGlass ? 0.10 : 0.10)
+          : Colors.white.withValues(alpha: insideGlass ? 0.26 : 0.24);
     }
     final style = KyantLiquidGlassStyle.button(
       t,
       effectiveTier,
       surfaceColor: surfaceColor,
+      insideGlass: insideGlass,
     );
     final materializeAnim = GrassBagMaterializeScope.animationOf(context);
     return Semantics(
@@ -4291,11 +4319,11 @@ class GrassBagSquircleIcon extends StatelessWidget {
   }
 }
 
-/// Shared Apple iOS 26/27 & Kyant0 top-edge scroll dissolve veil placed BEHIND floating
-/// Liquid Glass navigation bars ([GrassBagUnifiedHeader] and [GrassBagShell]):
-/// - Extends `ProgressiveBlur` smoothly through the full floating nav pill zone (`topPad + 72dp`,
-///   `falloff: 1.75`) so scrolled card borders & text melt cleanly beneath `<` and title pills
-///   without double-blurring or colliding into high-contrast clutter!
+/// Lightweight pure-gradient top-edge scroll feather placed BEHIND floating Liquid Glass
+/// navigation bars ([GrassBagUnifiedHeader] and [GrassBagShell]):
+/// - Zero extra full-width `BackdropFilter` GPU readbacks per scroll frame (rock-solid 120Hz!)
+/// - Whisper-clear alpha curve keeps status-bar glyphs legible while letting scrolled content
+///   pass visibly right beneath the floating crystal nav pills for real live refraction!
 class GrassBagScrollEdgeMist extends StatelessWidget {
   const GrassBagScrollEdgeMist({
     super.key,
@@ -4312,68 +4340,38 @@ class GrassBagScrollEdgeMist extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
-    final isLiquid = effectiveTier == GrassBagGlassTier.liquid;
-    final useProgressiveBlur = effectiveTier != GrassBagGlassTier.solid &&
-        !MediaQuery.highContrastOf(context) &&
-        !kIsWeb &&
-        ui.ImageFilter.isShaderFilterSupported;
+    final isSolid = effectiveTier == GrassBagGlassTier.solid;
     final hasStatusBar = topPad > 4.0;
     final baseTop = hasStatusBar ? topPad : 0.0;
     final extra = extraHeight.clamp(0.0, 140.0);
-    final blurH = baseTop + (isLiquid ? 72.0 : 80.0) + extra;
-    final capH = baseTop + 68.0 + extra * 0.85;
-    final s1 = (baseTop / capH).clamp(0.18, 0.46);
-    final s2 = ((baseTop + 26.0) / capH).clamp(s1 + 0.14, 0.70);
-    final s3 = ((baseTop + 48.0) / capH).clamp(s2 + 0.12, 0.90);
-    final topAlphas = useProgressiveBlur
-        ? (t.isDark
-            ? const [0.88, 0.62, 0.30, 0.08, 0.0]
-            : const [0.92, 0.68, 0.34, 0.10, 0.0])
-        : (t.isDark
-            ? const [0.96, 0.80, 0.46, 0.14, 0.0]
-            : const [0.98, 0.84, 0.50, 0.16, 0.0]);
+    // Keep the narrow OS status-bar band cleanly shaded so system clock/5G glyphs NEVER
+    // collide with scrolled cards, then dissolve rapidly to 0.0 right above the floating
+    // crystal nav pills so scrolled content refracts unobstructed through the glass!
+    final capH = baseTop + (isSolid ? 64.0 : 28.0) + extra * 0.65;
+    final s1 = (baseTop * 0.85 / capH).clamp(0.18, 0.58);
+    final s2 = ((baseTop + 10.0) / capH).clamp(s1 + 0.10, 0.82);
+    final topAlphas = isSolid
+        ? (t.isDark ? const [0.94, 0.78, 0.34, 0.0] : const [0.96, 0.80, 0.36, 0.0])
+        : (t.isDark ? const [0.90, 0.70, 0.22, 0.0] : const [0.90, 0.68, 0.18, 0.0]);
 
     return IgnorePointer(
       child: SizedBox(
-        height: math.max(blurH, capH),
+        height: capH,
         width: double.infinity,
-        child: Stack(
-          children: [
-            if (useProgressiveBlur)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                height: blurH,
-                child: ProgressiveBlur(
-                  maxSigma: isLiquid ? 8.5 : 10.0,
-                  direction: ProgressiveBlurDirection.topToBottom,
-                  falloff: isLiquid ? 1.75 : 1.6,
-                ),
-              ),
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              height: capH,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      t.bgTop.withValues(alpha: topAlphas[0]),
-                      t.bgTop.withValues(alpha: topAlphas[1]),
-                      t.bgTop.withValues(alpha: topAlphas[2]),
-                      t.bgTop.withValues(alpha: topAlphas[3]),
-                      t.bgTop.withValues(alpha: topAlphas[4]),
-                    ],
-                    stops: [0.0, s1, s2, s3, 1.0],
-                  ),
-                ),
-              ),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [
+                t.bgTop.withValues(alpha: topAlphas[0]),
+                t.bgTop.withValues(alpha: topAlphas[1]),
+                t.bgTop.withValues(alpha: topAlphas[2]),
+                t.bgTop.withValues(alpha: topAlphas[3]),
+              ],
+              stops: [0.0, s1, s2, 1.0],
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -5388,33 +5386,8 @@ class GrassBagFilterChip extends StatelessWidget {
     final isSolid = ambientTier == GrassBagGlassTier.solid;
     final fg = selected ? t.onPrimary : t.text2;
     final animDur = GrassBagMotion.duration(context, const Duration(milliseconds: 170));
-    final pillBody = AnimatedContainer(
-      duration: animDur,
-      curve: Curves.easeOutCubic,
+    final chipContent = Padding(
       padding: padding,
-      decoration: BoxDecoration(
-        color: selected
-            ? t.primary
-            : (t.isDark
-                ? Colors.white.withValues(alpha: isSolid ? 0.09 : 0.085)
-                : const Color(0x11162E42)),
-        borderRadius: BorderRadius.circular(999),
-        border: isSolid
-            ? Border.all(
-                color: selected ? t.primary : t.sep,
-                width: 0.65,
-              )
-            : null,
-        boxShadow: selected && !isSolid
-            ? [
-                BoxShadow(
-                  color: t.primary.withValues(alpha: t.isDark ? 0.28 : 0.20),
-                  blurRadius: 8,
-                  offset: const Offset(0, 2.5),
-                ),
-              ]
-            : null,
-      ),
       child: AnimatedSize(
         duration: animDur,
         curve: Curves.easeOutCubic,
@@ -5462,6 +5435,39 @@ class GrassBagFilterChip extends StatelessWidget {
           ],
         ),
       ),
+    );
+    if (!isSolid && selected) {
+      return KyantInteractiveGlassButton(
+        onTap: onTap,
+        style: KyantLiquidGlassStyle.nestedControl(
+          t,
+          ambientTier,
+          tint: t.primary,
+        ),
+        isCapsule: true,
+        child: chipContent,
+      );
+    }
+    final pillBody = AnimatedContainer(
+      duration: animDur,
+      curve: Curves.easeOutCubic,
+      decoration: BoxDecoration(
+        color: selected
+            ? t.primary
+            : (t.isDark
+                ? Colors.white.withValues(alpha: isSolid ? 0.09 : 0.085)
+                : (isSolid ? const Color(0x11162E42) : Colors.white.withValues(alpha: 0.34))),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: isSolid
+              ? (selected ? t.primary : t.sep)
+              : (t.isDark
+                  ? Colors.white.withValues(alpha: 0.14)
+                  : Colors.white.withValues(alpha: 0.72)),
+          width: 0.65,
+        ),
+      ),
+      child: chipContent,
     );
     return GrassBagSpringTap(
       onTap: onTap,

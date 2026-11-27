@@ -86,12 +86,8 @@ Future<void> main() async {
     GrassBagController.preloadedInitialHosts = preloadedHosts;
   }
 
-  unawaited(
-    LiquidGlassWidgets.initialize(
-      warmUpMode: GlassWarmUpMode.auto,
-      enablePerformanceMonitor: false,
-    ),
-  );
+  // Warm up ONLY GrassBag's unified single-pass Kyant0 GLSL engine (skipping unused third-party
+  // multi-pass shaders to cut cold-start GPU pipeline compilation & memory usage).
   unawaited(KyantLiquidGlassEngine.warmUp());
 
   runApp(

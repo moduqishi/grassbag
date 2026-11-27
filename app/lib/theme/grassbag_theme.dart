@@ -908,11 +908,11 @@ class _AtmosphericSilkPainter extends CustomPainter {
     // 2. Sculpted aurora depth — derive ALL orb & ribbon hues strictly from each palette's
     //    calibrated `glowTopRight` & `glowBottomLeft` tokens so Graphite stays 100% pure
     //    monochrome and Amber/Moss stay warm/botanical with zero dark-grey or purple blotches!
-    final topGlowAlpha = (glowTopRight.a * (isDark ? 0.92 : 1.38)).clamp(0.0, 0.72);
-    final topSecondaryAlpha = (glowTopRight.a * (isDark ? 0.42 : 0.62)).clamp(0.0, 0.30);
-    final midGlowAlpha = (glowTopRight.a * (isDark ? 0.32 : 0.48)).clamp(0.0, 0.24);
-    final botGlowAlpha = (glowBottomLeft.a * (isDark ? 0.90 : 1.36)).clamp(0.0, 0.66);
-    final botSecondaryAlpha = (glowBottomLeft.a * (isDark ? 0.38 : 0.56)).clamp(0.0, 0.26);
+    final topGlowAlpha = (glowTopRight.a * (isDark ? 1.08 : 1.56)).clamp(0.0, 0.80);
+    final topSecondaryAlpha = (glowTopRight.a * (isDark ? 0.48 : 0.70)).clamp(0.0, 0.36);
+    final midGlowAlpha = (glowTopRight.a * (isDark ? 0.36 : 0.54)).clamp(0.0, 0.28);
+    final botGlowAlpha = (glowBottomLeft.a * (isDark ? 1.06 : 1.54)).clamp(0.0, 0.74);
+    final botSecondaryAlpha = (glowBottomLeft.a * (isDark ? 0.44 : 0.64)).clamp(0.0, 0.30);
     final topOrbCenter = Offset(w * 0.82, h * 0.13);
     final topOrbRadius = (w > h ? w : h) * 0.50;
     canvas.drawCircle(

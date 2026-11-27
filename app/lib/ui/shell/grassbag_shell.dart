@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show ValueListenable, defaultTargetPlatform, kIsWeb;
@@ -3617,26 +3616,23 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final effectiveTier = resolveEffectiveGlassTier(context, tier);
     final ime = _ImeMotionScope.of(context);
-    final useProgressiveBlur = effectiveTier != GrassBagGlassTier.solid &&
-        !MediaQuery.highContrastOf(context) &&
-        !kIsWeb &&
-        ui.ImageFilter.isShaderFilterSupported;
-    // Whisper-light bottom edge feather + restrained ProgressiveBlur behind the floating
-    // composer so scrolled chat messages stay crisp enough for authentic glass refraction!
+    final isSolid = effectiveTier == GrassBagGlassTier.solid;
+    // Whisper-light pure-gradient bottom edge feather (zero extra full-width BackdropFilter!)
+    // so scrolled chat messages remain crystal clear & visibly refract through the floating composer!
     final scrimDecoration = BoxDecoration(
       gradient: LinearGradient(
         begin: Alignment.bottomCenter,
         end: Alignment.topCenter,
         colors: [
           t.bgSolid.withValues(
-            alpha: useProgressiveBlur
-                ? (t.isDark ? 0.34 : 0.24)
-                : (t.isDark ? 0.50 : 0.40),
+            alpha: isSolid
+                ? (t.isDark ? 0.56 : 0.44)
+                : (t.isDark ? 0.24 : 0.18),
           ),
-          t.bgSolid.withValues(alpha: t.isDark ? 0.10 : 0.07),
+          t.bgSolid.withValues(alpha: isSolid ? (t.isDark ? 0.18 : 0.14) : (t.isDark ? 0.06 : 0.04)),
           t.bgSolid.withValues(alpha: 0.0),
         ],
-        stops: const [0.0, 0.44, 1.0],
+        stops: const [0.0, 0.46, 1.0],
       ),
     );
 
@@ -3646,24 +3642,13 @@ class _KeyboardAwareBottomScrim extends StatelessWidget {
       return ValueListenableBuilder<double>(
         valueListenable: composerHeightNotifier,
         builder: (_, compH, __) {
-          final restingH = baseComposerBottom + math.min(compH + 14.0, 240.0);
+          final restingH = baseComposerBottom + math.min(compH + 10.0, 220.0);
           return Transform.translate(
             offset: Offset(0, -lift),
             child: IgnorePointer(
               child: SizedBox(
                 height: restingH,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    if (useProgressiveBlur)
-                      ProgressiveBlur(
-                        maxSigma: effectiveTier == GrassBagGlassTier.liquid ? 7.5 : 8.5,
-                        direction: ProgressiveBlurDirection.bottomToTop,
-                        falloff: effectiveTier == GrassBagGlassTier.liquid ? 1.75 : 1.65,
-                      ),
-                    DecoratedBox(decoration: scrimDecoration),
-                  ],
-                ),
+                child: DecoratedBox(decoration: scrimDecoration),
               ),
             ),
           );

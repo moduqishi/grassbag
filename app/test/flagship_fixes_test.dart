@@ -455,21 +455,29 @@ void main() {
     testWidgets(
       'Model pill NEVER flashes 未连接 during ConnectionPhase.reconnecting & crystal-clear Liquid Glass optics contract holds',
       (tester) async {
-        // 1. Faithful Kyant0 AndroidLiquidGlass optical presets contract across Light & Dark modes:
+        // 1. Crystal-clear single-pass Kyant0 AndroidLiquidGlass optical presets contract across Light & Dark:
         for (final brightness in [Brightness.light, Brightness.dark]) {
           final tok = GrassBagTokens.resolve(GrassBagAccent.teal, brightness);
           final surf = KyantLiquidGlassStyle.chrome(tok, GrassBagGlassTier.liquid);
           final sheet = KyantLiquidGlassStyle.sheet(tok, GrassBagGlassTier.liquid);
           final btn = KyantLiquidGlassStyle.button(tok, GrassBagGlassTier.liquid, tint: tok.primary);
-          expect(surf.saturation, closeTo(1.5, 0.05));
-          expect(surf.refractionHeight, inInclusiveRange(12.0, 20.0));
-          expect(surf.refractionAmount, inInclusiveRange(20.0, 32.0));
-          expect(surf.chromaticAberration, greaterThan(0.10));
-          expect(surf.blurRadius, inInclusiveRange(3.0, 7.0));
-          expect(sheet.blurRadius, inInclusiveRange(7.0, 14.0));
-          expect(sheet.refractionAmount, greaterThanOrEqualTo(30.0));
+          expect(surf.saturation, greaterThanOrEqualTo(1.55));
+          expect(surf.refractionHeight, inInclusiveRange(12.0, 22.0));
+          expect(surf.refractionAmount, inInclusiveRange(20.0, 38.0));
+          expect(surf.chromaticAberration, greaterThan(0.08));
+          expect(surf.blurRadius, inInclusiveRange(0.8, 3.2));
+          expect(surf.surfaceColor.a, lessThanOrEqualTo(brightness == Brightness.dark ? 0.14 : 0.32));
+          expect(sheet.blurRadius, inInclusiveRange(4.0, 6.5));
+          expect(sheet.refractionAmount, greaterThanOrEqualTo(32.0));
+          expect(sheet.surfaceColor.a, lessThanOrEqualTo(brightness == Brightness.dark ? 0.38 : 0.48));
+          expect(btn.blurRadius, lessThanOrEqualTo(2.0));
           expect(btn.refractionHeight, closeTo(12.0, 0.5));
           expect(btn.refractionAmount, closeTo(24.0, 0.5));
+          final nested = KyantLiquidGlassStyle.nestedControl(tok, GrassBagGlassTier.liquid);
+          expect(nested.blurRadius, 0.0);
+          expect(nested.refractionHeight, greaterThanOrEqualTo(8.0));
+          expect(nested.refractionAmount, greaterThanOrEqualTo(14.0));
+          expect(nested.saturation, inInclusiveRange(1.0, 1.15));
         }
 
         // 2. Composer model pill during ConnectionPhase.reconnecting keeps showing cached model

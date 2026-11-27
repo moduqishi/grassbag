@@ -6,7 +6,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/scheduler.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 
 import 'grassbag_theme.dart';
@@ -27,25 +27,26 @@ enum KyantHighlightKind {
 @immutable
 class KyantLiquidGlassStyle {
   const KyantLiquidGlassStyle({
-    this.blurRadius = 2.0,
-    this.refractionHeight = 12.0,
-    this.refractionAmount = 24.0,
-    this.depthEffect = false,
+    this.blurRadius = 1.4,
+    this.refractionHeight = 14.0,
+    this.refractionAmount = 26.0,
+    this.depthEffect = true,
     this.chromaticAberration = 0.0,
     this.brightness = 0.0,
-    this.contrast = 1.0,
-    this.saturation = 1.5,
+    this.contrast = 1.03,
+    this.saturation = 1.65,
     this.surfaceColor = Colors.transparent,
     this.tintColor = Colors.transparent,
     this.highlightKind = KyantHighlightKind.defaultSpecular,
-    this.highlightAlpha = 0.50,
+    this.highlightAlpha = 0.72,
     this.highlightAngleDeg = 45.0,
-    this.highlightFalloff = 1.0,
-    this.highlightWidth = 0.65,
+    this.highlightFalloff = 1.2,
+    this.highlightWidth = 0.90,
     this.highlightBlur = 0.30,
     this.innerShadowRadius = 0.0,
     this.innerShadowAlpha = 0.0,
     this.ambientEdgeDarken = 0.0,
+    this.specularSheen = 0.62,
     this.shadows = const <BoxShadow>[],
   });
 
@@ -68,6 +69,7 @@ class KyantLiquidGlassStyle {
   final double innerShadowRadius;
   final double innerShadowAlpha;
   final double ambientEdgeDarken;
+  final double specularSheen;
   final List<BoxShadow> shadows;
 
   KyantLiquidGlassStyle copyWith({
@@ -90,6 +92,7 @@ class KyantLiquidGlassStyle {
     double? innerShadowRadius,
     double? innerShadowAlpha,
     double? ambientEdgeDarken,
+    double? specularSheen,
     List<BoxShadow>? shadows,
   }) {
     return KyantLiquidGlassStyle(
@@ -112,17 +115,22 @@ class KyantLiquidGlassStyle {
       innerShadowRadius: innerShadowRadius ?? this.innerShadowRadius,
       innerShadowAlpha: innerShadowAlpha ?? this.innerShadowAlpha,
       ambientEdgeDarken: ambientEdgeDarken ?? this.ambientEdgeDarken,
+      specularSheen: specularSheen ?? this.specularSheen,
       shadows: shadows ?? this.shadows,
     );
   }
 
-  /// Kyant0 `LiquidButton` optical recipe (vibrancy + 2dp blur + lens(12, 24) + Highlight.Default).
+  /// Crystal-clear single-pass Kyant0 `LiquidButton` optical recipe:
+  /// - Standalone (`insideGlass == false`): `vibrancy + 0.85dp in-shader micro-blur (0 extra BackdropFilter!) + lens(12, 24) + Highlight.Default`.
+  /// - Nested inside glass drawer/sheet (`insideGlass == true`): `blurRadius: 0.0` (1–4 taps total!)
+  ///   and `saturation: 1.06` so nested buttons refract cleanly without double-blurring or oversaturating!
   static KyantLiquidGlassStyle button(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
     Color? tint,
     Color? surfaceColor,
     bool elevated = false,
+    bool insideGlass = false,
   }) {
     final isFrosted = tier == GrassBagGlassTier.frosted || kIsWeb;
     final hasTint = tint != null && tint.a > 0.001;
@@ -130,41 +138,104 @@ class KyantLiquidGlassStyle {
         (hasTint
             ? Colors.transparent
             : (t.isDark
-                ? const Color(0xFF181C24).withValues(alpha: isFrosted ? 0.44 : 0.30)
-                : const Color(0xFFFAFAFA).withValues(alpha: isFrosted ? 0.62 : 0.42)));
+                ? (isFrosted
+                    ? const Color(0xFF161C26).withValues(alpha: 0.40)
+                    : Colors.white.withValues(alpha: insideGlass ? 0.095 : 0.085))
+                : (isFrosted
+                    ? const Color(0xFFFAFAFA).withValues(alpha: 0.54)
+                    : Colors.white.withValues(alpha: insideGlass ? 0.24 : 0.18))));
     return KyantLiquidGlassStyle(
-      blurRadius: isFrosted ? 8.0 : 2.5,
-      refractionHeight: isFrosted ? 0.0 : 12.0,
-      refractionAmount: isFrosted ? 0.0 : 24.0,
-      depthEffect: false,
-      chromaticAberration: isFrosted ? 0.0 : 0.16,
-      brightness: 0.0,
-      contrast: 1.0,
-      saturation: isFrosted ? 1.15 : 1.5,
+      blurRadius: isFrosted ? (insideGlass ? 0.0 : 8.0) : (insideGlass ? 0.0 : 0.85),
+      refractionHeight: isFrosted ? 0.0 : (insideGlass ? 10.0 : 12.0),
+      refractionAmount: isFrosted ? 0.0 : (insideGlass ? 20.0 : 24.0),
+      depthEffect: !isFrosted,
+      chromaticAberration: (isFrosted || insideGlass) ? 0.0 : 0.14,
+      brightness: (!t.isDark && !isFrosted && !hasTint && !insideGlass) ? 0.02 : 0.0,
+      contrast: (isFrosted || insideGlass) ? 1.02 : 1.04,
+      saturation: isFrosted
+          ? 1.12
+          : (insideGlass ? 1.06 : (t.isDark ? 1.58 : 1.66)),
       surfaceColor: resolvedSurface,
-      tintColor: hasTint ? tint.withValues(alpha: t.isDark ? 0.72 : 0.78) : Colors.transparent,
+      tintColor: hasTint ? tint.withValues(alpha: t.isDark ? 0.68 : 0.74) : Colors.transparent,
       highlightKind: KyantHighlightKind.defaultSpecular,
       highlightAlpha: hasTint
-          ? (t.isDark ? 0.56 : 0.68)
-          : (t.isDark ? 0.46 : 0.68),
+          ? (t.isDark ? 0.68 : 0.82)
+          : (t.isDark ? 0.60 : 0.86),
       highlightAngleDeg: 45.0,
-      highlightFalloff: 1.25,
-      highlightWidth: 0.68,
+      highlightFalloff: 1.2,
+      highlightWidth: 0.88,
       highlightBlur: 0.28,
-      ambientEdgeDarken: (!t.isDark && !hasTint) ? 0.07 : 0.0,
+      ambientEdgeDarken: (!t.isDark && !hasTint) ? (insideGlass ? 0.10 : 0.13) : 0.0,
+      specularSheen: isFrosted ? 0.22 : (hasTint ? 0.70 : (t.isDark ? 0.52 : 0.62)),
       shadows: [
         BoxShadow(
           color: hasTint
-              ? tint.withValues(alpha: t.isDark ? 0.30 : 0.22)
-              : Colors.black.withValues(alpha: t.isDark ? (elevated ? 0.28 : 0.18) : (elevated ? 0.10 : 0.07)),
-          blurRadius: elevated ? 20.0 : 14.0,
-          offset: Offset(0, elevated ? 5.0 : 3.5),
+              ? tint.withValues(alpha: t.isDark ? 0.28 : 0.22)
+              : Colors.black.withValues(alpha: t.isDark ? (elevated ? 0.24 : 0.14) : (elevated ? 0.08 : 0.055)),
+          blurRadius: elevated ? 16.0 : 11.0,
+          offset: Offset(0, elevated ? 4.5 : 2.5),
         ),
       ],
     );
   }
 
-  /// Kyant0 floating chrome recipe for navigation pills, composer dock, search capsules, and toasts.
+  /// Ultra-fast zero-blur single-pass Kyant0 lens for controls nested inside an already-blurred
+  /// glass container (floating composer `+` / Model / Send orbs, drawer search bar & footer orbs,
+  /// active filter chips): 1-tap interior + 4-tap curved edge refraction, ZERO saturation doubling!
+  static KyantLiquidGlassStyle nestedControl(
+    GrassBagTokens t,
+    GrassBagGlassTier tier, {
+    Color? tint,
+    Color? surfaceColor,
+    bool subtleShadow = true,
+  }) {
+    final isFrosted = tier == GrassBagGlassTier.frosted || kIsWeb;
+    final hasTint = tint != null && tint.a > 0.001;
+    final resolvedSurface = surfaceColor ??
+        (hasTint
+            ? Colors.transparent
+            : (t.isDark
+                ? Colors.white.withValues(alpha: 0.085)
+                : Colors.white.withValues(alpha: 0.28)));
+    return KyantLiquidGlassStyle(
+      blurRadius: 0.0,
+      refractionHeight: isFrosted ? 0.0 : 9.5,
+      refractionAmount: isFrosted ? 0.0 : 16.0,
+      depthEffect: !isFrosted,
+      chromaticAberration: 0.0,
+      brightness: 0.0,
+      contrast: 1.02,
+      saturation: 1.06,
+      surfaceColor: resolvedSurface,
+      tintColor: hasTint ? tint.withValues(alpha: t.isDark ? 0.72 : 0.78) : Colors.transparent,
+      highlightKind: KyantHighlightKind.defaultSpecular,
+      highlightAlpha: hasTint
+          ? (t.isDark ? 0.66 : 0.80)
+          : (t.isDark ? 0.48 : 0.76),
+      highlightAngleDeg: 45.0,
+      highlightFalloff: 1.25,
+      highlightWidth: 0.82,
+      highlightBlur: 0.26,
+      ambientEdgeDarken: (!t.isDark && !hasTint) ? 0.11 : 0.0,
+      specularSheen: isFrosted ? 0.18 : (hasTint ? 0.64 : (t.isDark ? 0.40 : 0.46)),
+      shadows: subtleShadow
+          ? [
+              BoxShadow(
+                color: hasTint
+                    ? tint.withValues(alpha: t.isDark ? 0.28 : 0.22)
+                    : Colors.black.withValues(alpha: t.isDark ? 0.16 : 0.055),
+                blurRadius: hasTint ? 10.0 : 7.0,
+                offset: const Offset(0, 2.5),
+              ),
+            ]
+          : const [],
+    );
+  }
+
+  /// Crystal-clear single-pass floating chrome recipe for navigation pills, title capsule,
+  /// workspace pill, composer dock, search capsules, and toasts:
+  /// runs in ONE single BackdropFilter pass (in-shader 5-tap micro-bokeh `1.8..2.4dp`, ZERO 2nd blur pass!)
+  /// with crisp legibility over scrolling lists, clean curved refraction, and gleaming 3D speculars.
   static KyantLiquidGlassStyle chrome(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
@@ -176,39 +247,45 @@ class KyantLiquidGlassStyle {
     final surface = hasTint
         ? tintColor
         : (t.isDark
-            ? const Color(0xFF141820).withValues(alpha: isFrosted ? 0.60 : (elevated ? 0.48 : 0.40))
-            : const Color(0xFFFAFAFA).withValues(alpha: isFrosted ? 0.74 : (elevated ? 0.62 : 0.52)));
+            ? (isFrosted
+                ? const Color(0xFF141820).withValues(alpha: elevated ? 0.48 : 0.40)
+                : Colors.white.withValues(alpha: elevated ? 0.115 : 0.085))
+            : (isFrosted
+                ? const Color(0xFFFAFAFA).withValues(alpha: elevated ? 0.62 : 0.52)
+                : Colors.white.withValues(alpha: elevated ? 0.30 : 0.24)));
     return KyantLiquidGlassStyle(
-      blurRadius: isFrosted ? 12.0 : (elevated ? 6.0 : 4.0),
-      refractionHeight: isFrosted ? 0.0 : (elevated ? 16.0 : 14.0),
-      refractionAmount: isFrosted ? 0.0 : (elevated ? 28.0 : 24.0),
-      depthEffect: false,
-      chromaticAberration: isFrosted ? 0.0 : 0.18,
-      brightness: (!t.isDark && !isFrosted) ? 0.04 : 0.0,
-      contrast: 1.0,
-      saturation: isFrosted ? 1.15 : 1.5,
+      blurRadius: isFrosted ? 10.0 : (elevated ? 2.4 : 1.8),
+      refractionHeight: isFrosted ? 0.0 : (elevated ? 16.0 : 13.0),
+      refractionAmount: isFrosted ? 0.0 : (elevated ? 28.0 : 22.0),
+      depthEffect: !isFrosted,
+      chromaticAberration: isFrosted ? 0.0 : 0.11,
+      brightness: (!t.isDark && !isFrosted) ? 0.02 : 0.0,
+      contrast: isFrosted ? 1.0 : 1.03,
+      saturation: isFrosted ? 1.15 : (t.isDark ? 1.60 : 1.68),
       surfaceColor: surface,
       highlightKind: KyantHighlightKind.defaultSpecular,
-      highlightAlpha: t.isDark ? 0.44 : 0.72,
+      highlightAlpha: t.isDark ? 0.62 : 0.88,
       highlightAngleDeg: 45.0,
-      highlightFalloff: 1.3,
-      highlightWidth: 0.68,
+      highlightFalloff: 1.25,
+      highlightWidth: 0.90,
       highlightBlur: 0.28,
-      ambientEdgeDarken: t.isDark ? 0.0 : 0.075,
+      ambientEdgeDarken: t.isDark ? 0.0 : 0.14,
+      specularSheen: isFrosted ? 0.22 : (t.isDark ? 0.48 : 0.52),
       shadows: [
         BoxShadow(
           color: Colors.black.withValues(
-            alpha: t.isDark ? (elevated ? 0.34 : 0.22) : (elevated ? 0.11 : 0.075),
+            alpha: t.isDark ? (elevated ? 0.30 : 0.20) : (elevated ? 0.10 : 0.065),
           ),
-          blurRadius: elevated ? 22.0 : 14.0,
-          offset: Offset(0, elevated ? 6.0 : 4.0),
+          blurRadius: elevated ? 20.0 : 13.0,
+          offset: Offset(0, elevated ? 5.5 : 3.5),
         ),
       ],
     );
   }
 
-  /// Kyant0 `DialogContent` / modal sheet / '+' deck / floating drawer recipe:
-  /// `colorControls(brightness: 0.12 Light / 0 Dark, saturation: 1.5) + blur(10..14dp) + lens(20, 38, depthEffect: true) + Highlight.Plain`.
+  /// Luminous low-haze bokeh recipe for modal sheets, '+' deck, floating drawer, and dialogs:
+  /// crisp `4.8..5.5dp` translucent bokeh (replacing 14dp opaque fog!), deep curved bevel lens
+  /// refraction (`18..22dp` height, `34..40dp` bend), and directional specular catchlights.
   static KyantLiquidGlassStyle sheet(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
@@ -220,69 +297,75 @@ class KyantLiquidGlassStyle {
     final surface = hasTint
         ? tintColor
         : (t.isDark
-            ? const Color(0xFF141820).withValues(alpha: isDialog ? 0.56 : 0.54)
-            : const Color(0xFFFAFAFA).withValues(alpha: isDialog ? 0.70 : 0.68));
+            ? const Color(0xFF141B26).withValues(
+                alpha: isFrosted ? 0.52 : (isDialog ? 0.36 : 0.26),
+              )
+            : Colors.white.withValues(
+                alpha: isFrosted ? 0.64 : (isDialog ? 0.46 : 0.38),
+              ));
     return KyantLiquidGlassStyle(
-      blurRadius: isFrosted ? 14.0 : (t.isDark ? (isDialog ? 9.0 : 8.0) : (isDialog ? 14.0 : 10.0)),
+      blurRadius: isFrosted ? 12.0 : (isDialog ? 5.5 : 4.8),
       refractionHeight: isFrosted ? 0.0 : (isDialog ? 22.0 : 18.0),
-      refractionAmount: isFrosted ? 0.0 : (isDialog ? 42.0 : 34.0),
-      depthEffect: !isFrosted && isDialog,
-      chromaticAberration: isFrosted ? 0.0 : 0.14,
-      brightness: (!t.isDark && !isFrosted) ? (isDialog ? 0.12 : 0.06) : 0.0,
-      contrast: 1.0,
-      saturation: isFrosted ? 1.12 : 1.5,
+      refractionAmount: isFrosted ? 0.0 : (isDialog ? 40.0 : 34.0),
+      depthEffect: !isFrosted,
+      chromaticAberration: isFrosted ? 0.0 : 0.09,
+      brightness: (!t.isDark && !isFrosted) ? (isDialog ? 0.04 : 0.025) : 0.0,
+      contrast: isFrosted ? 1.0 : 1.03,
+      saturation: isFrosted ? 1.12 : (t.isDark ? 1.55 : 1.62),
       surfaceColor: surface,
-      highlightKind: KyantHighlightKind.plain,
-      highlightAlpha: t.isDark ? 0.34 : 0.54,
+      highlightKind: KyantHighlightKind.defaultSpecular,
+      highlightAlpha: t.isDark ? 0.56 : 0.84,
       highlightAngleDeg: 45.0,
-      highlightFalloff: 1.0,
-      highlightWidth: 0.65,
+      highlightFalloff: 1.15,
+      highlightWidth: 0.90,
       highlightBlur: 0.30,
-      ambientEdgeDarken: t.isDark ? 0.0 : 0.055,
+      ambientEdgeDarken: t.isDark ? 0.0 : 0.11,
+      specularSheen: isFrosted ? 0.18 : (t.isDark ? 0.38 : 0.42),
       shadows: [
         BoxShadow(
-          color: Colors.black.withValues(alpha: t.isDark ? 0.42 : 0.13),
-          blurRadius: isDialog ? 30.0 : 24.0,
-          offset: Offset(0, isDialog ? 10.0 : 8.0),
+          color: Colors.black.withValues(alpha: t.isDark ? 0.38 : 0.11),
+          blurRadius: isDialog ? 26.0 : 22.0,
+          offset: Offset(0, isDialog ? 9.0 : 7.0),
         ),
       ],
     );
   }
 
-  /// Kyant0 `LiquidBottomTabs` / `LiquidSegmentedControl` outer capsule track recipe.
+  /// Single-pass Kyant0 `LiquidBottomTabs` / `LiquidSegmentedControl` outer capsule track recipe.
   static KyantLiquidGlassStyle segmentedTrack(
     GrassBagTokens t,
     GrassBagGlassTier tier,
   ) {
     final isFrosted = tier == GrassBagGlassTier.frosted || kIsWeb;
     return KyantLiquidGlassStyle(
-      blurRadius: isFrosted ? 8.0 : 5.0,
+      blurRadius: isFrosted ? 8.0 : 1.8,
       refractionHeight: isFrosted ? 0.0 : 10.0,
-      refractionAmount: isFrosted ? 0.0 : 16.0,
+      refractionAmount: isFrosted ? 0.0 : 18.0,
       depthEffect: false,
       chromaticAberration: 0.0,
-      saturation: isFrosted ? 1.1 : 1.45,
+      saturation: isFrosted ? 1.1 : 1.50,
       surfaceColor: t.isDark
-          ? const Color(0xFF10141B).withValues(alpha: 0.48)
-          : const Color(0xFFECEFF4).withValues(alpha: 0.56),
+          ? Colors.white.withValues(alpha: isFrosted ? 0.12 : 0.08)
+          : Colors.white.withValues(alpha: isFrosted ? 0.46 : 0.26),
       highlightKind: KyantHighlightKind.defaultSpecular,
-      highlightAlpha: t.isDark ? 0.30 : 0.52,
+      highlightAlpha: t.isDark ? 0.40 : 0.68,
       highlightAngleDeg: 45.0,
-      highlightFalloff: 1.5,
-      highlightWidth: 0.60,
+      highlightFalloff: 1.35,
+      highlightWidth: 0.72,
       highlightBlur: 0.25,
-      ambientEdgeDarken: t.isDark ? 0.0 : 0.06,
+      ambientEdgeDarken: t.isDark ? 0.0 : 0.09,
+      specularSheen: isFrosted ? 0.15 : 0.42,
       shadows: const [],
     );
   }
 
-  /// Kyant0 `GlassPlayground` crystal prism lens showcase recipe (clear, vivid 7-band corner dispersion!).
+  /// Kyant0 `GlassPlayground` crystal prism lens showcase recipe (ultra-clear, vivid 7-band corner dispersion!).
   static KyantLiquidGlassStyle prismShowcase(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
     double blurRadius = 0.0,
     double refractionHeight = 20.0,
-    double refractionAmount = 34.0,
+    double refractionAmount = 36.0,
     double chromaticAberration = 1.0,
     bool depthEffect = true,
   }) {
@@ -293,24 +376,26 @@ class KyantLiquidGlassStyle {
       refractionAmount: isFrosted ? 0.0 : refractionAmount,
       depthEffect: !isFrosted && depthEffect,
       chromaticAberration: isFrosted ? 0.0 : chromaticAberration,
-      saturation: isFrosted ? 1.15 : 1.5,
+      contrast: isFrosted ? 1.0 : 1.04,
+      saturation: isFrosted ? 1.15 : 1.72,
       surfaceColor: t.isDark
-          ? Colors.white.withValues(alpha: isFrosted ? 0.12 : 0.04)
-          : Colors.white.withValues(alpha: isFrosted ? 0.40 : 0.08),
+          ? Colors.white.withValues(alpha: isFrosted ? 0.12 : 0.03)
+          : Colors.white.withValues(alpha: isFrosted ? 0.40 : 0.06),
       highlightKind: KyantHighlightKind.defaultSpecular,
-      highlightAlpha: t.isDark ? 0.56 : 0.72,
+      highlightAlpha: t.isDark ? 0.68 : 0.90,
       highlightAngleDeg: 45.0,
-      highlightFalloff: 1.2,
-      highlightWidth: 0.75,
+      highlightFalloff: 1.15,
+      highlightWidth: 0.95,
       highlightBlur: 0.30,
       innerShadowRadius: isFrosted ? 0.0 : 4.0,
-      innerShadowAlpha: isFrosted ? 0.0 : 0.55,
-      ambientEdgeDarken: t.isDark ? 0.0 : 0.06,
+      innerShadowAlpha: isFrosted ? 0.0 : 0.50,
+      ambientEdgeDarken: t.isDark ? 0.0 : 0.09,
+      specularSheen: isFrosted ? 0.20 : 0.85,
       shadows: [
         BoxShadow(
-          color: Colors.black.withValues(alpha: t.isDark ? 0.30 : 0.11),
-          blurRadius: 20.0,
-          offset: const Offset(0, 6.0),
+          color: Colors.black.withValues(alpha: t.isDark ? 0.28 : 0.10),
+          blurRadius: 18.0,
+          offset: const Offset(0, 5.5),
         ),
       ],
     );
@@ -339,6 +424,7 @@ class KyantLiquidGlassStyle {
         other.innerShadowRadius == innerShadowRadius &&
         other.innerShadowAlpha == innerShadowAlpha &&
         other.ambientEdgeDarken == ambientEdgeDarken &&
+        other.specularSheen == specularSheen &&
         listEquals(other.shadows, shadows);
   }
 
@@ -363,6 +449,7 @@ class KyantLiquidGlassStyle {
         innerShadowRadius,
         innerShadowAlpha,
         ambientEdgeDarken,
+        specularSheen,
         Object.hashAll(shadows),
       ]);
 }
@@ -793,11 +880,18 @@ class _KyantShaderBox extends SingleChildRenderObjectWidget {
   }
 }
 
-class _KyantTransformTrackingLayer extends OffsetLayer {
-  _KyantTransformTrackingLayer();
+/// Custom [BackdropFilterLayer] placed INSIDE `_backdropClipHandle.layer` (`ClipRRectLayer`).
+///
+/// Because [alwaysNeedsAddToScene] is `true`, Flutter's `updateSubtreeNeedsAddToScene()`
+/// ALWAYS marks both this layer AND its parent `ClipRRectLayer` / `RepaintBoundary` dirty for
+/// scene building — eliminating retained-layer stale `uBoxBounds` clipping & whiteout bugs
+/// during scrolling, card resizing, drawer drags, and spring transforms!
+/// When the widget hasn't moved since the last frame, `_syncFilterForComposite` takes the
+/// O(1) fast path with zero uniform writes and zero `ImageFilter` allocations.
+class _KyantBackdropFilterLayer extends BackdropFilterLayer {
+  _KyantBackdropFilterLayer();
 
   _RenderKyantLiquidGlass? renderObject;
-  Matrix4? _lastTransform;
 
   @override
   bool get alwaysNeedsAddToScene => true;
@@ -805,31 +899,19 @@ class _KyantTransformTrackingLayer extends OffsetLayer {
   @override
   void addToScene(ui.SceneBuilder builder) {
     final ro = renderObject;
-    if (ro == null || !ro.attached) return;
-    Matrix4 currentTransform;
-    try {
-      currentTransform = ro.getTransformTo(null);
-    } catch (_) {
-      return;
+    if (ro != null && ro.attached) {
+      ro._syncFilterForComposite(this);
     }
-    final changed = !MatrixUtils.matrixEquals(currentTransform, _lastTransform);
-    final updated = ro._updateAtComposite(currentTransform);
-    if (!updated && changed && _lastTransform != null) {
-      final binding = SchedulerBinding.instance;
-      if (binding.schedulerPhase
-          case SchedulerPhase.idle || SchedulerPhase.postFrameCallbacks) {
-        ro.markNeedsPaint();
-      } else {
-        binding.addPostFrameCallback((_) {
-          if (ro.attached) ro.markNeedsPaint();
-        });
-      }
-    }
-    _lastTransform = currentTransform;
+    super.addToScene(builder);
   }
 }
 
 class _RenderKyantLiquidGlass extends RenderProxyBox {
+  /// Blur radii `<= 3.2dp` run directly inside `kyant_liquid_glass.frag` (single GPU pass,
+  /// zero second `BackdropFilterLayer` readback!). Larger frosted/sheet bokeh blurs use
+  /// Flutter's separable `ImageFilter.blur` pass first + a fast 1–3 tap lens shader.
+  static const double _externalBlurThreshold = 3.2;
+
   _RenderKyantLiquidGlass({
     required ui.FragmentProgram program,
     required KyantLiquidGlassStyle style,
@@ -857,26 +939,28 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
         _clipBehavior = clipBehavior;
 
   ui.FragmentShader? _shader;
-  final LayerHandle<_KyantTransformTrackingLayer> _trackingHandle =
-      LayerHandle<_KyantTransformTrackingLayer>();
   final LayerHandle<ClipRRectLayer> _backdropClipHandle =
       LayerHandle<ClipRRectLayer>();
   final LayerHandle<BackdropFilterLayer> _blurLayerHandle =
       LayerHandle<BackdropFilterLayer>();
-  final LayerHandle<BackdropFilterLayer> _shaderLayerHandle =
-      LayerHandle<BackdropFilterLayer>();
+  final LayerHandle<_KyantBackdropFilterLayer> _shaderLayerHandle =
+      LayerHandle<_KyantBackdropFilterLayer>();
   final LayerHandle<ClipRRectLayer> _childClipHandle =
       LayerHandle<ClipRRectLayer>();
 
   ui.ImageFilter? _cachedBlurFilter;
   double _cachedBlurSigma = -1.0;
+  ui.ImageFilter? _cachedShaderFilter;
   Matrix4? _lastWrittenTransform;
   Rect? _lastPassPhysical;
+  Size? _lastWrittenSize;
+  bool _uniformsDirty = true;
 
   KyantLiquidGlassStyle _style;
   set style(KyantLiquidGlassStyle value) {
     if (_style == value) return;
     _style = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -884,6 +968,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set borderRadius(BorderRadius value) {
     if (_borderRadius == value) return;
     _borderRadius = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -891,6 +976,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set isCapsule(bool value) {
     if (_isCapsule == value) return;
     _isCapsule = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -898,6 +984,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set isCircle(bool value) {
     if (_isCircle == value) return;
     _isCircle = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -905,6 +992,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set isDark(bool value) {
     if (_isDark == value) return;
     _isDark = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -912,6 +1000,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set devicePixelRatio(double value) {
     if (_dpr == value) return;
     _dpr = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -919,6 +1008,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set rootPhysicalSize(Size value) {
     if (_rootPhysicalSize == value) return;
     _rootPhysicalSize = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -927,6 +1017,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
     final next = value.clamp(0.0, 1.0);
     if ((_visibility - next).abs() < 0.0005) return;
     _visibility = next;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -934,6 +1025,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
   set pressPos(Offset value) {
     if (_pressPos == value) return;
     _pressPos = value;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -942,6 +1034,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
     final next = value.clamp(0.0, 1.0);
     if ((_pressIntensity - next).abs() < 0.0005) return;
     _pressIntensity = next;
+    _uniformsDirty = true;
     markNeedsPaint();
   }
 
@@ -957,24 +1050,26 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
 
   @override
   void dispose() {
-    _trackingHandle.layer?.renderObject = null;
-    _trackingHandle.layer = null;
+    _shaderLayerHandle.layer?.renderObject = null;
     _backdropClipHandle.layer = null;
     _blurLayerHandle.layer = null;
     _shaderLayerHandle.layer = null;
     _childClipHandle.layer = null;
+    _cachedShaderFilter = null;
     _shader?.dispose();
     _shader = null;
     super.dispose();
   }
 
   Rect _resolvePassPhysical() {
-    // Check if an external Flutter `BackdropFilter` wraps this subtree;
+    // Check if an external Flutter `BackdropFilter` or `ShaderMask` saveLayer wraps this subtree;
     // our own `KyantLiquidGlass` closes its BackdropFilterLayer before painting children,
-    // so nested Kyant glass always runs in root screen coordinates!
+    // so nested Kyant glass runs in root screen coordinates unless isolated by an ancestor saveLayer!
     RenderObject? node = parent;
     while (node != null) {
-      if (node is RenderBackdropFilter && node.attached && node.hasSize) {
+      if ((node is RenderBackdropFilter || node is RenderShaderMask) &&
+          node.attached &&
+          (node as RenderBox).hasSize) {
         final local = Offset.zero & node.size;
         final global = MatrixUtils.transformRect(node.getTransformTo(null), local);
         final rootLogical = Offset.zero & (_rootPhysicalSize / _dpr);
@@ -991,7 +1086,12 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
     return Offset.zero & _rootPhysicalSize;
   }
 
-  void _writeUniforms(Matrix4 transform, Rect passPhysical, bool hasBlurPass) {
+  void _writeUniforms(
+    Matrix4 transform,
+    Rect passPhysical,
+    bool hasExternalBlur,
+    double inShaderBlurLogical,
+  ) {
     final shader = _shader;
     if (shader == null || size.isEmpty) return;
 
@@ -1076,32 +1176,49 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
     shader.setFloat(34, _pressPos.dx * sx * _dpr);
     shader.setFloat(35, _pressPos.dy * sy * _dpr);
     shader.setFloat(36, _pressIntensity);
-    shader.setFloat(37, hasBlurPass ? 1.0 : 0.0);
+    shader.setFloat(37, hasExternalBlur ? 1.0 : 0.0);
     // 38..41: uExtraParams
     shader.setFloat(38, s.ambientEdgeDarken);
     shader.setFloat(39, _isDark ? 1.0 : 0.0);
-    shader.setFloat(40, 0.0);
-    shader.setFloat(41, 0.0);
+    shader.setFloat(40, hasExternalBlur ? 0.0 : (inShaderBlurLogical * effScaleDpr));
+    shader.setFloat(41, s.specularSheen);
 
     _lastWrittenTransform = transform;
     _lastPassPhysical = passPhysical;
+    _lastWrittenSize = size;
+    _uniformsDirty = false;
   }
 
-  bool _updateAtComposite(Matrix4 currentTransform) {
-    final shaderLayer = _shaderLayerHandle.layer;
+  void _syncFilterForComposite(_KyantBackdropFilterLayer layer) {
     final shader = _shader;
-    if (!attached || shaderLayer == null || shader == null || size.isEmpty) {
-      return false;
+    if (!attached || shader == null || !hasSize || size.isEmpty) return;
+    Matrix4 currentTransform;
+    try {
+      currentTransform = getTransformTo(null);
+    } catch (_) {
+      return;
     }
     final passPhysical = _resolvePassPhysical();
-    if (MatrixUtils.matrixEquals(currentTransform, _lastWrittenTransform) &&
-        passPhysical == _lastPassPhysical) {
-      return true;
+    if (!_uniformsDirty &&
+        _cachedShaderFilter != null &&
+        _lastWrittenSize == size &&
+        passPhysical == _lastPassPhysical &&
+        MatrixUtils.matrixEquals(currentTransform, _lastWrittenTransform)) {
+      if (layer.filter != _cachedShaderFilter) {
+        layer.filter = _cachedShaderFilter;
+      }
+      return;
     }
-    final hasBlurPass = (_style.blurRadius * _visibility) > 0.05;
-    _writeUniforms(currentTransform, passPhysical, hasBlurPass);
-    shaderLayer.filter = ui.ImageFilter.shader(shader);
-    return true;
+    final effectiveBlur = _style.blurRadius * _visibility;
+    final hasExternalBlur = effectiveBlur > _externalBlurThreshold;
+    _writeUniforms(
+      currentTransform,
+      passPhysical,
+      hasExternalBlur,
+      hasExternalBlur ? 0.0 : effectiveBlur,
+    );
+    _cachedShaderFilter = ui.ImageFilter.shader(shader);
+    layer.filter = _cachedShaderFilter;
   }
 
   Path? _cachedShadowClipPath;
@@ -1163,20 +1280,20 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
     // 1. Paint inverse-clipped outer elevation shadow (matches Kyant0 ShadowModifier.kt)
     _paintOuterShadows(context.canvas, offset, rrect);
 
-    // 2. Push transform-tracking layer BEFORE BackdropFilterLayers so composite-time
-    //    scroll/drag/scale updates apply in the exact same frame!
-    final trackingLayer = (_trackingHandle.layer ??= _KyantTransformTrackingLayer())
-      ..renderObject = this;
-    context.pushLayer(trackingLayer, (ctx, off) {}, offset);
-
-    // 3. Write exact physical-pixel uniforms for this frame
+    // 2. Write exact physical-pixel uniforms for this frame (and re-sync automatically
+    //    at composite time inside `_KyantBackdropFilterLayer.addToScene` if scrolled/moved!)
     final transform = getTransformTo(null);
     final passPhysical = _resolvePassPhysical();
     final effectiveBlur = _style.blurRadius * _visibility;
-    final hasBlurPass = effectiveBlur > 0.05;
-    _writeUniforms(transform, passPhysical, hasBlurPass);
+    final hasExternalBlur = effectiveBlur > _externalBlurThreshold;
+    _writeUniforms(
+      transform,
+      passPhysical,
+      hasExternalBlur,
+      hasExternalBlur ? 0.0 : effectiveBlur,
+    );
 
-    if (hasBlurPass) {
+    if (hasExternalBlur) {
       if (_cachedBlurFilter == null || (_cachedBlurSigma - effectiveBlur).abs() > 0.01) {
         _cachedBlurFilter = ui.ImageFilter.blur(
           sigmaX: effectiveBlur,
@@ -1190,11 +1307,13 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
       _blurLayerHandle.layer = null;
     }
 
-    final shaderLayer = (_shaderLayerHandle.layer ??= BackdropFilterLayer())
-      ..filter = ui.ImageFilter.shader(_shader!);
+    _cachedShaderFilter = ui.ImageFilter.shader(_shader!);
+    final shaderLayer = (_shaderLayerHandle.layer ??= _KyantBackdropFilterLayer())
+      ..renderObject = this
+      ..filter = _cachedShaderFilter!;
 
-    // 4. Push shape-clipped Blur + Kyant0 Refraction/Dispersion/Highlight passes
-    //    with EMPTY child painters so child widgets paint cleanly in root coordinates after!
+    // 3. Push shape-clipped single-pass (or external-bokeh + lens) pass with EMPTY child painters
+    //    so child widgets paint cleanly in root coordinates after!
     _backdropClipHandle.layer = context.pushClipRRect(
       needsCompositing,
       offset,
@@ -1210,7 +1329,7 @@ class _RenderKyantLiquidGlass extends RenderProxyBox {
       oldLayer: _backdropClipHandle.layer,
     );
 
-    // 5. Paint child content cleanly ON TOP of the finished Liquid Glass surface!
+    // 4. Paint child content cleanly ON TOP of the finished Liquid Glass surface!
     if (_clipBehavior != Clip.none) {
       _childClipHandle.layer = context.pushClipRRect(
         needsCompositing,

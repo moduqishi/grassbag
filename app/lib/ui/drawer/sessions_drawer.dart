@@ -753,10 +753,10 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
             }
             return LayoutBuilder(
               builder: (_, box) {
-                final row = SingleChildScrollView(
+                return SingleChildScrollView(
                   scrollDirection: Axis.horizontal,
                   physics: const BouncingScrollPhysics(),
-                  padding: EdgeInsets.fromLTRB(14, 0, box.maxWidth < 310 ? 22 : 14, 8),
+                  padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
                   child: Row(
                     children: [
                       for (final f in SessionFilter.values) ...[
@@ -770,17 +770,6 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
                       ],
                     ],
                   ),
-                );
-                if (box.maxWidth >= 310) return row;
-                return ShaderMask(
-                  blendMode: BlendMode.dstIn,
-                  shaderCallback: (bounds) => const LinearGradient(
-                    begin: Alignment.centerLeft,
-                    end: Alignment.centerRight,
-                    colors: [Colors.white, Colors.white, Colors.transparent],
-                    stops: [0.0, 0.93, 1.0],
-                  ).createShader(bounds),
-                  child: row,
                 );
               },
             );
@@ -2353,17 +2342,15 @@ class _FooterIconButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return Tooltip(
-      message: tooltip,
-      child: GrassBagSpringTap(
-        onTap: onTap,
-        pressedScale: 0.90,
-        enablePointerGlow: false,
-        haptic: true,
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            GrassBagFresnelGlassSurface(
+    final ambientTier = resolveAmbientGlassTier(context);
+    final isSolid = ambientTier == GrassBagGlassTier.solid;
+    final Widget orb = isSolid
+        ? GrassBagSpringTap(
+            onTap: onTap,
+            pressedScale: 0.90,
+            enablePointerGlow: false,
+            haptic: true,
+            child: GrassBagFresnelGlassSurface(
               isCircle: true,
               innerWell: true,
               interactive: true,
@@ -2372,10 +2359,33 @@ class _FooterIconButton extends StatelessWidget {
               alignment: Alignment.center,
               child: Icon(icon, size: 18, color: t.text2),
             ),
-            if (showBadge)
-              Positioned(
-                top: -1,
-                right: -1,
+          )
+        : KyantInteractiveGlassButton(
+            onTap: onTap,
+            isCircle: true,
+            isCapsule: false,
+            width: 36,
+            height: 36,
+            style: KyantLiquidGlassStyle.nestedControl(
+              t,
+              ambientTier,
+              surfaceColor: t.isDark
+                  ? Colors.white.withValues(alpha: 0.09)
+                  : Colors.white.withValues(alpha: 0.30),
+            ),
+            child: Icon(icon, size: 18, color: t.text2),
+          );
+    return Tooltip(
+      message: tooltip,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          orb,
+          if (showBadge)
+            Positioned(
+              top: -1,
+              right: -1,
+              child: IgnorePointer(
                 child: Container(
                   width: 9.5,
                   height: 9.5,
@@ -2393,8 +2403,8 @@ class _FooterIconButton extends StatelessWidget {
                   ),
                 ),
               ),
-          ],
-        ),
+            ),
+        ],
       ),
     );
   }

@@ -2057,9 +2057,10 @@ void main() {
       expect(rejectedSelf, isNull);
       expect(container.read(appProvider).hosts.where((h) => !h.isLocal), isEmpty);
 
-      // 3) Faithful Kyant0 AndroidLiquidGlass optical presets across Light & Dark modes:
-      //    vibrancy (1.5x saturation), calibrated blur, inward curved refraction, 7-band corner
-      //    chromatic dispersion, and delicate 0.65dp Highlight.Default / Highlight.Plain rims!
+      // 3) Crystal-clear single-pass Kyant0 AndroidLiquidGlass optical presets across Light & Dark:
+      //    vivid saturation (>= 1.55), single-pass micro-bokeh (<= 3.2dp -> 0 extra blur readback!),
+      //    translucent low-haze surface alpha, inward curved refraction, directional specular rims,
+      //    3D meniscus sheen, and full 7-band rainbow dispersion on prism showcase!
       for (final dark in [false, true]) {
         final tokens = GrassBagTokens.resolve(
           GrassBagAccent.teal,
@@ -2070,16 +2071,21 @@ void main() {
         final dialog = KyantLiquidGlassStyle.sheet(tokens, GrassBagGlassTier.liquid, isDialog: true);
         final button = KyantLiquidGlassStyle.button(tokens, GrassBagGlassTier.liquid, tint: tokens.primary);
         final prism = KyantLiquidGlassStyle.prismShowcase(tokens, GrassBagGlassTier.liquid);
-        expect(chrome.saturation, closeTo(1.5, 0.05));
+        expect(chrome.saturation, greaterThanOrEqualTo(1.55));
         expect(chrome.refractionHeight, greaterThanOrEqualTo(12.0));
         expect(chrome.refractionAmount, greaterThanOrEqualTo(20.0));
         expect(chrome.chromaticAberration, greaterThan(0.0));
         expect(chrome.highlightKind, KyantHighlightKind.defaultSpecular);
-        expect(chrome.blurRadius, inInclusiveRange(3.0, 8.0));
-        expect(sheet.highlightKind, KyantHighlightKind.plain);
-        expect(sheet.refractionAmount, greaterThanOrEqualTo(30.0));
+        expect(chrome.blurRadius, inInclusiveRange(0.8, 3.2));
+        expect(chrome.surfaceColor.a, lessThanOrEqualTo(dark ? 0.14 : 0.32));
+        expect(chrome.specularSheen, greaterThan(0.40));
+        expect(sheet.highlightKind, KyantHighlightKind.defaultSpecular);
+        expect(sheet.refractionAmount, greaterThanOrEqualTo(32.0));
+        expect(sheet.blurRadius, inInclusiveRange(4.0, 6.5));
+        expect(sheet.surfaceColor.a, lessThanOrEqualTo(dark ? 0.38 : 0.48));
         expect(dialog.depthEffect, isTrue);
-        expect(button.tintColor.a, greaterThan(0.65));
+        expect(button.blurRadius, lessThanOrEqualTo(2.0));
+        expect(button.tintColor.a, inInclusiveRange(0.60, 0.78));
         expect(prism.chromaticAberration, closeTo(1.0, 0.05));
       }
 
@@ -2352,8 +2358,8 @@ void main() {
         expect(frosted.blurRadius, greaterThanOrEqualTo(10.0));
         expect(frostedCfg.lightIntensity, 0.0);
         expect(frostedCfg.rimShade, 0.0);
-        expect(norm.highlightWidth, inInclusiveRange(0.4, 0.85));
-        expect(sheet.highlightKind, KyantHighlightKind.plain);
+        expect(norm.highlightWidth, inInclusiveRange(0.6, 1.15));
+        expect(sheet.highlightKind, KyantHighlightKind.defaultSpecular);
       }
 
       // 2) Named weekday/month Cron validation

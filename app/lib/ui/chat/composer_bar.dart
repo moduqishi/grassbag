@@ -3304,65 +3304,84 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   !veryTightRow && !(tightRow && hasExtraStreamActions);
                               return Row(
                             children: [
-                              // Crisp spring-animated '+' toggle button (rotates 45° into '×')
-                              Tooltip(
-                                message: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
-                                excludeFromSemantics: true,
-                                child: Semantics(
-                                  button: true,
-                                  label: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
-                                  child: GrassBagSpringTap(
-                                    key: const ValueKey('composer-plus-btn'),
-                                    onTap: _togglePlus,
-                                    pressedScale: 0.88,
-                                    enablePointerGlow: false,
-                                    child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 220),
-                                  curve: Curves.easeOutCubic,
-                                  width: 36,
-                                  height: 36,
-                                  decoration: BoxDecoration(
-                                    color: _plusOpen
-                                        ? t.primary.withValues(alpha: t.isDark ? 0.28 : 0.16)
-                                        : (t.isDark
-                                            ? Colors.white.withValues(alpha: 0.11)
-                                            : Colors.black.withValues(alpha: 0.06)),
-                                    shape: BoxShape.circle,
-                                    border: state.glassTier == GrassBagGlassTier.solid
-                                        ? Border.all(
-                                            color: _plusOpen
-                                                ? t.primary.withValues(alpha: t.isDark ? 0.46 : 0.32)
-                                                : t.sepStrong,
-                                            width: 0.65,
-                                            )
-                                          : null,
-                                      boxShadow: t.isDark
-                                          ? null
-                                          : const [
-                                              BoxShadow(
-                                                color: Color(0x0B0E243B),
-                                                blurRadius: 6,
-                                                offset: Offset(0, 2),
-                                              ),
-                                            ],
-                                    ),
-                                      child: AnimatedRotation(
-                                        turns: _plusOpen ? 0.125 : 0.0,
-                                        duration: GrassBagMotion.duration(
-                                          context,
-                                          const Duration(milliseconds: 260),
-                                        ),
-                                        curve: Curves.easeOutBack,
-                                        child: Icon(
-                                          CupertinoIcons.plus,
-                                          size: 19,
-                                          color: _plusOpen ? t.primary : t.text2,
-                                        ),
-                                      ),
+                              // Crisp spring-animated '+' Liquid Glass orb (rotates 45° into '×')
+                              () {
+                                final effectiveTier =
+                                    resolveEffectiveGlassTier(context, state.glassTier);
+                                final plusIcon = AnimatedRotation(
+                                  turns: _plusOpen ? 0.125 : 0.0,
+                                  duration: GrassBagMotion.duration(
+                                    context,
+                                    const Duration(milliseconds: 260),
                                   ),
-                                ),
-                              ),
-                              ),
+                                  curve: Curves.easeOutBack,
+                                  child: Icon(
+                                    CupertinoIcons.plus,
+                                    size: 19,
+                                    color: _plusOpen
+                                        ? (effectiveTier == GrassBagGlassTier.solid
+                                            ? t.primary
+                                            : t.onPrimary)
+                                        : t.text2,
+                                  ),
+                                );
+                                final Widget plusBtn = effectiveTier == GrassBagGlassTier.solid
+                                    ? GrassBagSpringTap(
+                                        key: const ValueKey('composer-plus-btn'),
+                                        onTap: _togglePlus,
+                                        pressedScale: 0.88,
+                                        enablePointerGlow: false,
+                                        child: AnimatedContainer(
+                                          duration: const Duration(milliseconds: 220),
+                                          curve: Curves.easeOutCubic,
+                                          width: 36,
+                                          height: 36,
+                                          decoration: BoxDecoration(
+                                            color: _plusOpen
+                                                ? t.primary.withValues(alpha: t.isDark ? 0.28 : 0.16)
+                                                : (t.isDark
+                                                    ? Colors.white.withValues(alpha: 0.11)
+                                                    : Colors.black.withValues(alpha: 0.06)),
+                                            shape: BoxShape.circle,
+                                            border: Border.all(
+                                              color: _plusOpen
+                                                  ? t.primary.withValues(alpha: t.isDark ? 0.46 : 0.32)
+                                                  : t.sepStrong,
+                                              width: 0.65,
+                                            ),
+                                          ),
+                                          child: plusIcon,
+                                        ),
+                                      )
+                                    : KyantInteractiveGlassButton(
+                                        key: const ValueKey('composer-plus-btn'),
+                                        onTap: _togglePlus,
+                                        isCircle: true,
+                                        isCapsule: false,
+                                        width: 36,
+                                        height: 36,
+                                        style: KyantLiquidGlassStyle.nestedControl(
+                                          t,
+                                          effectiveTier,
+                                          tint: _plusOpen ? t.primary : null,
+                                          surfaceColor: _plusOpen
+                                              ? null
+                                              : (t.isDark
+                                                  ? Colors.white.withValues(alpha: 0.10)
+                                                  : Colors.white.withValues(alpha: 0.28)),
+                                        ),
+                                        child: plusIcon,
+                                      );
+                                return Tooltip(
+                                  message: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
+                                  excludeFromSemantics: true,
+                                  child: Semantics(
+                                    button: true,
+                                    label: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
+                                    child: plusBtn,
+                                  ),
+                                );
+                              }(),
                               const SizedBox(width: 7),
 
                               // Concentric Model & Effort Pill (`height: 36`, `radius: 18 = 28 - 10`)
@@ -3453,80 +3472,102 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               onOpenModelSettings: widget.onOpenModelSettings,
                                             );
                                       }
-                                      return GrassBagSpringTap(
+                                      final effectiveTier =
+                                          resolveEffectiveGlassTier(context, state.glassTier);
+                                      final modelRow = Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(pillIcon, size: 13.5, color: pillIconColor),
+                                          const SizedBox(width: 5),
+                                          Flexible(
+                                            child: Text(
+                                              pillLabel,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 12.5,
+                                                fontWeight: FontWeight.w500,
+                                                letterSpacing: -0.1,
+                                                color: pillTextColor,
+                                              ),
+                                            ),
+                                          ),
+                                          if (effortBadge != null &&
+                                              !veryTightRow &&
+                                              !(tightRow && hasExtraStreamActions)) ...[
+                                            const SizedBox(width: 5),
+                                            Tooltip(
+                                              message: state.canCycleEffort
+                                                  ? '点击快速切换思考深度'
+                                                  : '当前思考深度',
+                                              child: GestureDetector(
+                                                behavior: HitTestBehavior.opaque,
+                                                onTap: state.canCycleEffort
+                                                    ? () {
+                                                        HapticFeedback.selectionClick();
+                                                        if (_plusOpen) _setPlusOpen(false);
+                                                        unawaited(ctrl.cycleReasoningEffort());
+                                                      }
+                                                    : null,
+                                                child: GrassBagFresnelGlassSurface(
+                                                  isPill: true,
+                                                  innerWell: true,
+                                                  tintColor: t.primarySoft,
+                                                  padding: const EdgeInsets.symmetric(
+                                                    horizontal: 6,
+                                                    vertical: 2,
+                                                  ),
+                                                  child: Text(
+                                                    effortBadge,
+                                                    style: TextStyle(
+                                                      fontSize: 10.5,
+                                                      fontWeight: FontWeight.w600,
+                                                      color: t.primary,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                          const SizedBox(width: 3),
+                                          Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
+                                        ],
+                                      );
+                                      if (effectiveTier == GrassBagGlassTier.solid) {
+                                        return GrassBagSpringTap(
+                                          onTap: () {
+                                            if (_plusOpen) _setPlusOpen(false);
+                                            pillTap();
+                                          },
+                                          pressedScale: 0.94,
+                                          enablePointerGlow: false,
+                                          haptic: true,
+                                          child: GrassBagFresnelGlassSurface(
+                                            isPill: true,
+                                            innerWell: true,
+                                            interactive: true,
+                                            height: 36,
+                                            padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
+                                            child: modelRow,
+                                          ),
+                                        );
+                                      }
+                                      return KyantInteractiveGlassButton(
                                         onTap: () {
                                           if (_plusOpen) _setPlusOpen(false);
                                           pillTap();
                                         },
-                                        pressedScale: 0.94,
-                                        enablePointerGlow: false,
-                                        haptic: true,
-                                        child: GrassBagFresnelGlassSurface(
-                                          isPill: true,
-                                          innerWell: true,
-                                          interactive: true,
-                                          height: 36,
-                                          padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
-                                          child: Row(
-                                            mainAxisSize: MainAxisSize.min,
-                                            children: [
-                                              Icon(pillIcon, size: 13.5, color: pillIconColor),
-                                              const SizedBox(width: 5),
-                                              Flexible(
-                                                child: Text(
-                                                  pillLabel,
-                                                  maxLines: 1,
-                                                  overflow: TextOverflow.ellipsis,
-                                                  style: TextStyle(
-                                                    fontSize: 12.5,
-                                                    fontWeight: FontWeight.w500,
-                                                    letterSpacing: -0.1,
-                                                    color: pillTextColor,
-                                                  ),
-                                                ),
-                                              ),
-                                              if (effortBadge != null &&
-                                                  !veryTightRow &&
-                                                  !(tightRow && hasExtraStreamActions)) ...[
-                                                const SizedBox(width: 5),
-                                                Tooltip(
-                                                  message: state.canCycleEffort
-                                                      ? '点击快速切换思考深度'
-                                                      : '当前思考深度',
-                                                  child: GestureDetector(
-                                                    behavior: HitTestBehavior.opaque,
-                                                    onTap: state.canCycleEffort
-                                                        ? () {
-                                                            HapticFeedback.selectionClick();
-                                                            if (_plusOpen) _setPlusOpen(false);
-                                                            unawaited(ctrl.cycleReasoningEffort());
-                                                          }
-                                                        : null,
-                                                    child: GrassBagFresnelGlassSurface(
-                                                      isPill: true,
-                                                      innerWell: true,
-                                                      tintColor: t.primarySoft,
-                                                      padding: const EdgeInsets.symmetric(
-                                                        horizontal: 6,
-                                                        vertical: 2,
-                                                      ),
-                                                      child: Text(
-                                                        effortBadge,
-                                                        style: TextStyle(
-                                                          fontSize: 10.5,
-                                                          fontWeight: FontWeight.w600,
-                                                          color: t.primary,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ),
-                                              ],
-                                              const SizedBox(width: 3),
-                                              Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
-                                            ],
-                                          ),
+                                        isCapsule: true,
+                                        height: 36,
+                                        padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
+                                        style: KyantLiquidGlassStyle.nestedControl(
+                                          t,
+                                          effectiveTier,
+                                          surfaceColor: t.isDark
+                                              ? Colors.white.withValues(alpha: 0.09)
+                                              : Colors.white.withValues(alpha: 0.28),
                                         ),
+                                        child: modelRow,
                                       );
                                   }(),
                                 ),
@@ -3672,6 +3713,104 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                             : (hasText
                                                 ? '发送消息'
                                                 : (state.speechConfigured ? '语音输入' : '发送消息'))));
+                                final effectiveTier =
+                                    resolveEffectiveGlassTier(context, state.glassTier);
+                                final orbChild = AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 200),
+                                  switchInCurve: Curves.easeOutCubic,
+                                  switchOutCurve: Curves.easeInCubic,
+                                  transitionBuilder: (child, anim) => FadeTransition(
+                                    opacity: anim,
+                                    child: ScaleTransition(
+                                      scale: Tween<double>(begin: 0.72, end: 1.0)
+                                          .animate(anim),
+                                      child: child,
+                                    ),
+                                  ),
+                                  child: showPrimarySpinner
+                                      ? GrassBagActivityIndicator(
+                                          key: const ValueKey('sending'),
+                                          radius: 7.5,
+                                          color: t.onPrimary,
+                                        )
+                                      : (isStopOrb && state.isStopping)
+                                          ? GrassBagActivityIndicator(
+                                              key: const ValueKey('stopping'),
+                                              radius: 7.0,
+                                              color: t.err,
+                                            )
+                                          : Icon(
+                                              hasText
+                                                  ? sendIcon
+                                                  : isStopOrb
+                                                      ? CupertinoIcons.stop_fill
+                                                      : (state.speechConfigured
+                                                          ? CupertinoIcons.mic_fill
+                                                          : CupertinoIcons.arrow_up),
+                                              key: ValueKey(
+                                                hasText
+                                                    ? (isFollowUpSend
+                                                        ? 'send-${state.busyEnterMode}'
+                                                        : 'send')
+                                                    : (isStopOrb
+                                                        ? 'stop'
+                                                        : (state.speechConfigured
+                                                            ? 'mic'
+                                                            : 'send')),
+                                              ),
+                                              size: hasText
+                                                  ? (isFollowUpSend ? 15.5 : 17)
+                                                  : (isStopOrb ? 14 : 16.5),
+                                              color: hasText
+                                                  ? t.onPrimary
+                                                  : isStopOrb
+                                                      ? t.err
+                                                      : (state.speechConfigured
+                                                          ? t.text
+                                                          : t.text3),
+                                            ),
+                                );
+                                void handleOrbTap() {
+                                  if (isStopOrb) {
+                                    if (state.isStopping) return;
+                                    HapticFeedback.lightImpact();
+                                    _flushDraftSync();
+                                    ctrl.cancelStreaming();
+                                  } else if (_submitting || state.isStopping) {
+                                    return;
+                                  } else if (hasText) {
+                                    _submit();
+                                  } else if (state.speechConfigured) {
+                                    _openVoiceInput();
+                                  }
+                                }
+                                if (effectiveTier != GrassBagGlassTier.solid) {
+                                  return Tooltip(
+                                    message: orbTooltip,
+                                    child: KyantInteractiveGlassButton(
+                                      key: const ValueKey('composer-action-btn'),
+                                      enabled: orbEnabled,
+                                      onTap: orbEnabled ? handleOrbTap : null,
+                                      isCircle: true,
+                                      isCapsule: false,
+                                      width: 36,
+                                      height: 36,
+                                      style: KyantLiquidGlassStyle.nestedControl(
+                                        t,
+                                        effectiveTier,
+                                        tint: primaryActive ? t.primary : null,
+                                        surfaceColor: primaryActive
+                                            ? null
+                                            : (isStopOrb
+                                                ? t.err.withValues(alpha: t.isDark ? 0.26 : 0.16)
+                                                : (t.isDark
+                                                    ? Colors.white.withValues(alpha: 0.10)
+                                                    : Colors.white.withValues(alpha: 0.28))),
+                                      ),
+                                      child: orbChild,
+                                    ),
+                                  );
+                                }
                                 return Tooltip(
                                   message: orbTooltip,
                                   child: GrassBagSpringTap(
@@ -3679,28 +3818,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                     enabled: orbEnabled,
                                     enablePointerGlow: orbInteractive,
                                     pressedScale: orbInteractive ? 0.86 : 1.0,
-                                    onTap: () {
-                                      if (isStopOrb) {
-                                        if (state.isStopping) return;
-                                        HapticFeedback.lightImpact();
-                                        _flushDraftSync();
-                                        ctrl.cancelStreaming();
-                                      } else if (_submitting || state.isStopping) {
-                                        return;
-                                      } else if (hasText) {
-                                        _submit();
-                                      } else if (state.speechConfigured) {
-                                        _openVoiceInput();
-                                      }
-                                    },
+                                    onTap: handleOrbTap,
                                     child: AnimatedContainer(
                                       duration: const Duration(milliseconds: 220),
                                       curve: Curves.easeOutCubic,
                                       width: 36,
                                       height: 36,
                                       decoration: BoxDecoration(
-                                        // Always provide a 2-stop LinearGradient so BoxDecoration.lerp
-                                        // interpolates Send <-> Stop <-> Mic smoothly instead of snapping at t=0.5!
                                         gradient: LinearGradient(
                                           begin: Alignment.topLeft,
                                           end: Alignment.bottomRight,
@@ -3725,16 +3849,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                         ])),
                                         ),
                                         shape: BoxShape.circle,
-                                        border: state.glassTier == GrassBagGlassTier.solid
-                                            ? Border.all(
-                                                color: isStopOrb
-                                                    ? t.err.withValues(alpha: 0.34)
-                                                    : (primaryActive
-                                                        ? Colors.white.withValues(alpha: 0.24)
-                                                        : t.sepStrong),
-                                                width: 0.65,
-                                              )
-                                            : null,
+                                        border: Border.all(
+                                          color: isStopOrb
+                                              ? t.err.withValues(alpha: 0.34)
+                                              : (primaryActive
+                                                  ? Colors.white.withValues(alpha: 0.24)
+                                                  : t.sepStrong),
+                                          width: 0.65,
+                                        ),
                                         boxShadow: primaryActive
                                             ? [
                                                 BoxShadow(
@@ -3745,64 +3867,10 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               ]
                                             : null,
                                       ),
-                                      child: AnimatedSwitcher(
-                                        duration: const Duration(milliseconds: 200),
-                                        switchInCurve: Curves.easeOutCubic,
-                                        switchOutCurve: Curves.easeInCubic,
-                                        transitionBuilder: (child, anim) => FadeTransition(
-                                          opacity: anim,
-                                          child: ScaleTransition(
-                                            scale: Tween<double>(begin: 0.72, end: 1.0)
-                                                .animate(anim),
-                                            child: child,
-                                          ),
-                                        ),
-                                        child: showPrimarySpinner
-                                            ? GrassBagActivityIndicator(
-                                                key: const ValueKey('sending'),
-                                                radius: 7.5,
-                                                color: t.onPrimary,
-                                              )
-                                            : (isStopOrb && state.isStopping)
-                                                ? GrassBagActivityIndicator(
-                                                    key: const ValueKey('stopping'),
-                                                    radius: 7.0,
-                                                    color: t.err,
-                                                  )
-                                                : Icon(
-                                                    hasText
-                                                        ? sendIcon
-                                                        : isStopOrb
-                                                            ? CupertinoIcons.stop_fill
-                                                            : (state.speechConfigured
-                                                                ? CupertinoIcons.mic_fill
-                                                                : CupertinoIcons.arrow_up),
-                                                    key: ValueKey(
-                                                      hasText
-                                                          ? (isFollowUpSend
-                                                              ? 'send-${state.busyEnterMode}'
-                                                              : 'send')
-                                                          : (isStopOrb
-                                                              ? 'stop'
-                                                              : (state.speechConfigured
-                                                                  ? 'mic'
-                                                                  : 'send')),
-                                                    ),
-                                                    size: hasText
-                                                        ? (isFollowUpSend ? 15.5 : 17)
-                                                        : (isStopOrb ? 14 : 16.5),
-                                                    color: hasText
-                                                        ? t.onPrimary
-                                                        : isStopOrb
-                                                            ? t.err
-                                                            : (state.speechConfigured
-                                                                ? t.text
-                                                                : t.text3),
-                                                  ),
-                                      ),
+                                      child: orbChild,
                                     ),
                                   ),
-                              );
+                                );
                             }(),
                             ],
                           );

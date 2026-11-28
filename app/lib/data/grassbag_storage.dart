@@ -14,6 +14,8 @@ class GrassBagStorage {
   static const _kDomainKey = 'grassbag_domain_cache_v2';
   static const _kHostContextsKey = 'grassbag_host_contexts_v1';
   static const _kWebSecretsKey = 'grassbag_web_secrets_v1';
+  static const _kOfflineHistoryKey = 'grassbag_offline_history_v1';
+  static const _kPendingOutboxKey = 'grassbag_pending_outbox_v1';
 
   SharedPreferences? _cachedPrefs;
 
@@ -163,6 +165,53 @@ class GrassBagStorage {
         } else {
           await p.setString(_kWebSecretsKey, jsonEncode(map));
         }
+      }
+    } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>> loadOfflineHistory() async {
+    final p = await _prefs();
+    final raw = p?.getString(_kOfflineHistoryKey);
+    if (raw == null || raw.isEmpty) return <String, dynamic>{};
+    try {
+      final decoded = jsonDecode(raw);
+      return decoded is Map<String, dynamic> ? decoded : <String, dynamic>{};
+    } catch (_) {
+      return <String, dynamic>{};
+    }
+  }
+
+  Future<void> saveOfflineHistory(Map<String, dynamic> history) async {
+    final p = await _prefs();
+    if (p == null) return;
+    try {
+      await p.setString(_kOfflineHistoryKey, jsonEncode(history));
+    } catch (_) {}
+  }
+
+  Future<List<Map<String, dynamic>>> loadPendingOutbox() async {
+    final p = await _prefs();
+    final raw = p?.getString(_kPendingOutboxKey);
+    if (raw == null || raw.isEmpty) return const [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return decoded.whereType<Map<String, dynamic>>().toList(growable: false);
+      }
+      return const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> savePendingOutbox(List<Map<String, dynamic>> entries) async {
+    final p = await _prefs();
+    if (p == null) return;
+    try {
+      if (entries.isEmpty) {
+        await p.remove(_kPendingOutboxKey);
+      } else {
+        await p.setString(_kPendingOutboxKey, jsonEncode(entries));
       }
     } catch (_) {}
   }

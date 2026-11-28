@@ -448,6 +448,10 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
     if (target == null) return;
 
     if (type == 'term.snapshot') {
+      target.streamRetryTimer?.cancel();
+      target.streamRetryTimer = null;
+      target.streamRetryCount = 0;
+      target.streamReconnecting = false;
       final screen = data?['data']?.toString() ?? data?['screen']?.toString() ?? '';
       if (target.exited && mounted) {
         setState(() => target!.exited = false);
@@ -458,28 +462,78 @@ class _TerminalPageState extends ConsumerState<TerminalPage>
       }
       return;
     }
-    if (type == 'term.exit' || type == 'terminal.exit' || type == 'terminal.stream_end') {
+    if (type == 'term.exit' || type == 'terminal.exit') {
+      target.streamRetryTimer?.cancel();
+      target.streamRetryTimer = null;
+      target.streamReconnecting = false;
       _flushPtyBuffers();
       final code = data?['exitCode'] ?? data?['code'];
-      final exitNote = code != null ? '[远端 PTY 已退出 code=$code]' : '[远端 PTY 流已结束]';
+      final exitNote = code != null ? '[远端 PTY 已退出 code=$code]' : '[远端 PTY 已退出]';
       target.terminal.write('\r\n\x1b[90m$exitNote\x1b[0m\r\n');
       if (!target.exited) {
         setState(() => target!.exited = true);
       }
       return;
     }
-    if (type == 'terminal.stream_error' || type == 'terminal.unavailable') {
+    if (type == 'terminal.unavailable') {
+      target.streamRetryTimer?.cancel();
+      target.streamRetryTimer = null;
+      target.streamReconnecting = false;
       _flushPtyBuffers();
-      final msg = data?['message']?.toString() ?? data?['error']?.toString() ?? '远端 PTY 连接中断';
+      final msg = data?['message']?.toString() ?? data?['error']?.toString() ?? '远端 PTY 不可用';
       target.terminal.write('\r\n\x1b[31m[$msg]\x1b[0m\r\n');
       if (!target.exited) {
         setState(() => target!.exited = true);
       }
       return;
     }
+    if (type == 'terminal.stream_error' || type == 'terminal.stream_end') {
+      _flushPtyBuffers();
+      final msg = data?['message']?.toString() ??
+          data?['error']?.toString() ??
+          (type == 'terminal.stream_end' ? '远端 PTY 子流已断开' : '远端 PTY 子流异常');
+      const maxRetries = 4;
+      final channel = target.wsChannel;
+      if (channel != null &&
+          channel.isNotEmpty &&
+          !target.closed &&
+          target.streamRetryCount < maxRetries) {
+        final attempt = ++target.streamRetryCount;
+        final delayMs = 500 * (1 << (attempt - 1));
+        target.streamReconnecting = true;
+        target.terminal.write(
+          '\r\n\x1b[33m[$msg，正在尝试重新订阅（第 $attempt/$maxRetries 次）…]\x1b[0m\r\n',
+        );
+        target.streamRetryTimer?.cancel();
+        final capturedTab = target;
+        target.streamRetryTimer = Timer(Duration(milliseconds: delayMs), () {
+          if (!mounted ||
+              capturedTab.closed ||
+              !identical(capturedTab.ownerClient, sourceClient)) {
+            return;
+          }
+          sourceClient.stream.subscribe(channel, force: true);
+        });
+      } else {
+        target.streamRetryTimer?.cancel();
+        target.streamRetryTimer = null;
+        target.streamReconnecting = false;
+        target.terminal.write('\r\n\x1b[31m[$msg，自动重连已达上限，可点击重连按钮恢复]\x1b[0m\r\n');
+        if (!target.exited) {
+          setState(() => target!.exited = true);
+        }
+      }
+      return;
+    }
 
     final chunk = data?['data']?.toString() ?? data?['chunk']?.toString() ?? '';
     if (chunk.isNotEmpty) {
+      if (target.streamRetryCount > 0 || target.streamReconnecting) {
+        target.streamRetryTimer?.cancel();
+        target.streamRetryTimer = null;
+        target.streamRetryCount = 0;
+        target.streamReconnecting = false;
+      }
       if (target.exited && mounted) {
         setState(() => target!.exited = false);
       }
@@ -2108,6 +2162,9 @@ class _LocalTermTab {
   int sentCols = -1;
   int sentRows = -1;
   Timer? resizeDebounce;
+  Timer? streamRetryTimer;
+  int streamRetryCount = 0;
+  bool streamReconnecting = false;
   String? remoteTermId;
   String? remoteSessionId;
   String? wsChannel;
@@ -2119,6 +2176,8 @@ class _LocalTermTab {
     _disposed = true;
     resizeDebounce?.cancel();
     resizeDebounce = null;
+    streamRetryTimer?.cancel();
+    streamRetryTimer = null;
     terminalController.dispose();
     scrollController.dispose();
     focusNode.dispose();

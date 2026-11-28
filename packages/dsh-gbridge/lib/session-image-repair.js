@@ -1,7 +1,18 @@
 import { existsSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { constants as zlibConstants, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
 import { ignoreCleanupError } from './diagnostics.js';
+
+const zlibConstants = zlib.constants;
+function requireZstdFn(name) {
+  const fn = zlib[name];
+  if (typeof fn !== 'function') {
+    throw new Error(`Node.js >= 22.15.0 is required for built-in zlib.${name} (current: ${process.versions?.node ?? 'unknown'})`);
+  }
+  return fn;
+}
+const zstdCompressSync = (...args) => requireZstdFn('zstdCompressSync')(...args);
+const zstdDecompressSync = (...args) => requireZstdFn('zstdDecompressSync')(...args);
 
 const ZSTD_MAGIC = 0xFD2FB528;
 

@@ -174,7 +174,18 @@ flowchart LR
 
 ### 1. 直接体验（推荐）
 
-前往 [GitHub Releases](https://github.com/moduqishi/grassbag/releases/latest) 下载最新的 `grassbag-v*-arm64-v8a.apk`，安装后即可在 Android 设备上离线部署本机容器或连接远程 DSH 主机。
+前往 [GitHub Releases](https://github.com/moduqishi/grassbag/releases/latest) 下载最新的精简版 `grassbag-v*-arm64-v8a.apk`（约 21 MB）：
+- **远程模式**：安装后即可直接免插件连接局域网 / Tailscale / HTTPS 远程 DSH 主机，或一键安装经 SHA-256 校验的 `dsh-gbridge` 连接助手。
+- **本机模式**：首次在 Android 手机启用本机容器时，App 会按需断点续传下载约 **188 MiB** 的 Ubuntu 24.04.5 + Node 24 + DSH ARM64 运行时并校验 SHA-256（如需完全零联网的离线包，可使用下方 `--full --fetch` 本地构建）。
+
+### 平台支持与能力矩阵
+
+| 平台 / 组件 | 交付状态 | 要求与部署说明 |
+| :--- | :--- | :--- |
+| **Android (ARM64)** | **正式主平台** | Android 10+；支持本机 Ubuntu + Node 24 + DSH 容器、硬件 Keystore 凭据加密、加密备份校验恢复、通知直达与无障碍操控 |
+| **Web 客户端** | **预览可用（需同源反代）** | 跨源请求默认仅对回环或 `GB_ALLOWED_ORIGINS` 白名单开放；生产部署请将 Flutter Web 静态资源与 `/gbridge/v1`、`/api/` 置于同一 HTTPS 反向代理域名下；浏览器凭据存放在同源浏览器存储中（请勿在公共设备上勾选记住） |
+| **macOS 桌面端** | **实验预览** | 已补齐沙盒出站网络权限 `com.apple.security.network.client`；尚未内置原生 Keychain 凭据保管，推荐搭配远端 DSH 主机调试使用 |
+| **`dsh-gbridge` 桥插件** | **正式发布** | 需要 **Node.js `>= 22.15.0`**（依赖内置 `node:zlib` Zstd 编解码修复历史坏块） |
 
 ### 2. 运行全套自动化测试
 

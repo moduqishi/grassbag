@@ -96,9 +96,12 @@ jobs:
           echo "检测到可发版源码改动："
           echo "${changed}"
 
-      - name: Run release version script tests
+      - name: Run release version, bridge & runtime shim tests
         if: steps.gate.outputs.should_release == 'true'
-        run: npm run test:release
+        run: |
+          npm run test:release
+          (cd packages/dsh-gbridge && npm test)
+          node --test runtime/shims/*.test.mjs
 
       - name: Resolve release tag from release-version branch
         id: release_ref
@@ -252,12 +255,26 @@ jobs:
           echo "require_release_signing=true" >> "$GITHUB_OUTPUT"
           echo "已解码 Release 签名密钥：${ANDROID_KEYSTORE_PATH}"
 
-      - name: Install Flutter dependencies & verify version wiring
+      - name: Install dependencies & run full Dart/Flutter CI verification
         run: |
-          (cd "${FLUTTER_WORKDIR}" && flutter pub get)
+          (cd packages/gbridge-client-dart && dart pub get && dart analyze && dart test)
+          (cd "${FLUTTER_WORKDIR}" && flutter pub get && flutter analyze && flutter test)
           grep -nE "app\.getVersion" "${FLUTTER_WORKDIR}/lib/services/native_bridge.dart"
           grep -nE "getPackageInfo" "${FLUTTER_WORKDIR}/android/app/src/main/kotlin/dev/grassbag/grassbag/GrassBagBridgePlugin.kt"
           grep -nE "kGrassBagGitHubRepo" "${FLUTTER_WORKDIR}/lib/services/app_update_service.dart"
+
+      - name: Pack companion dsh-gbridge plugin tarball & compute SHA-256 before APK build
+        id: plugin_pkg
+        run: |
+          plugin_path="${RUNNER_TEMP}/dsh-gbridge.tgz"
+          node scripts/pack_gbridge_plugin.mjs \
+            --out "${plugin_path}" \
+            --github-output "$GITHUB_OUTPUT"
+          plugin_sha="$(sha256sum "${plugin_path}" | awk '{print $1}')"
+          {
+            echo "plugin_path=${plugin_path}"
+            echo "plugin_sha=${plugin_sha}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build signed ARM64 Release APK
         working-directory: ${{ env.FLUTTER_WORKDIR }}
@@ -269,7 +286,8 @@ jobs:
             --dart-define=BUILD_CHANNEL=${BUILD_CHANNEL} \
             --dart-define=GRASSBAG_GITHUB_REPO=${{ github.repository }} \
             --dart-define=GRASSBAG_VERSION_NAME=${{ needs.prepare_release.outputs.version_name }} \
-            --dart-define=GRASSBAG_BUILD_NUMBER=${{ needs.prepare_release.outputs.build_number }}
+            --dart-define=GRASSBAG_BUILD_NUMBER=${{ needs.prepare_release.outputs.build_number }} \
+            --dart-define=GRASSBAG_GBRIDGE_SHA256=${{ steps.plugin_pkg.outputs.plugin_sha }}
 
       - name: Verify APK versionName & versionCode match pubspec.yaml
         run: |
@@ -277,7 +295,7 @@ jobs:
             --file "${FLUTTER_WORKDIR}/build/app/outputs/apk/release/output-metadata.json" \
             --pubspec "${FLUTTER_WORKDIR}/pubspec.yaml"
 
-      - name: Package APK, dsh-gbridge plugin tarball & SHA-256 checksums
+      - name: Package APK & SHA-256 checksums
         id: package
         run: |
           source_apk="${FLUTTER_WORKDIR}/build/app/outputs/apk/release/app-release.apk"
@@ -285,16 +303,12 @@ jobs:
 
           apk_name="grassbag-v${{ needs.prepare_release.outputs.version }}-arm64-v8a.apk"
           apk_path="${RUNNER_TEMP}/${apk_name}"
-          plugin_path="${RUNNER_TEMP}/dsh-gbridge.tgz"
+          plugin_path="${{ steps.plugin_pkg.outputs.plugin_path }}"
+          plugin_sha="${{ steps.plugin_pkg.outputs.plugin_sha }}"
           sums_path="${RUNNER_TEMP}/SHA256SUMS.txt"
 
           cp "${source_apk}" "${apk_path}"
           apk_sha="$(sha256sum "${apk_path}" | awk '{print $1}')"
-
-          node scripts/pack_gbridge_plugin.mjs \
-            --out "${plugin_path}" \
-            --github-output "$GITHUB_OUTPUT"
-          plugin_sha="$(sha256sum "${plugin_path}" | awk '{print $1}')"
 
           {
             printf '%s  %s\n' "${apk_sha}" "${apk_name}"
@@ -305,23 +319,32 @@ jobs:
             echo "apk_name=${apk_name}"
             echo "apk_path=${apk_path}"
             echo "apk_sha=${apk_sha}"
+            echo "plugin_name=${{ steps.plugin_pkg.outputs.plugin_name }}"
+            echo "plugin_path=${plugin_path}"
+            echo "plugin_sha=${plugin_sha}"
             echo "sums_path=${sums_path}"
           } >> "$GITHUB_OUTPUT"
           ls -lh "${apk_path}" "${plugin_path}" "${sums_path}"
 
-      - name: Create release tag at the built commit
-        if: github.ref != format('refs/tags/{0}', needs.prepare_release.outputs.release_tag)
+      - name: Verify or create release tag at the exact built commit
         env:
           RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
           BUILT_SHA: ${{ needs.prepare_release.outputs.release_checkout_ref }}
         run: |
+          built_commit="$(git rev-parse "${BUILT_SHA}^{commit}")"
           if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            echo "标签 ${RELEASE_TAG} 已存在，跳过创建。"
+            git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force
+            existing_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "${existing_commit}" != "${built_commit}" ]]; then
+              echo "::error::标签 ${RELEASE_TAG} 已存在且指向不同提交 (${existing_commit} != ${built_commit})。可能上次 release-version 状态写回失败；已拒绝覆盖已有发版资产！"
+              exit 1
+            fi
+            echo "标签 ${RELEASE_TAG} 已存在且精确指向本次构建提交 ${built_commit}。"
             exit 0
           fi
-          git tag "${RELEASE_TAG}" "${BUILT_SHA}"
+          git tag "${RELEASE_TAG}" "${built_commit}"
           git push origin "refs/tags/${RELEASE_TAG}"
-          echo "已创建并推送标签 ${RELEASE_TAG} -> ${BUILT_SHA}"
+          echo "已创建并推送标签 ${RELEASE_TAG} -> ${built_commit}"
 
       - name: Generate release notes
         id: notes
@@ -351,6 +374,10 @@ jobs:
           RELEASE_SUMS_PATH: ${{ steps.package.outputs.sums_path }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+              echo "::error::GitHub Release ${RELEASE_TAG} 已存在，自动发版禁止覆写已发布的 Release 资产！请先同步 ${VERSION_STATE_BRANCH} 或手动通过 workflow_dispatch 补发同一提交。"
+              exit 1
+            fi
             gh release edit "${RELEASE_TAG}" \
               --repo "${RELEASE_REPO}" \
               --title "GrassBag ${RELEASE_TAG}" \

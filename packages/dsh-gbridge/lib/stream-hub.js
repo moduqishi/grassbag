@@ -392,6 +392,7 @@ export class StreamHub {
         }
       } else if (item.gatewayClientId && item.eventId) {
         let wireOutcome = outcome;
+        let pendingAlwaysAllow = null;
         if (!wireOutcome) {
           if (decision === 'pass') {
             wireOutcome = { kind: 'next' };
@@ -403,16 +404,7 @@ export class StreamHub {
                 item.payload?.toolName ?? item.payload?.tool ?? item.payload?.name ?? item.payload?.kind ?? '',
               ).trim().toLowerCase();
               if (toolKey && toolKey !== '*' && !toolKey.startsWith('phone_')) {
-                let set = this.sessionAlwaysAllowed.get(sidKey);
-                if (!set) {
-                  if (this.sessionAlwaysAllowed.size >= 256) {
-                    const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
-                    if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
-                  }
-                  set = new Set();
-                  this.sessionAlwaysAllowed.set(sidKey, set);
-                }
-                set.add(toolKey);
+                pendingAlwaysAllow = { sidKey, toolKey };
               }
             }
             const normalized = (d === 'allow' || d === 'approve' || d === 'allowed-once' || d === 'always')
@@ -460,6 +452,20 @@ export class StreamHub {
           signal,
           item.gatewayPeer,
         );
+        // Commit session-scoped persistent allow rule ONLY AFTER upstream DSH confirms the approval!
+        if (pendingAlwaysAllow) {
+          const { sidKey, toolKey } = pendingAlwaysAllow;
+          let set = this.sessionAlwaysAllowed.get(sidKey);
+          if (!set) {
+            if (this.sessionAlwaysAllowed.size >= 256) {
+              const oldestKey = this.sessionAlwaysAllowed.keys().next().value;
+              if (oldestKey !== undefined) this.sessionAlwaysAllowed.delete(oldestKey);
+            }
+            set = new Set();
+            this.sessionAlwaysAllowed.set(sidKey, set);
+          }
+          set.add(toolKey);
+        }
       }
       this.pendingInteractions.delete(id);
       this.publish('host', 'interaction.resolved', { id, kind: item.kind, settledBy: 'gbridge' });

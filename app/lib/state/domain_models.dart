@@ -1196,6 +1196,33 @@ class ModelEffortOption {
         'max' => '极高',
         _ => name,
       };
+
+  /// Concise Chinese description shown in iOS Liquid Glass thinking-effort menus.
+  String get zhSubtitle {
+    final raw = description.trim();
+    if (raw.isNotEmpty) return raw;
+    return switch (id.toLowerCase()) {
+      'off' || 'none' => '直接输出，响应最快',
+      'minimal' => '极简推理，低延迟直答',
+      'low' => '轻度思考，日常对话高效',
+      'medium' || 'mid' => '均衡速度与推理质量',
+      'high' => '深度分析，复杂任务推荐',
+      'xhigh' || 'very_high' || 'very-high' => '多步严密推演，攻克难题',
+      'max' => '极限思考预算，最高精度',
+      'auto' => '按问题复杂度自动调节',
+      _ => '调整当前模型的思考深度',
+    };
+  }
+
+  /// Normalized 0..4 visual depth level for iOS-style effort intensity bars.
+  int get depthLevel => switch (id.toLowerCase()) {
+        'off' || 'none' => 0,
+        'minimal' || 'low' => 1,
+        'medium' || 'mid' || 'auto' => 2,
+        'high' => 3,
+        'xhigh' || 'very_high' || 'very-high' || 'max' => 4,
+        _ => 2,
+      };
 }
 
 /// Real model entry from DSH `session/modelCatalog`.

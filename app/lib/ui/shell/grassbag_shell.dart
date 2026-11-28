@@ -91,9 +91,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   final ValueNotifier<double> _topBannerStackHeight = ValueNotifier<double>(0.0);
   final ValueNotifier<bool> _drawerOpenForBackNotifier = ValueNotifier<bool>(false);
   late final Listenable _backScopeListenable;
-  Ticker? _streamScrollTicker;
-  Duration? _lastScrollTick;
-  double _streamSettleRemainingMs = 0.0;
+  Timer? _streamSettleTimer;
+  bool _streamStickWindowActive = false;
 
   bool _userScrolledAway = false;
   bool _userDraggingList = false;
@@ -131,6 +130,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       upperBound: 1.0,
     );
     _drawerCtrl.addListener(_syncDrawerBackState);
+    _scrollCtrl.onLargeStreamGrowth = _handleLargeStreamGrowth;
     _backScopeListenable = Listenable.merge([
       _drawerOpenForBackNotifier,
       _plusOpenNotifier,
@@ -173,7 +173,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     _highlightClearTimer?.cancel();
     _inChatSearchCtrl.dispose();
     _inChatSearchFocus.dispose();
-    _streamScrollTicker?.dispose();
+    _streamSettleTimer?.cancel();
+    _scrollCtrl.onLargeStreamGrowth = null;
     _composerFocus.removeListener(_onComposerFocusChanged);
     _drawerCtrl.removeListener(_syncDrawerBackState);
     _composerFocus.dispose();
@@ -194,82 +195,64 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     super.dispose();
   }
 
-  /// Starts a single silky 60/120Hz critically-damped scroll chase during live streaming,
-  /// replacing repeated cancelled `animateTo(110ms)` calls that caused vertical twitching!
-  void _ensureStreamScrollFollower({double settleTailMs = 0.0}) {
+  /// Synchronizes 0-frame lockstep bottom pinning on [_scrollCtrl].
+  /// Only active when the user is pinned at bottom AND streaming (or briefly settling after send),
+  /// and ALWAYS yields instantaneously to user drags/flings/selection auto-scroll.
+  void _syncStickToBottomLock() {
+    final active = !_userScrolledAway &&
+        !_userDraggingList &&
+        !_selectionAutoScrolling &&
+        (_streamStickWindowActive || (mounted && ref.read(appProvider).isStreaming));
+    _scrollCtrl.stickToBottom = active;
+    _scrollCtrl.allowImeAnchor = !_userScrolledAway && !_userDraggingList;
+  }
+
+  /// Arms zero-lag lockstep bottom pinning while live tokens stream or during a brief post-send settle.
+  /// Never runs an exponential lag-chase ticker that artificially yanks/tugs the scroll viewport!
+  void _armStreamBottomPin({int settleWindowMs = 220}) {
     if (_userScrolledAway) return;
-    if (settleTailMs > _streamSettleRemainingMs) {
-      _streamSettleRemainingMs = settleTailMs;
-    }
-    _streamScrollTicker ??= createTicker(_onStreamScrollTick);
-    if (!_streamScrollTicker!.isActive) {
-      _lastScrollTick = null;
-      _streamScrollTicker!.start();
-    }
+    _streamStickWindowActive = true;
+    _streamSettleTimer?.cancel();
+    _streamSettleTimer = Timer(Duration(milliseconds: settleWindowMs), () {
+      _streamStickWindowActive = false;
+      if (mounted) _syncStickToBottomLock();
+    });
+    _syncStickToBottomLock();
   }
 
-  void _stopStreamScrollFollower() {
-    if (_streamScrollTicker != null && _streamScrollTicker!.isActive) {
-      _streamScrollTicker!.stop();
-    }
-    _lastScrollTick = null;
-    _streamSettleRemainingMs = 0.0;
+  void _disarmStreamBottomPin() {
+    _streamSettleTimer?.cancel();
+    _streamSettleTimer = null;
+    _streamStickWindowActive = false;
+    _scrollCtrl.stickToBottom = false;
   }
 
-  void _onStreamScrollTick(Duration elapsed) {
-    if (!mounted || _userScrolledAway) {
-      _stopStreamScrollFollower();
-      return;
-    }
-    final prev = _lastScrollTick;
-    _lastScrollTick = elapsed;
-    final dtSec = prev == null
-        ? 0.016
-        : ((elapsed - prev).inMicroseconds / 1000000.0).clamp(0.004, 0.05);
-
-    if (_streamSettleRemainingMs > 0) {
-      _streamSettleRemainingMs = (_streamSettleRemainingMs - dtSec * 1000.0).clamp(0.0, 2000.0);
-    }
-    final inSettleTail = _streamSettleRemainingMs > 0.0;
-    if (!_scrollCtrl.hasClients || _scrollCtrl.positions.length != 1) {
-      if (!inSettleTail) _stopStreamScrollFollower();
-      return;
-    }
-
-    final pos = _scrollCtrl.position;
-    // Never fight the user while they are actively touching, dragging, flinging, or
-    // edge-selecting the list, and never fight an active programmatic `animateTo()` glide!
-    if (_userDraggingList ||
+  /// Called only when a single frame adds a very large block (>180px, e.g. image or big card)
+  /// while pinned at bottom, gliding smoothly ONCE instead of teleporting or rubber-band tugging.
+  void _handleLargeStreamGrowth() {
+    if (!mounted ||
+        _userScrolledAway ||
+        _userDraggingList ||
         _selectionAutoScrolling ||
-        _scrollCtrl.isUserDrivenScroll ||
-        _isProgrammaticScroll) {
+        _isProgrammaticScroll ||
+        !_scrollCtrl.hasClients ||
+        _scrollCtrl.positions.length != 1) {
       return;
     }
-    final gap = pos.maxScrollExtent - pos.pixels;
-    if (gap <= 24.0) {
-      if (_showScrollToBottomNotifier.value) {
-        _showScrollToBottomNotifier.value = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          _userScrolledAway ||
+          _userDraggingList ||
+          _selectionAutoScrolling ||
+          _isProgrammaticScroll ||
+          !_scrollCtrl.hasClients ||
+          _scrollCtrl.positions.length != 1) {
+        return;
       }
-      if (_hasNewBelowNotifier.value) {
-        _hasNewBelowNotifier.value = false;
-      }
-    }
-    if (gap > 0.5) {
-      final rawStep = gap <= 2.0 ? gap : gap * (1.0 - math.exp(-16.0 * dtSec));
-      // Cap per-frame jump when catching up over a large distance so scroll stays graceful.
-      final maxFrameStep = math.max(96.0, pos.viewportDimension * 0.42) * (dtSec / 0.016);
-      final step = math.min(rawStep, maxFrameStep);
-      final next = (pos.pixels + step).clamp(pos.minScrollExtent, pos.maxScrollExtent);
-      _isProgrammaticScroll = true;
-      try {
-        _scrollCtrl.chaseTo(next);
-      } finally {
-        _isProgrammaticScroll = false;
-      }
-    } else if (!inSettleTail) {
-      // Stop spinning immediately once caught up at bottom; woken automatically on next streamTick!
-      _stopStreamScrollFollower();
-    }
+      final pos = _scrollCtrl.position;
+      if ((pos.maxScrollExtent - pos.pixels) <= 2.0) return;
+      _performScrollToBottom(animated: true, durationMs: 200);
+    });
   }
 
   bool _isTablet(BuildContext context) {
@@ -350,30 +333,22 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
   void _scheduleScrollToBottom({
     bool animated = true,
     bool settle = false,
-    int durationMs = 320,
+    int durationMs = 220,
   }) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _performScrollToBottom(animated: animated, durationMs: durationMs);
-      if (settle) {
-        // Secondary pass after tall newly-inserted bubbles & process blocks finish measuring.
-        Future<void>.delayed(const Duration(milliseconds: 70), () {
-          if (mounted && !_userScrolledAway) {
-            _performScrollToBottom(animated: animated, durationMs: durationMs);
-          }
-        });
-      }
     });
   }
 
-  void _performScrollToBottom({required bool animated, int durationMs = 320}) {
+  void _performScrollToBottom({required bool animated, int durationMs = 220}) {
     if (!mounted || !_scrollCtrl.hasClients || _scrollCtrl.positions.length != 1) return;
     final pos = _scrollCtrl.position;
     final target = pos.maxScrollExtent;
-    final needsImmediate = (target - pos.pixels).abs() >= 1.5;
-    if (animated && !needsImmediate) return;
+    final gap = (target - pos.pixels).abs();
+    if (gap < 1.5) return;
 
     final gen = ++_programmaticScrollGen;
-    void reanchor(int remaining) {
+    void reanchorInitial(int remaining) {
       if (remaining <= 0) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted ||
@@ -392,44 +367,40 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           } finally {
             if (_programmaticScrollGen == gen) _isProgrammaticScroll = false;
           }
-          reanchor(remaining - 1);
+          reanchorInitial(remaining - 1);
         }
       });
     }
 
-    if (animated) {
+    if (animated && gap > 12.0 && !MediaQuery.disableAnimationsOf(context)) {
       _isProgrammaticScroll = true;
       _scrollCtrl
           .animateTo(
             target,
             duration: Duration(milliseconds: durationMs),
-            curve: durationMs <= 140 ? Curves.easeOut : Curves.easeOutCubic,
+            curve: Curves.easeOutCubic,
           )
           .whenComplete(() {
             if (_programmaticScrollGen == gen) {
               _isProgrammaticScroll = false;
-              // Bounded multi-pass post-frame re-anchor so tall lazy Markdown/code blocks
-              // materialized near bottom NEVER leave scroll-to-bottom stranded above bottom!
-              if (mounted &&
-                  !_userScrolledAway &&
-                  _scrollCtrl.hasClients &&
-                  _scrollCtrl.positions.length == 1) {
-                reanchor(4);
-              }
+              if (mounted) _syncStickToBottomLock();
             }
           });
     } else {
-      if (needsImmediate) {
-        _isProgrammaticScroll = true;
-        try {
-          _scrollCtrl.jumpTo(target);
-        } finally {
-          if (_programmaticScrollGen == gen) {
-            _isProgrammaticScroll = false;
-          }
+      _isProgrammaticScroll = true;
+      try {
+        _scrollCtrl.jumpTo(target);
+      } finally {
+        if (_programmaticScrollGen == gen) {
+          _isProgrammaticScroll = false;
         }
       }
-      reanchor(6);
+      if (!animated) {
+        // Initial history open only: absorb 2 post-frame lazy sliver layouts cleanly.
+        reanchorInitial(2);
+      } else if (mounted) {
+        _syncStickToBottomLock();
+      }
     }
   }
 
@@ -444,7 +415,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     // Pause streaming auto-follow so loading older history NEVER yanks the user back to bottom!
     _userScrolledAway = true;
     _scrollCtrl.allowImeAnchor = false;
-    _stopStreamScrollFollower();
+    _disarmStreamBottomPin();
     await ref.read(appProvider.notifier).loadOlderTurns();
     if (!mounted) return;
     final afterState = ref.read(appProvider);
@@ -625,7 +596,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     if (idx < 0) return;
     _userScrolledAway = true;
     _scrollCtrl.allowImeAnchor = false;
-    _stopStreamScrollFollower();
+    _disarmStreamBottomPin();
     setState(() => _highlightedTurnId = turnId);
     _highlightClearTimer?.cancel();
     _highlightClearTimer = Timer(const Duration(milliseconds: 2200), () {
@@ -816,11 +787,10 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     final maxExtent = notification.metrics.maxScrollExtent;
     final pixels = notification.metrics.pixels;
     final distFromBottom = (maxExtent - pixels).clamp(0.0, double.infinity);
-    final wasScrolledAway = _userScrolledAway;
 
-    // Detect ONLY genuine user-initiated upward scroll across touch drag, mouse wheel,
-    // trackpad, and keyboard — NEVER trip `_userScrolledAway` when `maxScrollExtent`
-    // grows dynamically from streaming text, expanded tool cards, or IME opening!
+    // Absolute user ownership: ANY upward touch drag, mouse wheel up, or upward fling
+    // IMMEDIATELY detaches stick-to-bottom — even by 1px near the bottom — and NEVER
+    // snaps the user back down when they lift their finger!
     if (notification is ScrollStartNotification) {
       if (!_isProgrammaticScroll) {
         _upwardScrollAccum = 0.0;
@@ -828,17 +798,20 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       if (notification.dragDetails != null) {
         _userDraggingList = true;
         _scrollCtrl.clearPendingImeAnchor();
+        _syncStickToBottomLock();
         if (_suggestionsOpenNotifier.value) {
           _suggestionsOpenNotifier.value = false;
         }
       }
     } else if (notification is UserScrollNotification) {
-      if (notification.direction == ScrollDirection.forward && distFromBottom > 28) {
+      if (notification.direction == ScrollDirection.forward) {
         _isProgrammaticScroll = false;
         _userScrolledAway = true;
-      } else if (notification.direction == ScrollDirection.reverse && distFromBottom <= 24) {
+        _disarmStreamBottomPin();
+      } else if (notification.direction == ScrollDirection.reverse && distFromBottom <= 16.0) {
         _userScrolledAway = false;
         _upwardScrollAccum = 0.0;
+        _syncStickToBottomLock();
       }
     } else if (notification is ScrollUpdateNotification) {
       final delta = notification.scrollDelta ?? 0.0;
@@ -856,87 +829,65 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
           _suggestionsOpenNotifier.value = false;
         }
       }
-      if (notification.dragDetails != null && (delta < -0.5 || _upwardScrollAccum >= 2.5)) {
+      if (notification.dragDetails != null && (delta < -0.5 || _upwardScrollAccum >= 1.5)) {
+        // User actively dragged upward -> yield control immediately!
         _isProgrammaticScroll = false;
         _userScrolledAway = true;
+        _disarmStreamBottomPin();
       } else if (!_isProgrammaticScroll &&
           (delta < -0.5 || _upwardScrollAccum >= 2.0) &&
           maxExtent >= _lastMaxScrollExtent - 1.0 &&
-          pixels <= maxExtent - 1.0 &&
-          distFromBottom > 16.0) {
-        // Require `distFromBottom > 16` AND `pixels <= maxExtent - 1` so BouncingScrollPhysics
-        // shrink/clamp rebound (e.g. process-block fold or IME dismiss) never falsely detaches!
+          pixels <= maxExtent - 1.0) {
+        // Ballistic upward fling / wheel scroll -> yield control immediately!
         _userScrolledAway = true;
-      } else if (!_isProgrammaticScroll && delta > 0.5 && distFromBottom <= 24) {
+        _disarmStreamBottomPin();
+      } else if (!_isProgrammaticScroll && delta > 0.5 && distFromBottom <= 16.0) {
+        // User explicitly scrolled DOWN back to the bottom dock -> re-pin seamlessly!
         _userScrolledAway = false;
         _upwardScrollAccum = 0.0;
+        _syncStickToBottomLock();
       }
     } else if (notification is ScrollEndNotification) {
-      // ALWAYS clear `_userDraggingList` on ScrollEndNotification so touching the list
-      // during a programmatic animation can NEVER permanently lock auto-follow!
       _userDraggingList = false;
       if (!_isProgrammaticScroll) {
         _upwardScrollAccum = 0.0;
-        if (distFromBottom <= 24) {
-          _userScrolledAway = false;
-        }
       }
+      // Re-sync lockstep ONLY if already pinned (NEVER override an intentional upward scroll!).
+      _syncStickToBottomLock();
     }
 
-    if (wasScrolledAway && !_userScrolledAway && !_isProgrammaticScroll && ref.read(appProvider).isStreaming) {
-      _ensureStreamScrollFollower(settleTailMs: 260.0);
-    }
-
-    if (distFromBottom <= 24 && _hasNewBelowNotifier.value) {
+    if (distFromBottom <= 16.0 && _hasNewBelowNotifier.value) {
       _hasNewBelowNotifier.value = false;
     }
 
-    _scrollCtrl.allowImeAnchor = !_userScrolledAway && !_userDraggingList;
+    _syncStickToBottomLock();
     _lastMaxScrollExtent = maxExtent;
 
-    final isActivelyAutoFollowing = !_userScrolledAway && (_streamScrollTicker?.isActive ?? false);
+    final isPinned = !_userScrolledAway && _scrollCtrl.stickToBottom;
     final hasLiveOrNewBelow = _hasNewBelowNotifier.value || ref.read(appProvider).isStreaming;
     final showThreshold = (hasLiveOrNewBelow && _userScrolledAway) ? 36.0 : 120.0;
     final shouldShowBtn =
-        distFromBottom > showThreshold && !_isProgrammaticScroll && !isActivelyAutoFollowing;
+        distFromBottom > showThreshold && !_isProgrammaticScroll && !isPinned;
     if (shouldShowBtn != _showScrollToBottomNotifier.value) {
       _showScrollToBottomNotifier.value = shouldShowBtn;
     }
     return false;
   }
 
-  /// Reacts immediately whenever chat content height grows (typewriter lines, markdown tables,
-  /// expanded tool rows, composer height, or soft keyboard tail) while anchored at bottom!
+  /// Keeps floating scroll-to-bottom pill accurate when content height grows during streaming.
+  /// Actual bottom pinning runs in 0-frame lockstep inside `_ImeLockStepScrollPosition`!
   bool _handleScrollMetricsNotification(ScrollMetricsNotification notification) {
     if (notification.depth != 0 || notification.metrics.axis != Axis.vertical) return false;
     final maxExtent = notification.metrics.maxScrollExtent;
     final pixels = notification.metrics.pixels;
-    final prevMax = _lastMaxScrollExtent;
-    final grew = maxExtent > prevMax + 1.0;
     final distFromBottom = (maxExtent - pixels).clamp(0.0, double.infinity);
-    final wasNearBottom = (prevMax - pixels).clamp(0.0, double.infinity) <= 48.0;
     _lastMaxScrollExtent = maxExtent;
 
-    // ONLY auto-follow growth while actively streaming or during the explicit send/stream settle tail!
-    // Run BEFORE evaluating `shouldShowBtn` so large markdown tables/code blocks never flash the
-    // scroll-to-bottom pill for 1 frame before the 120Hz follower engages!
-    final streamingOrSettling =
-        _streamSettleRemainingMs > 0 || ref.read(appProvider).isStreaming;
-    if (grew &&
-        streamingOrSettling &&
-        distFromBottom > 1.5 &&
-        !_isProgrammaticScroll &&
-        !_userScrolledAway &&
-        !_userDraggingList &&
-        (wasNearBottom || _streamSettleRemainingMs > 0)) {
-      _ensureStreamScrollFollower(settleTailMs: 260.0);
-    }
-
-    final isActivelyAutoFollowing = !_userScrolledAway && (_streamScrollTicker?.isActive ?? false);
+    final isPinned = !_userScrolledAway && _scrollCtrl.stickToBottom;
     final hasLiveOrNewBelow = _hasNewBelowNotifier.value || ref.read(appProvider).isStreaming;
     final showThreshold = (hasLiveOrNewBelow && _userScrolledAway) ? 36.0 : 120.0;
     final shouldShowBtn =
-        distFromBottom > showThreshold && !_isProgrammaticScroll && !isActivelyAutoFollowing;
+        distFromBottom > showThreshold && !_isProgrammaticScroll && !isPinned;
     if (shouldShowBtn != _showScrollToBottomNotifier.value) {
       _showScrollToBottomNotifier.value = shouldShowBtn;
     }
@@ -952,46 +903,14 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     if (s.activeSessionId != null) {
       _savedScrollOffsetBySession.remove('${s.activeHostId}::${s.activeSessionId}');
     }
-    _scrollCtrl.allowImeAnchor = true;
     if (_showScrollToBottomNotifier.value) {
       _showScrollToBottomNotifier.value = false;
     }
     if (_hasNewBelowNotifier.value) {
       _hasNewBelowNotifier.value = false;
     }
-    if (s.isStreaming) {
-      final hasLargeGap = _scrollCtrl.hasClients &&
-          _scrollCtrl.positions.length == 1 &&
-          (_scrollCtrl.position.maxScrollExtent - _scrollCtrl.position.pixels) >
-              _scrollCtrl.position.viewportDimension;
-      if (hasLargeGap) {
-        // Glide gracefully across long history with easeOutCubic first, then hand off to
-        // the 120Hz critically-damped follower for live streaming tail lock!
-        _stopStreamScrollFollower();
-        final gen = ++_programmaticScrollGen;
-        _isProgrammaticScroll = true;
-        _scrollCtrl
-            .animateTo(
-              _scrollCtrl.position.maxScrollExtent,
-              duration: const Duration(milliseconds: 280),
-              curve: Curves.easeOutCubic,
-            )
-            .whenComplete(() {
-              if (_programmaticScrollGen == gen) {
-                _isProgrammaticScroll = false;
-                if (mounted && !_userScrolledAway) {
-                  _ensureStreamScrollFollower(settleTailMs: 360.0);
-                }
-              }
-            });
-      } else {
-        // Cooperate cleanly with the 120Hz follower instead of fighting animateTo vs jumpTo!
-        _ensureStreamScrollFollower(settleTailMs: 360.0);
-      }
-    } else {
-      _stopStreamScrollFollower();
-      _performScrollToBottom(animated: true);
-    }
+    _armStreamBottomPin(settleWindowMs: 280);
+    _performScrollToBottom(animated: true, durationMs: 240);
   }
 
   void _scheduleRestoreScrollOffset(double targetPixels) {
@@ -1198,26 +1117,232 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     );
   }
 
+  GrassBagLongPressMenuSpec _buildNewChatLongPressMenu(BuildContext context) {
+    final appState = ref.read(appProvider);
+    final ctrl = ref.read(appProvider.notifier);
+    final t = GrassBagTokens.of(context);
+    final wsName = appState.activeWorkspaceDisplayName;
+    final activeWsId = appState.activeWorkspace;
+
+    final otherWorkspaces = appState.workspaces
+        .where((w) =>
+            w.id != activeWsId &&
+            w.name != activeWsId &&
+            w.path != activeWsId &&
+            w.name.trim().isNotEmpty)
+        .take(3)
+        .toList(growable: false);
+
+    return GrassBagLongPressMenuSpec(
+      headerTitle: '新建对话',
+      headerSubtitle: wsName.isNotEmpty ? '当前工作区 · $wsName' : '快速选择新建方式',
+      menuWidth: 254.0,
+      preferAbove: false,
+      items: [
+        GrassBagContextMenuItem(
+          label: '空白新对话',
+          subtitle: '在当前工作区开启全新对话',
+          icon: CupertinoIcons.square_pencil,
+          accentColor: t.primary,
+          onTap: () {
+            _dismissKeyboardAndPopovers();
+            ctrl.startNewChat();
+          },
+        ),
+        GrassBagContextMenuItem(
+          label: '计划模式新对话',
+          subtitle: '先共同制定计划再执行改动',
+          icon: CupertinoIcons.list_bullet_indent,
+          accentColor: t.dusk,
+          onTap: () {
+            _dismissKeyboardAndPopovers();
+            ctrl.startNewChat();
+            unawaited(ctrl.setPlanMode(true));
+          },
+        ),
+        if (!appState.isEmptyChat)
+          GrassBagContextMenuItem(
+            label: '创建分支对话 (Fork)',
+            subtitle: '保留当前上下文分叉继续',
+            icon: CupertinoIcons.arrow_branch,
+            onTap: () {
+              _dismissKeyboardAndPopovers();
+              unawaited(ctrl.forkActiveSession());
+            },
+          ),
+        for (var i = 0; i < otherWorkspaces.length; i++)
+          GrassBagContextMenuItem(
+            label: '在「${otherWorkspaces[i].name}」新建',
+            subtitle: otherWorkspaces[i].path.isNotEmpty
+                ? otherWorkspaces[i].path
+                : null,
+            icon: CupertinoIcons.folder,
+            dividerBefore: i == 0,
+            onTap: () {
+              _dismissKeyboardAndPopovers();
+              final w = otherWorkspaces[i];
+              ctrl.startNewChat(workspace: w.id.isNotEmpty ? w.id : w.name);
+            },
+          ),
+      ],
+    );
+  }
+
+  GrassBagLongPressMenuSpec? _buildTitlePillLongPressMenu(BuildContext context) {
+    final appState = ref.read(appProvider);
+    final ctrl = ref.read(appProvider.notifier);
+    final t = GrassBagTokens.of(context);
+    final host = appState.activeHost;
+
+    // Empty chat -> instant iOS Liquid Glass Host Switcher!
+    if (appState.isEmptyChat || appState.activeSession == null) {
+      final hosts = appState.hosts;
+      return GrassBagLongPressMenuSpec(
+        headerTitle: '切换运行主机',
+        headerSubtitle: host.isLocal ? '当前：本机运行环境' : '当前：${host.address}',
+        menuWidth: 260.0,
+        preferAbove: false,
+        items: [
+          for (final h in hosts.take(6))
+            GrassBagContextMenuItem(
+              label: h.name,
+              subtitle: h.isLocal ? '本机运行环境' : h.address,
+              icon: h.isLocal
+                  ? CupertinoIcons.device_phone_portrait
+                  : CupertinoIcons.desktopcomputer,
+              selected: h.id == appState.activeHostId,
+              accentColor: h.id == appState.activeHostId
+                  ? t.primary
+                  : (h.online ? t.ok : null),
+              badge: h.id == appState.activeHostId
+                  ? null
+                  : (h.online ? '在线' : null),
+              onTap: () {
+                if (h.id != appState.activeHostId) {
+                  unawaited(ctrl.switchHost(h.id));
+                }
+              },
+            ),
+          GrassBagContextMenuItem(
+            label: '管理与添加主机…',
+            icon: CupertinoIcons.slider_horizontal_3,
+            dividerBefore: hosts.isNotEmpty,
+            onTap: () => _openSettings(initialSection: SettingsSection.hosts),
+          ),
+        ],
+      );
+    }
+
+    final active = appState.activeSession!;
+    final isTab = _isTablet(context);
+    final media = MediaQuery.of(context);
+    final canDualPane = media.size.width >= 1080;
+    final wbOpen =
+        appState.tabletWorkbenchOpen && (canDualPane || !appState.tabletSidebarOpen);
+    final multiHost = !host.isLocal || appState.hosts.length > 1;
+
+    return GrassBagLongPressMenuSpec(
+      headerTitle: active.title,
+      headerSubtitle: appState.activeWorkspaceDisplayName.isNotEmpty
+          ? '${appState.activeWorkspaceDisplayName} · ${host.name}'
+          : host.name,
+      menuWidth: 266.0,
+      preferAbove: false,
+      quickActions: [
+        GrassBagContextMenuQuickAction(
+          label: '搜索',
+          icon: CupertinoIcons.search,
+          onTap: _openInChatSearch,
+        ),
+        GrassBagContextMenuQuickAction(
+          label: '大纲',
+          icon: CupertinoIcons.list_number,
+          onTap: _showTurnOutlineSheet,
+        ),
+        GrassBagContextMenuQuickAction(
+          label: '分支',
+          icon: CupertinoIcons.arrow_branch,
+          onTap: () => unawaited(ctrl.forkActiveSession()),
+        ),
+        GrassBagContextMenuQuickAction(
+          label: '终端',
+          icon: CupertinoIcons.chevron_left_slash_chevron_right,
+          onTap: _openTerminal,
+        ),
+      ],
+      items: [
+        if (isTab)
+          GrassBagContextMenuItem(
+            label: wbOpen ? '收起右侧工作台' : '展开右侧工作台',
+            subtitle: '文件、Git 改动、终端与轨迹',
+            icon: CupertinoIcons.sidebar_right,
+            selected: wbOpen,
+            onTap: () {
+              final nextOpen = !wbOpen;
+              if (nextOpen && !canDualPane && ref.read(appProvider).tabletSidebarOpen) {
+                ctrl.setTabletSidebarOpen(false);
+              }
+              ctrl.setTabletWorkbenchOpen(nextOpen);
+            },
+          )
+        else
+          GrassBagContextMenuItem(
+            label: '对话详情与工作台',
+            subtitle: '文件、Git 改动、上下文与终端',
+            icon: CupertinoIcons.sidebar_right,
+            onTap: _openSessionDetail,
+          ),
+        GrassBagContextMenuItem(
+          label: '重命名对话',
+          icon: CupertinoIcons.pencil,
+          onTap: () => showRenameSessionSheet(context, ref, active),
+        ),
+        GrassBagContextMenuItem(
+          label: '导出为 Markdown',
+          icon: CupertinoIcons.share,
+          onTap: () => ctrl.exportActiveSession(),
+        ),
+        if (!host.directMode)
+          GrassBagContextMenuItem(
+            label: '导出完整会话 ZIP',
+            subtitle: '含对话全文、附件与子代理记录',
+            icon: CupertinoIcons.archivebox,
+            onTap: () => unawaited(ctrl.exportActiveSessionZip()),
+          ),
+        if (multiHost)
+          GrassBagContextMenuItem(
+            label: '切换主机 · ${host.name}',
+            subtitle: host.isLocal ? '本机运行环境' : host.address,
+            icon: CupertinoIcons.desktopcomputer,
+            dividerBefore: true,
+            onTap: () => showHostQuickSheet(
+              context,
+              ref,
+              onOpenHostSettings: () => _openSettings(
+                initialSection: SettingsSection.hosts,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
   void _openSessionTitleAction({bool forceMenu = false}) {
     final active = ref.read(appProvider).activeSession;
     if ((!_isTablet(context) && !forceMenu) || active == null) {
       _openSessionDetail();
       return;
     }
-    final isTab = _isTablet(context);
-    final ctrl = ref.read(appProvider.notifier);
-    final appState = ref.read(appProvider);
+    final spec = _buildTitlePillLongPressMenu(context);
+    if (spec == null) return;
+    final tier = ref.read(appProvider).glassTier;
     final media = MediaQuery.of(context);
-    final canDualPane = media.size.width >= 1080;
-    final wbOpen =
-        appState.tabletWorkbenchOpen && (canDualPane || !appState.tabletSidebarOpen);
-    final tier = appState.glassTier;
-    final host = appState.activeHost;
-    final multiHost = !host.isLocal || appState.hosts.length > 1;
+    Rect? targetRect;
     var anchor = Offset(media.size.width * 0.5, media.viewPadding.top + 64);
     final pillRender = _titlePillKey.currentContext?.findRenderObject();
     if (pillRender is RenderBox && pillRender.hasSize && pillRender.attached) {
       final topLeft = pillRender.localToGlobal(Offset.zero);
+      targetRect = topLeft & pillRender.size;
       anchor = Offset(
         topLeft.dx + pillRender.size.width * 0.5,
         topLeft.dy + pillRender.size.height + 8.0,
@@ -1227,81 +1352,14 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       showGrassBagGlassContextMenu(
         context,
         tier: tier,
+        targetRect: targetRect,
         globalAnchor: anchor,
-        headerTitle: active.title,
-        items: [
-          if (multiHost)
-            GrassBagContextMenuItem(
-              label: '切换主机 · ${host.name}',
-              subtitle: host.isLocal ? '本机运行环境' : host.address,
-              icon: CupertinoIcons.desktopcomputer,
-              onTap: () => showHostQuickSheet(
-                context,
-                ref,
-                onOpenHostSettings: () => _openSettings(
-                  initialSection: SettingsSection.hosts,
-                ),
-              ),
-            ),
-          GrassBagContextMenuItem(
-            label: '搜索当前对话',
-            subtitle: '快速检索消息与工具记录',
-            icon: CupertinoIcons.search,
-            dividerBefore: multiHost,
-            onTap: _openInChatSearch,
-          ),
-          GrassBagContextMenuItem(
-            label: '提问大纲',
-            subtitle: '按轮次跳转历史提问',
-            icon: CupertinoIcons.list_number,
-            onTap: _showTurnOutlineSheet,
-          ),
-          if (isTab)
-            GrassBagContextMenuItem(
-              label: wbOpen ? '收起右侧工作台' : '展开右侧工作台',
-              subtitle: '文件、Git 改动、终端与轨迹',
-              icon: CupertinoIcons.sidebar_right,
-              selected: wbOpen,
-              dividerBefore: true,
-              onTap: () {
-                final nextOpen = !wbOpen;
-                if (nextOpen && !canDualPane && ref.read(appProvider).tabletSidebarOpen) {
-                  ctrl.setTabletSidebarOpen(false);
-                }
-                ctrl.setTabletWorkbenchOpen(nextOpen);
-              },
-            )
-          else
-            GrassBagContextMenuItem(
-              label: '对话详情与工作台',
-              subtitle: '文件、Git 改动、上下文与终端',
-              icon: CupertinoIcons.sidebar_right,
-              dividerBefore: true,
-              onTap: _openSessionDetail,
-            ),
-          GrassBagContextMenuItem(
-            label: '重命名对话',
-            icon: CupertinoIcons.pencil,
-            onTap: () => showRenameSessionSheet(context, ref, active),
-          ),
-          GrassBagContextMenuItem(
-            label: '创建分支对话 (Fork)',
-            subtitle: '保留上下文分叉探索',
-            icon: CupertinoIcons.arrow_branch,
-            onTap: () => ctrl.forkActiveSession(),
-          ),
-          GrassBagContextMenuItem(
-            label: '导出为 Markdown',
-            icon: CupertinoIcons.share,
-            onTap: () => ctrl.exportActiveSession(),
-          ),
-          GrassBagContextMenuItem(
-            label: '打开交互终端',
-            icon: CupertinoIcons.chevron_left_slash_chevron_right,
-            dividerBefore: true,
-            onTap: _openTerminal,
-          ),
-        ],
+        headerTitle: spec.headerTitle,
+        headerSubtitle: spec.headerSubtitle,
+        quickActions: spec.quickActions,
+        menuWidth: spec.menuWidth,
+        preferAbove: spec.preferAbove,
+        items: spec.items,
       ),
     );
   }
@@ -1337,7 +1395,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     });
 
     void resetScrollAnchoring() {
-      _stopStreamScrollFollower();
+      _disarmStreamBottomPin();
       _lastMaxScrollExtent = 0.0;
       _upwardScrollAccum = 0.0;
       _animatedTurnIds.clear();
@@ -1457,6 +1515,17 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     // Switching to another historical session -> restore saved reading spot if previously
     // scrolled up AND the anchor turn matches (guards against cache eviction / reconnect shifts),
     // otherwise silently anchor at the latest message via instant jumpTo.
+    ref.listen<int>(appProvider.select((s) => s.openJobsSignal), (prev, next) {
+      if (prev != null && next != prev && mounted) {
+        if (_drawerCtrl.value > 0.01) {
+          _animateDrawerTo(0.0);
+        }
+        Navigator.of(context).push(
+          GrassBagPageRoute<void>(builder: (_) => const JobsPage()),
+        );
+      }
+    });
+
     ref.listen<int>(appProvider.select((s) => s.sessionJumpSignal), (prev, next) {
       if (prev != null && next != prev) {
         resetScrollAnchoring();
@@ -1486,8 +1555,8 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       }
     });
 
-    // React to every newly sent prompt -> halt any upward fling inertia, glide smoothly if
-    // far above bottom, and hand off cleanly to the 120Hz critically-damped scroll follower!
+    // React to every newly sent prompt -> halt any upward fling inertia, glide ONCE smoothly
+    // to the newly inserted turn, and hand off seamlessly to 0-frame lockstep bottom pinning!
     ref.listen<int>(appProvider.select((s) => s.scrollSignal), (prev, next) {
       if (prev != null && next != prev) {
         _scrollCtrl.cancelMomentumAndHold();
@@ -1497,67 +1566,42 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         if (s.activeSessionId != null) {
           _savedScrollOffsetBySession.remove('${s.activeHostId}::${s.activeSessionId}');
         }
-        _scrollCtrl.allowImeAnchor = true;
         if (_showScrollToBottomNotifier.value) {
           _showScrollToBottomNotifier.value = false;
         }
         if (_hasNewBelowNotifier.value) {
           _hasNewBelowNotifier.value = false;
         }
-        // Defer scroll chase into post-frame so `maxScrollExtent` reflects the newly mounted
-        // optimistic turn instead of animating to the pre-send bottom and double-hopping!
+        _armStreamBottomPin(settleWindowMs: 260);
+        // Defer one frame so `maxScrollExtent` reflects the newly mounted turn, then glide cleanly!
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted || _userScrolledAway) return;
-          final hasLargeGap = _scrollCtrl.hasClients &&
-              _scrollCtrl.positions.length == 1 &&
-              (_scrollCtrl.position.maxScrollExtent - _scrollCtrl.position.pixels) >
-                  _scrollCtrl.position.viewportDimension;
-          if (hasLargeGap) {
-            _stopStreamScrollFollower();
-            final gen = ++_programmaticScrollGen;
-            _isProgrammaticScroll = true;
-            _scrollCtrl
-                .animateTo(
-                  _scrollCtrl.position.maxScrollExtent,
-                  duration: const Duration(milliseconds: 260),
-                  curve: Curves.easeOutCubic,
-                )
-                .whenComplete(() {
-                  if (_programmaticScrollGen == gen) {
-                    _isProgrammaticScroll = false;
-                    if (mounted && !_userScrolledAway) {
-                      _ensureStreamScrollFollower(settleTailMs: 360.0);
-                    }
-                  }
-                });
-          } else {
-            _ensureStreamScrollFollower(settleTailMs: 360.0);
-          }
+          _performScrollToBottom(animated: true, durationMs: 220);
         });
       }
     });
 
-    // React to live streaming chunks AND background-completed cached-session updates ->
-    // keep 120Hz smooth chase alive, or raise `_hasNewBelowNotifier` ("有新回复") when scrolled up!
+    // React to live streaming chunks -> keep 0-frame lockstep pin active if at bottom,
+    // or gently surface `_hasNewBelowNotifier` ("有新回复") when the user scrolled up to read!
     ref.listen<int>(appProvider.select((s) => s.streamTick), (prev, next) {
       if (prev != null && next != prev && ref.read(appProvider).turns.isNotEmpty) {
-        if (!_userScrolledAway && !_isProgrammaticScroll) {
-          _ensureStreamScrollFollower(settleTailMs: 280.0);
-        } else if (_userScrolledAway && !_hasNewBelowNotifier.value) {
+        if (!_userScrolledAway) {
+          _syncStickToBottomLock();
+        } else if (!_hasNewBelowNotifier.value) {
           _hasNewBelowNotifier.value = true;
         }
       }
     });
 
-    // When streaming starts/completes -> glide smoothly through the typewriter's completion
-    // tail, action strip SizeTransition, and post-turn deliverables sync, then stop automatically!
+    // When streaming starts/completes -> enable 0-frame lockstep while live, and release cleanly
+    // right after the brief completion settle so idle reading NEVER gets yanked!
     ref.listen<bool>(appProvider.select((s) => s.isStreaming), (prev, next) {
-      if (next == true && !_userScrolledAway && !_isProgrammaticScroll) {
-        _ensureStreamScrollFollower(settleTailMs: 320.0);
+      if (next == true && !_userScrolledAway) {
+        _armStreamBottomPin(settleWindowMs: 240);
       } else if (prev == true && next == false) {
-        if (!_userScrolledAway && !_isProgrammaticScroll) {
-          _ensureStreamScrollFollower(settleTailMs: 850.0);
-        } else if (_userScrolledAway && !_hasNewBelowNotifier.value) {
+        if (!_userScrolledAway) {
+          _armStreamBottomPin(settleWindowMs: 220);
+        } else if (!_hasNewBelowNotifier.value) {
           _hasNewBelowNotifier.value = true;
         }
       }
@@ -1733,7 +1777,7 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               onUserUpwardWheel: () {
                 if (!_userScrolledAway) {
                   _userScrolledAway = true;
-                  _stopStreamScrollFollower();
+                  _disarmStreamBottomPin();
                 }
               },
               onSelectionChanged: (plainText) {
@@ -1747,11 +1791,12 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
               getSelectedPlainText: () => _chatSelectedPlainText,
               onSelectionAutoScrollActiveChanged: (active) {
                 _selectionAutoScrolling = active;
+                _syncStickToBottomLock();
               },
               onSelectionAutoScrollStep: (deltaPx) {
                 if (deltaPx < -0.5) {
                   _userScrolledAway = true;
-                  _stopStreamScrollFollower();
+                  _disarmStreamBottomPin();
                 }
               },
               screenH: screenH,
@@ -1970,17 +2015,30 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                     SizedBox(
                                       width: 44,
                                       height: 44,
-                                      child: GrassBagGlassCircleButton(
-                                        key: const ValueKey('top-left-tab-new-chat'),
-                                        icon: CupertinoIcons.square_pencil,
-                                        iconSize: 18,
-                                        useOwnLayer: false,
-                                        tooltip: '新对话',
+                                      child: GrassBagGlassLongPressTrigger(
                                         tier: shellSlice.glassTier,
-                                        onTap: () {
-                                          _dismissKeyboardAndPopovers();
-                                          ctrl.startNewChat();
-                                        },
+                                        isCircle: true,
+                                        onWillOpen: _dismissKeyboardAndPopovers,
+                                        menuBuilder: _buildNewChatLongPressMenu,
+                                        liftedBuilder: (_) => GrassBagGlassCircleButton(
+                                          icon: CupertinoIcons.square_pencil,
+                                          iconSize: 18,
+                                          useOwnLayer: true,
+                                          tier: shellSlice.glassTier,
+                                          onTap: () {},
+                                        ),
+                                        child: GrassBagGlassCircleButton(
+                                          key: const ValueKey('top-left-tab-new-chat'),
+                                          icon: CupertinoIcons.square_pencil,
+                                          iconSize: 18,
+                                          useOwnLayer: false,
+                                          tooltip: '新对话 · 长按更多方式',
+                                          tier: shellSlice.glassTier,
+                                          onTap: () {
+                                            _dismissKeyboardAndPopovers();
+                                            ctrl.startNewChat();
+                                          },
+                                        ),
                                       ),
                                     ),
                                     const SizedBox(width: 10),
@@ -1997,9 +2055,151 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                               final clampedTitleScaler =
                                                   MediaQuery.textScalerOf(pillCtx)
                                                       .clamp(maxScaleFactor: 1.15);
+                                              final pillContent = AnimatedSize(
+                                                duration: GrassBagMotion.duration(
+                                                  context,
+                                                  const Duration(milliseconds: 220),
+                                                  reduced: const Duration(milliseconds: 1),
+                                                ),
+                                                curve: Curves.easeOutCubic,
+                                                alignment: Alignment.center,
+                                                child: AnimatedSwitcher(
+                                                  duration: GrassBagMotion.duration(
+                                                    context,
+                                                    const Duration(milliseconds: 180),
+                                                  ),
+                                                  switchInCurve: Curves.easeOutCubic,
+                                                  switchOutCurve: Curves.easeInCubic,
+                                                  child: showStackedHeader
+                                                    ? Column(
+                                                        key: ValueKey(
+                                                          'stacked:${shellSlice.hostId}:${shellSlice.activeWorkspaceName}:${shellSlice.activeSessionTitle}',
+                                                        ),
+                                                        mainAxisSize: MainAxisSize.min,
+                                                        mainAxisAlignment: MainAxisAlignment.center,
+                                                        children: [
+                                                          Row(
+                                                            mainAxisSize: MainAxisSize.min,
+                                                            children: [
+                                                              GrassBagStatusDot(
+                                                                size: 6.5,
+                                                                color: hostDotColor,
+                                                                pulsing: !hostHealthy &&
+                                                                    !hostHasErr &&
+                                                                    hostIsConnecting,
+                                                              ),
+                                                              const SizedBox(width: 6),
+                                                              Flexible(
+                                                                child: Text(
+                                                                  shellSlice.activeSessionTitle,
+                                                                  maxLines: 1,
+                                                                  overflow: TextOverflow.ellipsis,
+                                                                  textScaler: clampedTitleScaler,
+                                                                  style: TextStyle(
+                                                                    fontSize: 13.5,
+                                                                    fontWeight: FontWeight.w600,
+                                                                    height: 1.12,
+                                                                    letterSpacing: -0.25,
+                                                                    color: t.text,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                              if (isTab &&
+                                                                  shellSlice.hasActiveSession) ...[
+                                                                const SizedBox(width: 3),
+                                                                Icon(
+                                                                  CupertinoIcons.chevron_down,
+                                                                  size: 10,
+                                                                  color: t.text3,
+                                                                ),
+                                                              ] else if (!isTab &&
+                                                                  shellSlice.hasActiveSession) ...[
+                                                                const SizedBox(width: 3),
+                                                                Icon(
+                                                                  CupertinoIcons.chevron_right,
+                                                                  size: 10,
+                                                                  color: t.text3,
+                                                                ),
+                                                              ],
+                                                            ],
+                                                          ),
+                                                          const SizedBox(height: 1.5),
+                                                          Row(
+                                                            mainAxisSize: MainAxisSize.min,
+                                                            children: [
+                                                              Flexible(
+                                                                child: _HeaderLiveSubtitle(
+                                                                  workspaceName: shellSlice.activeWorkspaceName,
+                                                                  fallbackHostName: shellSlice.hostName,
+                                                                  showHostName: showHostInSub,
+                                                                  hostIsLocal: shellSlice.hostIsLocal,
+                                                                  textScaler: clampedTitleScaler,
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ],
+                                                      )
+                                                    : Row(
+                                                        key: ValueKey(
+                                                          shellSlice.isEmptyChat
+                                                              ? 'host:${shellSlice.hostId}:${shellSlice.hostName}'
+                                                              : '${shellSlice.hostId}:${shellSlice.activeSessionTitle}',
+                                                        ),
+                                                        mainAxisSize: MainAxisSize.min,
+                                                        children: [
+                                                          GrassBagStatusDot(
+                                                            size: 7,
+                                                            color: hostDotColor,
+                                                            pulsing: !hostHealthy &&
+                                                                !hostHasErr &&
+                                                                hostIsConnecting,
+                                                          ),
+                                                          const SizedBox(width: 7),
+                                                          Flexible(
+                                                            child: Text(
+                                                              shellSlice.isEmptyChat
+                                                                  ? shellSlice.hostName
+                                                                  : shellSlice.activeSessionTitle,
+                                                              maxLines: 1,
+                                                              overflow: TextOverflow.ellipsis,
+                                                              textScaler: clampedTitleScaler,
+                                                              style: TextStyle(
+                                                                fontSize: 14.5,
+                                                                fontWeight: FontWeight.w600,
+                                                                letterSpacing: -0.25,
+                                                                color: t.text,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          if (!shellSlice.isEmptyChat)
+                                                            _HeaderLiveStatusChip(
+                                                              textScaler: clampedTitleScaler,
+                                                            ),
+                                                          if (shellSlice.isEmptyChat ||
+                                                              (shellSlice.hasActiveSession && isTab)) ...[
+                                                            const SizedBox(width: 5),
+                                                            Icon(
+                                                              CupertinoIcons.chevron_down,
+                                                              size: 11,
+                                                              color: t.text3,
+                                                            ),
+                                                          ] else if (!isTab &&
+                                                              shellSlice.hasActiveSession) ...[
+                                                            const SizedBox(width: 4),
+                                                            Icon(
+                                                              CupertinoIcons.chevron_right,
+                                                              size: 10.5,
+                                                              color: t.text3,
+                                                            ),
+                                                          ],
+                                                        ],
+                                                      ),
+                                                ),
+                                              );
                                               final pillButton = Tooltip(
                                                 message: shellSlice.isEmptyChat
-                                                    ? '切换主机'
+                                                    ? '点击管理主机 · 长按快速切换'
                                                     : (isTab ? '对话操作与详情' : '点击打开工作台 · 长按更多操作'),
                                                 child: GrassBagGlassPillButton(
                                                   key: _titlePillKey,
@@ -2022,160 +2222,24 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                                           _dismissKeyboardAndPopovers();
                                                           _openSessionTitleAction();
                                                         },
-                                                  child: AnimatedSize(
-                                                    duration: GrassBagMotion.duration(
-                                                      context,
-                                                      const Duration(milliseconds: 220),
-                                                    ),
-                                                    curve: Curves.easeOutCubic,
-                                                    alignment: Alignment.center,
-                                                    child: AnimatedSwitcher(
-                                                      duration: GrassBagMotion.duration(
-                                                        context,
-                                                        const Duration(milliseconds: 180),
-                                                      ),
-                                                      switchInCurve: Curves.easeOutCubic,
-                                                      switchOutCurve: Curves.easeInCubic,
-                                                      child: showStackedHeader
-                                                        ? Column(
-                                                            key: ValueKey(
-                                                              'stacked:${shellSlice.hostId}:${shellSlice.activeWorkspaceName}:${shellSlice.activeSessionTitle}',
-                                                            ),
-                                                            mainAxisSize: MainAxisSize.min,
-                                                            mainAxisAlignment: MainAxisAlignment.center,
-                                                            children: [
-                                                              Row(
-                                                                mainAxisSize: MainAxisSize.min,
-                                                                children: [
-                                                                  GrassBagStatusDot(
-                                                                    size: 6.5,
-                                                                    color: hostDotColor,
-                                                                    pulsing: !hostHealthy &&
-                                                                        !hostHasErr &&
-                                                                        hostIsConnecting,
-                                                                  ),
-                                                                  const SizedBox(width: 6),
-                                                                  Flexible(
-                                                                    child: Text(
-                                                                      shellSlice.activeSessionTitle,
-                                                                      maxLines: 1,
-                                                                      overflow: TextOverflow.ellipsis,
-                                                                      textScaler: clampedTitleScaler,
-                                                                      style: TextStyle(
-                                                                        fontSize: 13.5,
-                                                                        fontWeight: FontWeight.w600,
-                                                                        height: 1.12,
-                                                                        letterSpacing: -0.25,
-                                                                        color: t.text,
-                                                                      ),
-                                                                    ),
-                                                                  ),
-                                                                  if (isTab &&
-                                                                      shellSlice.hasActiveSession) ...[
-                                                                    const SizedBox(width: 3),
-                                                                    Icon(
-                                                                      CupertinoIcons.chevron_down,
-                                                                      size: 10,
-                                                                      color: t.text3,
-                                                                    ),
-                                                                  ] else if (!isTab &&
-                                                                      shellSlice.hasActiveSession) ...[
-                                                                    const SizedBox(width: 3),
-                                                                    Icon(
-                                                                      CupertinoIcons.chevron_right,
-                                                                      size: 10,
-                                                                      color: t.text3,
-                                                                    ),
-                                                                  ],
-                                                                ],
-                                                              ),
-                                                              const SizedBox(height: 1.5),
-                                                              Row(
-                                                                mainAxisSize: MainAxisSize.min,
-                                                                children: [
-                                                                  Flexible(
-                                                                    child: _HeaderLiveSubtitle(
-                                                                      workspaceName: shellSlice.activeWorkspaceName,
-                                                                      fallbackHostName: shellSlice.hostName,
-                                                                      showHostName: showHostInSub,
-                                                                      hostIsLocal: shellSlice.hostIsLocal,
-                                                                      textScaler: clampedTitleScaler,
-                                                                    ),
-                                                                  ),
-                                                                ],
-                                                              ),
-                                                            ],
-                                                          )
-                                                        : Row(
-                                                            key: ValueKey(
-                                                              shellSlice.isEmptyChat
-                                                                  ? 'host:${shellSlice.hostId}:${shellSlice.hostName}'
-                                                                  : '${shellSlice.hostId}:${shellSlice.activeSessionTitle}',
-                                                            ),
-                                                            mainAxisSize: MainAxisSize.min,
-                                                            children: [
-                                                              GrassBagStatusDot(
-                                                                size: 7,
-                                                                color: hostDotColor,
-                                                                pulsing: !hostHealthy &&
-                                                                    !hostHasErr &&
-                                                                    hostIsConnecting,
-                                                              ),
-                                                              const SizedBox(width: 7),
-                                                              Flexible(
-                                                                child: Text(
-                                                                  shellSlice.isEmptyChat
-                                                                      ? shellSlice.hostName
-                                                                      : shellSlice.activeSessionTitle,
-                                                                  maxLines: 1,
-                                                                  overflow: TextOverflow.ellipsis,
-                                                                  textScaler: clampedTitleScaler,
-                                                                  style: TextStyle(
-                                                                    fontSize: 14.5,
-                                                                    fontWeight: FontWeight.w600,
-                                                                    letterSpacing: -0.25,
-                                                                    color: t.text,
-                                                                  ),
-                                                                ),
-                                                              ),
-                                                              if (!shellSlice.isEmptyChat)
-                                                                _HeaderLiveStatusChip(
-                                                                  textScaler: clampedTitleScaler,
-                                                                ),
-                                                              if (shellSlice.isEmptyChat ||
-                                                                  (shellSlice.hasActiveSession && isTab)) ...[
-                                                                const SizedBox(width: 5),
-                                                                Icon(
-                                                                  CupertinoIcons.chevron_down,
-                                                                  size: 11,
-                                                                  color: t.text3,
-                                                                ),
-                                                              ] else if (!isTab &&
-                                                                  shellSlice.hasActiveSession) ...[
-                                                                const SizedBox(width: 4),
-                                                                Icon(
-                                                                  CupertinoIcons.chevron_right,
-                                                                  size: 10.5,
-                                                                  color: t.text3,
-                                                                ),
-                                                              ],
-                                                              ],
-                                                            ),
-                                                    ),
-                                                  ),
+                                                  child: pillContent,
                                                 ),
                                               );
-                                              if (!isTab && !shellSlice.isEmptyChat) {
-                                                return GestureDetector(
-                                                  onLongPress: () {
-                                                    HapticFeedback.mediumImpact();
-                                                    _dismissKeyboardAndPopovers();
-                                                    _openSessionTitleAction(forceMenu: true);
-                                                  },
-                                                  child: pillButton,
-                                                );
-                                              }
-                                              return pillButton;
+                                              return GrassBagGlassLongPressTrigger(
+                                                tier: shellSlice.glassTier,
+                                                anticipationBorderRadius: 22.0,
+                                                onWillOpen: _dismissKeyboardAndPopovers,
+                                                menuBuilder: _buildTitlePillLongPressMenu,
+                                                liftedBuilder: (_) => GrassBagGlassPillButton(
+                                                  tier: shellSlice.glassTier,
+                                                  height: 44,
+                                                  useOwnLayer: true,
+                                                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                                                  onTap: () {},
+                                                  child: pillContent,
+                                                ),
+                                                child: pillButton,
+                                              );
                                             },
                                           ),
                                         ),
@@ -2187,26 +2251,40 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                   SizedBox(
                                     width: 44,
                                     height: 44,
-                                    child: GrassBagGlassCircleButton(
-                                      key: ValueKey('top-right-$isTab'),
-                                      icon: isTab
-                                          ? CupertinoIcons.sidebar_right
-                                          : CupertinoIcons.square_pencil,
-                                      iconSize: 19,
-                                      useOwnLayer: false,
-                                      tooltip: isTab ? '展开工作台' : '新对话',
+                                    child: GrassBagGlassLongPressTrigger(
                                       tier: shellSlice.glassTier,
-                                      onTap: () {
-                                        _dismissKeyboardAndPopovers();
-                                        if (isTab) {
-                                          if (!canDualPane && shellSlice.tabletSidebarOpen) {
-                                            ctrl.setTabletSidebarOpen(false);
+                                      isCircle: true,
+                                      enabled: !isTab,
+                                      onWillOpen: _dismissKeyboardAndPopovers,
+                                      menuBuilder: _buildNewChatLongPressMenu,
+                                      liftedBuilder: (_) => GrassBagGlassCircleButton(
+                                        icon: CupertinoIcons.square_pencil,
+                                        iconSize: 19,
+                                        useOwnLayer: true,
+                                        tier: shellSlice.glassTier,
+                                        onTap: () {},
+                                      ),
+                                      child: GrassBagGlassCircleButton(
+                                        key: ValueKey('top-right-$isTab'),
+                                        icon: isTab
+                                            ? CupertinoIcons.sidebar_right
+                                            : CupertinoIcons.square_pencil,
+                                        iconSize: 19,
+                                        useOwnLayer: false,
+                                        tooltip: isTab ? '展开工作台' : '新对话 · 长按更多方式',
+                                        tier: shellSlice.glassTier,
+                                        onTap: () {
+                                          _dismissKeyboardAndPopovers();
+                                          if (isTab) {
+                                            if (!canDualPane && shellSlice.tabletSidebarOpen) {
+                                              ctrl.setTabletSidebarOpen(false);
+                                            }
+                                            ctrl.setTabletWorkbenchOpen(true);
+                                          } else {
+                                            ctrl.startNewChat();
                                           }
-                                          ctrl.setTabletWorkbenchOpen(true);
-                                        } else {
-                                          ctrl.startNewChat();
-                                        }
-                                      },
+                                        },
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -3156,6 +3234,14 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
 class _ImeLockStepScrollController extends ScrollController {
   bool allowImeAnchor = true;
 
+  /// When true, incremental streaming content growth locks 0-frame smoothly inside
+  /// `correctForNewDimensions` without any lagging ticker tug or rubber-band bounce.
+  bool stickToBottom = false;
+
+  /// Fired if a single frame grows by >180px while [stickToBottom] is true so the
+  /// shell can perform one smooth glide instead of an abrupt jump.
+  VoidCallback? onLargeStreamGrowth;
+
   void queueImeAnchorDelta(double delta) {
     if (delta.abs() <= 0.05 || !allowImeAnchor) return;
     if (!hasClients || positions.length != 1) return;
@@ -3307,6 +3393,40 @@ class _ImeLockStepScrollPosition extends ScrollPositionWithSingleContext {
               return false;
             }
           }
+        }
+      }
+    }
+    // Prevent SliverList lazy-estimate shrink from stranding `pixels` past `maxScrollExtent`
+    // (eliminates overshooting into blank void below the last message and jarring snap-backs!):
+    if (newPosition.hasContentDimensions &&
+        hasPixels &&
+        pixels > newPosition.maxScrollExtent + 0.5 &&
+        (!isUserDrivenActivity || physics is ClampingScrollPhysics)) {
+      correctPixels(newPosition.maxScrollExtent);
+      return false;
+    }
+    // Zero-frame-lag streaming bottom lockstep (Vercel `use-stick-to-bottom` / native iOS pattern):
+    // when pinned at bottom and streaming lines grow `maxScrollExtent`, shift `pixels` inside
+    // layout BEFORE paint -> ZERO lag, ZERO artificial tug, ZERO notification storm!
+    if (controller.stickToBottom &&
+        !isUserDrivenActivity &&
+        activity is! DrivenScrollActivity &&
+        oldPosition.hasContentDimensions &&
+        oldPosition.hasPixels) {
+      final prevMax = oldPosition.maxScrollExtent;
+      final nextMax = newPosition.maxScrollExtent;
+      final growth = nextMax - prevMax;
+      final distFromPrevBottom =
+          (prevMax - oldPosition.pixels).clamp(0.0, double.infinity);
+      final wasBottomAnchored = prevMax <= 12.0 || distFromPrevBottom <= 64.0;
+      if (wasBottomAnchored && growth > 0.1) {
+        if (growth <= 180.0) {
+          if ((nextMax - pixels).abs() > 0.1) {
+            correctPixels(nextMax);
+            return false;
+          }
+        } else {
+          controller.onLargeStreamGrowth?.call();
         }
       }
     }
@@ -3744,7 +3864,7 @@ class _KeyboardScrollTailState extends State<_KeyboardScrollTail> {
         builder: (_, compH, __) {
           final totalTail = bottomGap + compH;
           _syncGapDelta(totalTail);
-          return SizedBox(height: totalTail + 24.0);
+          return SizedBox(height: totalTail + 10.0);
         },
       );
     }
@@ -4021,9 +4141,14 @@ class _ChatCanvasArea extends ConsumerWidget {
                     keyboardDismissBehavior: isDesktop
                         ? ScrollViewKeyboardDismissBehavior.manual
                         : ScrollViewKeyboardDismissBehavior.onDrag,
-                    physics: const BouncingScrollPhysics(
-                      parent: AlwaysScrollableScrollPhysics(),
-                    ),
+                    // Crisp platform-native scroll physics: ClampingScrollPhysics on Android/Desktop
+                    // prevents floaty 200px overscroll past the bottom & short-chat drift; iOS/macOS
+                    // keeps native BouncingScrollPhysics ONLY when content actually scrolls!
+                    physics: (!kIsWeb &&
+                            (defaultTargetPlatform == TargetPlatform.iOS ||
+                                defaultTargetPlatform == TargetPlatform.macOS))
+                        ? const BouncingScrollPhysics()
+                        : const ClampingScrollPhysics(),
                     slivers: [
                       // Upward-growing negative sliver for turns prepended via `loadOlderTurns()`.
                       // Empty on initial loads (`minScrollExtent == 0.0`), and mathematically
@@ -4577,9 +4702,11 @@ class _KeyboardAwareEmptyStageState extends State<_KeyboardAwareEmptyStage> {
         return SingleChildScrollView(
           controller: _emptyScrollCtrl,
           keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-          physics: const BouncingScrollPhysics(
-            parent: AlwaysScrollableScrollPhysics(),
-          ),
+          physics: (!kIsWeb &&
+                  (defaultTargetPlatform == TargetPlatform.iOS ||
+                      defaultTargetPlatform == TargetPlatform.macOS))
+              ? const BouncingScrollPhysics()
+              : const ClampingScrollPhysics(),
           padding: EdgeInsets.fromLTRB(
             20,
             effectiveTopPad,
@@ -5477,7 +5604,11 @@ class _InChatSearchBar extends ConsumerWidget {
             ),
           ),
           AnimatedSize(
-            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 160)),
+            duration: GrassBagMotion.duration(
+              context,
+              const Duration(milliseconds: 160),
+              reduced: const Duration(milliseconds: 1),
+            ),
             curve: Curves.easeOutCubic,
             alignment: Alignment.centerRight,
             child: hasQuery

@@ -89,6 +89,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
   int _guideTab = 0; // 0: 桌面端 (免命令), 1: 命令行 (dsh web)
   int _cliOsTab = 0; // 0: macOS, 1: Windows, 2: Linux
   bool _allowBadCerts = false;
+  bool _allowInsecurePublicHttp = false;
   bool _obscureToken = true;
   bool _connecting = false;
   bool _hasScannedLan = false;
@@ -248,6 +249,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             token: _tokenCtrl.text.trim().isEmpty ? null : _tokenCtrl.text.trim(),
             cookie: _capturedCookie,
             allowBadCertificates: _allowBadCerts,
+            allowInsecurePublicHttp: _allowInsecurePublicHttp,
           );
       if (!mounted) return diag;
       _applyDiagnosisFields(diag, raw);
@@ -316,6 +318,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
           token: tokenText.isEmpty ? null : tokenText,
           cookie: _capturedCookie,
           allowBadCertificates: _allowBadCerts,
+          allowInsecurePublicHttp: _allowInsecurePublicHttp,
         );
         if (!mounted) return;
         _applyDiagnosisFields(diag, raw);
@@ -349,6 +352,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
         token: tokenText.isEmpty ? null : tokenText,
         cookie: _capturedCookie,
         allowBadCertificates: _allowBadCerts,
+        allowInsecurePublicHttp: _allowInsecurePublicHttp,
       );
       if (!mounted) return;
       _applyDiagnosisFields(outcome.diagnosis, raw);
@@ -1048,6 +1052,49 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
               ),
             ],
           ],
+        ],
+      );
+    }
+    if (diag.kind == RemoteDiagnosisKind.insecurePublicHttp) {
+      return Row(
+        children: [
+          Expanded(
+            child: GrassBagPrimaryGlassButton(
+              label: '改用 HTTPS 连接',
+              icon: CupertinoIcons.lock_shield_fill,
+              height: 34,
+              tier: tier,
+              insideGlass: true,
+              enabled: !_connecting,
+              onTap: _connecting
+                  ? null
+                  : () {
+                      final cur = _addrCtrl.text.trim();
+                      if (cur.toLowerCase().startsWith('http://')) {
+                        _addrCtrl.text = 'https://${cur.substring(7)}';
+                      }
+                      setState(() => _allowInsecurePublicHttp = false);
+                      _connectNow();
+                    },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: GrassBagSecondaryGlassButton(
+              label: '仍以明文继续',
+              icon: CupertinoIcons.exclamationmark_triangle,
+              height: 34,
+              tier: tier,
+              insideGlass: true,
+              enabled: !_connecting,
+              onTap: _connecting
+                  ? null
+                  : () {
+                      setState(() => _allowInsecurePublicHttp = true);
+                      _connectNow();
+                    },
+            ),
+          ),
         ],
       );
     }

@@ -127,6 +127,8 @@ class _GrassBagAppState extends ConsumerState<GrassBagApp> {
     final accent = ref.watch(appProvider.select((s) => s.accent));
     final isDark = ref.watch(appProvider.select((s) => s.isDark));
     final glassTier = ref.watch(appProvider.select((s) => s.glassTier));
+    final glassOpticalStrength =
+        ref.watch(appProvider.select((s) => s.glassOpticalStrength));
     _syncSystemOverlay(isDark);
 
     final lightTokens = GrassBagTokens.resolve(accent, Brightness.light);
@@ -135,9 +137,15 @@ class _GrassBagAppState extends ConsumerState<GrassBagApp> {
 
     return GrassBagGlassTierScope(
       tier: glassTier,
+      opticalStrength: glassOpticalStrength,
       child: LiquidGlassWidgets.wrap(
         brightnessResolver: Theme.maybeBrightnessOf,
-        theme: GrassBagGlassConfig.themeDataFor(lightTokens, darkTokens, glassTier),
+        theme: GrassBagGlassConfig.themeDataFor(
+          lightTokens,
+          darkTokens,
+          glassTier,
+          opticalStrength: glassOpticalStrength,
+        ),
         child: AnnotatedRegion<SystemUiOverlayStyle>(
           value: overlayStyle,
           child: MaterialApp(

@@ -288,9 +288,57 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
   double _maxLinePx = 280.0;
   Uint8List? _imageBytes;
   Uint8List? _binaryBytes;
+  Uint8List? _renderedPdfBytes;
+  int? _pdfPageCount;
+  bool _convertingOfficePdf = false;
+  String? _officePdfError;
   Size? _imageDims;
   String? _error;
   String? _loadMoreError;
+
+  static const Set<String> _officeExtensions = {
+    'doc',
+    'docx',
+    'xls',
+    'xlsx',
+    'ppt',
+    'pptx',
+    'odt',
+    'ods',
+    'odp',
+    'rtf',
+  };
+
+  bool get _isPdfDocument {
+    final ext = _effectiveName.split('.').last.toLowerCase();
+    final mime = (widget.source.mimeType ?? '').toLowerCase();
+    return ext == 'pdf' || mime == 'application/pdf';
+  }
+
+  bool get _isOfficeDocument {
+    final ext = _effectiveName.split('.').last.toLowerCase();
+    return _officeExtensions.contains(ext);
+  }
+
+  static int? _estimatePdfPages(Uint8List bytes) {
+    if (bytes.length < 8) return null;
+    // Scan lightweight ASCII header/objects for `/Type /Page` (excluding `/Pages`).
+    final sample = latin1.decode(
+      bytes.length > 2 * 1024 * 1024 ? bytes.sublist(0, 2 * 1024 * 1024) : bytes,
+      allowInvalid: true,
+    );
+    final matches = RegExp(r'/Type\s*/Page(?![a-zA-Z])').allMatches(sample).length;
+    return matches > 0 ? matches : null;
+  }
+
+  static String _withPartialRangeSuffix(String filename, int startLine, int endLine) {
+    final dot = filename.lastIndexOf('.');
+    final tag = '.L$startLine-L$endLine.partial';
+    if (dot > 0 && dot < filename.length - 1) {
+      return '${filename.substring(0, dot)}$tag${filename.substring(dot)}';
+    }
+    return '$filename$tag';
+  }
 
   // Format-specific caches
   String? _prettyJsonText;
@@ -483,6 +531,10 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
       _loadMoreError = null;
       _imageBytes = null;
       _binaryBytes = null;
+      _renderedPdfBytes = null;
+      _pdfPageCount = null;
+      _convertingOfficePdf = false;
+      _officePdfError = null;
       _imageDims = null;
       _binary = false;
       _lines = const [];
@@ -535,10 +587,15 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
           return;
         }
         if (_fileKind == PreviewFileKind.binary || _looksBinaryBytes(bytes)) {
+          final binBytes = bytes;
           setState(() {
             _loading = false;
             _binary = true;
-            _binaryBytes = bytes;
+            _binaryBytes = binBytes;
+            if (_isPdfDocument) {
+              _renderedPdfBytes = binBytes;
+              _pdfPageCount = _estimatePdfPages(binBytes);
+            }
             _eof = true;
           });
           return;
@@ -576,6 +633,31 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
           _loading = false;
           _imageBytes = bytes;
         });
+        return;
+      }
+
+      if (_isPdfDocument) {
+        final bytes = await ctrl.readWorkspaceFileBytes(targetPath);
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _binary = true;
+          _binaryBytes = bytes;
+          _renderedPdfBytes = bytes;
+          _byteSize = bytes?.length;
+          _pdfPageCount = bytes != null ? _estimatePdfPages(bytes) : null;
+          _eof = true;
+        });
+        return;
+      }
+
+      if (_isOfficeDocument) {
+        setState(() {
+          _loading = false;
+          _binary = true;
+          _eof = true;
+        });
+        unawaited(_convertOfficeToPdf());
         return;
       }
 
@@ -798,6 +880,48 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
     ctrl.showToast('已引用 @$refPath 到输入框', tone: ToastTone.info);
   }
 
+  Future<void> _convertOfficeToPdf() async {
+    if (_convertingOfficePdf || _resolvedPath.isEmpty) return;
+    setState(() {
+      _convertingOfficePdf = true;
+      _officePdfError = null;
+    });
+    final pdfBytes =
+        await ref.read(appProvider.notifier).renderWorkspaceOfficeToPdf(_resolvedPath);
+    if (!mounted) return;
+    setState(() {
+      _convertingOfficePdf = false;
+      if (pdfBytes != null && pdfBytes.isNotEmpty) {
+        _renderedPdfBytes = pdfBytes;
+        _pdfPageCount = _estimatePdfPages(pdfBytes);
+        _byteSize ??= pdfBytes.length;
+      } else {
+        _officePdfError = '主机未启用 Office 转 PDF 插件或当前为直连模式，仍可直接导出原文件';
+      }
+    });
+  }
+
+  Future<void> _sharePdfBytes(Uint8List pdfBytes) async {
+    final ctrl = ref.read(appProvider.notifier);
+    final rawBase = (_resolvedPath.isNotEmpty
+            ? _resolvedPath.split(RegExp(r'[/\\]')).where((s) => s.isNotEmpty).lastOrNull
+            : null) ??
+        widget.source.name;
+    final pdfName = rawBase.toLowerCase().endsWith('.pdf') ? rawBase : '$rawBase.pdf';
+    if (GrassBagNativeBridge.instance.isAndroidNative) {
+      final ok = await GrassBagNativeBridge.instance.shareFileBytes(
+        bytes: pdfBytes,
+        filename: pdfName,
+        mimeType: 'application/pdf',
+      );
+      if (!ok) ctrl.showToast('调用系统 PDF 打开/分享失败');
+    } else if (downloadWebBytes(pdfName, pdfBytes, mimeType: 'application/pdf')) {
+      ctrl.showToast(kIsWeb ? '已下载 $pdfName' : '已保存至下载目录 · $pdfName');
+    } else {
+      ctrl.showToast('当前环境暂不支持导出 PDF');
+    }
+  }
+
   Future<void> _shareOrExport() async {
     HapticFeedback.selectionClick();
     final ctrl = ref.read(appProvider.notifier);
@@ -833,7 +957,8 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
         }
       }
       if (binBytes != null && binBytes.isNotEmpty) {
-        final mime = widget.source.mimeType ?? 'application/octet-stream';
+        final mime = widget.source.mimeType ??
+            (_isPdfDocument ? 'application/pdf' : 'application/octet-stream');
         if (GrassBagNativeBridge.instance.isAndroidNative) {
           final ok = await GrassBagNativeBridge.instance.shareFileBytes(
             bytes: binBytes,
@@ -852,27 +977,60 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
       return;
     }
 
+    // For paged/sliced workspace text files (`_firstLineNumber > 1` or `!_eof`), ALWAYS prefer
+    // the full raw byte channel first so we NEVER silently export a truncated slice under the original name!
+    final isPartialPreview = !_eof || _firstLineNumber > 1;
+    final mime = widget.source.mimeType ?? 'text/plain';
+    if (isPartialPreview && _resolvedPath.isNotEmpty) {
+      final rawBytes = await ctrl.readWorkspaceFileBytes(_resolvedPath);
+      if (!mounted) return;
+      if (rawBytes != null && rawBytes.isNotEmpty) {
+        if (GrassBagNativeBridge.instance.isAndroidNative) {
+          final ok = await GrassBagNativeBridge.instance.shareFileBytes(
+            bytes: rawBytes,
+            filename: baseName,
+            mimeType: mime,
+          );
+          if (!ok) ctrl.showToast('调用系统分享完整原文件失败');
+        } else if (downloadWebBytes(baseName, rawBytes, mimeType: mime)) {
+          ctrl.showToast(kIsWeb ? '已下载完整原文件 $baseName' : '已保存完整原文件 · $baseName');
+        } else {
+          ctrl.showToast('当前环境暂不支持导出完整原文件');
+        }
+        return;
+      }
+    }
+
     final text = _activeCopyText;
     if (text.isEmpty) {
       ctrl.showToast('文件内容为空');
       return;
     }
-    final mime = widget.source.mimeType ?? 'text/plain';
+    final endLine = _firstLineNumber + math.max<int>(0, _activeCodeLines.length - 1);
+    final exportName = isPartialPreview
+        ? _withPartialRangeSuffix(baseName, _firstLineNumber, endLine)
+        : baseName;
+    if (isPartialPreview) {
+      ctrl.showToast(
+        '无法读取完整原文件，已导出当前预览片段（第 $_firstLineNumber–$endLine 行）',
+        tone: ToastTone.warn,
+      );
+    }
     if (GrassBagNativeBridge.instance.isAndroidNative) {
       final ok = await GrassBagNativeBridge.instance.shareTextFile(
         text: text,
-        filename: baseName,
+        filename: exportName,
         mimeType: mime,
       );
       if (!ok) {
         await GrassBagNativeBridge.instance.shareText(text);
       }
     } else if (downloadWebBytes(
-      baseName,
+      exportName,
       Uint8List.fromList(utf8.encode(text)),
       mimeType: mime,
     )) {
-      ctrl.showToast(kIsWeb ? '已下载 $baseName' : '已保存至下载目录 · $baseName');
+      ctrl.showToast(kIsWeb ? '已下载 $exportName' : '已保存至下载目录 · $exportName');
     } else {
       await Clipboard.setData(ClipboardData(text: text));
       ctrl.showToast('已复制文件内容到剪贴板');
@@ -1472,6 +1630,16 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
     }
 
     if (_binary) {
+      final isPdf = _isPdfDocument;
+      final isOffice = _isOfficeDocument;
+      final pdfReady = _renderedPdfBytes != null && _renderedPdfBytes!.isNotEmpty;
+      final sizeDesc = _byteSize != null ? formatPreviewBytes(_byteSize!) : '';
+      final pageDesc = _pdfPageCount != null ? '共 $_pdfPageCount 页' : '';
+      final metaLine = [
+        if (pageDesc.isNotEmpty) pageDesc,
+        if (sizeDesc.isNotEmpty) sizeDesc,
+      ].join(' · ');
+
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(20),
@@ -1479,23 +1647,67 @@ class _UnifiedFilePreviewBodyState extends ConsumerState<_UnifiedFilePreviewBody
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
-                previewFileIcon(_effectiveName, mimeType: widget.source.mimeType),
-                size: 36,
-                color: t.text3,
+                (isPdf || pdfReady)
+                    ? CupertinoIcons.doc_richtext
+                    : previewFileIcon(_effectiveName, mimeType: widget.source.mimeType),
+                size: 38,
+                color: (isPdf || pdfReady) ? t.primary : t.text3,
               ),
               const SizedBox(height: 10),
               Text(
-                '二进制文件，不支持纯文本预览',
-                style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: t.text2),
+                isPdf
+                    ? 'PDF 文档已就绪'
+                    : (isOffice
+                        ? (_convertingOfficePdf
+                            ? '正在通过 DSH 桥转换 Office 为 PDF…'
+                            : (pdfReady ? 'Office 文档已转换为 PDF' : 'Office 文档'))
+                        : '二进制文件，不支持纯文本预览'),
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: t.text),
               ),
-              const SizedBox(height: 5),
-              Text(
-                _resolvedPath.isNotEmpty
-                    ? '可点击下方「分享 / 导出」或引用路径到对话检查'
-                    : '可点击下方「分享 / 导出」使用外部应用打开',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 12, color: t.text3),
-              ),
+              if (metaLine.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  metaLine,
+                  style: TextStyle(fontSize: 12, color: t.text2),
+                ),
+              ],
+              const SizedBox(height: 6),
+              if (_convertingOfficePdf)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  child: GrassBagActivityIndicator(radius: 10, color: t.primary),
+                )
+              else if (pdfReady) ...[
+                const SizedBox(height: 6),
+                GrassBagPrimaryGlassButton(
+                  label: isOffice ? '打开 / 分享转换后的 PDF' : '用系统阅读器打开 / 分享 PDF',
+                  icon: CupertinoIcons.doc_text_viewfinder,
+                  height: 40,
+                  tier: tier,
+                  onTap: () => unawaited(_sharePdfBytes(_renderedPdfBytes!)),
+                ),
+              ] else if (isOffice && _officePdfError != null) ...[
+                Text(
+                  _officePdfError!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: t.text3),
+                ),
+                const SizedBox(height: 10),
+                GrassBagPrimaryGlassButton(
+                  label: '重试转 PDF',
+                  icon: CupertinoIcons.arrow_clockwise,
+                  height: 36,
+                  tier: tier,
+                  onTap: () => unawaited(_convertOfficeToPdf()),
+                ),
+              ] else
+                Text(
+                  _resolvedPath.isNotEmpty
+                      ? '可点击下方「分享 / 导出」下载原文件或引用路径到对话检查'
+                      : '可点击下方「分享 / 导出」使用外部应用打开',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: t.text3),
+                ),
             ],
           ),
         ),

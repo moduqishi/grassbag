@@ -17,6 +17,7 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -40,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 interface RuntimeAssetSource {
@@ -2196,25 +2198,61 @@ class RuntimeController private constructor(
                                     if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
                                     val extractBase = if (rootfsIsBundled) 10 else 34
                                     val extractSpan = if (rootfsIsBundled) 38 else 12
-                                    sendProgress("rootfs", extractBase, "正在解压 Ubuntu 24.04.5 + Node 24.22.3 ARM64…", mapOf("canCancel" to false), force = true)
-                                    TarGzExtractor.deleteTreeNoFollow(ubuntuRoot)
-                                    ubuntuRoot.mkdirs()
-                                    val extractingFlag = File(ubuntuRoot, ".extracting").apply { writeText("1") }
-                                    openRootfsStream().use { ins ->
-                                        TarGzExtractor.extractStream(
-                                            compressedStream = ins,
-                                            destDir = ubuntuRoot,
-                                            expectedSha256 = wantSha,
-                                            totalCompressedBytes = total,
-                                            freshDir = true
-                                        ) { read, tot ->
-                                            val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
-                                            sendProgress("rootfs", pct, "正在解压 Ubuntu + Node 24 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
-                                        }
+                                    sendProgress("rootfs", extractBase, "正在隔离目录解压并校验 Ubuntu 24.04.5 + Node 24.22.3 ARM64…", mapOf("canCancel" to false), force = true)
+                                    val requiredRootfsSpace = maxOf(total * 3L, 260L * 1024L * 1024L)
+                                    val availRootfsSpace = runCatching { StatFs(containersRoot.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
+                                    if (availRootfsSpace < requiredRootfsSpace) {
+                                        error("磁盘可用空间不足（需要至少 ${requiredRootfsSpace / (1024 * 1024)} MB，当前剩余 ${availRootfsSpace / (1024 * 1024)} MB），已保留现有容器环境")
                                     }
-                                    extractingFlag.delete()
-                                    File(ubuntuRoot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                                    // Immediately reclaim compressed archive (~72MB) once extracted!
+                                    val stageRoot = File(containersRoot, "${ubuntuRoot.name}.stage-${System.currentTimeMillis()}")
+                                    val oldRootBackup = File(containersRoot, "${ubuntuRoot.name}.old-${System.currentTimeMillis()}")
+                                    TarGzExtractor.deleteTreeNoFollow(stageRoot)
+                                    TarGzExtractor.deleteTreeNoFollow(oldRootBackup)
+                                    stageRoot.mkdirs()
+                                    val extractingFlag = File(stageRoot, ".extracting").apply { writeText("1") }
+                                    try {
+                                        openRootfsStream().use { ins ->
+                                            TarGzExtractor.extractStream(
+                                                compressedStream = ins,
+                                                destDir = stageRoot,
+                                                expectedSha256 = wantSha,
+                                                totalCompressedBytes = total,
+                                                freshDir = true
+                                            ) { read, tot ->
+                                                val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
+                                                sendProgress("rootfs", pct, "正在解压 Ubuntu + Node 24 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                            }
+                                        }
+                                        val hasShellOrNode = File(stageRoot, "bin/sh").exists() ||
+                                            File(stageRoot, "usr/bin/sh").exists() ||
+                                            File(stageRoot, "usr/local/bin/node").exists()
+                                        if (!hasShellOrNode) {
+                                            error("新根文件系统缺少关键可执行文件（bin/sh 或 node），已中止激活并保留原环境")
+                                        }
+                                        extractingFlag.delete()
+                                        File(stageRoot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
+                                        // Atomic swap: move old rootfs aside only AFTER staging extraction & verification succeeded!
+                                        val movedOld = if (ubuntuRoot.exists()) ubuntuRoot.renameTo(oldRootBackup) else false
+                                        if (ubuntuRoot.exists() && !movedOld) {
+                                            error("无法原子切换旧根文件系统目录，已保留原环境")
+                                        }
+                                        if (!stageRoot.renameTo(ubuntuRoot)) {
+                                            if (movedOld && oldRootBackup.exists() && !ubuntuRoot.exists()) {
+                                                oldRootBackup.renameTo(ubuntuRoot)
+                                            }
+                                            error("激活新根文件系统失败，已自动回退到原环境")
+                                        }
+                                        if (movedOld) {
+                                            runCatching { TarGzExtractor.deleteTreeNoFollow(oldRootBackup) }
+                                        }
+                                    } catch (t: Throwable) {
+                                        runCatching { TarGzExtractor.deleteTreeNoFollow(stageRoot) }
+                                        if (!ubuntuRoot.exists() && oldRootBackup.exists()) {
+                                            runCatching { oldRootBackup.renameTo(ubuntuRoot) }
+                                        }
+                                        throw t
+                                    }
+                                    // Immediately reclaim compressed archive (~72MB) once extracted & activated!
                                     downloadedFile?.let { runCatching { it.delete() } }
                                     etcPrepared = false
                                     ptySupportedCache = null
@@ -2250,25 +2288,59 @@ class RuntimeController private constructor(
                                     if (bootstrapCancelRequested.get()) throw BootstrapCancelledException()
                                     val extractBase = if (engineIsBundled) 50 else 80
                                     val extractSpan = if (engineIsBundled) 34 else 9
-                                    sendProgress("engine", extractBase, "正在解压并部署真实 DSH $manifestDshVer…", mapOf("canCancel" to false), force = true)
-                                    TarGzExtractor.deleteTreeNoFollow(targetSlotDir)
-                                    targetSlotDir.mkdirs()
-                                    val extractingFlag = File(targetSlotDir, ".extracting").apply { writeText("1") }
-                                    openEngineStream().use { ins ->
-                                        TarGzExtractor.extractStream(
-                                            compressedStream = ins,
-                                            destDir = targetSlotDir,
-                                            expectedSha256 = wantSha,
-                                            totalCompressedBytes = total,
-                                            freshDir = true
-                                        ) { read, tot ->
-                                            val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
-                                            sendProgress("engine", pct, "正在部署 DSH 引擎 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
-                                        }
+                                    sendProgress("engine", extractBase, "正在隔离目录解压并校验真实 DSH $manifestDshVer…", mapOf("canCancel" to false), force = true)
+                                    val requiredEngineSpace = maxOf(total * 3L, 320L * 1024L * 1024L)
+                                    val availEngineSpace = runCatching { StatFs(slotsRoot.absolutePath).availableBytes }.getOrDefault(Long.MAX_VALUE)
+                                    if (availEngineSpace < requiredEngineSpace) {
+                                        error("磁盘可用空间不足（需要至少 ${requiredEngineSpace / (1024 * 1024)} MB，当前剩余 ${availEngineSpace / (1024 * 1024)} MB），已保留现有引擎槽位")
                                     }
-                                    extractingFlag.delete()
-                                    File(targetSlotDir, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
-                                    // Immediately reclaim compressed archive (~116MB) once extracted!
+                                    val stageSlot = File(slotsRoot, "${targetSlotDir.name}.stage-${System.currentTimeMillis()}")
+                                    val oldSlotBackup = File(slotsRoot, "${targetSlotDir.name}.old-${System.currentTimeMillis()}")
+                                    TarGzExtractor.deleteTreeNoFollow(stageSlot)
+                                    TarGzExtractor.deleteTreeNoFollow(oldSlotBackup)
+                                    stageSlot.mkdirs()
+                                    val extractingFlag = File(stageSlot, ".extracting").apply { writeText("1") }
+                                    try {
+                                        openEngineStream().use { ins ->
+                                            TarGzExtractor.extractStream(
+                                                compressedStream = ins,
+                                                destDir = stageSlot,
+                                                expectedSha256 = wantSha,
+                                                totalCompressedBytes = total,
+                                                freshDir = true
+                                            ) { read, tot ->
+                                                val pct = if (tot > 0) extractBase + ((read * extractSpan) / tot).toInt().coerceIn(0, extractSpan) else extractBase + extractSpan / 2
+                                                sendProgress("engine", pct, "正在部署 DSH 引擎 (${read / (1024 * 1024)} / ${tot / (1024 * 1024)} MB)…")
+                                            }
+                                        }
+                                        val hasDshPayload = File(stageSlot, "node_modules/@deepseek-ai/dsh").exists() ||
+                                            File(stageSlot, "package.json").exists()
+                                        if (!hasDshPayload) {
+                                            error("新引擎槽位缺少 DSH 核心文件，已中止激活并保留现有槽位")
+                                        }
+                                        extractingFlag.delete()
+                                        File(stageSlot, ".extract-complete").writeText(wantSha.ifBlank { "ok" })
+                                        val movedOld = if (targetSlotDir.exists()) targetSlotDir.renameTo(oldSlotBackup) else false
+                                        if (targetSlotDir.exists() && !movedOld) {
+                                            error("无法原子切换旧引擎槽位目录，已保留原槽位")
+                                        }
+                                        if (!stageSlot.renameTo(targetSlotDir)) {
+                                            if (movedOld && oldSlotBackup.exists() && !targetSlotDir.exists()) {
+                                                oldSlotBackup.renameTo(targetSlotDir)
+                                            }
+                                            error("激活新引擎槽位失败，已自动回退到原槽位")
+                                        }
+                                        if (movedOld) {
+                                            runCatching { TarGzExtractor.deleteTreeNoFollow(oldSlotBackup) }
+                                        }
+                                    } catch (t: Throwable) {
+                                        runCatching { TarGzExtractor.deleteTreeNoFollow(stageSlot) }
+                                        if (!targetSlotDir.exists() && oldSlotBackup.exists()) {
+                                            runCatching { oldSlotBackup.renameTo(targetSlotDir) }
+                                        }
+                                        throw t
+                                    }
+                                    // Immediately reclaim compressed archive (~116MB) once extracted & activated!
                                     downloadedFile?.let { runCatching { it.delete() } }
                                     if (wantSha.isNotEmpty()) {
                                         st.put("engineInitSha256", wantSha)
@@ -3875,6 +3947,10 @@ class RuntimeController private constructor(
                 return@execute
             }
             try {
+                var prevSlot = ""
+                var targetSlot = ""
+                var prevVer = ""
+                var curVer = ""
                 val canProceed = synchronized(bootstrapLock) {
                     val st = readMeta()
                     val cur = st.optString("activeSlot", "slot-a")
@@ -3883,16 +3959,18 @@ class RuntimeController private constructor(
                         done(mapOf("ok" to false, "error" to "备用 LKG 槽位 ($lkg) 尚未写入历史版本，当前无需回滚", "status" to getStatus()))
                         false
                     } else {
-                        val prevVer = st.optString("dshPrevVersion", "")
-                        val curVer = st.optString("dshVersion", "0.2.2-rc.5")
+                        prevSlot = cur
+                        targetSlot = lkg
+                        prevVer = st.optString("dshPrevVersion", "")
+                        curVer = st.optString("dshVersion", "0.2.2-rc.5")
                         updateMeta { fresh ->
-                            fresh.put("activeSlot", lkg)
-                            fresh.put("lkgSlot", cur)
+                            fresh.put("activeSlot", targetSlot)
+                            fresh.put("lkgSlot", prevSlot)
                             if (prevVer.isNotEmpty()) fresh.put("dshVersion", prevVer)
                             fresh.put("dshPrevVersion", curVer)
                         }
-                        updateRelativeSymlink(File(slotsRoot, "current"), lkg)
-                        updateRelativeSymlink(File(slotsRoot, "lkg"), cur)
+                        updateRelativeSymlink(File(slotsRoot, "current"), targetSlot)
+                        updateRelativeSymlink(File(slotsRoot, "lkg"), prevSlot)
                         true
                     }
                 }
@@ -3901,9 +3979,39 @@ class RuntimeController private constructor(
                 stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
                 val res = startEngineSync()
                 if (res["ok"] != true) {
-                    sendProgress("error", 0, "回滚后引擎启动失败：${res["error"]}")
+                    val failReason = res["error"]?.toString() ?: "health_check_failed"
+                    appendLog("[rollback] target slot $targetSlot failed to start ($failReason); reverting to $prevSlot")
+                    synchronized(bootstrapLock) {
+                        updateMeta { fresh ->
+                            fresh.put("activeSlot", prevSlot)
+                            fresh.put("lkgSlot", targetSlot)
+                            if (curVer.isNotEmpty()) fresh.put("dshVersion", curVer)
+                            if (prevVer.isNotEmpty()) fresh.put("dshPrevVersion", prevVer) else fresh.remove("dshPrevVersion")
+                        }
+                        updateRelativeSymlink(File(slotsRoot, "current"), prevSlot)
+                        updateRelativeSymlink(File(slotsRoot, "lkg"), targetSlot)
+                    }
+                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                    val revertRes = startEngineSync()
+                    val revertedOk = revertRes["ok"] == true
+                    val msg = if (revertedOk) {
+                        "回滚槽位 ($targetSlot) 启动失败（$failReason），已自动切回原槽位 ($prevSlot) 并恢复运行"
+                    } else {
+                        "回滚槽位 ($targetSlot) 启动失败（$failReason），已切回原槽位 ($prevSlot)，请手动重启引擎"
+                    }
+                    sendProgress("error", 0, msg)
+                    done(
+                        mapOf(
+                            "ok" to false,
+                            "reverted" to true,
+                            "revertedEngineOk" to revertedOk,
+                            "error" to msg,
+                            "status" to getStatus()
+                        )
+                    )
+                    return@execute
                 }
-                done(mapOf("ok" to (res["ok"] == true), "error" to res["error"], "status" to getStatus()))
+                done(mapOf("ok" to true, "activeSlot" to targetSlot, "status" to getStatus()))
             } catch (t: Throwable) {
                 val msg = t.message ?: "rollback_failed"
                 appendLog("[rollback] ERROR: $msg")
@@ -4131,60 +4239,323 @@ class RuntimeController private constructor(
         return ok
     }
 
+    private fun backupStorageDir(): File {
+        val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
+        dir.mkdirs()
+        return dir
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    fun listEncryptedBackups(): Map<String, Any?> = runCatching {
+        val dir = backupStorageDir()
+        val files = (dir.listFiles() ?: emptyArray())
+            .filter { it.isFile && it.name.endsWith(".gbag.enc") }
+            .sortedByDescending { it.lastModified() }
+            .take(20)
+            .map { f ->
+                mapOf(
+                    "path" to f.absolutePath,
+                    "filename" to f.name,
+                    "bytes" to f.length(),
+                    "modifiedAtMs" to f.lastModified()
+                )
+            }
+        mapOf("ok" to true, "dir" to dir.absolutePath, "backups" to files)
+    }.getOrElse { mapOf("ok" to false, "error" to (it.message ?: "list_backups_error")) }
+
     fun exportEncryptedBackup(passphrase: String): Map<String, Any?> = runCatching {
         val cleanPass = passphrase.trim()
         require(cleanPass.length >= 6) { "备份加密口令至少需要 6 位字符" }
-        val maxTotalBytes = 16L * 1024L * 1024L
+        val maxTotalBytes = 64L * 1024L * 1024L
+        val maxSingleFileBytes = 8L * 1024L * 1024L
+        val maxDepth = 6
         var packedBytes = 0L
+        val includedManifest = JSONArray()
+        val skippedList = mutableListOf<Map<String, Any>>()
+        val skippedManifest = JSONArray()
+
+        fun recordSkip(relPath: String, sizeBytes: Long, reason: String) {
+            skippedManifest.put(JSONObject().apply {
+                put("path", relPath)
+                put("bytes", sizeBytes)
+                put("reason", reason)
+            })
+            if (skippedList.size < 30) {
+                skippedList.add(mapOf("path" to relPath, "bytes" to sizeBytes, "reason" to reason))
+            }
+        }
+
         val zipOut = ByteArrayOutputStream()
         ZipOutputStream(zipOut).use { zos ->
             fun pack(f: File, name: String) {
                 val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: return
-                if (!android.system.OsConstants.S_ISREG(st.st_mode)) return
-                val fLen = st.st_size.coerceAtLeast(0L)
-                if (fLen > 2L * 1024L * 1024L || packedBytes + fLen > maxTotalBytes) return
-                zos.putNextEntry(ZipEntry(name))
-                FileInputStream(f).use { ins ->
-                    val buf = ByteArray(8192)
-                    var copied = 0L
-                    while (true) {
-                        val n = ins.read(buf)
-                        if (n <= 0) break
-                        if (packedBytes + copied + n > maxTotalBytes) break
-                        zos.write(buf, 0, n)
-                        copied += n
-                    }
-                    packedBytes += copied
+                if (!OsConstants.S_ISREG(st.st_mode)) {
+                    recordSkip(name, 0L, "non_regular")
+                    return
                 }
+                val fLen = st.st_size.coerceAtLeast(0L)
+                if (fLen > maxSingleFileBytes) {
+                    recordSkip(name, fLen, "exceeds_8mb_limit")
+                    return
+                }
+                if (packedBytes + fLen > maxTotalBytes) {
+                    recordSkip(name, fLen, "exceeds_64mb_archive_budget")
+                    return
+                }
+                val raw = f.readBytes()
+                if (packedBytes + raw.size > maxTotalBytes) {
+                    recordSkip(name, raw.size.toLong(), "exceeds_64mb_archive_budget")
+                    return
+                }
+                val digest = sha256Hex(raw)
+                zos.putNextEntry(ZipEntry(name))
+                zos.write(raw)
                 zos.closeEntry()
+                packedBytes += raw.size.toLong()
+                includedManifest.put(JSONObject().apply {
+                    put("path", name)
+                    put("bytes", raw.size)
+                    put("sha256", digest)
+                })
             }
-            pack(metaFile, "runtime-state.json")
-            pack(aptFile, "apt-manifest.json")
+
+            if (metaFile.exists()) pack(metaFile, "runtime-state.json")
+            if (aptFile.exists()) pack(aptFile, "apt-manifest.json")
+
             val dshDir = File(homeDir, ".dsh")
             val dshDirSt = runCatching { Os.lstat(dshDir.absolutePath) }.getOrNull()
-            if (dshDirSt != null && android.system.OsConstants.S_ISDIR(dshDirSt.st_mode)) {
-                dshDir.walkTopDown()
-                    .maxDepth(3)
-                    .onEnter { dir ->
-                        val st = runCatching { Os.lstat(dir.absolutePath) }.getOrNull()
-                        st != null && android.system.OsConstants.S_ISDIR(st.st_mode)
-                    }
-                    .forEach { f ->
-                        if (packedBytes >= maxTotalBytes) return@forEach
-                        val st = runCatching { Os.lstat(f.absolutePath) }.getOrNull() ?: return@forEach
-                        if (android.system.OsConstants.S_ISREG(st.st_mode) && st.st_size < 2L * 1024L * 1024L) {
-                            pack(f, "home/${f.relativeTo(homeDir).path}")
+            if (dshDirSt != null && OsConstants.S_ISDIR(dshDirSt.st_mode)) {
+                fun walkDir(dir: File, depth: Int) {
+                    val children = dir.listFiles()?.sortedBy { it.name } ?: return
+                    for (child in children) {
+                        val rel = "home/${child.relativeTo(homeDir).path}"
+                        val st = runCatching { Os.lstat(child.absolutePath) }.getOrNull()
+                        if (st == null) {
+                            recordSkip(rel, 0L, "unreadable")
+                            continue
+                        }
+                        if (OsConstants.S_ISDIR(st.st_mode)) {
+                            if (depth >= maxDepth) {
+                                recordSkip("$rel/", 0L, "max_depth_exceeded")
+                            } else {
+                                walkDir(child, depth + 1)
+                            }
+                        } else if (OsConstants.S_ISREG(st.st_mode)) {
+                            pack(child, rel)
+                        } else {
+                            recordSkip(rel, 0L, "symlink_or_special")
                         }
                     }
+                }
+                walkDir(dshDir, 0)
             }
+
+            val manifestJson = JSONObject().apply {
+                put("schema", "grassbag-backup-v2")
+                put("createdAtMs", System.currentTimeMillis())
+                put("scope", "runtime-meta + /root/.dsh")
+                put("includedCount", includedManifest.length())
+                put("skippedCount", skippedManifest.length())
+                put("totalUncompressedBytes", packedBytes)
+                put("included", includedManifest)
+                put("skipped", skippedManifest)
+            }.toString(2).toByteArray(Charsets.UTF_8)
+            zos.putNextEntry(ZipEntry("backup-manifest.json"))
+            zos.write(manifestJson)
+            zos.closeEntry()
         }
         val cipherBytes = vault.encryptWithPassphrase(zipOut.toByteArray(), cleanPass)
-        val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
-        dir.mkdirs()
-        val dest = File(dir, "GrassBag-Backup-${System.currentTimeMillis()}.gbag.enc")
+        val dir = backupStorageDir()
+        val filename = "GrassBag-Backup-${System.currentTimeMillis()}.gbag.enc"
+        val dest = File(dir, filename)
         FileOutputStream(dest).use { it.write(cipherBytes) }
-        mapOf("ok" to true, "path" to dest.absolutePath, "bytes" to cipherBytes.size)
+        mapOf(
+            "ok" to true,
+            "path" to dest.absolutePath,
+            "filename" to filename,
+            "bytes" to cipherBytes.size,
+            "includedCount" to includedManifest.length(),
+            "skippedCount" to skippedManifest.length(),
+            "skippedFiles" to skippedList,
+            "scope" to "runtime-meta + /root/.dsh",
+            "locationNote" to "已保存在应用专属下载目录，可点击「分享 / 另存」导出到系统 Download 或云盘"
+        )
     }.getOrElse { mapOf("ok" to false, "error" to (it.message ?: "backup_error")) }
+
+    private fun readAndVerifyBackupArchive(filePath: String, passphrase: String): Pair<JSONObject?, Map<String, ByteArray>> {
+        val cleanPass = passphrase.trim()
+        require(cleanPass.length >= 6) { "解密口令至少需要 6 位字符" }
+        val file = File(filePath)
+        require(file.exists() && file.isFile) { "未找到指定备份文件：$filePath" }
+        val plainZip = vault.decryptWithPassphrase(file.readBytes(), cleanPass)
+        val entries = LinkedHashMap<String, ByteArray>()
+        var manifest: JSONObject? = null
+        var totalDecoded = 0L
+        val maxRestoreBytes = 96L * 1024L * 1024L
+        ZipInputStream(ByteArrayInputStream(plainZip)).use { zis ->
+            while (true) {
+                val entry = zis.nextEntry ?: break
+                val name = entry.name.replace('\\', '/')
+                if (name.isEmpty() || name.startsWith("/") || name.split('/').any { it == ".." }) {
+                    throw SecurityException("备份包含非法路径条目：$name")
+                }
+                if (!entry.isDirectory) {
+                    val out = ByteArrayOutputStream()
+                    val buf = ByteArray(8192)
+                    while (true) {
+                        val n = zis.read(buf)
+                        if (n <= 0) break
+                        totalDecoded += n.toLong()
+                        if (totalDecoded > maxRestoreBytes) {
+                            throw IllegalStateException("备份解压体积超过安全上限（96 MB）")
+                        }
+                        out.write(buf, 0, n)
+                    }
+                    val bytes = out.toByteArray()
+                    if (name == "backup-manifest.json") {
+                        manifest = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrNull()
+                    } else {
+                        entries[name] = bytes
+                    }
+                }
+                zis.closeEntry()
+            }
+        }
+        return Pair(manifest, entries)
+    }
+
+    fun previewEncryptedBackup(filePath: String, passphrase: String): Map<String, Any?> = runCatching {
+        val (manifest, entries) = readAndVerifyBackupArchive(filePath, passphrase)
+        val corrupted = mutableListOf<String>()
+        val manifestIncluded = manifest?.optJSONArray("included")
+        if (manifestIncluded != null) {
+            for (i in 0 until manifestIncluded.length()) {
+                val item = manifestIncluded.optJSONObject(i) ?: continue
+                val p = item.optString("path", "")
+                val expectedSha = item.optString("sha256", "")
+                val actualBytes = entries[p]
+                if (actualBytes == null || (expectedSha.isNotEmpty() && sha256Hex(actualBytes) != expectedSha)) {
+                    corrupted.add(p)
+                }
+            }
+        }
+        val skippedPreview = mutableListOf<Map<String, Any>>()
+        val manifestSkipped = manifest?.optJSONArray("skipped")
+        if (manifestSkipped != null) {
+            for (i in 0 until minOf(manifestSkipped.length(), 20)) {
+                val item = manifestSkipped.optJSONObject(i) ?: continue
+                skippedPreview.add(
+                    mapOf(
+                        "path" to item.optString("path", ""),
+                        "bytes" to item.optLong("bytes", 0L),
+                        "reason" to item.optString("reason", "")
+                    )
+                )
+            }
+        }
+        val totalBytes = entries.values.sumOf { it.size.toLong() }
+        mapOf(
+            "ok" to true,
+            "schema" to (manifest?.optString("schema", "grassbag-backup-v1") ?: "grassbag-backup-v1"),
+            "scope" to (manifest?.optString("scope", "runtime-meta + /root/.dsh") ?: "runtime-meta + /root/.dsh"),
+            "createdAtMs" to (manifest?.optLong("createdAtMs", File(filePath).lastModified()) ?: File(filePath).lastModified()),
+            "includedCount" to entries.size,
+            "skippedCount" to (manifestSkipped?.length() ?: 0),
+            "skippedFiles" to skippedPreview,
+            "totalBytes" to totalBytes,
+            "integrityOk" to corrupted.isEmpty(),
+            "corruptedEntries" to corrupted,
+            "sampleEntries" to entries.keys.take(25).toList()
+        )
+    }.getOrElse { mapOf("ok" to false, "error" to (it.message ?: "preview_backup_error")) }
+
+    fun restoreEncryptedBackup(filePath: String, passphrase: String, done: (Map<String, Any?>) -> Unit) {
+        worker.execute {
+            if (bootstrapRunning.get() || upgradeInProgress.get()) {
+                done(mapOf("ok" to false, "error" to "当前正在部署或升级运行环境，请稍后再执行恢复"))
+                return@execute
+            }
+            try {
+                val (manifest, entries) = readAndVerifyBackupArchive(filePath, passphrase)
+                val manifestIncluded = manifest?.optJSONArray("included")
+                if (manifestIncluded != null) {
+                    for (i in 0 until manifestIncluded.length()) {
+                        val item = manifestIncluded.optJSONObject(i) ?: continue
+                        val p = item.optString("path", "")
+                        val expectedSha = item.optString("sha256", "")
+                        val actualBytes = entries[p]
+                        if (actualBytes == null || (expectedSha.isNotEmpty() && sha256Hex(actualBytes) != expectedSha)) {
+                            done(mapOf("ok" to false, "error" to "备份完整性校验未通过（条目 $p 缺失或校验和不匹配），已中止恢复"))
+                            return@execute
+                        }
+                    }
+                }
+                if (entries.isEmpty()) {
+                    done(mapOf("ok" to false, "error" to "备份归档中没有任何可恢复的文件"))
+                    return@execute
+                }
+                val wasRunning = isEngineAlive() && engineState == "running"
+                if (wasRunning) {
+                    stopEngineSync(keepForegroundService = true, emitStoppedEvent = false)
+                }
+                val ts = System.currentTimeMillis()
+                val dshDir = File(homeDir, ".dsh")
+                val dshPreRestore = File(homeDir, ".dsh.pre-restore-$ts")
+                val hasHomeEntries = entries.keys.any { it.startsWith("home/.dsh/") }
+                var restoredCount = 0
+                try {
+                    if (hasHomeEntries && dshDir.exists()) {
+                        TarGzExtractor.deleteTreeNoFollow(dshPreRestore)
+                        dshDir.copyRecursively(dshPreRestore, overwrite = true)
+                    }
+                    val canonicalHome = homeDir.canonicalFile
+                    for ((rel, bytes) in entries) {
+                        val dest: File = when {
+                            rel == "apt-manifest.json" -> aptFile
+                            rel.startsWith("home/.dsh/") -> {
+                                val sub = rel.removePrefix("home/")
+                                val candidate = File(homeDir, sub).canonicalFile
+                                if (!candidate.path.startsWith(canonicalHome.path + File.separator)) {
+                                    throw SecurityException("越界路径已被拦截：$rel")
+                                }
+                                candidate
+                            }
+                            else -> continue
+                        }
+                        dest.parentFile?.mkdirs()
+                        FileOutputStream(dest).use { it.write(bytes) }
+                        restoredCount++
+                    }
+                    if (dshPreRestore.exists()) {
+                        runCatching { TarGzExtractor.deleteTreeNoFollow(dshPreRestore) }
+                    }
+                } catch (t: Throwable) {
+                    if (dshPreRestore.exists()) {
+                        runCatching {
+                            TarGzExtractor.deleteTreeNoFollow(dshDir)
+                            dshPreRestore.renameTo(dshDir)
+                        }
+                    }
+                    throw t
+                }
+                if (wasRunning) {
+                    startEngineSync()
+                }
+                done(
+                    mapOf(
+                        "ok" to true,
+                        "restoredCount" to restoredCount,
+                        "restartedEngine" to wasRunning,
+                        "status" to getStatus()
+                    )
+                )
+            } catch (t: Throwable) {
+                done(mapOf("ok" to false, "error" to (t.message ?: "restore_backup_error")))
+            }
+        }
+    }
 
     fun startLocalShell(tabId: String, cwd: String?, cols: Int = 80, rows: Int = 24): Map<String, Any?> {
         closeLocalShell(tabId)

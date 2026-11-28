@@ -2147,6 +2147,7 @@ class _SessionListRowState extends State<_SessionListRow> {
                       duration: GrassBagMotion.duration(
                         context,
                         const Duration(milliseconds: 140),
+                        reduced: const Duration(milliseconds: 1),
                       ),
                       curve: Curves.easeOutCubic,
                       child: _hovered

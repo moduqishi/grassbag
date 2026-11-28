@@ -719,16 +719,6 @@ class ChatEmptyState extends ConsumerWidget {
                                   ),
                                 _StaggeredDeckSlice(
                                   progress: p,
-                                  start: 0.01,
-                                  end: 0.48,
-                                  dy: 14.0,
-                                  minScale: 0.95,
-                                  child: const RepaintBoundary(
-                                    child: _RecentSessionsResumeStrip(),
-                                  ),
-                                ),
-                                _StaggeredDeckSlice(
-                                  progress: p,
                                   start: 0.0,
                                   end: 0.42,
                                   dy: 12.0,
@@ -941,85 +931,6 @@ class _RenderMeasureBoxHeight extends RenderProxyBox {
         cb(h);
       });
     }
-  }
-}
-
-/// Isolated leaf widget surfacing 1-2 recent sessions on New Chat so returning users
-/// can jump back into an active or recent thread in 1 tap without opening the drawer.
-class _RecentSessionsResumeStrip extends ConsumerWidget {
-  const _RecentSessionsResumeStrip();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final recentSig = ref.watch(
-      appProvider.select((s) {
-        final items = s.sessions.where((x) => !x.archived).take(2);
-        return items
-            .map((x) => '${x.id}|${x.title}|${x.running ? 1 : 0}|${x.pendingApproval ? 1 : 0}')
-            .join('\u0000');
-      }),
-    );
-    if (recentSig.isEmpty) return const SizedBox.shrink();
-    final recent = ref
-        .read(appProvider)
-        .sessions
-        .where((x) => !x.archived)
-        .take(2)
-        .toList(growable: false);
-    if (recent.isEmpty) return const SizedBox.shrink();
-    final t = GrassBagTokens.of(context);
-    final ctrl = ref.read(appProvider.notifier);
-    return Padding(
-      padding: const EdgeInsets.only(top: 12),
-      child: Wrap(
-        alignment: WrapAlignment.center,
-        spacing: 8,
-        runSpacing: 6,
-        children: [
-          for (final sess in recent)
-            GrassBagSpringTap(
-              onTap: () => ctrl.selectSession(sess.id),
-              pressedScale: 0.95,
-              haptic: true,
-              child: GrassBagFresnelGlassSurface(
-                isPill: true,
-                innerWell: true,
-                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 230),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (sess.pendingApproval) ...[
-                        GrassBagStatusDot(color: t.warn, pulsing: true, size: 6.5),
-                        const SizedBox(width: 6),
-                      ] else if (sess.running) ...[
-                        GrassBagStatusDot(color: t.primary, pulsing: true, size: 6.5),
-                        const SizedBox(width: 6),
-                      ] else ...[
-                        Icon(CupertinoIcons.clock, size: 12, color: t.text3),
-                        const SizedBox(width: 5),
-                      ],
-                      Flexible(
-                        child: Text(
-                          '继续 · ${sess.title}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.w500,
-                            color: t.text2,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
   }
 }
 

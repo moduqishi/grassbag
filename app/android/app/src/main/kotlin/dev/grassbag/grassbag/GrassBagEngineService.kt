@@ -282,6 +282,12 @@ class GrassBagEngineService : Service() {
         private const val ENGINE_CH = "grassbag_engine_channel"
         private const val ALERT_CH = "grassbag_approval_channel"
         private const val FG_NOTIF_ID = 1001
+        private const val ALERT_TAG_NOTIF_ID = 3999
+        const val EXTRA_NOTIFY_KIND = "gb_notify_kind"
+        const val EXTRA_HOST_ID = "gb_host_id"
+        const val EXTRA_SESSION_ID = "gb_session_id"
+        const val EXTRA_INTERACTION_ID = "gb_interaction_id"
+        const val EXTRA_JOB_ID = "gb_job_id"
         private const val KEY_HEADING = "heading"
         private const val KEY_DETAIL = "detail"
         private const val KEY_WAKELOCK_MS = "wakelock_ms"
@@ -509,16 +515,33 @@ class GrassBagEngineService : Service() {
             }
         }
 
-        fun postAlertNotification(ctx: Context, heading: String, detail: String) {
+        fun postAlertNotification(
+            ctx: Context,
+            heading: String,
+            detail: String,
+            tag: String? = null,
+            kind: String? = null,
+            hostId: String? = null,
+            sessionId: String? = null,
+            interactionId: String? = null,
+            jobId: String? = null
+        ) {
             registerChannels(ctx)
             val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val id = alertCounter.incrementAndGet()
+            val cleanTag = tag?.trim()?.takeIf { it.isNotEmpty() }
+            val reqCode = cleanTag?.hashCode() ?: alertCounter.incrementAndGet()
+            val launchIntent = Intent(ctx, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                if (!kind.isNullOrBlank()) putExtra(EXTRA_NOTIFY_KIND, kind.trim())
+                if (!hostId.isNullOrBlank()) putExtra(EXTRA_HOST_ID, hostId.trim())
+                if (!sessionId.isNullOrBlank()) putExtra(EXTRA_SESSION_ID, sessionId.trim())
+                if (!interactionId.isNullOrBlank()) putExtra(EXTRA_INTERACTION_ID, interactionId.trim())
+                if (!jobId.isNullOrBlank()) putExtra(EXTRA_JOB_ID, jobId.trim())
+            }
             val openApp = PendingIntent.getActivity(
                 ctx,
-                id,
-                Intent(ctx, MainActivity::class.java).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                },
+                reqCode,
+                launchIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
             val alert = NotificationCompat.Builder(ctx, ALERT_CH)
@@ -528,7 +551,20 @@ class GrassBagEngineService : Service() {
                 .setAutoCancel(true)
                 .setContentIntent(openApp)
                 .build()
-            runCatching { mgr.notify(id, alert) }
+            runCatching {
+                if (cleanTag != null) {
+                    mgr.notify(cleanTag, ALERT_TAG_NOTIF_ID, alert)
+                } else {
+                    mgr.notify(reqCode, alert)
+                }
+            }
+        }
+
+        fun cancelAlertNotification(ctx: Context, tag: String) {
+            val cleanTag = tag.trim()
+            if (cleanTag.isEmpty()) return
+            val mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            runCatching { mgr.cancel(cleanTag, ALERT_TAG_NOTIF_ID) }
         }
     }
 }

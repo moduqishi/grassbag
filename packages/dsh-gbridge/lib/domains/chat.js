@@ -157,11 +157,14 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
 
     const created = await gateway.call('session/create', createArgs, { peer });
     const createdId = created?.sessionId ?? created?.id;
+    const warnings = [];
     if (createdId) {
       const postOps = [];
       if (typeof body.title === 'string' && body.title.trim() && gateway.has('session/rename')) {
         postOps.push(
-          gateway.call('session/rename', { sessionId: createdId, title: body.title.trim() }, { peer }).catch(() => {}),
+          gateway.call('session/rename', { sessionId: createdId, title: body.title.trim() }, { peer }).catch((err) => {
+            warnings.push({ step: 'title', message: String(err?.message || err || 'rename failed') });
+          }),
         );
       }
       if (typeof body.permission === 'string' && body.permission.trim() && gateway.has('commands/execute')) {
@@ -172,7 +175,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
               agentId: createdId,
               line: `/permission ${permPreset}`,
               submittedAttachments: [],
-            }, { peer }).catch(() => {}),
+            }, { peer }).catch((err) => {
+              warnings.push({ step: 'permission', message: String(err?.message || err || 'permission setup failed') });
+            }),
           );
         }
       }
@@ -185,7 +190,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
             ...(typeof body.reasoningEffort === 'string' && body.reasoningEffort.trim()
               ? { reasoningEffort: body.reasoningEffort.trim() }
               : {}),
-          }, { peer }).catch(() => {}),
+          }, { peer }).catch((err) => {
+            warnings.push({ step: 'model', message: String(err?.message || err || 'model selection failed') });
+          }),
         );
       }
       if (postOps.length > 0) {
@@ -197,7 +204,9 @@ export function registerChatAndInteractionsDomain(router, { ctx, gateway, hub, n
       session: {
         ...(created && typeof created === 'object' ? created : { sessionId: createdId }),
         ...(resolvedWorkspaceId ? { workspaceId: resolvedWorkspaceId } : {}),
+        ...(warnings.length > 0 ? { setupWarnings: warnings } : {}),
       },
+      ...(warnings.length > 0 ? { warnings } : {}),
     });
   }, { domain: 'chat' });
 

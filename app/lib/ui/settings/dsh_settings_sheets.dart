@@ -337,6 +337,8 @@ class _ConfigSyncSheetBodyState extends ConsumerState<_ConfigSyncSheetBody> {
   late final TextEditingController _jsonCtrl;
   String? _err;
 
+  bool _replaceHosts = false;
+
   @override
   void initState() {
     super.initState();
@@ -354,6 +356,11 @@ class _ConfigSyncSheetBodyState extends ConsumerState<_ConfigSyncSheetBody> {
     final t = GrassBagTokens.of(context);
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
     final ctrl = ref.read(appProvider.notifier);
+    final preview = ctrl.previewImportConfigJson(_jsonCtrl.text);
+    final addedHosts = (preview?['addedHosts'] as int?) ?? 0;
+    final updatedHosts = (preview?['updatedHosts'] as int?) ?? 0;
+    final preservedHosts = (preview?['preservedExistingHosts'] as int?) ?? 0;
+    final originChanged = (preview?['originChangedHosts'] as int?) ?? 0;
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -369,9 +376,64 @@ class _ConfigSyncSheetBodyState extends ConsumerState<_ConfigSyncSheetBody> {
           padding: const EdgeInsets.all(12),
           hasError: _err != null,
           onChanged: (_) {
-            if (_err != null) setState(() => _err = null);
+            setState(() => _err = null);
           },
         ),
+        if (preview != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+            decoration: BoxDecoration(
+              color: t.primary.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: t.primary.withValues(alpha: 0.22)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _replaceHosts
+                      ? '替换模式预览：新增 $addedHosts 台 · 更新 $updatedHosts 台 · 移除现有未列出 $preservedHosts 台主机及其凭证'
+                      : '合并模式预览：新增 $addedHosts 台 · 更新 $updatedHosts 台 · 保留现有 $preservedHosts 台主机及凭证',
+                  style: TextStyle(fontSize: 11.5, color: t.text, height: 1.35),
+                ),
+                if (originChanged > 0) ...[
+                  const SizedBox(height: 3),
+                  Text(
+                    '有 $originChanged 台主机地址已变化，将不会复用旧凭证（需重新认证）',
+                    style: TextStyle(fontSize: 11, color: t.warn, height: 1.3),
+                  ),
+                ],
+                const SizedBox(height: 4),
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => setState(() => _replaceHosts = !_replaceHosts),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _replaceHosts
+                            ? CupertinoIcons.checkmark_square_fill
+                            : CupertinoIcons.square,
+                        size: 15,
+                        color: _replaceHosts ? t.warn : t.text3,
+                      ),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          '改为覆盖替换主机列表（清空未列出的远程主机与凭证）',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: _replaceHosts ? t.warn : t.text2,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
         if (_err != null) ...[
           const SizedBox(height: 6),
           Text(_err!, style: TextStyle(fontSize: 12, color: t.err)),
@@ -394,12 +456,15 @@ class _ConfigSyncSheetBodyState extends ConsumerState<_ConfigSyncSheetBody> {
             const SizedBox(width: 10),
             Expanded(
               child: GrassBagPrimaryGlassButton(
-                label: '导入应用',
+                label: _replaceHosts ? '替换并应用' : '合并应用',
                 icon: CupertinoIcons.square_arrow_down,
                 tier: tier,
                 insideGlass: true,
                 onTap: () {
-                  final ok = ctrl.importConfigJson(_jsonCtrl.text);
+                  final ok = ctrl.importConfigJson(
+                    _jsonCtrl.text,
+                    replaceHosts: _replaceHosts,
+                  );
                   if (ok) {
                     Navigator.of(context).pop();
                   } else {

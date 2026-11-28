@@ -113,7 +113,7 @@ class GbridgeHttpTransport {
           final probeUri = endpoint.resolveHttpUri('/api/settings/describe');
           final probeInit = JSObject();
           probeInit.setProperty('method'.toJS, 'POST'.toJS);
-          probeInit.setProperty('credentials'.toJS, 'include'.toJS);
+          probeInit.setProperty('credentials'.toJS, _credentialsModeFor(probeUri).toJS);
           final probeHeaders = JSObject();
           probeHeaders.setProperty('Content-Type'.toJS, 'application/json'.toJS);
           for (final e in buildAuthHeaders().entries) {
@@ -231,6 +231,26 @@ class GbridgeHttpTransport {
     return future;
   }
 
+  String _credentialsModeFor(Uri targetUri, {bool forceInclude = false}) {
+    if (forceInclude) return 'include';
+    try {
+      final loc = globalContext.getProperty<JSObject?>('location'.toJS);
+      final pageOrigin = loc?.getProperty<JSString?>('origin'.toJS)?.toDart.toLowerCase();
+      if (pageOrigin != null && pageOrigin.isNotEmpty) {
+        final targetOrigin = targetUri.origin.toLowerCase();
+        if (targetOrigin == pageOrigin) {
+          return 'include';
+        }
+      }
+    } catch (_) {}
+    // Cross-origin requests with an explicit Bearer token should use `omit` so standard
+    // loopback/proxy CORS without `Access-Control-Allow-Credentials: true` succeeds cleanly.
+    if (endpoint.token != null && endpoint.token!.isNotEmpty) {
+      return 'omit';
+    }
+    return 'include';
+  }
+
   Map<String, String> buildAuthHeaders() {
     final headers = <String, String>{};
     if (endpoint.token != null && endpoint.token!.isNotEmpty) {
@@ -272,7 +292,7 @@ class GbridgeHttpTransport {
 
     final init = JSObject();
     init.setProperty('method'.toJS, method.toJS);
-    init.setProperty('credentials'.toJS, 'include'.toJS);
+    init.setProperty('credentials'.toJS, _credentialsModeFor(uri).toJS);
     if (body != null) {
       headersObj.setProperty('Content-Type'.toJS, 'application/json'.toJS);
       init.setProperty('body'.toJS, jsonEncode(body).toJS);
@@ -392,7 +412,7 @@ class GbridgeHttpTransport {
     }
     final init = JSObject();
     init.setProperty('method'.toJS, method.toJS);
-    init.setProperty('credentials'.toJS, 'include'.toJS);
+    init.setProperty('credentials'.toJS, _credentialsModeFor(uri).toJS);
     if (bodyBytes != null) {
       headersObj.setProperty('Content-Type'.toJS, (contentType ?? 'application/octet-stream').toJS);
       init.setProperty('body'.toJS, bodyBytes.toJS);

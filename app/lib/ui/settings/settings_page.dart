@@ -1521,6 +1521,7 @@ class _SettingsDetailBody extends ConsumerWidget {
             _InteractiveGlassDiorama(
               accent: state.accent,
               glassTier: state.glassTier,
+              opticalStrength: state.glassOpticalStrength,
               isDark: state.isDark,
               tierHint: tierHint,
               onCycleAccent: () {
@@ -1529,6 +1530,9 @@ class _SettingsDetailBody extends ConsumerWidget {
                 ctrl.setAccent(vals[nextIdx]);
               },
               onToggleDark: () => ctrl.setDark(!state.isDark),
+              onOpticalStrengthChanged: ctrl.setGlassOpticalStrength,
+              onOpticalStrengthChangeEnd: (v) =>
+                  ctrl.setGlassOpticalStrength(v, persistImmediately: true),
             ),
             const SizedBox(height: 18),
             GrassBagGroupedSection(
@@ -1709,8 +1713,8 @@ class _SettingsDetailBody extends ConsumerWidget {
                   alignment: Alignment.centerLeft,
                   child: Text(
                     switch (state.glassTier) {
-                      GrassBagGlassTier.liquid => '通透液态玻璃：开启完整实时光学折射、7 段色散与镜面高光',
-                      GrassBagGlassTier.frosted => '轻柔磨砂：均衡 GPU 功耗与半透明通透层次，适合日常续航',
+                      GrassBagGlassTier.liquid => '通透液态玻璃：开启完整实时光学折射、色散与镜面高光（可在上方滑块调节强度）',
+                      GrassBagGlassTier.frosted => '轻柔磨砂：均衡 GPU 功耗与半透明通透层次，无折射色散，适合日常续航',
                       GrassBagGlassTier.solid => '纯色简约：零实时模糊开销，极致清晰对比度与省电表现',
                     },
                     style: TextStyle(fontSize: 11.5, height: 1.4, color: t.text3),
@@ -2152,18 +2156,24 @@ class _InteractiveGlassDiorama extends StatefulWidget {
   const _InteractiveGlassDiorama({
     required this.accent,
     required this.glassTier,
+    required this.opticalStrength,
     required this.isDark,
     required this.tierHint,
     required this.onCycleAccent,
     required this.onToggleDark,
+    required this.onOpticalStrengthChanged,
+    required this.onOpticalStrengthChangeEnd,
   });
 
   final GrassBagAccent accent;
   final GrassBagGlassTier glassTier;
+  final double opticalStrength;
   final bool isDark;
   final String tierHint;
   final VoidCallback onCycleAccent;
   final VoidCallback onToggleDark;
+  final ValueChanged<double> onOpticalStrengthChanged;
+  final ValueChanged<double> onOpticalStrengthChangeEnd;
 
   @override
   State<_InteractiveGlassDiorama> createState() => _InteractiveGlassDioramaState();
@@ -2177,7 +2187,6 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
   late final Listenable _dragMerged;
   double _rawDragX = 0.0;
   double _rawDragY = 0.0;
-  double _refractionScale = 0.72;
 
   static double _rubberClamp(double v, double minSoft, double maxSoft) {
     if (v >= minSoft && v <= maxSoft) return v;
@@ -2241,16 +2250,18 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
     final t = GrassBagTokens.of(context);
     final isSolid = widget.glassTier == GrassBagGlassTier.solid;
     final isLiquid = widget.glassTier == GrassBagGlassTier.liquid;
+    final opticalStrength = widget.opticalStrength.clamp(0.0, 1.0);
+    final opticalPct = (opticalStrength * 100).round();
+    final isModified =
+        (opticalStrength - GrassBagGlassConfig.defaultOpticalStrength).abs() >= 0.015;
 
     // Draggable genuine liquid_glass_widgets 1.19.0 iOS 27 crystal prism lens capsule
-    final prismBase = GrassBagGlassConfig.prismLensSettings(t, widget.glassTier);
-    final prismSettings = isLiquid
-        ? prismBase.copyWith(
-            thickness: 20.0 + 18.0 * _refractionScale,
-            refractiveIndex: 1.24 + 0.20 * _refractionScale,
-            chromaticAberration: 0.08 + 0.16 * _refractionScale,
-          )
-        : prismBase;
+    // driven directly by the global persisted `opticalStrength` setting.
+    final prismSettings = GrassBagGlassConfig.prismLensSettings(
+      t,
+      widget.glassTier,
+      opticalStrength: opticalStrength,
+    );
 
     final draggableLensCard = RawGestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -2448,12 +2459,12 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
           ),
         ),
         GrassBagSmoothDisclosure(
-          expanded: !isSolid,
+          expanded: isLiquid,
           child: Padding(
             padding: const EdgeInsets.only(top: 12),
             child: GrassBagCard(
               borderRadius: 22,
-              padding: const EdgeInsets.fromLTRB(15, 10, 15, 8),
+              padding: const EdgeInsets.fromLTRB(15, 11, 15, 9),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -2461,17 +2472,51 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
                     children: [
                       Expanded(
                         child: Text(
-                          '光学折射演示（拖动滑块与上方透镜体验色散）',
+                          '液态玻璃折射与色散强度',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2),
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: t.text,
+                          ),
                         ),
                       ),
+                      if (isModified) ...[
+                        const SizedBox(width: 8),
+                        GrassBagSpringTap(
+                          key: const ValueKey('glass-optical-strength-reset'),
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            widget.onOpticalStrengthChangeEnd(
+                              GrassBagGlassConfig.defaultOpticalStrength,
+                            );
+                          },
+                          pressedScale: 0.94,
+                          enablePointerGlow: false,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                            decoration: ShapeDecoration(
+                              color: t.fill1,
+                              shape: const StadiumBorder(),
+                            ),
+                            child: Text(
+                              '恢复默认',
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w600,
+                                color: t.text2,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                       const SizedBox(width: 8),
                       Text(
-                        '${(_refractionScale * 100).round()}%',
+                        key: const ValueKey('glass-optical-strength-label'),
+                        opticalPct == 0 ? '关闭' : '$opticalPct%',
                         style: TextStyle(
-                          fontSize: 12,
+                          fontSize: 12.5,
                           fontWeight: FontWeight.w600,
                           fontFeatures: const [FontFeature.tabularFigures()],
                           color: t.primary,
@@ -2480,12 +2525,21 @@ class _InteractiveGlassDioramaState extends State<_InteractiveGlassDiorama>
                     ],
                   ),
                   const SizedBox(height: 2),
+                  Text(
+                    '全局实时生效并自动保存 · 可拖动上方棱镜预览边缘色散',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: t.text3),
+                  ),
+                  const SizedBox(height: 2),
                   GrassBagGlassSlider(
-                    value: _refractionScale,
-                    min: 0.15,
+                    key: const ValueKey('glass-optical-strength-slider'),
+                    value: opticalStrength,
+                    min: 0.0,
                     max: 1.0,
                     tier: widget.glassTier,
-                    onChanged: (v) => setState(() => _refractionScale = v),
+                    onChanged: widget.onOpticalStrengthChanged,
+                    onChangeEnd: widget.onOpticalStrengthChangeEnd,
                   ),
                 ],
               ),
@@ -3245,14 +3299,14 @@ class _HostDetailSectionState extends ConsumerState<_HostDetailSection> {
                     size: 34,
                     iconSize: 16,
                   ),
-                  title: const Text('加密导出本机备份到 Download/'),
-                  subtitle: const Text('使用 AES-256-GCM 口令加密归档对话与配置'),
+                  title: const Text('加密备份与校验恢复（.dsh 配置与会话）'),
+                  subtitle: const Text('AES-256-GCM 归档运行时状态与 .dsh 数据，展示遗漏项、支持分享保存与校验恢复'),
                   showChevron: true,
                   onTap: () {
                     showGrassBagSheet<void>(
                       context,
-                      title: '设置备份加密口令',
-                      subtitle: '导出前对 /root 与密钥摘要进行本地 AES-GCM 加密（至少 6 位）',
+                      title: '加密备份与恢复',
+                      subtitle: '归档范围：运行时元数据与 /root/.dsh（单文件 ≤8 MB、总计 ≤64 MB，不含大型项目代码）',
                       bodyBuilder: (_) => const _BackupPassphraseSheetBody(),
                     );
                   },
@@ -3834,19 +3888,49 @@ class _BackupPassphraseSheetBody extends ConsumerStatefulWidget {
 class _BackupPassphraseSheetBodyState extends ConsumerState<_BackupPassphraseSheetBody> {
   final _passCtrl = TextEditingController();
   final _confirmCtrl = TextEditingController();
+  final _restorePassCtrl = TextEditingController();
   final _confirmFocus = FocusNode();
+  int _tab = 0; // 0 = 加密导出, 1 = 校验并恢复
   bool _obscure = true;
+  bool _busy = false;
   String? _err;
+  Map<String, dynamic>? _exportResult;
+  List<Map<String, dynamic>> _backups = const [];
+  String? _selectedBackupPath;
+  Map<String, dynamic>? _previewResult;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadBackups());
+  }
 
   @override
   void dispose() {
     _passCtrl.dispose();
     _confirmCtrl.dispose();
+    _restorePassCtrl.dispose();
     _confirmFocus.dispose();
     super.dispose();
   }
 
-  void _submit() {
+  Future<void> _loadBackups() async {
+    final res = await ref.read(appProvider.notifier).listEncryptedBackups();
+    if (!mounted) return;
+    final raw = res['backups'];
+    final list = raw is List
+        ? raw.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList(growable: false)
+        : const <Map<String, dynamic>>[];
+    setState(() {
+      _backups = list;
+      if (_selectedBackupPath == null && list.isNotEmpty) {
+        _selectedBackupPath = list.first['path']?.toString();
+      }
+    });
+  }
+
+  Future<void> _submitExport() async {
+    if (_busy) return;
     final p = _passCtrl.text.trim();
     final c = _confirmCtrl.text.trim();
     if (p.length < 6) {
@@ -3857,72 +3941,337 @@ class _BackupPassphraseSheetBodyState extends ConsumerState<_BackupPassphraseShe
       setState(() => _err = '两次输入的加密口令不一致，请核对后再导出');
       return;
     }
-    Navigator.of(context).pop();
-    ref.read(appProvider.notifier).exportEncryptedBackup(p);
+    setState(() {
+      _busy = true;
+      _err = null;
+    });
+    final res = await ref.read(appProvider.notifier).exportEncryptedBackup(p);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (res['ok'] == true) {
+        _exportResult = res;
+      } else {
+        _err = res['error']?.toString() ?? '导出失败';
+      }
+    });
+    unawaited(_loadBackups());
+  }
+
+  Future<void> _shareExportedFile() async {
+    final path = _exportResult?['path']?.toString();
+    final filename = _exportResult?['filename']?.toString() ?? 'GrassBag-Backup.gbag.enc';
+    if (path == null || path.isEmpty) return;
+    final ok = await GrassBagNativeBridge.instance.shareBackupFile(path, filename);
+    if (!ok && mounted) {
+      ref.read(appProvider.notifier).showToast('调用系统分享失败，文件仍保留在应用下载目录', tone: ToastTone.warn);
+    }
+  }
+
+  Future<void> _previewSelectedBackup() async {
+    if (_busy) return;
+    final path = _selectedBackupPath;
+    final pass = _restorePassCtrl.text.trim();
+    if (path == null || path.isEmpty) {
+      setState(() => _err = '请先选择一个加密备份文件');
+      return;
+    }
+    if (pass.length < 6) {
+      setState(() => _err = '请输入导出时设置的至少 6 位解密口令');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _err = null;
+      _previewResult = null;
+    });
+    final res = await ref.read(appProvider.notifier).previewEncryptedBackup(path, pass);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (res['ok'] == true) {
+        _previewResult = res;
+      } else {
+        _err = res['error']?.toString() ?? '解密或校验失败';
+      }
+    });
+  }
+
+  Future<void> _confirmRestore() async {
+    if (_busy || _previewResult == null || _previewResult!['integrityOk'] != true) return;
+    final path = _selectedBackupPath;
+    final pass = _restorePassCtrl.text.trim();
+    if (path == null || path.isEmpty || pass.length < 6) return;
+    setState(() {
+      _busy = true;
+      _err = null;
+    });
+    final res = await ref.read(appProvider.notifier).restoreEncryptedBackup(path, pass);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (res['ok'] == true) {
+      Navigator.of(context).pop();
+    } else {
+      setState(() => _err = res['error']?.toString() ?? '恢复失败');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final st = GrassBagTokens.of(context);
     final tier = ref.watch(appProvider.select((s) => s.glassTier));
+    final skippedItems = (_exportResult?['skippedFiles'] as List?)
+            ?.whereType<Map>()
+            .map((e) => Map<String, dynamic>.from(e))
+            .toList(growable: false) ??
+        const <Map<String, dynamic>>[];
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        GrassBagTextField(
-          controller: _passCtrl,
-          obscureText: _obscure,
-          autofocus: true,
-          insideGlass: true,
-          textInputAction: TextInputAction.next,
-          placeholder: '输入至少 6 位加密口令…',
-          fontSize: 14,
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          hasError: _err != null,
-          suffix: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => setState(() => _obscure = !_obscure),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-              child: Icon(
-                _obscure ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
-                size: 17,
-                color: st.text3,
+        GrassBagSegmentedControl(
+          labels: const ['加密导出', '校验恢复'],
+          selectedIndex: _tab,
+          tier: tier,
+          height: 36,
+          onSelected: (i) => setState(() {
+            _tab = i;
+            _err = null;
+          }),
+        ),
+        const SizedBox(height: 12),
+        if (_tab == 0) ...[
+          GrassBagTextField(
+            controller: _passCtrl,
+            obscureText: _obscure,
+            autofocus: true,
+            insideGlass: true,
+            textInputAction: TextInputAction.next,
+            placeholder: '输入至少 6 位加密口令…',
+            fontSize: 14,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            hasError: _err != null,
+            suffix: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _obscure = !_obscure),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Icon(
+                  _obscure ? CupertinoIcons.eye : CupertinoIcons.eye_slash,
+                  size: 17,
+                  color: st.text3,
+                ),
               ),
             ),
+            onChanged: (_) {
+              if (_err != null) setState(() => _err = null);
+            },
+            onSubmitted: (_) => _confirmFocus.requestFocus(),
           ),
-          onChanged: (_) {
-            if (_err != null) setState(() => _err = null);
-          },
-          onSubmitted: (_) => _confirmFocus.requestFocus(),
-        ),
-        const SizedBox(height: 10),
-        GrassBagTextField(
-          controller: _confirmCtrl,
-          focusNode: _confirmFocus,
-          obscureText: _obscure,
-          insideGlass: true,
-          textInputAction: TextInputAction.done,
-          placeholder: '再次输入口令以防输错…',
-          fontSize: 14,
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          hasError: _err != null,
-          onChanged: (_) {
-            if (_err != null) setState(() => _err = null);
-          },
-          onSubmitted: (_) => _submit(),
-        ),
-        if (_err != null) ...[
-          const SizedBox(height: 6),
-          Text(_err!, style: TextStyle(fontSize: 12, color: st.err)),
+          const SizedBox(height: 10),
+          GrassBagTextField(
+            controller: _confirmCtrl,
+            focusNode: _confirmFocus,
+            obscureText: _obscure,
+            insideGlass: true,
+            textInputAction: TextInputAction.done,
+            placeholder: '再次输入口令以防输错…',
+            fontSize: 14,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            hasError: _err != null,
+            onChanged: (_) {
+              if (_err != null) setState(() => _err = null);
+            },
+            onSubmitted: (_) => unawaited(_submitExport()),
+          ),
+          if (_exportResult != null) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(11),
+              decoration: BoxDecoration(
+                color: st.fill1,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '已归档 ${_exportResult!['includedCount']} 个文件'
+                    '${((_exportResult!['skippedCount'] as num?)?.toInt() ?? 0) > 0 ? ' · 跳过 ${_exportResult!['skippedCount']} 项' : ' · 零遗漏'}',
+                    style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: st.text),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '保存位置（应用专属下载目录）：${_exportResult!['path']}',
+                    style: TextStyle(fontSize: 11, color: st.text3),
+                  ),
+                  if (skippedItems.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      '被跳过条目（超限/非普通文件）：',
+                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: st.warn),
+                    ),
+                    for (final item in skippedItems.take(5))
+                      Text(
+                        '• ${item['path']} (${item['reason']})',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11, color: st.text2),
+                      ),
+                  ],
+                  const SizedBox(height: 8),
+                  GrassBagSecondaryGlassButton(
+                    label: '分享 / 另存到系统目录或云盘',
+                    icon: CupertinoIcons.share,
+                    height: 36,
+                    tier: tier,
+                    insideGlass: true,
+                    onTap: _shareExportedFile,
+                  ),
+                ],
+              ),
+            ),
+          ],
+          if (_err != null) ...[
+            const SizedBox(height: 6),
+            Text(_err!, style: TextStyle(fontSize: 12, color: st.err)),
+          ],
+          const SizedBox(height: 12),
+          GrassBagPrimaryGlassButton(
+            label: _busy ? '正在校验与加密归档…' : '立即加密归档',
+            tier: tier,
+            insideGlass: true,
+            enabled: !_busy,
+            onTap: () => unawaited(_submitExport()),
+          ),
+        ] else ...[
+          if (_backups.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(
+                '应用下载目录暂无 .gbag.enc 加密备份，请先在「加密导出」中创建备份。',
+                style: TextStyle(fontSize: 12.5, color: st.text3),
+              ),
+            )
+          else ...[
+            for (final b in _backups.take(4))
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: GrassBagSpringTap(
+                  onTap: () => setState(() {
+                    _selectedBackupPath = b['path']?.toString();
+                    _previewResult = null;
+                    _err = null;
+                  }),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                    decoration: BoxDecoration(
+                      color: _selectedBackupPath == b['path']?.toString()
+                          ? st.primarySoft
+                          : st.fill1,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _selectedBackupPath == b['path']?.toString()
+                              ? CupertinoIcons.checkmark_circle_fill
+                              : CupertinoIcons.doc_fill,
+                          size: 16,
+                          color: _selectedBackupPath == b['path']?.toString()
+                              ? st.primary
+                              : st.text3,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            b['filename']?.toString() ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w500, color: st.text),
+                          ),
+                        ),
+                        Text(
+                          '${(((b['bytes'] as num?)?.toInt() ?? 0) / 1024).toStringAsFixed(1)} KB',
+                          style: TextStyle(fontSize: 11, color: st.text3),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 6),
+            GrassBagTextField(
+              controller: _restorePassCtrl,
+              obscureText: _obscure,
+              insideGlass: true,
+              placeholder: '输入该备份的解密口令…',
+              fontSize: 14,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              hasError: _err != null,
+              onChanged: (_) {
+                if (_err != null || _previewResult != null) {
+                  setState(() {
+                    _err = null;
+                    _previewResult = null;
+                  });
+                }
+              },
+            ),
+            if (_previewResult != null) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(11),
+                decoration: BoxDecoration(
+                  color: _previewResult!['integrityOk'] == true ? st.okSoft : st.errSoft,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _previewResult!['integrityOk'] == true
+                          ? 'SHA-256 完整性校验通过 · 可恢复 ${_previewResult!['includedCount']} 个文件'
+                          : '完整性校验失败，已禁止恢复！',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: _previewResult!['integrityOk'] == true ? st.ok : st.err,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '范围：${_previewResult!['scope']} · 解压体积 ${(((_previewResult!['totalBytes'] as num?)?.toInt() ?? 0) / 1024).toStringAsFixed(1)} KB',
+                      style: TextStyle(fontSize: 11, color: st.text2),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (_err != null) ...[
+              const SizedBox(height: 6),
+              Text(_err!, style: TextStyle(fontSize: 12, color: st.err)),
+            ],
+            const SizedBox(height: 12),
+            if (_previewResult == null || _previewResult!['integrityOk'] != true)
+              GrassBagPrimaryGlassButton(
+                label: _busy ? '正在解密校验…' : '解密预览并校验完整性',
+                tier: tier,
+                insideGlass: true,
+                enabled: !_busy,
+                onTap: () => unawaited(_previewSelectedBackup()),
+              )
+            else
+              GrassBagPrimaryGlassButton(
+                label: _busy ? '正在恢复并重启引擎…' : '确认覆盖恢复 .dsh 数据',
+                tier: tier,
+                insideGlass: true,
+                enabled: !_busy,
+                onTap: () => unawaited(_confirmRestore()),
+              ),
+          ],
         ],
-        const SizedBox(height: 12),
-        GrassBagPrimaryGlassButton(
-          label: '立即加密导出',
-          tier: tier,
-          insideGlass: true,
-          onTap: _submit,
-        ),
       ],
     );
   }

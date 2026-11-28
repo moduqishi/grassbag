@@ -363,6 +363,20 @@ class SessionSummary {
   final bool unread;
   final Map<String, dynamic> raw;
 
+  /// Non-fatal post-creation setup warnings (e.g. model/permission/title RPC failed).
+  List<Map<String, String>> get setupWarnings {
+    final list = raw['setupWarnings'];
+    if (list is! List) return const [];
+    return [
+      for (final item in list)
+        if (item is Map)
+          {
+            'step': (item['step'] ?? 'setup').toString(),
+            'message': (item['message'] ?? '').toString(),
+          },
+    ];
+  }
+
   static final RegExp _trailingSlashesRe = RegExp(r'/+$');
   static final RegExp _corruptObjRe = RegExp(r'\[object Object\]', caseSensitive: false);
   static final RegExp _leadingPunctRe = RegExp(r'^[\s,，:：\-·]+');

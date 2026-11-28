@@ -3053,6 +3053,17 @@ class _SessionDetailContentState extends ConsumerState<SessionDetailContent> {
               onTap: () => ctrl.exportActiveSession(),
             ),
             GrassBagListTile(
+              title: const Text('导出完整会话归档 (ZIP)', style: TextStyle(fontSize: 14)),
+              subtitle: Text(
+                host.directMode
+                    ? '直连模式暂不支持 ZIP，请安装连接助手或使用 Markdown 导出'
+                    : '打包完整对话、附件与分支记录',
+                style: TextStyle(fontSize: 11.5, color: t.text3),
+              ),
+              showChevron: !host.directMode,
+              onTap: () => unawaited(ctrl.exportActiveSessionZip()),
+            ),
+            GrassBagListTile(
               title: const Text('在官方网页版中打开', style: TextStyle(fontSize: 14)),
               showChevron: true,
               onTap: widget.onOpenWebUi,

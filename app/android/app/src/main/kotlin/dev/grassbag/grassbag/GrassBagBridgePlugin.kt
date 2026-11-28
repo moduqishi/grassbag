@@ -82,6 +82,8 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     private var pendingPermResult: MethodChannel.Result? = null
     private var pendingCameraPermResult: MethodChannel.Result? = null
     private var pendingCameraFile: File? = null
+    @Volatile
+    private var pendingNotificationPayload: Map<String, String>? = null
     private val runtimeListener: (String, Map<String, Any?>) -> Unit = { type, payload ->
         sendEvent(type, payload)
     }
@@ -277,6 +279,37 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }, 400L)
     }
 
+    fun handleNotificationIntent(intent: Intent?) {
+        if (intent == null) return
+        val kind = intent.getStringExtra(GrassBagEngineService.EXTRA_NOTIFY_KIND)?.trim() ?: ""
+        val hostId = intent.getStringExtra(GrassBagEngineService.EXTRA_HOST_ID)?.trim() ?: ""
+        val sessionId = intent.getStringExtra(GrassBagEngineService.EXTRA_SESSION_ID)?.trim() ?: ""
+        val interactionId = intent.getStringExtra(GrassBagEngineService.EXTRA_INTERACTION_ID)?.trim() ?: ""
+        val jobId = intent.getStringExtra(GrassBagEngineService.EXTRA_JOB_ID)?.trim() ?: ""
+        if (kind.isEmpty() && hostId.isEmpty() && sessionId.isEmpty() && interactionId.isEmpty() && jobId.isEmpty()) {
+            return
+        }
+        intent.removeExtra(GrassBagEngineService.EXTRA_NOTIFY_KIND)
+        intent.removeExtra(GrassBagEngineService.EXTRA_HOST_ID)
+        intent.removeExtra(GrassBagEngineService.EXTRA_SESSION_ID)
+        intent.removeExtra(GrassBagEngineService.EXTRA_INTERACTION_ID)
+        intent.removeExtra(GrassBagEngineService.EXTRA_JOB_ID)
+        val payload = buildMap {
+            if (kind.isNotEmpty()) put("kind", kind)
+            if (hostId.isNotEmpty()) put("hostId", hostId)
+            if (sessionId.isNotEmpty()) put("sessionId", sessionId)
+            if (interactionId.isNotEmpty()) put("interactionId", interactionId)
+            if (jobId.isNotEmpty()) put("jobId", jobId)
+        }
+        if (eventSink != null && !detached) {
+            sendEvent("notification.opened", payload)
+        } else {
+            synchronized(lifecycleLock) {
+                pendingNotificationPayload = payload
+            }
+        }
+    }
+
     override fun onCancel(arguments: Any?) {
         eventSink = null
     }
@@ -383,10 +416,72 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                 }
             }
             "runtime.exportBackup" -> {
-                val pass = call.argument<String>("passphrase") ?: "grassbag"
+                val pass = call.argument<String>("passphrase") ?: ""
                 withRuntime(result) { rt ->
                     val res = rt.exportEncryptedBackup(pass)
                     replySafe(result) { it.success(res) }
+                }
+            }
+            "runtime.listBackups" -> {
+                withRuntime(result) { rt ->
+                    val res = rt.listEncryptedBackups()
+                    replySafe(result) { it.success(res) }
+                }
+            }
+            "runtime.previewBackup" -> {
+                val path = call.argument<String>("path") ?: ""
+                val pass = call.argument<String>("passphrase") ?: ""
+                withRuntime(result) { rt ->
+                    val res = rt.previewEncryptedBackup(path, pass)
+                    replySafe(result) { it.success(res) }
+                }
+            }
+            "runtime.restoreBackup" -> {
+                val path = call.argument<String>("path") ?: ""
+                val pass = call.argument<String>("passphrase") ?: ""
+                withRuntime(result) { rt ->
+                    rt.restoreEncryptedBackup(path, pass) { res ->
+                        replySafe(result) { it.success(res) }
+                    }
+                }
+            }
+            "runtime.shareBackupFile" -> {
+                val path = call.argument<String>("path") ?: ""
+                val rawName = call.argument<String>("filename")?.trim() ?: "GrassBag-Backup.gbag.enc"
+                runBg(result) {
+                    runCatching {
+                        val src = File(path)
+                        if (!src.exists() || !src.isFile) {
+                            replySafe(result) { it.success(false) }
+                            return@runBg
+                        }
+                        val safeName = rawName
+                            .replace(Regex("""[/\\:*?"<>|\r\n]+"""), "_")
+                            .trim()
+                            .ifEmpty { "GrassBag-Backup.gbag.enc" }
+                        val shareDir = File(activity.cacheDir, "share").apply { mkdirs() }
+                        val dest = File(shareDir, safeName)
+                        dest.writeBytes(src.readBytes())
+                        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", dest)
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "application/octet-stream"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            clipData = ClipData.newRawUri(dest.name, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        mainHandler.post {
+                            val launched = runCatching {
+                                val chooser = Intent.createChooser(intent, safeName).apply {
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                activity.startActivity(chooser)
+                                true
+                            }.getOrDefault(false)
+                            replySafe(result) { it.success(launched) }
+                        }
+                    }.onFailure {
+                        replySafe(result) { it.success(false) }
+                    }
                 }
             }
 
@@ -662,10 +757,41 @@ class GrassBagBridgePlugin(private val activity: Activity) :
             "service.notify" -> {
                 val title = call.argument<String>("title") ?: "GrassBag"
                 val text = call.argument<String>("text") ?: ""
+                val tag = call.argument<String>("tag")
+                val kind = call.argument<String>("kind")
+                val hostId = call.argument<String>("hostId")
+                val sessionId = call.argument<String>("sessionId")
+                val interactionId = call.argument<String>("interactionId")
+                val jobId = call.argument<String>("jobId")
                 runBg(result) {
-                    GrassBagEngineService.postAlertNotification(activity.applicationContext, title, text)
+                    GrassBagEngineService.postAlertNotification(
+                        ctx = activity.applicationContext,
+                        heading = title,
+                        detail = text,
+                        tag = tag,
+                        kind = kind,
+                        hostId = hostId,
+                        sessionId = sessionId,
+                        interactionId = interactionId,
+                        jobId = jobId
+                    )
                     replySafe(result) { it.success(true) }
                 }
+            }
+            "service.cancelNotify" -> {
+                val tag = call.argument<String>("tag") ?: ""
+                runBg(result) {
+                    GrassBagEngineService.cancelAlertNotification(activity.applicationContext, tag)
+                    replySafe(result) { it.success(true) }
+                }
+            }
+            "service.takePendingNotification" -> {
+                val payload = synchronized(lifecycleLock) {
+                    val current = pendingNotificationPayload
+                    pendingNotificationPayload = null
+                    current
+                }
+                replySafe(result) { it.success(payload) }
             }
 
             // Permissions status & OS settings deep links (off UI thread: avoids 6+ Binder IPCs on UI Looper!)

@@ -214,6 +214,37 @@ class KeystoreVault(ctx: Context) {
         }
     }
 
+    fun decryptWithPassphrase(blob: ByteArray, pass: String): ByteArray {
+        require(pass.isNotBlank()) { "口令不能为空" }
+        val expectedHeader = "GBAG2".toByteArray(Charsets.US_ASCII)
+        val minLen = expectedHeader.size + 16 + 12 + 16
+        require(blob.size >= minLen) { "备份文件格式无效或已截断" }
+        val header = blob.copyOfRange(0, expectedHeader.size)
+        require(header.contentEquals(expectedHeader)) { "备份文件头不匹配（非 GBAG2 加密归档）" }
+        val saltStart = expectedHeader.size
+        val ivStart = saltStart + 16
+        val cipherStart = ivStart + 12
+        val salt = blob.copyOfRange(saltStart, ivStart)
+        val iv = blob.copyOfRange(ivStart, cipherStart)
+        val cipherData = blob.copyOfRange(cipherStart, blob.size)
+        val spec = PBEKeySpec(pass.toCharArray(), salt, PBKDF2_ITERATIONS, 256)
+        val key = try {
+            SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        } finally {
+            spec.clearPassword()
+        }
+        return try {
+            val c = Cipher.getInstance(ALG)
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+            c.updateAAD(header + salt)
+            c.doFinal(cipherData)
+        } catch (_: Throwable) {
+            throw IllegalArgumentException("口令错误或备份文件已被篡改损坏")
+        } finally {
+            key.fill(0)
+        }
+    }
+
     companion object {
         private const val ALIAS = "grassbag_master_aes_v1"
         private const val ALG = "AES/GCM/NoPadding"

@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
 import 'models.dart';
 import 'transport.dart';
@@ -8,6 +10,10 @@ import 'transport.dart';
 /// directly in ~1-2s without hitting npmjs or git!).
 const String kOfficialGbridgeDirectUrl =
     'https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz';
+
+/// Official GitHub Release `SHA256SUMS.txt` matching `dsh-gbridge.tgz`.
+const String kOfficialGbridgeChecksumsUrl =
+    'https://github.com/moduqishi/grassbag/releases/latest/download/SHA256SUMS.txt';
 
 /// Primary China-accelerated GitHub mirror URL for `dsh-gbridge.tgz`.
 const String kOfficialGbridgeAcceleratedUrl =
@@ -19,6 +25,111 @@ const List<String> kOfficialGbridgeInstallSpecs = [
   'https://ghfast.top/https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz',
   kOfficialGbridgeDirectUrl,
 ];
+
+/// Parses the SHA-256 hex digest for [targetFileName] (default `dsh-gbridge.tgz`) from a
+/// standard `sha256sum` manifest (`<64-hex>  <filename>`).
+String? parseSha256SumsForFile(
+  String manifestText, {
+  String targetFileName = 'dsh-gbridge.tgz',
+}) {
+  for (final rawLine in manifestText.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (line.isEmpty) continue;
+    final match = RegExp(r'^([0-9a-fA-F]{64})\s+\*?(.+)$').firstMatch(line);
+    if (match == null) continue;
+    final name = match.group(2)!.trim();
+    if (name == targetFileName || name.endsWith('/$targetFileName')) {
+      return match.group(1)!.toLowerCase();
+    }
+  }
+  return null;
+}
+
+/// Pure-Dart FIPS 180-4 SHA-256 digest (hex lowercase), keeping `gbridge_client` zero-dependency.
+String sha256HexBytes(Uint8List data) {
+  const k = <int>[
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ];
+  int rotr(int x, int n) => ((x & 0xffffffff) >>> n) | ((x << (32 - n)) & 0xffffffff);
+  final len = data.length;
+  final bitLen = len * 8;
+  final padLen = ((len + 9 + 63) ~/ 64) * 64;
+  final padded = Uint8List(padLen);
+  padded.setRange(0, len, data);
+  padded[len] = 0x80;
+  final bd = ByteData.sublistView(padded);
+  bd.setUint32(padLen - 8, (bitLen ~/ 0x100000000) & 0xffffffff, Endian.big);
+  bd.setUint32(padLen - 4, bitLen & 0xffffffff, Endian.big);
+
+  var h0 = 0x6a09e667;
+  var h1 = 0xbb67ae85;
+  var h2 = 0x3c6ef372;
+  var h3 = 0xa54ff53a;
+  var h4 = 0x510e527f;
+  var h5 = 0x9b05688c;
+  var h6 = 0x1f83d9ab;
+  var h7 = 0x5be0cd19;
+  final w = Uint32List(64);
+
+  for (var offset = 0; offset < padLen; offset += 64) {
+    for (var i = 0; i < 16; i++) {
+      w[i] = bd.getUint32(offset + i * 4, Endian.big);
+    }
+    for (var i = 16; i < 64; i++) {
+      final s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      final s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xffffffff;
+    }
+    var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (var i = 0; i < 64; i++) {
+      final s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      final ch = (e & f) ^ ((~e & 0xffffffff) & g);
+      final t1 = (h + s1 + ch + k[i] + w[i]) & 0xffffffff;
+      final s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      final maj = (a & b) ^ (a & c) ^ (b & c);
+      final t2 = (s0 + maj) & 0xffffffff;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + t1) & 0xffffffff;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) & 0xffffffff;
+    }
+    h0 = (h0 + a) & 0xffffffff;
+    h1 = (h1 + b) & 0xffffffff;
+    h2 = (h2 + c) & 0xffffffff;
+    h3 = (h3 + d) & 0xffffffff;
+    h4 = (h4 + e) & 0xffffffff;
+    h5 = (h5 + f) & 0xffffffff;
+    h6 = (h6 + g) & 0xffffffff;
+    h7 = (h7 + h) & 0xffffffff;
+  }
+  final out = StringBuffer();
+  for (final v in [h0, h1, h2, h3, h4, h5, h6, h7]) {
+    out.write(v.toRadixString(16).padLeft(8, '0'));
+  }
+  return out.toString();
+}
+
+/// Converts a 64-character lowercase SHA-256 hex digest into an SRI integrity token (`sha256-<base64>`).
+String sha256HexToSri(String hexDigest) {
+  final clean = hexDigest.trim().toLowerCase();
+  if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(clean)) return '';
+  final bytes = Uint8List(32);
+  for (var i = 0; i < 32; i++) {
+    bytes[i] = int.parse(clean.substring(i * 2, i * 2 + 2), radix: 16);
+  }
+  return 'sha256-${base64Encode(bytes)}';
+}
 
 /// Detailed result of remotely installing `dsh-gbridge` via DSH's `pluginManager/installBundle`.
 class HelperInstallResult {
@@ -335,6 +446,8 @@ class RemoteBootstrapClient {
   Future<HelperInstallResult> installHelperBundleDetailed({
     String packageSpec = kOfficialGbridgeAcceleratedUrl,
     String? registryUrl,
+    String? expectedSha256,
+    Future<Uint8List> Function(Uri uri)? fetchRemoteBytes,
     Duration pollTimeout = const Duration(seconds: 35),
     Duration pollInterval = const Duration(milliseconds: 900),
     void Function(String stage)? onProgress,
@@ -356,6 +469,24 @@ class RemoteBootstrapClient {
             : kOfficialGbridgeInstallSpecs)
         : <String>[trimmedSpec];
 
+    String? resolvedExpectedSha =
+        (expectedSha256 != null && RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(expectedSha256.trim()))
+            ? expectedSha256.trim().toLowerCase()
+            : null;
+    if (resolvedExpectedSha == null && useOfficialMirrors && fetchRemoteBytes != null) {
+      try {
+        onProgress?.call('正在获取官方 dsh-gbridge.tgz SHA-256 校验摘要…');
+        final sumsBytes = await fetchRemoteBytes(Uri.parse(kOfficialGbridgeChecksumsUrl));
+        resolvedExpectedSha = parseSha256SumsForFile(
+          utf8.decode(sumsBytes, allowMalformed: true),
+          targetFileName: 'dsh-gbridge.tgz',
+        );
+      } catch (_) {
+        // Proceed cleanly if GitHub direct checksums endpoint is unreachable from client network;
+        // any caller-provided pinned expectedSha256 is still enforced strictly.
+      }
+    }
+
     Map<String, dynamic>? installValue;
     String succeededSpec = candidateSpecs.first;
     GbridgeException? lastFailure;
@@ -365,14 +496,28 @@ class RemoteBootstrapClient {
       final requestId = 'gb-inst-${DateTime.now().microsecondsSinceEpoch}-$i';
       onProgress?.call(
         candidateSpecs.length > 1
-            ? '正在通过${i == 0 ? '加速镜像' : (i == candidateSpecs.length - 1 ? 'GitHub 直连' : '备用镜像')}安装连接助手 (${i + 1}/${candidateSpecs.length})…'
-            : '正在向远程主机下发连接助手安装指令…',
+            ? '正在通过${i == 0 ? '加速镜像' : (i == candidateSpecs.length - 1 ? 'GitHub 直连' : '备用镜像')}校验并安装连接助手 (${i + 1}/${candidateSpecs.length})…'
+            : '正在校验并向远程主机下发连接助手安装指令…',
       );
       try {
+        if (resolvedExpectedSha != null &&
+            fetchRemoteBytes != null &&
+            (spec.startsWith('https://') || spec.startsWith('http://'))) {
+          final tarballBytes = await fetchRemoteBytes(Uri.parse(spec));
+          final actualSha = sha256HexBytes(tarballBytes);
+          if (actualSha != resolvedExpectedSha) {
+            throw GbridgeException(
+              status: 422,
+              code: 'bootstrap/checksum_mismatch',
+              message: '镜像插件包 SHA-256 校验不匹配（期望 ${resolvedExpectedSha.substring(0, 12)}…，实际 ${actualSha.substring(0, 12)}…），已拒绝安装',
+            );
+          }
+        }
         final rawResult = await _invokeInstallBundleWithRecovery(
           spec: spec,
           requestId: requestId,
           registryUrl: registryUrl,
+          expectedSha256: resolvedExpectedSha,
         );
         final err = _extractInstallFailure(rawResult);
         if (err != null) {
@@ -478,6 +623,8 @@ class RemoteBootstrapClient {
   Future<Capabilities> installHelperBundle({
     String packageSpec = kOfficialGbridgeAcceleratedUrl,
     String? registryUrl,
+    String? expectedSha256,
+    Future<Uint8List> Function(Uri uri)? fetchRemoteBytes,
     Duration pollTimeout = const Duration(seconds: 45),
     Duration pollInterval = const Duration(milliseconds: 900),
     void Function(String stage)? onProgress,
@@ -485,6 +632,8 @@ class RemoteBootstrapClient {
     final result = await installHelperBundleDetailed(
       packageSpec: packageSpec,
       registryUrl: registryUrl,
+      expectedSha256: expectedSha256,
+      fetchRemoteBytes: fetchRemoteBytes,
       pollTimeout: pollTimeout,
       pollInterval: pollInterval,
       onProgress: onProgress,
@@ -501,13 +650,17 @@ class RemoteBootstrapClient {
     required String spec,
     required String requestId,
     String? registryUrl,
+    String? expectedSha256,
   }) async {
+    final sri = expectedSha256 != null ? sha256HexToSri(expectedSha256) : '';
     final args = <String, dynamic>{
       'spec': spec,
       'options': <String, dynamic>{
         'enabled': true,
         'requestId': requestId,
         if (registryUrl != null && registryUrl.isNotEmpty) 'registry': registryUrl,
+        if (expectedSha256 != null && expectedSha256.isNotEmpty) 'expectedSha256': expectedSha256,
+        if (sri.isNotEmpty) 'integrity': sri,
       },
     };
     try {
@@ -575,6 +728,9 @@ class RemoteBootstrapClient {
   }
 
   static bool _isRetryableMirrorError(GbridgeException e) {
+    if (e.code == 'bootstrap/checksum_mismatch') {
+      return true;
+    }
     if (e.code == 'plugin/pnpm_missing' ||
         e.code == 'plugin/not_bundle' ||
         e.code == 'plugin/build_blocked' ||

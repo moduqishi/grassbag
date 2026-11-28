@@ -97,11 +97,40 @@ class VanillaDshAdapter {
     }
   }
 
-  /// Build synthetic [Capabilities] accurately reflecting direct native stock DSH support.
+  final Set<String> _unsupportedDomains = <String>{};
+
+  void _recordUnsupportedIfMissing(String method, Object error) {
+    if (error is! GbridgeException) return;
+    if (error.status != 404 && error.status != 501 && error.code != 'gbridge/endpoint_unsupported') {
+      return;
+    }
+    if (method.startsWith('scheduler/') || method.startsWith('schedule/')) {
+      _unsupportedDomains.add('schedule');
+    } else if (method.startsWith('jobs/') || method.startsWith('backgroundJobs/')) {
+      _unsupportedDomains.add('jobs');
+    } else if (method.startsWith('plugin')) {
+      _unsupportedDomains.add('plugins');
+    } else if (method.startsWith('goal')) {
+      _unsupportedDomains.add('goals');
+    } else if (method.startsWith('subagent')) {
+      _unsupportedDomains.add('subagents');
+    }
+  }
+
+  /// Build synthetic [Capabilities] accurately reflecting direct native stock DSH support
+  /// (explicitly excluding gbridge-only features like ZIP export, Office->PDF, and SDUI,
+  /// and degrading any domain observed to return 404/501 on this stock host).
   Capabilities buildCapabilities() {
     final hostLabel = (hostName != null && hostName!.isNotEmpty)
         ? hostName!
         : (transport.endpoint.baseUri?.host ?? 'remote-dsh');
+    DomainCapability cap(String domain, List<String> features) {
+      if (_unsupportedDomains.contains(domain)) {
+        return const DomainCapability(ok: false, reason: 'endpoint_unsupported');
+      }
+      return DomainCapability(ok: true, features: features);
+    }
+
     return Capabilities(
       v: 1,
       bridgeVersion: 'direct',
@@ -119,21 +148,27 @@ class VanillaDshAdapter {
         coalesceMs: 35,
         replayCapacity: 0,
       ),
-      domains: const {
-        'chat': DomainCapability(ok: true, features: ['streaming', 'turns', 'search', 'fork', 'queue', 'attachments']),
-        'interactions': DomainCapability(ok: true, features: ['approval', 'user_questions']),
-        'workspaces': DomainCapability(ok: true, features: ['list', 'create', 'rename', 'delete', 'browse']),
-        'files': DomainCapability(ok: true, features: ['tree', 'read', 'changes', 'upload']),
-        'terminal': DomainCapability(ok: true, features: ['pty', 'shells', 'multi_tab']),
-        'settings': DomainCapability(ok: true, features: ['schema', 'manifest', 'models', 'credentials', 'account', 'presets']),
-        'plugins': DomainCapability(ok: true, features: ['bundles', 'entries', 'install', 'mcp']),
-        'schedule': DomainCapability(ok: true, features: ['list', 'create', 'edit', 'run', 'history']),
-        'jobs': DomainCapability(ok: true, features: ['list', 'follow', 'kill']),
-        'goals': DomainCapability(ok: true, features: ['get', 'mutate']),
-        'subagents': DomainCapability(ok: true, features: ['prompt', 'interrupt']),
-        'sdui': DomainCapability(ok: false, reason: 'direct_mode'),
+      domains: {
+        'chat': const DomainCapability(
+          ok: true,
+          features: ['streaming', 'turns', 'search', 'fork', 'queue', 'export_markdown'],
+        ),
+        'interactions': const DomainCapability(ok: true, features: ['approval', 'user_questions']),
+        'workspaces': const DomainCapability(ok: true, features: ['list', 'create', 'rename', 'delete', 'browse']),
+        'files': const DomainCapability(ok: true, features: ['tree', 'read', 'changes']),
+        'terminal': const DomainCapability(ok: true, features: ['pty', 'shells', 'multi_tab']),
+        'settings': const DomainCapability(
+          ok: true,
+          features: ['schema', 'manifest', 'models', 'credentials', 'account', 'presets'],
+        ),
+        'plugins': cap('plugins', const ['bundles', 'entries', 'install', 'mcp']),
+        'schedule': cap('schedule', const ['list', 'create', 'edit', 'run', 'history']),
+        'jobs': cap('jobs', const ['list', 'follow', 'kill']),
+        'goals': cap('goals', const ['get', 'mutate']),
+        'subagents': cap('subagents', const ['prompt', 'interrupt']),
+        'sdui': const DomainCapability(ok: false, reason: 'direct_mode'),
       },
-      endpointsCount: 60,
+      endpointsCount: 52,
     );
   }
 
@@ -158,16 +193,21 @@ class VanillaDshAdapter {
           final code = (err is Map ? err['code']?.toString() : null) ?? 'dsh/rpc_error';
           final msg = (err is Map ? err['message']?.toString() : err?.toString()) ?? 'RPC $method failed';
           final details = err is Map ? err['details'] : null;
-          throw GbridgeException(
+          final ex = GbridgeException(
             status: _mapCodeToStatus(code),
             code: code,
             message: msg,
             details: details,
           );
+          _recordUnsupportedIfMissing(method, ex);
+          throw ex;
         }
         return result['value'];
       }
       return res;
+    } catch (e) {
+      _recordUnsupportedIfMissing(method, e);
+      rethrow;
     } finally {
       _invalidateCachesForMutation(method);
     }
@@ -310,19 +350,25 @@ class VanillaDshAdapter {
     final raw = await rpc('session/create', {'request': req});
     final m = _asMap(raw);
     final sid = (m['sessionId'] ?? m['id'] ?? '').toString();
+    final setupWarnings = <Map<String, String>>[];
     if (sid.isNotEmpty) {
       final setupFutures = <Future<Object?>>[];
       if (title != null && title.trim().isNotEmpty) {
         setupFutures.add(
           rpc('session/rename', {
             'request': {'sessionId': sid, 'title': title.trim()},
-          }).catchError((_) => null),
+          }).catchError((Object e) {
+            setupWarnings.add({'step': 'title', 'message': e.toString()});
+            return null;
+          }),
         );
       }
       if (permission != null && permission.trim().isNotEmpty) {
         setupFutures.add(
-          executeSlashCommand(sid, command: '/permission ${permission.trim()}')
-              .catchError((_) => const <String, dynamic>{}),
+          executeSlashCommand(sid, command: '/permission ${permission.trim()}').catchError((Object e) {
+            setupWarnings.add({'step': 'permission', 'message': e.toString()});
+            return const <String, dynamic>{};
+          }),
         );
       }
       if (provider != null && provider.isNotEmpty && model != null && model.isNotEmpty) {
@@ -332,7 +378,10 @@ class VanillaDshAdapter {
             'model': model,
             if (reasoningEffort != null && reasoningEffort.isNotEmpty)
               'reasoningEffort': reasoningEffort,
-          }).catchError((_) => const <String, dynamic>{}),
+          }).catchError((Object e) {
+            setupWarnings.add({'step': 'model', 'message': e.toString()});
+            return const <String, dynamic>{};
+          }),
         );
       }
       if (setupFutures.isNotEmpty) {
@@ -345,6 +394,7 @@ class VanillaDshAdapter {
       if (title != null && title.isNotEmpty) 'title': title,
       if (workspaceId != null) 'workspaceId': workspaceId,
       if (cwd != null) 'cwd': cwd,
+      if (setupWarnings.isNotEmpty) 'setupWarnings': setupWarnings,
     });
   }
 

@@ -126,7 +126,16 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         bridgePlugin?.detach()
-        bridgePlugin = GrassBagBridgePlugin(this).also { it.attach(flutterEngine) }
+        bridgePlugin = GrassBagBridgePlugin(this).also {
+            it.attach(flutterEngine)
+            it.handleNotificationIntent(intent)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        bridgePlugin?.handleNotificationIntent(intent)
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {

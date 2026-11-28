@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:gbridge_client/gbridge_client.dart';
 import 'package:test/test.dart';
@@ -269,6 +270,121 @@ void main() {
       expect(attempts, 3);
       expect(caps.bootId, 'boot-after-reload');
       expect(caps.bridgeVersion, '0.2.0');
+    });
+  });
+
+  group('P1.4 & B-1: Helper SHA-256 verification and direct-mode capability honesty', () {
+    test('sha256HexBytes, parseSha256SumsForFile, and sha256HexToSri compute valid digests', () {
+      final bytes = Uint8List.fromList(utf8.encode('grassbag-dsh-gbridge-tarball'));
+      final hex = sha256HexBytes(bytes);
+      expect(hex.length, 64);
+      final sums = '$hex  dsh-gbridge.tgz\n0000000000000000000000000000000000000000000000000000000000000000  other.apk\n';
+      expect(parseSha256SumsForFile(sums, targetFileName: 'dsh-gbridge.tgz'), hex);
+      expect(sha256HexToSri(hex).startsWith('sha256-'), isTrue);
+    });
+
+    test('rejects tampered mirror tarball on SHA-256 mismatch and fails over to matching mirror', () async {
+      final goodBytes = Uint8List.fromList(utf8.encode('verified-dsh-gbridge-payload-v0.2.0'));
+      final badBytes = Uint8List.fromList(utf8.encode('tampered-mirror-payload'));
+      final expectedSha = sha256HexBytes(goodBytes);
+      final installedSpecs = <String>[];
+      final installArgs = <Map<String, dynamic>>[];
+      var installed = false;
+
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+
+      server.listen((req) async {
+        if (req.uri.path == '/api/pluginManager/installBundle') {
+          final body = jsonDecode(await utf8.decoder.bind(req).join()) as Map<String, dynamic>;
+          final args = Map<String, dynamic>.from((body['payload'] as Map)['args'] as Map);
+          installedSpecs.add(args['spec'].toString());
+          installArgs.add(args);
+          installed = true;
+          req.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({
+              'result': {'ok': true, 'value': {'application': 'applied'}},
+            }));
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/gbridge/v1/capabilities' && installed) {
+          req.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(jsonEncode({
+              'v': 1,
+              'bridgeVersion': '0.2.0',
+              'dshVersion': '0.2.2-rc.5',
+              'bootId': 'boot-sha-verified',
+              'host': {'name': 'PC', 'platform': 'darwin', 'arch': 'arm64'},
+              'transport': {'wsPath': '/gbridge/v1/stream'},
+              'domains': {'chat': {'ok': true}},
+              'endpointsCount': 40,
+            }));
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final client = GbridgeClient(
+        HostEndpoint.http(baseUri: Uri.parse('http://127.0.0.1:${server.port}')),
+        autoReconnect: false,
+      );
+      addTearDown(client.dispose);
+
+      var fetchAttempt = 0;
+      final res = await client.bootstrap.installHelperBundleDetailed(
+        packageSpec: 'dsh-gbridge',
+        expectedSha256: expectedSha,
+        pollInterval: const Duration(milliseconds: 50),
+        fetchRemoteBytes: (uri) async {
+          fetchAttempt++;
+          return fetchAttempt == 1 ? badBytes : goodBytes;
+        },
+      );
+      expect(fetchAttempt, 2);
+      expect(installedSpecs, [kOfficialGbridgeInstallSpecs[1]]);
+      final opts = Map<String, dynamic>.from(installArgs.single['options'] as Map);
+      expect(opts['expectedSha256'], expectedSha);
+      expect(opts['integrity'], sha256HexToSri(expectedSha));
+      expect(res.capabilities?.bootId, 'boot-sha-verified');
+    });
+
+    test('VanillaDshAdapter reports honest direct-mode capabilities and degrades 404 domains', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((req) async {
+        req.response
+          ..statusCode = 404
+          ..headers.contentType = ContentType.json
+          ..write(jsonEncode({'error': {'message': 'not found'}}));
+        await req.response.close();
+      });
+
+      final client = GbridgeClient(
+        HostEndpoint.http(baseUri: Uri.parse('http://127.0.0.1:${server.port}')),
+        autoReconnect: false,
+      );
+      addTearDown(client.dispose);
+
+      final initialCaps = client.enableVanillaDirectMode(dshVersion: '0.2.2-rc.5', hostName: 'DirectBox');
+      expect(initialCaps.hasDomain('sdui'), isFalse);
+      expect(initialCaps.domains['sdui']?.reason, 'direct_mode');
+      expect(initialCaps.hasFeature('chat', 'export_markdown'), isTrue);
+      expect(initialCaps.hasFeature('chat', 'attachments'), isFalse);
+      expect(initialCaps.hasFeature('files', 'upload'), isFalse);
+
+      // Calling an unsupported scheduler endpoint records `schedule` as unavailable
+      final schedRes = await client.listSchedules();
+      expect(schedRes['schedules'], isEmpty);
+      final updatedCaps = await client.getCapabilities();
+      expect(updatedCaps.hasDomain('schedule'), isFalse);
+      expect(updatedCaps.domains['schedule']?.reason, 'endpoint_unsupported');
     });
   });
 }

@@ -104,6 +104,29 @@ class AllFeaturesPage extends ConsumerWidget {
         state.localHost.hasLocalUpdates;
     final phoneReady = state.nativePermissions.accessibilityEnabled &&
         !state.nativePermissions.accessibilityNeedsRetoggle;
+    final ctrl = ref.read(appProvider.notifier);
+    final caps = state.liveCapabilities;
+    final isConnected = state.connectionPhase == ConnectionPhase.connected;
+    bool domainSupported(String domain) {
+      if (!isConnected) return true; // Let user inspect cached/guidance state while offline.
+      if (caps == null) return true;
+      return caps.hasDomain(domain);
+    }
+
+    final pluginsSupported = domainSupported('plugins');
+    final scheduleSupported = domainSupported('schedule');
+    final jobsSupported = domainSupported('jobs');
+    final subagentsSupported = domainSupported('subagents');
+    final sduiSupported = domainSupported('sdui');
+
+    void notifyUnsupported(String featureName, String domain) {
+      final isDirect = state.activeHost.directMode || caps?.bridgeVersion == 'direct';
+      final reason = caps?.domains[domain]?.reason ?? '';
+      final hint = (isDirect || reason == 'direct_mode')
+          ? '「$featureName」需要远程主机安装连接助手插件（dsh-gbridge）后启用'
+          : '当前主机未开放「$featureName」接口（$domain 不可用）';
+      ctrl.showToast(hint, tone: ToastTone.info);
+    }
 
     void pushOrCall(VoidCallback? cb, WidgetBuilder builder) {
       if (cb != null) {
@@ -148,11 +171,17 @@ class AllFeaturesPage extends ConsumerWidget {
             icon: CupertinoIcons.arrow_branch,
             color: t.dusk,
             title: '协作子代理',
-            subtitle: '并发任务流与实时补充指令',
-            badgeText: state.subagents.isNotEmpty ? '${state.subagents.length} 条' : null,
-            badgeColor: t.dusk,
-            badgeBg: t.dusk.withValues(alpha: t.isDark ? 0.22 : 0.12),
-            onTap: () => pushOrCall(onOpenSubagents, (_) => const SubagentsPage()),
+            subtitle: subagentsSupported ? '并发任务流与实时补充指令' : '当前主机未启用子代理接口',
+            badgeText: !subagentsSupported
+                ? '不可用'
+                : (state.subagents.isNotEmpty ? '${state.subagents.length} 条' : null),
+            badgeColor: !subagentsSupported ? t.text3 : t.dusk,
+            badgeBg: !subagentsSupported
+                ? t.fill1
+                : t.dusk.withValues(alpha: t.isDark ? 0.22 : 0.12),
+            onTap: subagentsSupported
+                ? () => pushOrCall(onOpenSubagents, (_) => const SubagentsPage())
+                : () => notifyUnsupported('协作子代理', 'subagents'),
           ),
           _FeatureTileSpec(
             icon: CupertinoIcons.globe,
@@ -173,46 +202,68 @@ class AllFeaturesPage extends ConsumerWidget {
             icon: CupertinoIcons.square_stack_3d_up_fill,
             color: t.ok,
             title: '插件与市场',
-            subtitle: '市场安装与动态扩展能力',
-            badgeText: state.plugins.isNotEmpty ? '${state.plugins.length} 已装' : null,
-            badgeColor: t.ok,
-            badgeBg: t.okSoft,
-            onTap: () => pushOrCall(onOpenPlugins, (_) => const PluginsCenterPage()),
+            subtitle: pluginsSupported ? '市场安装与动态扩展能力' : '当前主机未开放插件管理',
+            badgeText: !pluginsSupported
+                ? '不可用'
+                : (state.plugins.isNotEmpty ? '${state.plugins.length} 已装' : null),
+            badgeColor: !pluginsSupported ? t.text3 : t.ok,
+            badgeBg: !pluginsSupported ? t.fill1 : t.okSoft,
+            onTap: pluginsSupported
+                ? () => pushOrCall(onOpenPlugins, (_) => const PluginsCenterPage())
+                : () => notifyUnsupported('插件与市场', 'plugins'),
           ),
           _FeatureTileSpec(
             icon: CupertinoIcons.clock_fill,
             color: t.warn,
             title: '定时任务',
-            subtitle: '按计划周期自动触发执行',
-            badgeText: state.activeScheduleCount > 0
-                ? '${state.activeScheduleCount} 启用'
-                : null,
-            badgeColor: t.warn,
-            badgeBg: t.warnSoft,
-            onTap: () => pushOrCall(onOpenSchedules, (_) => const SchedulesPage()),
+            subtitle: scheduleSupported ? '按计划周期自动触发执行' : '当前主机未启用定时任务域',
+            badgeText: !scheduleSupported
+                ? '不可用'
+                : (state.activeScheduleCount > 0
+                    ? '${state.activeScheduleCount} 启用'
+                    : null),
+            badgeColor: !scheduleSupported ? t.text3 : t.warn,
+            badgeBg: !scheduleSupported ? t.fill1 : t.warnSoft,
+            onTap: scheduleSupported
+                ? () => pushOrCall(onOpenSchedules, (_) => const SchedulesPage())
+                : () => notifyUnsupported('定时任务', 'schedule'),
           ),
           _FeatureTileSpec(
             icon: CupertinoIcons.waveform_path_ecg,
             color: t.isDark ? const Color(0xFF34D399) : const Color(0xFF0E9F6E),
             title: '后台任务',
-            subtitle: '长耗时命令与实时日志流',
-            badgeText: state.runningJobsCount > 0
-                ? '${state.runningJobsCount} 运行中'
-                : null,
-            badgeColor: t.ok,
-            badgeBg: t.okSoft,
-            onTap: () => pushOrCall(onOpenJobs, (_) => const JobsPage()),
+            subtitle: jobsSupported ? '长耗时命令与实时日志流' : '当前主机未开放后台任务域',
+            badgeText: !jobsSupported
+                ? '不可用'
+                : (state.runningJobsCount > 0
+                    ? '${state.runningJobsCount} 运行中'
+                    : null),
+            badgeColor: !jobsSupported ? t.text3 : t.ok,
+            badgeBg: !jobsSupported ? t.fill1 : t.okSoft,
+            onTap: jobsSupported
+                ? () => pushOrCall(onOpenJobs, (_) => const JobsPage())
+                : () => notifyUnsupported('后台任务', 'jobs'),
           ),
           _FeatureTileSpec(
             icon: CupertinoIcons.chart_bar_alt_fill,
             color: t.isDark ? const Color(0xFFF472B6) : const Color(0xFFC026D3),
             title: '诊断与扩展',
-            subtitle: '动态交互面板与系统诊断',
-            badgeText: state.sduiSurfaces.isNotEmpty ? '${state.sduiSurfaces.length} 面板' : null,
-            badgeColor: t.isDark ? const Color(0xFFF472B6) : const Color(0xFFC026D3),
-            badgeBg: (t.isDark ? const Color(0xFFF472B6) : const Color(0xFFC026D3))
-                .withValues(alpha: t.isDark ? 0.20 : 0.11),
-            onTap: () => pushOrCall(onOpenSdui, (_) => const SduiExtensionsPage()),
+            subtitle: sduiSupported
+                ? '动态交互面板与系统诊断'
+                : '需安装连接助手插件（直连模式不可用）',
+            badgeText: !sduiSupported
+                ? '需装助手'
+                : (state.sduiSurfaces.isNotEmpty ? '${state.sduiSurfaces.length} 面板' : null),
+            badgeColor: !sduiSupported
+                ? t.warn
+                : (t.isDark ? const Color(0xFFF472B6) : const Color(0xFFC026D3)),
+            badgeBg: !sduiSupported
+                ? t.warnSoft
+                : (t.isDark ? const Color(0xFFF472B6) : const Color(0xFFC026D3))
+                    .withValues(alpha: t.isDark ? 0.20 : 0.11),
+            onTap: sduiSupported
+                ? () => pushOrCall(onOpenSdui, (_) => const SduiExtensionsPage())
+                : () => notifyUnsupported('诊断与扩展', 'sdui'),
           ),
         ],
       ),

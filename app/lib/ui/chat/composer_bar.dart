@@ -510,6 +510,505 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _setPlusOpen(!_plusOpen);
   }
 
+  static IconData _effortIconFor(String effortId) => switch (effortId.trim().toLowerCase()) {
+        'off' || 'none' => CupertinoIcons.bolt_fill,
+        'minimal' => CupertinoIcons.hare_fill,
+        'low' => CupertinoIcons.gauge,
+        'medium' || 'mid' || 'auto' => CupertinoIcons.sparkles,
+        'high' => CupertinoIcons.wand_stars,
+        'xhigh' || 'very_high' || 'very-high' || 'max' => CupertinoIcons.flame_fill,
+        _ => CupertinoIcons.sparkles,
+      };
+
+  void _insertMentionAtCursor() {
+    final val = widget.controller.value;
+    final cur = val.text;
+    final sel = val.selection;
+    final start = sel.isValid ? sel.start.clamp(0, cur.length) : cur.length;
+    final end = sel.isValid ? sel.end.clamp(start, cur.length) : cur.length;
+    final needsLeadSpace = start > 0 &&
+        cur.codeUnitAt(start - 1) != 0x20 &&
+        cur.codeUnitAt(start - 1) != 0x0A;
+    final insert = needsLeadSpace ? ' @' : '@';
+    final updated = cur.replaceRange(start, end, insert);
+    widget.controller.value = TextEditingValue(
+      text: updated,
+      selection: TextSelection.collapsed(offset: start + insert.length),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.focusNode.requestFocus();
+    });
+  }
+
+  Future<void> _pasteClipboardIntoComposer() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final raw = data?.text ?? '';
+    if (!mounted) return;
+    if (raw.isEmpty) {
+      ref.read(appProvider.notifier).showToast('剪贴板暂无可粘贴的文字', tone: ToastTone.info);
+      return;
+    }
+    final val = widget.controller.value;
+    final cur = val.text;
+    final sel = val.selection;
+    final start = sel.isValid ? sel.start.clamp(0, cur.length) : cur.length;
+    final end = sel.isValid ? sel.end.clamp(start, cur.length) : cur.length;
+    final updated = cur.replaceRange(start, end, raw);
+    widget.controller.value = TextEditingValue(
+      text: updated,
+      selection: TextSelection.collapsed(offset: start + raw.length),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) widget.focusNode.requestFocus();
+    });
+  }
+
+  void _clearDraftAndAttachments() {
+    final ctrl = ref.read(appProvider.notifier);
+    final snap = ref.read(appProvider);
+    widget.controller.clear();
+    if (_pickedReferences.isNotEmpty) {
+      setState(() => _pickedReferences.clear());
+    }
+    for (final att in List<ComposerAttachment>.of(snap.pendingAttachments)) {
+      ctrl.removePendingAttachment(att.id);
+    }
+    _flushDraftSync();
+  }
+
+  GrassBagLongPressMenuSpec? _buildModelLongPressMenu(BuildContext context) {
+    final snap = ref.read(appProvider);
+    final ctrl = ref.read(appProvider.notifier);
+    final t = GrassBagTokens.of(context);
+    final host = snap.activeHost;
+    final isHostNeedsAuth = !host.isLocal &&
+        (host.needsAuth || snap.connectionPhase == ConnectionPhase.needsAuth);
+    final isHostConnected = snap.isDshConnected &&
+        snap.connectionPhase == ConnectionPhase.connected;
+    final hasCachedModelWhileReconnecting =
+        snap.connectionPhase == ConnectionPhase.reconnecting && snap.hasAvailableModels;
+
+    if (isHostNeedsAuth) {
+      return GrassBagLongPressMenuSpec(
+        headerTitle: host.name,
+        headerSubtitle: '远程主机待授权',
+        preferAbove: true,
+        items: [
+          GrassBagContextMenuItem(
+            label: '完成主机授权',
+            subtitle: '授权后同步可用模型与会话',
+            icon: CupertinoIcons.lock_shield_fill,
+            accentColor: t.primary,
+            onTap: () => showRemoteHostAuthSheet(context, ref, snap.activeHost),
+          ),
+          GrassBagContextMenuItem(
+            label: '切换其他主机',
+            icon: CupertinoIcons.desktopcomputer,
+            dividerBefore: true,
+            onTap: () => showHostQuickSheet(
+              context,
+              ref,
+              onOpenHostSettings: widget.onOpenHostSettings,
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (!isHostConnected && !hasCachedModelWhileReconnecting) {
+      return GrassBagLongPressMenuSpec(
+        headerTitle: host.name,
+        headerSubtitle: '当前尚未连接到主机',
+        preferAbove: true,
+        items: [
+          GrassBagContextMenuItem(
+            label: '切换或管理主机',
+            subtitle: '查看连接状态与在线主机',
+            icon: CupertinoIcons.desktopcomputer,
+            onTap: () => showHostQuickSheet(
+              context,
+              ref,
+              onOpenHostSettings: widget.onOpenHostSettings,
+            ),
+          ),
+        ],
+      );
+    }
+
+    final activeEntry = snap.effectiveActiveModelEntry;
+    if (activeEntry == null) {
+      return GrassBagLongPressMenuSpec(
+        headerTitle: '模型与渠道',
+        headerSubtitle: '当前主机尚无可用模型',
+        preferAbove: true,
+        items: [
+          GrassBagContextMenuItem(
+            label: '配置模型与渠道',
+            subtitle: '添加 API Key 或登录服务商',
+            icon: CupertinoIcons.slider_horizontal_3,
+            accentColor: t.primary,
+            onTap: () {
+              if (widget.onOpenModelSettings != null) {
+                widget.onOpenModelSettings!();
+              } else {
+                showModelSheet(
+                  context,
+                  ref,
+                  onOpenModelSettings: widget.onOpenModelSettings,
+                );
+              }
+            },
+          ),
+        ],
+      );
+    }
+
+    final supportsReasoning = activeEntry.efforts.isNotEmpty;
+    final curEffortId = (snap.modelEffortId.isNotEmpty
+            ? snap.modelEffortId
+            : activeEntry.defaultEffort)
+        .trim()
+        .toLowerCase();
+    final items = <GrassBagContextMenuItem>[];
+
+    if (supportsReasoning) {
+      for (final opt in activeEntry.efforts) {
+        final optIdLower = opt.id.trim().toLowerCase();
+        final isSelected = optIdLower == curEffortId ||
+            (curEffortId.isEmpty && opt.zhLabel == snap.modelEffort);
+        final isDefault = activeEntry.defaultEffort.trim().isNotEmpty &&
+            optIdLower == activeEntry.defaultEffort.trim().toLowerCase();
+        items.add(
+          GrassBagContextMenuItem(
+            label: opt.zhLabel,
+            subtitle: opt.zhSubtitle,
+            icon: _effortIconFor(opt.id),
+            selected: isSelected,
+            badge: isDefault && !isSelected ? '默认' : null,
+            trailing: GrassBagEffortDepthBars(
+              level: opt.depthLevel,
+              activeColor: isSelected ? t.primary : t.text2,
+              inactiveColor: t.text3.withValues(alpha: 0.22),
+            ),
+            onTap: () {
+              if (_plusOpen) _setPlusOpen(false);
+              unawaited(ctrl.setReasoningEffort(opt.id));
+            },
+          ),
+        );
+      }
+    }
+
+    // Quick-switch up to 3 other routable models (same provider first, then other routable groups).
+    final otherModels = <ModelCatalogEntry>[];
+    final sortedGroups = List<ModelCatalogGroup>.of(snap.modelGroups)
+      ..sort((a, b) {
+        if (a.routable != b.routable) return a.routable ? -1 : 1;
+        if (a.id == activeEntry.providerId) return -1;
+        if (b.id == activeEntry.providerId) return 1;
+        return 0;
+      });
+    for (final g in sortedGroups) {
+      if (!g.routable && otherModels.isNotEmpty) continue;
+      for (final m in g.models) {
+        if (m.id == activeEntry.id && m.providerId == activeEntry.providerId) continue;
+        otherModels.add(m);
+        if (otherModels.length >= 3) break;
+      }
+      if (otherModels.length >= 3) break;
+    }
+
+    for (var i = 0; i < otherModels.length; i++) {
+      final m = otherModels[i];
+      items.add(
+        GrassBagContextMenuItem(
+          label: m.shortLabel,
+          subtitle: m.providerName.isNotEmpty ? m.providerName : m.providerId,
+          icon: m.supportsReasoning ? CupertinoIcons.sparkles : CupertinoIcons.cube_box,
+          badge: m.supportsReasoning ? '推理' : null,
+          dividerBefore: i == 0 && items.isNotEmpty,
+          onTap: () {
+            if (_plusOpen) _setPlusOpen(false);
+            unawaited(
+              ctrl.setModel(
+                m.name,
+                m.shortLabel,
+                provider: m.providerId,
+                modelId: m.id,
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    items.add(
+      GrassBagContextMenuItem(
+        label: '全部模型与渠道…',
+        subtitle: '搜索全部模型或配置 API 渠道',
+        icon: CupertinoIcons.slider_horizontal_3,
+        dividerBefore: items.isNotEmpty,
+        onTap: () {
+          if (_plusOpen) _setPlusOpen(false);
+          showModelSheet(
+            context,
+            ref,
+            onOpenModelSettings: widget.onOpenModelSettings,
+          );
+        },
+      ),
+    );
+
+    final providerTag = activeEntry.providerName.trim();
+    return GrassBagLongPressMenuSpec(
+      headerTitle: activeEntry.name,
+      headerSubtitle: supportsReasoning
+          ? '${providerTag.isNotEmpty ? '$providerTag · ' : ''}选择思考深度（滑动松手即选）'
+          : (providerTag.isNotEmpty ? '$providerTag · 快捷切换模型' : '快捷切换模型'),
+      menuWidth: 268.0,
+      preferAbove: true,
+      items: items,
+    );
+  }
+
+  GrassBagLongPressMenuSpec _buildPlusLongPressMenu(BuildContext context) {
+    final snap = ref.read(appProvider);
+    final ctrl = ref.read(appProvider.notifier);
+    final t = GrassBagTokens.of(context);
+    final perm = snap.activePermission;
+    final isMobileCameraCapable = !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.iOS);
+
+    return GrassBagLongPressMenuSpec(
+      headerTitle: '快捷操作与模式',
+      headerSubtitle: '滑动到目标松手即可触发',
+      menuWidth: 264.0,
+      preferAbove: true,
+      quickActions: [
+        GrassBagContextMenuQuickAction(
+          label: isMobileCameraCapable ? '相册' : '图片',
+          icon: CupertinoIcons.photo_fill,
+          accentColor: t.isDark ? const Color(0xFF4CA2F2) : const Color(0xFF2B7FC3),
+          onTap: () => ctrl.pickComposerAttachment(source: 'gallery'),
+        ),
+        if (isMobileCameraCapable)
+          GrassBagContextMenuQuickAction(
+            label: '拍照',
+            icon: CupertinoIcons.camera_fill,
+            accentColor: t.isDark ? const Color(0xFF7B87F5) : const Color(0xFF535EC0),
+            onTap: () => ctrl.pickComposerAttachment(source: 'camera'),
+          ),
+        GrassBagContextMenuQuickAction(
+          label: '文件',
+          icon: CupertinoIcons.doc_fill,
+          accentColor: t.isDark ? const Color(0xFF2DC496) : const Color(0xFF2D8A7B),
+          onTap: () => ctrl.pickComposerAttachment(source: 'file'),
+        ),
+        GrassBagContextMenuQuickAction(
+          label: '终端',
+          icon: CupertinoIcons.chevron_left_slash_chevron_right,
+          onTap: widget.onOpenTerminal,
+        ),
+      ],
+      items: [
+        GrassBagContextMenuItem(
+          label: snap.planMode ? '关闭计划模式' : '开启计划模式',
+          subtitle: snap.planMode ? '当前已开启 · 先规划后执行' : '先规划步骤，确认后再执行',
+          icon: CupertinoIcons.list_bullet_indent,
+          selected: snap.planMode,
+          accentColor: t.dusk,
+          badge: snap.planMode ? '已开启' : null,
+          onTap: () => unawaited(ctrl.setPlanMode(!snap.planMode)),
+        ),
+        GrassBagContextMenuItem(
+          label: '引用工作区文件 (@)',
+          subtitle: '插入 @ 快速检索项目文件或对话',
+          icon: CupertinoIcons.at,
+          onTap: _insertMentionAtCursor,
+        ),
+        GrassBagContextMenuItem(
+          label: '操作权限 · ${perm.name}',
+          subtitle: '切换只读、审批或自动放行级别',
+          icon: perm.risky
+              ? CupertinoIcons.exclamationmark_shield_fill
+              : (perm.id == 'read-only'
+                  ? CupertinoIcons.lock_shield_fill
+                  : CupertinoIcons.checkmark_shield_fill),
+          accentColor: perm.risky ? t.warn : null,
+          dividerBefore: true,
+          onTap: () => showPermissionSheet(context, ref),
+        ),
+        GrassBagContextMenuItem(
+          label: '角色预设 · ${snap.activePreset.name}',
+          icon: CupertinoIcons.compass_fill,
+          onTap: () => showPresetSheet(context, ref),
+        ),
+        if (snap.speechConfigured)
+          GrassBagContextMenuItem(
+            label: '语音输入',
+            subtitle: '实时听写并插入当前光标位置',
+            icon: CupertinoIcons.mic_fill,
+            dividerBefore: true,
+            onTap: _openVoiceInput,
+          ),
+      ],
+    );
+  }
+
+  GrassBagLongPressMenuSpec? _buildSendOrbLongPressMenu(
+    BuildContext context, {
+    required bool hasText,
+  }) {
+    final snap = ref.read(appProvider);
+    final ctrl = ref.read(appProvider.notifier);
+    final t = GrassBagTokens.of(context);
+    if (snap.isStopping || _submitting) return null;
+
+    if (snap.isStreaming && !hasText) {
+      // Stop orb when streaming with empty input -> short tap stops immediately.
+      return null;
+    }
+
+    if (snap.isStreaming && hasText) {
+      final conv = snap.dshNamespaces.where((n) => n.ns == 'ui-conversation').firstOrNull;
+      final busyMode = conv?.value['busyEnter']?.toString().trim().toLowerCase() == 'steer'
+          ? 'steer'
+          : 'queue';
+      return GrassBagLongPressMenuSpec(
+        headerTitle: '生成中发送方式',
+        headerSubtitle: '滑动选择本次如何介入当前回复',
+        menuWidth: 260.0,
+        preferAbove: true,
+        items: [
+          GrassBagContextMenuItem(
+            label: '插话引导',
+            subtitle: '立即注入当前正在执行的任务',
+            icon: CupertinoIcons.arrow_turn_down_right,
+            selected: busyMode == 'steer',
+            badge: busyMode == 'steer' ? '默认' : null,
+            onTap: () {
+              _setStreamModeDeckOpen(false);
+              unawaited(_submit(mode: 'steer'));
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: '本轮后排队',
+            subtitle: '等待当前回复结束后自动发送',
+            icon: CupertinoIcons.text_append,
+            selected: busyMode != 'steer',
+            badge: busyMode != 'steer' ? '默认' : null,
+            onTap: () {
+              _setStreamModeDeckOpen(false);
+              unawaited(_submit(mode: 'queue'));
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: '打断并改问',
+            subtitle: '立即停止当前回复并发送本条',
+            icon: CupertinoIcons.stop_circle_fill,
+            destructive: true,
+            dividerBefore: true,
+            onTap: () {
+              _setStreamModeDeckOpen(false);
+              unawaited(_submit(mode: 'interrupt'));
+            },
+          ),
+          GrassBagContextMenuItem(
+            label: '仅停止当前生成',
+            subtitle: '停止回复并保留输入框内容',
+            icon: CupertinoIcons.stop_fill,
+            onTap: () {
+              _setStreamModeDeckOpen(false);
+              _flushDraftSync();
+              ctrl.cancelStreaming();
+            },
+          ),
+        ],
+      );
+    }
+
+    if (hasText) {
+      return GrassBagLongPressMenuSpec(
+        headerTitle: '发送选项',
+        headerSubtitle: '长按发送键可切换发送模式',
+        menuWidth: 256.0,
+        preferAbove: true,
+        items: [
+          GrassBagContextMenuItem(
+            label: '立即发送',
+            subtitle: '按当前模型与设置直接发出',
+            icon: CupertinoIcons.arrow_up_circle_fill,
+            accentColor: t.primary,
+            onTap: () => unawaited(_submit()),
+          ),
+          if (!snap.planMode)
+            GrassBagContextMenuItem(
+              label: '以计划模式发送',
+              subtitle: '先制定执行方案，经确认后再执行',
+              icon: CupertinoIcons.list_bullet_indent,
+              accentColor: t.dusk,
+              onTap: () {
+                unawaited(() async {
+                  await ctrl.setPlanMode(true);
+                  if (mounted) await _submit();
+                }());
+              },
+            )
+          else
+            GrassBagContextMenuItem(
+              label: '退出计划并直接发送',
+              subtitle: '跳过方案阶段，直接动手执行',
+              icon: CupertinoIcons.bolt_fill,
+              onTap: () {
+                unawaited(() async {
+                  await ctrl.setPlanMode(false);
+                  if (mounted) await _submit();
+                }());
+              },
+            ),
+          GrassBagContextMenuItem(
+            label: '清空当前草稿',
+            subtitle: '清除输入框文字与待发送附件',
+            icon: CupertinoIcons.trash,
+            destructive: true,
+            dividerBefore: true,
+            onTap: _clearDraftAndAttachments,
+          ),
+        ],
+      );
+    }
+
+    return GrassBagLongPressMenuSpec(
+      headerTitle: '快捷输入',
+      preferAbove: true,
+      menuWidth: 244.0,
+      items: [
+        GrassBagContextMenuItem(
+          label: '粘贴剪贴板内容',
+          subtitle: '插入剪贴板文字到输入框',
+          icon: CupertinoIcons.doc_on_clipboard,
+          onTap: () => unawaited(_pasteClipboardIntoComposer()),
+        ),
+        if (snap.speechConfigured)
+          GrassBagContextMenuItem(
+            label: '语音输入',
+            subtitle: '开始实时语音听写',
+            icon: CupertinoIcons.mic_fill,
+            onTap: _openVoiceInput,
+          ),
+        GrassBagContextMenuItem(
+          label: snap.planMode ? '关闭计划模式' : '开启计划模式',
+          icon: CupertinoIcons.list_bullet_indent,
+          selected: snap.planMode,
+          accentColor: t.dusk,
+          dividerBefore: true,
+          onTap: () => unawaited(ctrl.setPlanMode(!snap.planMode)),
+        ),
+      ],
+    );
+  }
+
   void _openVoiceInput() {
     if (_plusOpen) _setPlusOpen(false);
     HapticFeedback.selectionClick();
@@ -992,13 +1491,17 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               (r['path'] == null || text.contains('@${r['path']}')),
         ),
     ];
-    // Clear input optimistically BEFORE awaiting async send so typing stays instant
-    // and Android IME composing state resets cleanly without dismissing the keyboard.
-    // When editing a previous turn, NEVER flush `""` over the stashed draft before fork/send!
-    widget.controller.clear();
+    // Persist the unconfirmed prompt BEFORE clearing the visual controller so an app kill,
+    // crash, offline failure, or RPC error NEVER loses the user's draft!
     if (editCtx == null) {
-      _flushDraftSync();
+      ctrl.setComposerDraftForScope(startHostId, startSessionId, rawText);
     }
+    _draftSyncTimer?.cancel();
+    _draftSyncTimer = null;
+    _hasUnsyncedDraftEdit = false;
+    _suppressDraftSync = true;
+    widget.controller.clear();
+    _suppressDraftSync = false;
     if (widget.editingContextNotifier?.value != null) {
       widget.editingContextNotifier!.value = null;
     }
@@ -1052,18 +1555,37 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         curState.activeHostId == startHostId && curState.sessionRenderGen == expectedRenderGen;
     setState(() => _submitting = false);
     if (!sameScope) {
-      // User switched hosts or sessions while sending; never overwrite the new composer,
-      // but if the send failed, save the prompt back into the original session's draft!
-      if (!sent && rawText.isNotEmpty) {
+      // User switched hosts or sessions while sending; never overwrite the new composer.
+      if (sent) {
+        // Confirmed by server: clear only if the persisted draft still holds our exact sent prompt.
+        if (editCtx == null &&
+            ctrl.getComposerDraftForScope(startHostId, startSessionId) == rawText) {
+          ctrl.setComposerDraftForScope(startHostId, startSessionId, '');
+        }
+      } else if (rawText.isNotEmpty) {
         final prevDraft = ctrl.getComposerDraftForScope(startHostId, startSessionId);
-        final saved = prevDraft.trim().isEmpty ? rawText : '$rawText\n\n$prevDraft';
-        ctrl.setComposerDraftForScope(startHostId, startSessionId, saved);
+        if (prevDraft != rawText && !prevDraft.startsWith(rawText)) {
+          final saved = prevDraft.trim().isEmpty ? rawText : '$rawText\n\n$prevDraft';
+          ctrl.setComposerDraftForScope(startHostId, startSessionId, saved);
+        }
         ctrl.showToast('原消息未发送，已保留在原会话草稿中', tone: ToastTone.info);
       }
       return;
     }
     if (sent) {
       _pickedReferences.clear();
+      // Server confirmed receipt: now clear the persisted pre-send draft (while keeping any
+      // brand-new text the user already started typing into the composer while in flight!).
+      if (editCtx == null) {
+        if (startSessionId != curState.activeSessionId) {
+          ctrl.setComposerDraftForScope(startHostId, startSessionId, '');
+        }
+        ctrl.setComposerDraftForScope(
+          startHostId,
+          curState.activeSessionId,
+          widget.controller.text,
+        );
+      }
       // If the user edited-and-resent in place (without forking), restore any stashed unsent draft!
       if (editCtx != null && !shouldForkBefore && editCtx.stashedDraft.isNotEmpty) {
         if (widget.controller.text.isEmpty) {
@@ -1091,6 +1613,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
         text: restored,
         selection: TextSelection.collapsed(offset: restored.length),
       );
+      if (editCtx == null) {
+        ctrl.setComposerDraftForScope(startHostId, curState.activeSessionId, restored);
+      }
     }
     if (hadFocus && mounted && !widget.focusNode.hasFocus) {
       widget.focusNode.requestFocus();
@@ -1177,6 +1702,20 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
             activeModelId: s.activeModelId,
             modelShort: s.modelShort,
             modelEffort: s.modelEffort,
+            activeEffortDepth: () {
+              if (model == null || model.efforts.isEmpty) return -1;
+              final curId = (s.modelEffortId.isNotEmpty
+                      ? s.modelEffortId
+                      : model.defaultEffort)
+                  .trim()
+                  .toLowerCase();
+              final matched = model.efforts
+                  .where((e) =>
+                      e.id.trim().toLowerCase() == curId ||
+                      (curId.isEmpty && e.zhLabel == s.modelEffort))
+                  .firstOrNull;
+              return matched?.depthLevel ?? 2;
+            }(),
             hasAvailableModels: s.hasAvailableModels,
             fallbackModelShort: model?.shortLabel ?? '',
             fallbackModelEffort: model != null
@@ -1631,6 +2170,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           duration: GrassBagMotion.duration(
                                             context,
                                             const Duration(milliseconds: 150),
+                                            reduced: const Duration(milliseconds: 1),
                                           ),
                                           curve: Curves.easeOutCubic,
                                           alignment: Alignment.bottomCenter,
@@ -2128,7 +2668,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   // Collapsible takeover bar: smoothly materializes & folds between expanded
                   // collapse action and minimized reminder pill!
                   AnimatedSize(
-                    duration: GrassBagMotion.duration(context, const Duration(milliseconds: 210)),
+                    duration: GrassBagMotion.duration(
+                      context,
+                      const Duration(milliseconds: 210),
+                      reduced: const Duration(milliseconds: 1),
+                    ),
                     curve: Curves.easeOutCubic,
                     alignment: Alignment.bottomCenter,
                     child: AnimatedSwitcher(
@@ -2414,7 +2958,11 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                   // Smooth height + Liquid Glass transition between Approval/Question/Cordis
                   // Takeover Cards & Floating Composer (genuine liquid_glass_widgets iOS 27 glass).
                   AnimatedSize(
-                    duration: GrassBagMotion.duration(context, const Duration(milliseconds: 230)),
+                    duration: GrassBagMotion.duration(
+                      context,
+                      const Duration(milliseconds: 230),
+                      reduced: const Duration(milliseconds: 1),
+                    ),
                     curve: Curves.easeOutCubic,
                     alignment: Alignment.bottomCenter,
                     child: AnimatedSwitcher(
@@ -2541,6 +3089,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 duration: GrassBagMotion.duration(
                                   context,
                                   const Duration(milliseconds: 180),
+                                  reduced: const Duration(milliseconds: 1),
                                 ),
                                 curve: Curves.easeOutCubic,
                                 alignment: Alignment.bottomCenter,
@@ -3305,31 +3854,27 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               return Row(
                             children: [
                               // Clean borderless Apple iOS 27 concentric '+' orb inside the floating glass composer
-                              // (ZERO nested wireframe rings — rotates 45° into accented '×' when open!)
+                              // (ZERO nested wireframe rings — rotates 45° into accented '×' when open!
+                              // Long-press lifts orb & opens one-thumb iOS Liquid Glass quick-action menu!)
                               () {
                                 final effectiveTier =
                                     resolveEffectiveGlassTier(context, state.glassTier);
                                 final isSolid = effectiveTier == GrassBagGlassTier.solid;
-                                final plusIcon = AnimatedRotation(
-                                  turns: _plusOpen ? 0.125 : 0.0,
-                                  duration: GrassBagMotion.duration(
-                                    context,
-                                    const Duration(milliseconds: 260),
-                                  ),
-                                  curve: Curves.easeOutBack,
-                                  child: Icon(
-                                    CupertinoIcons.plus,
-                                    size: 19,
-                                    color: _plusOpen ? t.primary : t.text2,
-                                  ),
-                                );
-                                final plusBtn = GrassBagSpringTap(
-                                  key: const ValueKey('composer-plus-btn'),
-                                  onTap: _togglePlus,
-                                  pressedScale: 0.88,
-                                  enablePointerGlow: false,
-                                  haptic: true,
-                                  child: AnimatedContainer(
+                                Widget buildPlusVisual() {
+                                  final plusIcon = AnimatedRotation(
+                                    turns: _plusOpen ? 0.125 : 0.0,
+                                    duration: GrassBagMotion.duration(
+                                      context,
+                                      const Duration(milliseconds: 260),
+                                    ),
+                                    curve: Curves.easeOutBack,
+                                    child: Icon(
+                                      CupertinoIcons.plus,
+                                      size: 19,
+                                      color: _plusOpen ? t.primary : t.text2,
+                                    ),
+                                  );
+                                  return AnimatedContainer(
                                     duration: const Duration(milliseconds: 220),
                                     curve: Curves.easeOutCubic,
                                     width: 36,
@@ -3351,10 +3896,28 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                           : null,
                                     ),
                                     child: plusIcon,
+                                  );
+                                }
+                                final plusBtn = GrassBagGlassLongPressTrigger(
+                                  tier: state.glassTier,
+                                  isCircle: true,
+                                  onWillOpen: () {
+                                    if (_plusOpen) _setPlusOpen(false);
+                                    if (_streamModeDeckOpen) _setStreamModeDeckOpen(false);
+                                  },
+                                  menuBuilder: _buildPlusLongPressMenu,
+                                  liftedBuilder: (_) => buildPlusVisual(),
+                                  child: GrassBagSpringTap(
+                                    key: const ValueKey('composer-plus-btn'),
+                                    onTap: _togglePlus,
+                                    pressedScale: 0.88,
+                                    enablePointerGlow: false,
+                                    haptic: true,
+                                    child: buildPlusVisual(),
                                   ),
                                 );
                                 return Tooltip(
-                                  message: _plusOpen ? '收起快捷面板' : '添加附件与快捷选项',
+                                  message: _plusOpen ? '收起快捷面板' : '点击展开面板 · 长按快捷操作',
                                   excludeFromSemantics: true,
                                   child: Semantics(
                                     button: true,
@@ -3366,6 +3929,8 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               const SizedBox(width: 7),
 
                               // Concentric Model & Effort Pill (`height: 36`, `radius: 18 = 28 - 10`)
+                              // Short tap opens full Model Sheet; Long-press lifts pill & blooms
+                              // Apple iOS 27 Liquid Glass Thinking-Effort & Quick-Switch menu!
                               Expanded(
                                 child: Align(
                                   alignment: Alignment.centerLeft,
@@ -3455,75 +4020,12 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                       }
                                       final effectiveTier =
                                           resolveEffectiveGlassTier(context, state.glassTier);
-                                      final modelRow = Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(pillIcon, size: 13.5, color: pillIconColor),
-                                          const SizedBox(width: 5),
-                                          Flexible(
-                                            child: Text(
-                                              pillLabel,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                fontSize: 12.5,
-                                                fontWeight: FontWeight.w500,
-                                                letterSpacing: -0.1,
-                                                color: pillTextColor,
-                                              ),
-                                            ),
-                                          ),
-                                          if (effortBadge != null &&
-                                              !veryTightRow &&
-                                              !(tightRow && hasExtraStreamActions)) ...[
-                                            const SizedBox(width: 5),
-                                            Tooltip(
-                                              message: state.canCycleEffort
-                                                  ? '点击快速切换思考深度'
-                                                  : '当前思考深度',
-                                              child: GestureDetector(
-                                                behavior: HitTestBehavior.opaque,
-                                                onTap: state.canCycleEffort
-                                                    ? () {
-                                                        HapticFeedback.selectionClick();
-                                                        if (_plusOpen) _setPlusOpen(false);
-                                                        unawaited(ctrl.cycleReasoningEffort());
-                                                      }
-                                                    : null,
-                                                child: GrassBagFresnelGlassSurface(
-                                                  isPill: true,
-                                                  innerWell: true,
-                                                  tintColor: t.primarySoft,
-                                                  padding: const EdgeInsets.symmetric(
-                                                    horizontal: 6,
-                                                    vertical: 2,
-                                                  ),
-                                                  child: Text(
-                                                    effortBadge,
-                                                    style: TextStyle(
-                                                      fontSize: 10.5,
-                                                      fontWeight: FontWeight.w600,
-                                                      color: t.primary,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                          const SizedBox(width: 3),
-                                          Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
-                                        ],
-                                      );
                                       final isSolid = effectiveTier == GrassBagGlassTier.solid;
-                                      return GrassBagSpringTap(
-                                        onTap: () {
-                                          if (_plusOpen) _setPlusOpen(false);
-                                          pillTap();
-                                        },
-                                        pressedScale: 0.94,
-                                        enablePointerGlow: false,
-                                        haptic: true,
-                                        child: Container(
+                                      final showEffortChip = effortBadge != null &&
+                                          !veryTightRow &&
+                                          !(tightRow && hasExtraStreamActions);
+                                      Widget buildModelPillVisual() {
+                                        return Container(
                                           height: 36,
                                           padding: EdgeInsets.symmetric(horizontal: tightRow ? 9 : 11),
                                           decoration: ShapeDecoration(
@@ -3536,7 +4038,115 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   : BorderSide.none,
                                             ),
                                           ),
-                                          child: modelRow,
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(pillIcon, size: 13.5, color: pillIconColor),
+                                              const SizedBox(width: 5),
+                                              Flexible(
+                                                child: Text(
+                                                  pillLabel,
+                                                  maxLines: 1,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: TextStyle(
+                                                    fontSize: 12.5,
+                                                    fontWeight: FontWeight.w500,
+                                                    letterSpacing: -0.1,
+                                                    color: pillTextColor,
+                                                  ),
+                                                ),
+                                              ),
+                                              if (showEffortChip) ...[
+                                                const SizedBox(width: 5),
+                                                GrassBagFresnelGlassSurface(
+                                                  isPill: true,
+                                                  innerWell: true,
+                                                  tintColor: t.primarySoft,
+                                                  padding: const EdgeInsets.symmetric(
+                                                    horizontal: 6,
+                                                    vertical: 2.5,
+                                                  ),
+                                                  child: AnimatedSwitcher(
+                                                    duration: GrassBagMotion.duration(
+                                                      context,
+                                                      const Duration(milliseconds: 180),
+                                                    ),
+                                                    switchInCurve: Curves.easeOutCubic,
+                                                    switchOutCurve: Curves.easeInCubic,
+                                                    transitionBuilder: (child, anim) =>
+                                                        FadeTransition(
+                                                      opacity: anim,
+                                                      child: ScaleTransition(
+                                                        scale: Tween<double>(
+                                                          begin: 0.88,
+                                                          end: 1.0,
+                                                        ).animate(anim),
+                                                        child: child,
+                                                      ),
+                                                    ),
+                                                    child: Row(
+                                                      key: ValueKey(
+                                                        'effort:$effortBadge:${state.activeEffortDepth}',
+                                                      ),
+                                                      mainAxisSize: MainAxisSize.min,
+                                                      children: [
+                                                        if (state.activeEffortDepth >= 0 &&
+                                                            !tightRow) ...[
+                                                          GrassBagEffortDepthBars(
+                                                            level: state.activeEffortDepth,
+                                                            activeColor: t.primary,
+                                                            inactiveColor: t.primary
+                                                                .withValues(alpha: 0.24),
+                                                            compact: true,
+                                                          ),
+                                                          const SizedBox(width: 4),
+                                                        ],
+                                                        Text(
+                                                          effortBadge!,
+                                                          style: TextStyle(
+                                                            fontSize: 10.5,
+                                                            fontWeight: FontWeight.w600,
+                                                            color: t.primary,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                              const SizedBox(width: 3),
+                                              Icon(CupertinoIcons.chevron_down, size: 11, color: t.text3),
+                                            ],
+                                          ),
+                                        );
+                                      }
+                                      return Tooltip(
+                                        message: state.canCycleEffort
+                                            ? '点击切换模型 · 长按选择思考深度'
+                                            : '点击切换模型 · 长按快捷操作',
+                                        child: GrassBagGlassLongPressTrigger(
+                                          key: const ValueKey('composer-model-pill-trigger'),
+                                          tier: state.glassTier,
+                                          anticipationBorderRadius: 18.0,
+                                          onWillOpen: () {
+                                            if (_plusOpen) _setPlusOpen(false);
+                                            if (_streamModeDeckOpen) {
+                                              _setStreamModeDeckOpen(false);
+                                            }
+                                          },
+                                          menuBuilder: _buildModelLongPressMenu,
+                                          liftedBuilder: (_) => buildModelPillVisual(),
+                                          child: GrassBagSpringTap(
+                                            key: const ValueKey('composer-model-pill'),
+                                            onTap: () {
+                                              if (_plusOpen) _setPlusOpen(false);
+                                              pillTap();
+                                            },
+                                            pressedScale: 0.94,
+                                            enablePointerGlow: false,
+                                            haptic: true,
+                                            child: buildModelPillVisual(),
+                                          ),
                                         ),
                                       );
                                   }(),
@@ -3755,60 +4365,78 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                   }
                                 }
                                 final isSolid = effectiveTier == GrassBagGlassTier.solid;
-                                return Tooltip(
-                                  message: orbTooltip,
-                                  child: GrassBagSpringTap(
-                                    key: const ValueKey('composer-action-btn'),
-                                    enabled: orbEnabled,
-                                    enablePointerGlow: false,
-                                    pressedScale: orbInteractive ? 0.88 : 1.0,
-                                    onTap: handleOrbTap,
-                                    child: AnimatedContainer(
-                                      duration: const Duration(milliseconds: 220),
-                                      curve: Curves.easeOutCubic,
-                                      width: 36,
-                                      height: 36,
-                                      decoration: BoxDecoration(
-                                        gradient: LinearGradient(
-                                          begin: Alignment.topLeft,
-                                          end: Alignment.bottomRight,
-                                          colors: primaryActive
-                                              ? [
-                                                  Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.10 : 0.14)!,
-                                                  t.primary,
-                                                ]
-                                              : (isStopOrb
-                                                  ? [t.errSoft, t.errSoft]
-                                                  : (t.isDark
-                                                      ? [
-                                                          Colors.white.withValues(alpha: 0.11),
-                                                          Colors.white.withValues(alpha: 0.09),
-                                                        ]
-                                                      : [
-                                                          Colors.black.withValues(alpha: 0.06),
-                                                          Colors.black.withValues(alpha: 0.05),
-                                                        ])),
-                                        ),
-                                        shape: BoxShape.circle,
-                                        border: isSolid && !primaryActive
-                                            ? Border.all(
-                                                color: isStopOrb
-                                                    ? t.err.withValues(alpha: 0.30)
-                                                    : t.sep,
-                                                width: 0.65,
-                                              )
-                                            : null,
-                                        boxShadow: primaryActive
+                                Widget buildActionOrbVisual() {
+                                  return AnimatedContainer(
+                                    duration: const Duration(milliseconds: 220),
+                                    curve: Curves.easeOutCubic,
+                                    width: 36,
+                                    height: 36,
+                                    decoration: BoxDecoration(
+                                      gradient: LinearGradient(
+                                        begin: Alignment.topLeft,
+                                        end: Alignment.bottomRight,
+                                        colors: primaryActive
                                             ? [
-                                                BoxShadow(
-                                                  color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.26),
-                                                  blurRadius: 10,
-                                                  offset: const Offset(0, 3),
-                                                ),
+                                                Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.10 : 0.14)!,
+                                                t.primary,
                                               ]
-                                            : null,
+                                            : (isStopOrb
+                                                ? [t.errSoft, t.errSoft]
+                                                : (t.isDark
+                                                    ? [
+                                                        Colors.white.withValues(alpha: 0.11),
+                                                        Colors.white.withValues(alpha: 0.09),
+                                                      ]
+                                                    : [
+                                                        Colors.black.withValues(alpha: 0.06),
+                                                        Colors.black.withValues(alpha: 0.05),
+                                                      ])),
                                       ),
-                                      child: orbChild,
+                                      shape: BoxShape.circle,
+                                      border: isSolid && !primaryActive
+                                          ? Border.all(
+                                              color: isStopOrb
+                                                  ? t.err.withValues(alpha: 0.30)
+                                                  : t.sep,
+                                              width: 0.65,
+                                            )
+                                          : null,
+                                      boxShadow: primaryActive
+                                          ? [
+                                              BoxShadow(
+                                                color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.26),
+                                                blurRadius: 10,
+                                                offset: const Offset(0, 3),
+                                              ),
+                                            ]
+                                          : null,
+                                    ),
+                                    child: orbChild,
+                                  );
+                                }
+                                final canLongPressOrb = !state.isStopping && !_submitting && !isStopOrb;
+                                return Tooltip(
+                                  message: hasText ? '$orbTooltip · 长按更多发送方式' : orbTooltip,
+                                  child: GrassBagGlassLongPressTrigger(
+                                    tier: state.glassTier,
+                                    isCircle: true,
+                                    enabled: canLongPressOrb,
+                                    onWillOpen: () {
+                                      if (_plusOpen) _setPlusOpen(false);
+                                      if (_streamModeDeckOpen) _setStreamModeDeckOpen(false);
+                                    },
+                                    menuBuilder: (ctx) => _buildSendOrbLongPressMenu(
+                                      ctx,
+                                      hasText: hasText,
+                                    ),
+                                    liftedBuilder: (_) => buildActionOrbVisual(),
+                                    child: GrassBagSpringTap(
+                                      key: const ValueKey('composer-action-btn'),
+                                      enabled: orbEnabled,
+                                      enablePointerGlow: false,
+                                      pressedScale: orbInteractive ? 0.88 : 1.0,
+                                      onTap: handleOrbTap,
+                                      child: buildActionOrbVisual(),
                                     ),
                                   ),
                                 );
@@ -5715,6 +6343,7 @@ class _ComposerContextRingButton extends ConsumerWidget {
           contextPct: s.contextPct,
           hasAnyData: s.sessionTelemetry.hasAnyData,
           isCompactingContext: s.isCompactingContext,
+          glassTier: s.glassTier,
         ),
       ),
     );
@@ -5723,81 +6352,123 @@ class _ComposerContextRingButton extends ConsumerWidget {
       return const SizedBox.shrink();
     }
     final t = GrassBagTokens.of(context);
+    final ctrl = ref.read(appProvider.notifier);
     final pctInt = slice.contextPct;
+    Widget buildRingVisual() {
+      return GrassBagFresnelGlassSurface(
+        isPill: true,
+        innerWell: true,
+        interactive: true,
+        height: 36,
+        padding: EdgeInsets.symmetric(horizontal: pctInt >= 65 ? 9 : 8.5),
+        tintColor: slice.isCompactingContext
+            ? t.primarySoft
+            : (pctInt >= 85
+                ? t.errSoft
+                : (pctInt >= 65 ? t.warnSoft : null)),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (slice.isCompactingContext)
+              const CupertinoActivityIndicator(radius: 7)
+            else if (pctInt <= 0)
+              Icon(
+                CupertinoIcons.chart_pie,
+                size: 15,
+                color: t.primary.withValues(alpha: 0.85),
+              )
+            else
+              RepaintBoundary(
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween<double>(end: pctInt / 100.0),
+                  duration: const Duration(milliseconds: 420),
+                  curve: Curves.easeOutCubic,
+                  builder: (context, pct, _) => SizedBox(
+                    width: 19,
+                    height: 19,
+                    child: CustomPaint(
+                      painter: _ContextRingPainter(
+                        percent: pct,
+                        trackColor: t.text3.withValues(alpha: 0.24),
+                        arcColor: pctInt >= 85
+                            ? t.err
+                            : pctInt >= 65
+                                ? t.warn
+                                : t.primary,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (pctInt >= 65) ...[
+              const SizedBox(width: 4),
+              Text(
+                '$pctInt%',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                  color: pctInt >= 85 ? t.err : t.warn,
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Tooltip(
           message: slice.isCompactingContext
               ? '正在精简上下文…'
-              : '上下文占用 $pctInt%（点击查看与精简）',
-          child: GrassBagSpringTap(
-            onTap: () {
-              onBeforeOpen?.call();
-              showContextSheet(context, ref);
-            },
-            pressedScale: 0.88,
-            enablePointerGlow: false,
-            haptic: true,
-            child: GrassBagFresnelGlassSurface(
-              isPill: true,
-              innerWell: true,
-              interactive: true,
-              height: 36,
-              padding: EdgeInsets.symmetric(horizontal: pctInt >= 65 ? 9 : 8.5),
-              tintColor: slice.isCompactingContext
-                  ? t.primarySoft
-                  : (pctInt >= 85
-                      ? t.errSoft
-                      : (pctInt >= 65 ? t.warnSoft : null)),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (slice.isCompactingContext)
-                    const CupertinoActivityIndicator(radius: 7)
-                  else if (pctInt <= 0)
-                    Icon(
-                      CupertinoIcons.chart_pie,
-                      size: 15,
-                      color: t.primary.withValues(alpha: 0.85),
-                    )
-                  else
-                    RepaintBoundary(
-                      child: TweenAnimationBuilder<double>(
-                        tween: Tween<double>(end: pctInt / 100.0),
-                        duration: const Duration(milliseconds: 420),
-                        curve: Curves.easeOutCubic,
-                        builder: (context, pct, _) => SizedBox(
-                          width: 19,
-                          height: 19,
-                          child: CustomPaint(
-                            painter: _ContextRingPainter(
-                              percent: pct,
-                              trackColor: t.text3.withValues(alpha: 0.24),
-                              arcColor: pctInt >= 85
-                                  ? t.err
-                                  : pctInt >= 65
-                                      ? t.warn
-                                      : t.primary,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  if (pctInt >= 65) ...[
-                    const SizedBox(width: 4),
-                    Text(
-                      '$pctInt%',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        fontFeatures: const [FontFeature.tabularFigures()],
-                        color: pctInt >= 85 ? t.err : t.warn,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
+              : '上下文占用 $pctInt% · 点击查看 · 长按精简与分支',
+          child: GrassBagGlassLongPressTrigger(
+            key: const ValueKey('composer-context-ring-trigger'),
+            tier: slice.glassTier,
+            anticipationBorderRadius: 18.0,
+            onWillOpen: onBeforeOpen,
+            liftedBuilder: (_) => buildRingVisual(),
+            menuBuilder: (_) => GrassBagLongPressMenuSpec(
+              headerTitle: '上下文占用 $pctInt%',
+              headerSubtitle: slice.isCompactingContext
+                  ? '正在精简上下文…'
+                  : '窗口精简与分支对话',
+              preferAbove: true,
+              menuWidth: 248.0,
+              items: [
+                GrassBagContextMenuItem(
+                  label: '立即精简上下文',
+                  subtitle: '压缩历史轮次以释放窗口空间',
+                  icon: CupertinoIcons.arrow_down_right_arrow_up_left,
+                  enabled: !slice.isCompactingContext,
+                  accentColor: pctInt >= 85 ? t.err : (pctInt >= 65 ? t.warn : t.primary),
+                  onTap: () => unawaited(ctrl.compactContext()),
+                ),
+                GrassBagContextMenuItem(
+                  label: '创建分支对话 (Fork)',
+                  subtitle: '保留当前上下文开启新分支',
+                  icon: CupertinoIcons.arrow_branch,
+                  onTap: () => unawaited(ctrl.forkActiveSession()),
+                ),
+                GrassBagContextMenuItem(
+                  label: '查看 Token 明细',
+                  icon: CupertinoIcons.chart_pie,
+                  dividerBefore: true,
+                  onTap: () => showContextSheet(context, ref),
+                ),
+              ],
+            ),
+            child: GrassBagSpringTap(
+              key: const ValueKey('composer-context-ring-btn'),
+              onTap: () {
+                onBeforeOpen?.call();
+                showContextSheet(context, ref);
+              },
+              pressedScale: 0.88,
+              enablePointerGlow: false,
+              haptic: true,
+              child: buildRingVisual(),
             ),
           ),
         ),

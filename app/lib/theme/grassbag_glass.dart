@@ -5,6 +5,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart' show ValueListenable, kIsWeb;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
@@ -36,6 +37,30 @@ export 'kyant_liquid_glass.dart'
 ///   Kyant0 chromatic dispersion on `GlassSwitch`, `GlassSlider`, and `GlassSegmentedControl`
 ///   (zero shaders at rest!).
 abstract final class GrassBagGlassConfig {
+  /// Default global Liquid Glass refraction & chromatic dispersion intensity (`0.0..1.0`).
+  /// `0.0` = clean refraction with zero RGB fringing; `0.50` = Apple iOS 27 calibrated baseline;
+  /// `1.0` = vivid prismatic refraction & chromatic dispersion across all floating chrome.
+  static const double defaultOpticalStrength = 0.50;
+
+  /// Maps user-facing optical strength (`0.0..1.0`) onto shader `chromaticAberration` so:
+  /// - `0.0` cleanly disables RGB channel splitting (`0.0`)
+  /// - `0.5` preserves the exact calibrated iOS 27 default (`atDefault`)
+  /// - `1.0` opens up rich prismatic corner/edge dispersion (`atMax`)
+  static double scaleChromatic(
+    double opticalStrength,
+    double atDefault,
+    double atMax,
+  ) {
+    final s = opticalStrength.clamp(0.0, 1.0);
+    if (s <= 0.001) return 0.0;
+    if (s <= defaultOpticalStrength) {
+      return atDefault * (s / defaultOpticalStrength);
+    }
+    return atDefault +
+        (atMax - atDefault) *
+            ((s - defaultOpticalStrength) / (1.0 - defaultOpticalStrength));
+  }
+
   /// Quality for persistent floating chrome (nav buttons, title capsule, floating composer, sheets).
   static GlassQuality chromeQualityFor(GrassBagGlassTier tier) {
     if (tier == GrassBagGlassTier.solid) return GlassQuality.minimal;
@@ -54,16 +79,13 @@ abstract final class GrassBagGlassConfig {
         GrassBagGlassTier.solid => GlassQuality.minimal,
       };
 
-  /// Calibrated Apple iOS 27 `GlassLensModel.paraxial` + frost-cloud Liquid Glass for floating chrome
-  /// (top nav pills, title capsule, floating composer, toasts):
-  /// - `frost: 12.0` + `frostOpacity: 0.72` (Light) / `0.84` (Dark) delivers silky frosted legibility
-  ///   while the paraxial ghost (`thickness: 30, n: 1.24`) folds the curved rim optically!
-  /// - `lightIntensity: 0.0` & `fresnelStrength: 0.0` eliminate blinding Dark-mode neon rings,
-  ///   leaving only Apple's measured dual-lobe `rimLight` and whisper-fine `rimShade` hairline.
+  /// Calibrated Apple iOS 27 `GlassLensModel.spherical` Liquid Glass for floating chrome
+  /// (top nav pills, title capsule, floating composer, toasts), scaled by [opticalStrength].
   static LiquidGlassSettings surfaceSettings(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
     bool elevated = false,
+    double opticalStrength = defaultOpticalStrength,
   }) {
     if (tier == GrassBagGlassTier.solid) {
       return LiquidGlassSettings(
@@ -140,16 +162,19 @@ abstract final class GrassBagGlassConfig {
       );
     }
 
+    final s = opticalStrength.clamp(0.0, 1.0);
+    final thickness = 22.0 + 16.0 * s;
+
     if (t.isDark) {
       return LiquidGlassSettings(
         glassColor: Colors.white.withValues(alpha: elevated ? 0.08 : 0.055),
         blur: 1.4,
         frost: 0.0,
         frostOpacity: 0.0,
-        thickness: 30.0,
-        refractiveIndex: 1.34,
+        thickness: thickness,
+        refractiveIndex: 1.22 + 0.24 * s,
         lensModel: GlassLensModel.spherical,
-        chromaticAberration: 0.14,
+        chromaticAberration: scaleChromatic(s, 0.14, 0.68),
         saturation: 1.58,
         lightAngle: 0.75 * math.pi,
         lightIntensity: 0.70,
@@ -170,10 +195,10 @@ abstract final class GrassBagGlassConfig {
       blur: 1.4,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 30.0,
-      refractiveIndex: 1.32,
+      thickness: thickness,
+      refractiveIndex: 1.20 + 0.24 * s,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.12,
+      chromaticAberration: scaleChromatic(s, 0.12, 0.62),
       saturation: 1.80,
       lightAngle: 0.75 * math.pi,
       lightIntensity: 0.72,
@@ -199,14 +224,19 @@ abstract final class GrassBagGlassConfig {
 
   /// Crystal-clear Apple iOS 27 modal sheet, '+' deck, alert platter, context menu & drawer glass:
   /// silky optical bokeh (`7.2dp` sheets / `9.5dp` centered dialogs, zero milky opaque frost wall!)
-  /// + spherical curved edge refraction (`thickness: 32, n: 1.28`) + razor-clean specular rim so
-  /// underlying colors glow through luminously while foreground labels & buttons stay effortlessly crisp.
+  /// + spherical curved edge refraction + chromatic dispersion scaled by [opticalStrength].
   static LiquidGlassSettings sheetSettings(
     GrassBagTokens t,
     GrassBagGlassTier tier, {
     bool isDialog = false,
+    double opticalStrength = defaultOpticalStrength,
   }) {
-    final base = surfaceSettings(t, tier, elevated: true);
+    final base = surfaceSettings(
+      t,
+      tier,
+      elevated: true,
+      opticalStrength: opticalStrength,
+    );
     if (tier == GrassBagGlassTier.solid) {
       return base;
     }
@@ -230,6 +260,7 @@ abstract final class GrassBagGlassConfig {
         bodyShade: t.isDark ? 0.18 : 0.0,
       );
     }
+    final s = opticalStrength.clamp(0.0, 1.0);
     return base.copyWith(
       glassColor: t.isDark
           ? Colors.white.withValues(alpha: isDialog ? 0.13 : 0.11)
@@ -237,10 +268,10 @@ abstract final class GrassBagGlassConfig {
       blur: isDialog ? (t.isDark ? 9.0 : 10.0) : 7.2,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 32.0,
-      refractiveIndex: 1.28,
+      thickness: 24.0 + 16.0 * s,
+      refractiveIndex: 1.18 + 0.20 * s,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.09,
+      chromaticAberration: scaleChromatic(s, 0.09, 0.48),
       saturation: t.isDark ? 1.52 : 1.72,
       bodyShade: t.isDark ? (isDialog ? 0.16 : 0.12) : 0.0,
       whitenStrength: t.isDark ? 0.0 : (isDialog ? 0.06 : 0.04),
@@ -268,19 +299,24 @@ abstract final class GrassBagGlassConfig {
 
   /// Pure optical crystal prism lens preset for interactive optical showcases
   /// (Appearance Studio draggable lens capsule) — crisp spherical refraction + chromatic dispersion.
-  static LiquidGlassSettings prismLensSettings(GrassBagTokens t, GrassBagGlassTier tier) {
+  static LiquidGlassSettings prismLensSettings(
+    GrassBagTokens t,
+    GrassBagGlassTier tier, {
+    double opticalStrength = defaultOpticalStrength,
+  }) {
     if (tier != GrassBagGlassTier.liquid || kIsWeb) {
-      return surfaceSettings(t, tier);
+      return surfaceSettings(t, tier, opticalStrength: opticalStrength);
     }
+    final s = opticalStrength.clamp(0.0, 1.0);
     return LiquidGlassSettings(
       glassColor: Colors.white.withValues(alpha: t.isDark ? 0.06 : 0.10),
       blur: 0.8,
       frost: 0.0,
       frostOpacity: 0.0,
-      thickness: 28.0,
-      refractiveIndex: 1.36,
+      thickness: 20.0 + 18.0 * s,
+      refractiveIndex: 1.22 + 0.28 * s,
       lensModel: GlassLensModel.spherical,
-      chromaticAberration: 0.18,
+      chromaticAberration: scaleChromatic(s, 0.18, 0.85),
       saturation: t.isDark ? 1.55 : 1.75,
       lightAngle: 0.75 * math.pi,
       lightIntensity: 0.78,
@@ -302,8 +338,9 @@ abstract final class GrassBagGlassConfig {
   static GlassThemeData themeDataFor(
     GrassBagTokens lightTokens,
     GrassBagTokens darkTokens,
-    GrassBagGlassTier tier,
-  ) {
+    GrassBagGlassTier tier, {
+    double opticalStrength = defaultOpticalStrength,
+  }) {
     if (tier == GrassBagGlassTier.solid) {
       return const GlassThemeData(
         style: GlassStyle.ios27,
@@ -313,13 +350,22 @@ abstract final class GrassBagGlassConfig {
     }
 
     final isFrosted = tier == GrassBagGlassTier.frosted || kIsWeb;
-    final lightSurf = surfaceSettings(lightTokens, tier);
-    final darkSurf = surfaceSettings(darkTokens, tier);
+    final s = opticalStrength.clamp(0.0, 1.0);
+    final lightSurf = surfaceSettings(
+      lightTokens,
+      tier,
+      opticalStrength: s,
+    );
+    final darkSurf = surfaceSettings(
+      darkTokens,
+      tier,
+      opticalStrength: s,
+    );
     final indicatorTheme = isFrosted
         ? null
-        : const GlassThemeSettings(
-            refractiveIndex: 1.32,
-            chromaticAberration: 0.14,
+        : GlassThemeSettings(
+            refractiveIndex: 1.20 + 0.24 * s,
+            chromaticAberration: scaleChromatic(s, 0.14, 0.60),
             lightIntensity: 0.55,
             ambientStrength: 0.10,
             fresnelStrength: 0.85,
@@ -400,16 +446,19 @@ abstract final class GrassBagGlassConfig {
   }
 }
 
-/// Explicit inherited scope carrying the active [GrassBagGlassTier] so Web builds and
-/// custom thickness tunings always resolve the exact user-selected glass tier.
+/// Explicit inherited scope carrying the active [GrassBagGlassTier] and user-tuned
+/// [opticalStrength] (`0.0..1.0`) so every Liquid Glass surface, button, sheet, menu,
+/// and interactive droplet lens updates live globally!
 class GrassBagGlassTierScope extends InheritedWidget {
   const GrassBagGlassTierScope({
     super.key,
     required this.tier,
+    this.opticalStrength = GrassBagGlassConfig.defaultOpticalStrength,
     required super.child,
   });
 
   final GrassBagGlassTier tier;
+  final double opticalStrength;
 
   static GrassBagGlassTier? maybeOf(BuildContext context) {
     return context
@@ -417,10 +466,22 @@ class GrassBagGlassTierScope extends InheritedWidget {
         ?.tier;
   }
 
+  static double opticalStrengthOf(BuildContext context) {
+    final v = context
+        .dependOnInheritedWidgetOfExactType<GrassBagGlassTierScope>()
+        ?.opticalStrength;
+    return (v ?? GrassBagGlassConfig.defaultOpticalStrength).clamp(0.0, 1.0);
+  }
+
   @override
   bool updateShouldNotify(GrassBagGlassTierScope oldWidget) =>
-      oldWidget.tier != tier;
+      oldWidget.tier != tier || oldWidget.opticalStrength != opticalStrength;
 }
+
+/// Resolves the ambient Liquid Glass optical refraction/dispersion strength (`0.0..1.0`)
+/// from [GrassBagGlassTierScope].
+double resolveAmbientGlassOpticalStrength(BuildContext context) =>
+    GrassBagGlassTierScope.opticalStrengthOf(context);
 
 /// Resolves the effective [GrassBagGlassTier], cleanly routing OS High Contrast /
 /// Reduce Transparency to [GrassBagGlassTier.solid] BEFORE `AdaptiveGlass` runs its
@@ -1178,8 +1239,13 @@ class GrassBagGlassBarLayer extends StatelessWidget {
       return child;
     }
     final t = GrassBagTokens.of(context);
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
     return AdaptiveLiquidGlassLayer(
-      settings: GrassBagGlassConfig.surfaceSettings(t, effectiveTier),
+      settings: GrassBagGlassConfig.surfaceSettings(
+        t,
+        effectiveTier,
+        opticalStrength: opticalStrength,
+      ),
       quality: GrassBagGlassConfig.chromeQualityFor(effectiveTier),
       blendAmount: 0.0,
       clipExpansion: const EdgeInsets.all(12),
@@ -1449,9 +1515,20 @@ class GrassBagGlass extends StatelessWidget {
 
     final isOverlayPlatter = useSheetSettings || isDialog;
     final effectiveOwnLayer = useOwnLayer || tintColor != null || isOverlayPlatter;
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
     final baseSettings = isOverlayPlatter
-        ? GrassBagGlassConfig.sheetSettings(t, effectiveTier, isDialog: isDialog)
-        : GrassBagGlassConfig.surfaceSettings(t, effectiveTier, elevated: elevated);
+        ? GrassBagGlassConfig.sheetSettings(
+            t,
+            effectiveTier,
+            isDialog: isDialog,
+            opticalStrength: opticalStrength,
+          )
+        : GrassBagGlassConfig.surfaceSettings(
+            t,
+            effectiveTier,
+            elevated: elevated,
+            opticalStrength: opticalStrength,
+          );
     final rawBaseShadows = baseSettings.shadow ?? const <BoxShadow>[];
     // Externalize standalone shadows via `BlurStyle.outer` so `LiquidGlassLayer._bakeShadows()`
     // NEVER calls synchronous `picture.toImageSync()` on sheets, drawers, dialogs, or cards!
@@ -1624,6 +1701,7 @@ class GrassBagGlassCircleButton extends StatelessWidget {
     }
 
     final effectiveOwnLayer = useOwnLayer || platformViewBackdrop || tintColor != null;
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
     final btn = Semantics(
       button: true,
       label: tooltip,
@@ -1642,7 +1720,11 @@ class GrassBagGlassCircleButton extends StatelessWidget {
         platformViewBackdrop: platformViewBackdrop,
         settings: !effectiveOwnLayer
             ? null
-            : GrassBagGlassConfig.surfaceSettings(t, effectiveTier),
+            : GrassBagGlassConfig.surfaceSettings(
+                t,
+                effectiveTier,
+                opticalStrength: opticalStrength,
+              ),
         interactionScale: 1.07,
         stretch: effectiveOwnLayer ? 0.35 : 0.16,
         anchorStretch: true,
@@ -1737,7 +1819,12 @@ class GrassBagGlassPillButton extends StatelessWidget {
     }
 
     final effectiveOwnLayer = useOwnLayer || platformViewBackdrop || prominent || tintColor != null;
-    final baseSettings = GrassBagGlassConfig.surfaceSettings(t, effectiveTier);
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
+    final baseSettings = GrassBagGlassConfig.surfaceSettings(
+      t,
+      effectiveTier,
+      opticalStrength: opticalStrength,
+    );
     final isLiquid = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb;
     final resolvedSettings = !effectiveOwnLayer
         ? null
@@ -1745,10 +1832,12 @@ class GrassBagGlassPillButton extends StatelessWidget {
             ? baseSettings.copyWith(
                 bodyMode: GlassBodyMode.clear,
                 glassColor: (tintColor ?? t.primary).withValues(alpha: t.isDark ? 0.80 : 0.88),
-                thickness: isLiquid ? 22.0 : 1.0,
-                refractiveIndex: isLiquid ? 1.28 : 1.01,
+                thickness: isLiquid ? (16.0 + 12.0 * opticalStrength) : 1.0,
+                refractiveIndex: isLiquid ? (1.18 + 0.20 * opticalStrength) : 1.01,
                 lensModel: GlassLensModel.spherical,
-                chromaticAberration: isLiquid ? 0.08 : 0.0,
+                chromaticAberration: isLiquid
+                    ? GrassBagGlassConfig.scaleChromatic(opticalStrength, 0.08, 0.40)
+                    : 0.0,
                 rimLight: isLiquid ? 0.86 : 0.36,
               )
             : baseSettings);
@@ -2004,6 +2093,7 @@ LiquidGlassSettings _interactiveLensSettings(
   GrassBagGlassTier tier, {
   double refractiveIndex = 1.38,
   double chromaticAberration = 0.15,
+  double opticalStrength = GrassBagGlassConfig.defaultOpticalStrength,
 }) {
   if (tier != GrassBagGlassTier.liquid || kIsWeb) {
     return LiquidGlassSettings.ios27Indicator.copyWith(
@@ -2011,9 +2101,17 @@ LiquidGlassSettings _interactiveLensSettings(
       chromaticAberration: 0.0,
     );
   }
+  final s = opticalStrength.clamp(0.0, 1.0);
+  final minN = math.max(1.16, refractiveIndex - 0.12);
+  final scaledN = minN + (refractiveIndex - minN) * (s / GrassBagGlassConfig.defaultOpticalStrength).clamp(0.0, 2.0);
+  final scaledCa = GrassBagGlassConfig.scaleChromatic(
+    s,
+    chromaticAberration,
+    math.min(0.65, chromaticAberration * 4.0),
+  );
   return LiquidGlassSettings.ios27Indicator.copyWith(
-    refractiveIndex: refractiveIndex,
-    chromaticAberration: chromaticAberration,
+    refractiveIndex: scaledN.clamp(1.16, 1.54),
+    chromaticAberration: scaledCa,
     lightIntensity: 0.55,
     ambientStrength: 0.10,
     fresnelStrength: 0.85,
@@ -2062,6 +2160,7 @@ class GrassBagGlassSwitch extends StatelessWidget {
     final lensQuality = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb
         ? GlassQuality.premium
         : GlassQuality.standard;
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
     return _GrassBagLensScope(
       tier: effectiveTier,
       child: GlassSwitch(
@@ -2077,6 +2176,7 @@ class GrassBagGlassSwitch extends StatelessWidget {
           effectiveTier,
           refractiveIndex: 1.40,
           chromaticAberration: 0.16,
+          opticalStrength: opticalStrength,
         ),
         enableHaptics: true,
       ),
@@ -2495,10 +2595,12 @@ class GrassBagSegmentedControl extends StatelessWidget {
     final lensQuality = effectiveTier == GrassBagGlassTier.liquid && !kIsWeb
         ? GlassQuality.premium
         : GlassQuality.standard;
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
     final lensSettings = _interactiveLensSettings(
       effectiveTier,
       refractiveIndex: 1.32,
       chromaticAberration: 0.14,
+      opticalStrength: opticalStrength,
     );
 
     final control = labels.length > 6
@@ -2556,6 +2658,7 @@ class GrassBagGlassSlider extends StatelessWidget {
     required this.min,
     required this.max,
     required this.onChanged,
+    this.onChangeEnd,
     this.divisions,
     this.activeColor,
     this.tier,
@@ -2565,6 +2668,7 @@ class GrassBagGlassSlider extends StatelessWidget {
   final double min;
   final double max;
   final ValueChanged<double>? onChanged;
+  final ValueChanged<double>? onChangeEnd;
   final int? divisions;
   final Color? activeColor;
   final GrassBagGlassTier? tier;
@@ -2605,6 +2709,7 @@ class GrassBagGlassSlider extends StatelessWidget {
           max: safeMax,
           divisions: divisions,
           onChanged: onChanged,
+          onChangeEnd: onChangeEnd,
         ),
       );
       if (enabled) return solidSlider;
@@ -2616,25 +2721,55 @@ class GrassBagGlassSlider extends StatelessWidget {
     final lensQuality = resolvedTier == GrassBagGlassTier.liquid && !kIsWeb
         ? GlassQuality.premium
         : GlassQuality.standard;
+    final opticalStrength = resolveAmbientGlassOpticalStrength(context);
+    const thumbRadius = 14.0;
     final slider = _GrassBagLensScope(
       tier: resolvedTier,
-      child: GlassSlider(
-        value: clampedVal,
-        min: min,
-        max: safeMax,
-        divisions: divisions,
-        onChanged: onChanged,
-        activeColor: resolvedActive,
-        inactiveColor: resolvedInactive,
-        trackHeight: 6.0,
-        thumbRadius: 14.0,
-        useOwnLayer: false,
-        quality: lensQuality,
-        settings: _interactiveLensSettings(
-          resolvedTier,
-          refractiveIndex: 1.38,
-          chromaticAberration: 0.16,
-        ),
+      child: LayoutBuilder(
+        builder: (ctx, constraints) {
+          void handleTapAt(Offset localPosition) {
+            if (!enabled) return;
+            final trackW = constraints.maxWidth - (thumbRadius * 2);
+            if (trackW <= 0) return;
+            final isRtl = Directionality.of(ctx) == TextDirection.rtl;
+            final rawNorm = ((localPosition.dx - thumbRadius) / trackW).clamp(0.0, 1.0);
+            final norm = isRtl ? 1.0 - rawNorm : rawNorm;
+            var next = min + norm * (safeMax - min);
+            if (divisions != null && divisions! > 0) {
+              final step = (safeMax - min) / divisions!;
+              next = ((next - min) / step).round() * step + min;
+            }
+            next = next.clamp(min, safeMax);
+            HapticFeedback.selectionClick();
+            onChanged?.call(next);
+            onChangeEnd?.call(next);
+          }
+
+          return GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTapUp: enabled ? (d) => handleTapAt(d.localPosition) : null,
+            child: GlassSlider(
+              value: clampedVal,
+              min: min,
+              max: safeMax,
+              divisions: divisions,
+              onChanged: onChanged,
+              onChangeEnd: onChangeEnd,
+              activeColor: resolvedActive,
+              inactiveColor: resolvedInactive,
+              trackHeight: 6.0,
+              thumbRadius: thumbRadius,
+              useOwnLayer: false,
+              quality: lensQuality,
+              settings: _interactiveLensSettings(
+                resolvedTier,
+                refractiveIndex: 1.38,
+                chromaticAberration: 0.16,
+                opticalStrength: opticalStrength,
+              ),
+            ),
+          );
+        },
       ),
     );
     if (enabled) return slider;
@@ -5049,8 +5184,79 @@ class GrassBagFilterChip extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Apple iOS 26 Floating Liquid Glass Context Menus & Text Selection Toolbars
+// Apple iOS 26/27 Floating Liquid Glass Context Menus, Press-Hold Scrubbing & Text Selection Toolbars
 // ---------------------------------------------------------------------------
+
+/// Miniature 4-bar Apple-style reasoning depth indicator used inside the composer
+/// effort badge and the iOS Liquid Glass long-press thinking-effort menu.
+class GrassBagEffortDepthBars extends StatelessWidget {
+  const GrassBagEffortDepthBars({
+    super.key,
+    required this.level,
+    required this.activeColor,
+    this.inactiveColor,
+    this.compact = false,
+  });
+
+  /// Normalized depth level in `0..4`.
+  final int level;
+  final Color activeColor;
+  final Color? inactiveColor;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final clamped = level.clamp(0, 4);
+    final offColor = inactiveColor ?? activeColor.withValues(alpha: 0.20);
+    final heights = compact
+        ? const [4.0, 6.2, 8.4, 10.6]
+        : const [5.0, 7.8, 10.6, 13.4];
+    final barW = compact ? 2.0 : 2.5;
+    final gap = compact ? 1.5 : 2.0;
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        for (var i = 0; i < 4; i++) ...[
+          if (i > 0) SizedBox(width: gap),
+          AnimatedContainer(
+            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 180)),
+            curve: Curves.easeOutCubic,
+            width: barW,
+            height: heights[i],
+            decoration: BoxDecoration(
+              color: i < clamped ? activeColor : offColor,
+              borderRadius: BorderRadius.circular(barW),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// Compact horizontal quick-action tile rendered at the top of an iOS 26/27
+/// Liquid Glass context menu (matching iOS Safari / Mail / Notes quick icon strip).
+class GrassBagContextMenuQuickAction {
+  const GrassBagContextMenuQuickAction({
+    required this.label,
+    required this.icon,
+    required this.onTap,
+    this.selected = false,
+    this.destructive = false,
+    this.accentColor,
+    this.enabled = true,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback onTap;
+  final bool selected;
+  final bool destructive;
+  final Color? accentColor;
+  final bool enabled;
+}
 
 /// Single item inside [showGrassBagGlassContextMenu].
 class GrassBagContextMenuItem {
@@ -5062,6 +5268,10 @@ class GrassBagContextMenuItem {
     this.destructive = false,
     this.selected = false,
     this.dividerBefore = false,
+    this.accentColor,
+    this.trailing,
+    this.badge,
+    this.enabled = true,
   });
 
   final String label;
@@ -5071,148 +5281,1457 @@ class GrassBagContextMenuItem {
   final bool destructive;
   final bool selected;
   final bool dividerBefore;
+  final Color? accentColor;
+  final Widget? trailing;
+  final String? badge;
+  final bool enabled;
 }
 
-/// Anchored Apple iOS 26 floating Liquid Glass popup context menu with spring
-/// scale-from-anchor animation, smart viewport edge clamping, and trailing Cupertino icons.
+/// Menu content specification returned dynamically by [GrassBagGlassLongPressTrigger].
+class GrassBagLongPressMenuSpec {
+  const GrassBagLongPressMenuSpec({
+    required this.items,
+    this.quickActions = const [],
+    this.headerTitle,
+    this.headerSubtitle,
+    this.menuWidth,
+    this.preferAbove,
+  });
+
+  final List<GrassBagContextMenuItem> items;
+  final List<GrassBagContextMenuQuickAction> quickActions;
+  final String? headerTitle;
+  final String? headerSubtitle;
+  final double? menuWidth;
+  final bool? preferAbove;
+}
+
+/// Native iOS 27 underdamped spring curve for blooming Liquid Glass menus.
+class _GrassBagSpringBloomCurve extends Curve {
+  const _GrassBagSpringBloomCurve();
+
+  static final SpringSimulation _sim = SpringSimulation(
+    const SpringDescription(mass: 1.0, stiffness: 330.0, damping: 24.5),
+    0.0,
+    1.0,
+    0.0,
+  );
+
+  @override
+  double transformInternal(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    // Scale simulation time to ~420ms so overshoot peeks gently (~1.035) and settles smoothly.
+    return _sim.x(t * 0.42);
+  }
+}
+
+/// Wraps any floating pill, orb, or chrome button with authentic Apple iOS 26/27
+/// **press-hold anticipation lift + Liquid Glass menu bloom + continuous single-gesture
+/// slide-to-select scrubbing** (plus desktop right-click parity).
+///
+/// - **Quick tap** (`< holdDuration`): zero delay, child's own `onTap` wins immediately.
+/// - **Touch & hold** (`105ms → holdDuration`): subtle elastic swell (`1.0 → 1.055`) & specular
+///   accent halo telegraphing the imminent Liquid Glass pop.
+/// - **Commit** (`holdDuration`): `LongPressGestureRecognizer` wins the arena (automatically
+///   cancelling child `onTap` so release never triggers a stray tap!), fires `mediumImpact()`,
+///   lifts the trigger spotlight above a whisper-clean scrim, and blooms the anchored Liquid
+///   Glass menu.
+/// - **Single-gesture scrub**: keeping the thumb down and gliding onto any quick-action tile
+///   or row glides a translucent Liquid Glass highlight capsule smoothly underneath with
+///   `selectionClick()` haptics; lifting the thumb activates that option immediately!
+/// - **Hold & lift**: releasing on the trigger keeps the menu gracefully open for tapping.
+class GrassBagGlassLongPressTrigger extends StatefulWidget {
+  const GrassBagGlassLongPressTrigger({
+    super.key,
+    required this.child,
+    required this.tier,
+    required this.menuBuilder,
+    this.liftedBuilder,
+    this.onWillOpen,
+    this.enabled = true,
+    this.enableSecondaryClick = true,
+    this.holdDuration = const Duration(milliseconds: 340),
+    this.anticipationBorderRadius = 18.0,
+    this.isCircle = false,
+  });
+
+  final Widget child;
+  final GrassBagGlassTier tier;
+  final GrassBagLongPressMenuSpec? Function(BuildContext context) menuBuilder;
+  final Widget Function(BuildContext context)? liftedBuilder;
+  final VoidCallback? onWillOpen;
+  final bool enabled;
+  final bool enableSecondaryClick;
+  final Duration holdDuration;
+  final double anticipationBorderRadius;
+  final bool isCircle;
+
+  @override
+  State<GrassBagGlassLongPressTrigger> createState() =>
+      _GrassBagGlassLongPressTriggerState();
+}
+
+class _GrassBagGlassLongPressTriggerState
+    extends State<GrassBagGlassLongPressTrigger>
+    with SingleTickerProviderStateMixin {
+  SingleSpringController? _chargeSpring;
+  final _SpringTickProxy _tickProxy = _SpringTickProxy();
+  Timer? _chargeTimer;
+  int? _activePointerId;
+  Offset _downGlobalPos = Offset.zero;
+  bool _charging = false;
+  bool _menuOpen = false;
+  GlobalKey<_GrassBagGlassContextMenuViewState>? _activeMenuKey;
+
+  void _ensureChargeSpring() {
+    if (_chargeSpring != null) return;
+    _chargeSpring = SingleSpringController(
+      vsync: this,
+      spring: GlassSpring.smooth(duration: const Duration(milliseconds: 220)),
+      initialValue: 0.0,
+    )..addListener(_tickProxy.notify);
+  }
+
+  void _cancelCharge({bool snap = false}) {
+    _chargeTimer?.cancel();
+    _chargeTimer = null;
+    final wasCharging = _charging;
+    _charging = false;
+    final spring = _chargeSpring;
+    if (spring != null && (wasCharging || spring.value.abs() > 0.001)) {
+      if (snap || !mounted || MediaQuery.disableAnimationsOf(context)) {
+        spring.setValue(0.0);
+      } else {
+        spring.spring = GlassSpring.snappy(duration: const Duration(milliseconds: 190));
+        spring.animateTo(0.0);
+      }
+    }
+  }
+
+  void _startChargeTimer() {
+    _chargeTimer?.cancel();
+    final delayMs = math.min(105, widget.holdDuration.inMilliseconds ~/ 3);
+    _chargeTimer = Timer(Duration(milliseconds: delayMs), () {
+      if (!mounted || _activePointerId == null || _menuOpen) return;
+      if (MediaQuery.disableAnimationsOf(context)) return;
+      _charging = true;
+      _ensureChargeSpring();
+      _chargeSpring!.spring = GlassSpring.smooth(
+        duration: Duration(
+          milliseconds: math.max(140, widget.holdDuration.inMilliseconds - delayMs),
+        ),
+      );
+      _chargeSpring!.animateTo(1.0);
+    });
+  }
+
+  void _openMenu({
+    required Offset fingerGlobalPos,
+    required bool interactiveScrub,
+  }) {
+    if (!widget.enabled || _menuOpen || !mounted) return;
+    final spec = widget.menuBuilder(context);
+    if (spec == null || (spec.items.isEmpty && spec.quickActions.isEmpty)) {
+      _cancelCharge();
+      return;
+    }
+    final renderBox = context.findRenderObject();
+    if (renderBox is! RenderBox || !renderBox.hasSize || !renderBox.attached) {
+      _cancelCharge();
+      return;
+    }
+    final targetRect = renderBox.localToGlobal(Offset.zero) & renderBox.size;
+    final pointerId = interactiveScrub ? _activePointerId : null;
+    _cancelCharge(snap: true);
+    widget.onWillOpen?.call();
+
+    final menuKey = GlobalKey<_GrassBagGlassContextMenuViewState>();
+    _activeMenuKey = menuKey;
+    setState(() => _menuOpen = true);
+
+    _showGrassBagGlassContextMenuInternal(
+      context,
+      tier: widget.tier,
+      items: spec.items,
+      quickActions: spec.quickActions,
+      headerTitle: spec.headerTitle,
+      headerSubtitle: spec.headerSubtitle,
+      menuWidth: spec.menuWidth,
+      preferAbove: spec.preferAbove,
+      targetRect: targetRect,
+      globalAnchor: targetRect.center,
+      liftedTriggerBuilder: widget.liftedBuilder,
+      interactiveScrub: interactiveScrub,
+      scrubPointerId: pointerId,
+      initialFingerPosition: fingerGlobalPos,
+      viewKey: menuKey,
+    ).whenComplete(() {
+      if (_activeMenuKey == menuKey) {
+        _activeMenuKey = null;
+      }
+      _activePointerId = null;
+      if (mounted && _menuOpen) {
+        setState(() => _menuOpen = false);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _chargeTimer?.cancel();
+    _chargeSpring?.removeListener(_tickProxy.notify);
+    _chargeSpring?.dispose();
+    _tickProxy.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.enabled) return widget.child;
+    final t = GrassBagTokens.of(context);
+    final hasLiftedSpotlight = widget.liftedBuilder != null;
+
+    final animatedChild = ListenableBuilder(
+      listenable: _tickProxy,
+      child: Visibility(
+        visible: !(_menuOpen && hasLiftedSpotlight),
+        maintainSize: true,
+        maintainAnimation: true,
+        maintainState: true,
+        child: widget.child,
+      ),
+      builder: (context, child) {
+        final c = (_chargeSpring?.value ?? 0.0).clamp(0.0, 1.25);
+        if (c < 0.002) return child!;
+        final scale = 1.0 + 0.055 * c;
+        final liftY = -1.8 * c;
+        return Transform(
+          alignment: Alignment.center,
+          transform: Matrix4.identity()
+            ..translateByDouble(0.0, liftY, 0.0, 1.0)
+            ..scaleByDouble(scale, scale, 1.0, 1.0),
+          child: CustomPaint(
+            foregroundPainter: _LongPressChargeHaloPainter(
+              progress: c.clamp(0.0, 1.0),
+              color: t.primaryHi,
+              isDark: t.isDark,
+              isCircle: widget.isCircle,
+              borderRadius: widget.anticipationBorderRadius,
+            ),
+            child: child!,
+          ),
+        );
+      },
+    );
+
+    final gestures = <Type, GestureRecognizerFactory>{
+      LongPressGestureRecognizer:
+          GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+        () => LongPressGestureRecognizer(
+          duration: widget.holdDuration,
+          debugOwner: this,
+        ),
+        (instance) {
+          instance
+            ..onLongPressStart = (details) {
+              _openMenu(
+                fingerGlobalPos: details.globalPosition,
+                interactiveScrub: true,
+              );
+            }
+            ..onLongPressMoveUpdate = (details) {
+              _activeMenuKey?.currentState?.handleFallbackScrubMove(
+                details.globalPosition,
+              );
+            }
+            ..onLongPressEnd = (details) {
+              _activeMenuKey?.currentState?.handleFallbackScrubEnd(
+                details.globalPosition,
+              );
+            }
+            ..onLongPressCancel = () {
+              _cancelCharge();
+            };
+        },
+      ),
+      if (widget.enableSecondaryClick)
+        TapGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<TapGestureRecognizer>(
+          () => TapGestureRecognizer(debugOwner: this),
+          (instance) {
+            instance.onSecondaryTapUp = (details) {
+              _openMenu(
+                fingerGlobalPos: details.globalPosition,
+                interactiveScrub: false,
+              );
+            };
+          },
+        ),
+    };
+
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (e) {
+        // Only track primary touch / primary mouse button for press-hold anticipation.
+        if (e.kind == PointerDeviceKind.mouse &&
+            (e.buttons & kPrimaryMouseButton) == 0) {
+          return;
+        }
+        if (_activePointerId != null || _menuOpen) return;
+        _activePointerId = e.pointer;
+        _downGlobalPos = e.position;
+        _startChargeTimer();
+      },
+      onPointerMove: (e) {
+        if (_activePointerId != e.pointer || _menuOpen) return;
+        if ((e.position - _downGlobalPos).distance > 18.0) {
+          _cancelCharge();
+        }
+      },
+      onPointerUp: (e) {
+        if (_activePointerId == e.pointer) {
+          if (!_menuOpen) {
+            _activePointerId = null;
+          }
+          _cancelCharge();
+        }
+      },
+      onPointerCancel: (e) {
+        if (_activePointerId == e.pointer) {
+          if (!_menuOpen) {
+            _activePointerId = null;
+          }
+          _cancelCharge();
+        }
+      },
+      child: RawGestureDetector(
+        behavior: HitTestBehavior.translucent,
+        gestures: gestures,
+        child: animatedChild,
+      ),
+    );
+  }
+}
+
+class _LongPressChargeHaloPainter extends CustomPainter {
+  const _LongPressChargeHaloPainter({
+    required this.progress,
+    required this.color,
+    required this.isDark,
+    required this.isCircle,
+    required this.borderRadius,
+  });
+
+  final double progress;
+  final Color color;
+  final bool isDark;
+  final bool isCircle;
+  final double borderRadius;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (progress <= 0.01) return;
+    final rect = Offset.zero & size;
+    final glowPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4
+      ..color = color.withValues(alpha: (isDark ? 0.42 : 0.34) * progress);
+    final fillPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = color.withValues(alpha: (isDark ? 0.12 : 0.08) * progress);
+    if (isCircle) {
+      final center = rect.center;
+      final radius = math.min(size.width, size.height) * 0.5;
+      canvas.drawCircle(center, radius, fillPaint);
+      canvas.drawCircle(center, radius - 0.5, glowPaint);
+    } else {
+      final r = math.min(borderRadius, math.min(size.width, size.height) * 0.5);
+      final shape = RSuperellipse.fromRectAndRadius(rect, Radius.circular(r));
+      canvas.drawRSuperellipse(shape, fillPaint);
+      canvas.drawRSuperellipse(shape.deflate(0.5), glowPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LongPressChargeHaloPainter oldDelegate) =>
+      oldDelegate.progress != progress ||
+      oldDelegate.color != color ||
+      oldDelegate.isDark != isDark ||
+      oldDelegate.isCircle != isCircle ||
+      oldDelegate.borderRadius != borderRadius;
+}
+
+/// Anchored Apple iOS 26/27 floating Liquid Glass popup context menu with:
+/// - Underdamped iOS 27 spring bloom from the trigger's exact bounding rect
+/// - Continuous translucent sliding Liquid Glass selection lens (`AnimatedPositioned`)
+/// - Optional compact top horizontal [quickActions] strip
+/// - Optional lifted trigger spotlight floating cleanly above a whisper-light scrim
+/// - Single-gesture press-hold-slide-release scrubbing + desktop hover & right-click parity
 Future<void> showGrassBagGlassContextMenu(
   BuildContext context, {
   required List<GrassBagContextMenuItem> items,
   required GrassBagGlassTier tier,
+  List<GrassBagContextMenuQuickAction> quickActions = const [],
   Offset? globalAnchor,
+  Rect? targetRect,
   String? headerTitle,
-}) async {
-  if (items.isEmpty) return;
-  HapticFeedback.mediumImpact();
-  final t = GrassBagTokens.of(context);
-  final media = MediaQuery.of(context);
-  final size = media.size;
-  final safePad = media.padding;
-  final effectiveBottom = math.max(safePad.bottom, media.viewInsets.bottom);
-  final textScale = media.textScaler.scale(1.0).clamp(1.0, 1.6);
-  const menuW = 228.0;
-  final estH = ((headerTitle != null ? 36.0 : 0.0) +
-          items.fold<double>(
-            12.0,
-            (acc, it) => acc + (it.subtitle != null ? 54.0 : 44.0) + (it.dividerBefore ? 7.0 : 0.0),
-          )) *
-      textScale;
-  final availH = math.max(120.0, size.height - safePad.top - effectiveBottom - 24.0);
-  final menuH = math.min(estH, availH);
-
-  final rawAnchor = globalAnchor ?? Offset(size.width * 0.5, size.height * 0.45);
-  final openRight = rawAnchor.dx + menuW + 14 <= size.width;
-  final openDown = rawAnchor.dy + menuH + effectiveBottom + 18 <= size.height;
-
-  final double left = (openRight ? rawAnchor.dx - 16 : rawAnchor.dx - menuW + 16)
-      .clamp(12.0, math.max(12.0, size.width - menuW - 12.0));
-  final double top = (rawAnchor.dy + 6).clamp(
-    safePad.top + 12.0,
-    math.max(safePad.top + 12.0, size.height - effectiveBottom - menuH - 12.0),
-  );
-  final double bottom = (size.height - rawAnchor.dy + 6).clamp(
-    effectiveBottom + 12.0,
-    math.max(effectiveBottom + 12.0, size.height - safePad.top - 120.0),
-  );
-
-  final alignX = ((rawAnchor.dx - left) / menuW * 2.0 - 1.0).clamp(-1.0, 1.0);
-  final alignY = openDown ? -0.9 : 0.9;
-
-  await showGeneralDialog<void>(
-    context: context,
-    barrierDismissible: true,
-    barrierLabel: '关闭菜单',
-    barrierColor: t.isDark ? const Color(0x4A06090F) : const Color(0x22101A28),
-    transitionDuration: GrassBagMotion.duration(
+  String? headerSubtitle,
+  double? menuWidth,
+  bool? preferAbove,
+  Widget Function(BuildContext context)? liftedTriggerBuilder,
+}) =>
+    _showGrassBagGlassContextMenuInternal(
       context,
-      const Duration(milliseconds: 220),
-      reduced: const Duration(milliseconds: 80),
+      items: items,
+      tier: tier,
+      quickActions: quickActions,
+      globalAnchor: globalAnchor,
+      targetRect: targetRect,
+      headerTitle: headerTitle,
+      headerSubtitle: headerSubtitle,
+      menuWidth: menuWidth,
+      preferAbove: preferAbove,
+      liftedTriggerBuilder: liftedTriggerBuilder,
+    );
+
+VoidCallback? _activeGlassContextMenuClose;
+
+Future<void> _showGrassBagGlassContextMenuInternal(
+  BuildContext context, {
+  required List<GrassBagContextMenuItem> items,
+  required GrassBagGlassTier tier,
+  List<GrassBagContextMenuQuickAction> quickActions = const [],
+  Offset? globalAnchor,
+  Rect? targetRect,
+  String? headerTitle,
+  String? headerSubtitle,
+  double? menuWidth,
+  bool? preferAbove,
+  Widget Function(BuildContext context)? liftedTriggerBuilder,
+  bool interactiveScrub = false,
+  int? scrubPointerId,
+  Offset? initialFingerPosition,
+  GlobalKey<_GrassBagGlassContextMenuViewState>? viewKey,
+}) async {
+  if (items.isEmpty && quickActions.isEmpty) return;
+  final overlay = Overlay.maybeOf(context, rootOverlay: true);
+  if (overlay == null) return;
+  _activeGlassContextMenuClose?.call();
+  HapticFeedback.mediumImpact();
+  final reduceMotion = MediaQuery.disableAnimationsOf(context);
+  final capturedThemes = InheritedTheme.capture(
+    from: context,
+    to: overlay.context,
+  );
+  final completer = Completer<void>();
+  var removed = false;
+  late final OverlayEntry entry;
+
+  void finishCompleter() {
+    if (!completer.isCompleted) {
+      completer.complete();
+    }
+  }
+
+  void removeEntry() {
+    if (removed) return;
+    removed = true;
+    if (_activeGlassContextMenuClose == removeEntry) {
+      _activeGlassContextMenuClose = null;
+    }
+    if (entry.mounted) {
+      entry.remove();
+    }
+    finishCompleter();
+  }
+
+  void handleViewDisposed() {
+    removed = true;
+    if (_activeGlassContextMenuClose == removeEntry) {
+      _activeGlassContextMenuClose = null;
+    }
+    finishCompleter();
+  }
+
+  // Hosted directly in the root Overlay (instead of Navigator.push) so active
+  // touch pointers are NEVER cancelled by NavigatorState._cancelActivePointers()
+  // — enabling true native iOS 27 continuous press-hold-slide-release scrubbing!
+  entry = OverlayEntry(
+    builder: (overlayContext) => capturedThemes.wrap(
+      _GrassBagGlassContextMenuView(
+        key: viewKey,
+        items: items,
+        quickActions: quickActions,
+        tier: tier,
+        reduceMotion: reduceMotion,
+        globalAnchor: globalAnchor,
+        targetRect: targetRect,
+        headerTitle: headerTitle,
+        headerSubtitle: headerSubtitle,
+        menuWidth: menuWidth,
+        preferAbove: preferAbove,
+        liftedTriggerBuilder: liftedTriggerBuilder,
+        interactiveScrub: interactiveScrub,
+        scrubPointerId: scrubPointerId,
+        initialFingerPosition: initialFingerPosition,
+        onRequestRemove: removeEntry,
+        onDisposed: handleViewDisposed,
+      ),
     ),
-    pageBuilder: (dialogCtx, anim, __) {
-      final dt = GrassBagTokens.of(dialogCtx);
-      return Stack(
-        children: [
-          Positioned(
-            left: left,
-            top: openDown ? top : null,
-            bottom: openDown ? null : bottom,
-            width: menuW,
-            child: GrassBagMaterializeTransition(
-              animation: anim,
-              tier: tier,
-              alignment: Alignment(alignX, alignY),
-              scaleFrom: 0.86,
-              contentSigma: 5.0,
-              child: Material(
-                type: MaterialType.transparency,
-                child: GrassBagGlass(
-                  tier: tier,
-                  borderRadius: 22,
-                  elevated: true,
-                  useSheetSettings: true,
-                  clipBehavior: Clip.antiAlias,
-                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 6),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(maxHeight: availH - 12.0),
-                    child: SingleChildScrollView(
-                      physics: const BouncingScrollPhysics(),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          if (headerTitle != null && headerTitle.trim().isNotEmpty) ...[
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
-                              child: Text(
-                                headerTitle,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 11.5,
-                                  fontWeight: FontWeight.w600,
-                                  letterSpacing: 0.1,
-                                  color: dt.text3,
-                                ),
+  );
+  _activeGlassContextMenuClose = removeEntry;
+  overlay.insert(entry);
+  return completer.future;
+}
+
+class _GrassBagGlassContextMenuView extends StatefulWidget {
+  const _GrassBagGlassContextMenuView({
+    super.key,
+    required this.items,
+    required this.quickActions,
+    required this.tier,
+    required this.reduceMotion,
+    required this.onRequestRemove,
+    required this.onDisposed,
+    this.globalAnchor,
+    this.targetRect,
+    this.headerTitle,
+    this.headerSubtitle,
+    this.menuWidth,
+    this.preferAbove,
+    this.liftedTriggerBuilder,
+    this.interactiveScrub = false,
+    this.scrubPointerId,
+    this.initialFingerPosition,
+  });
+
+  final List<GrassBagContextMenuItem> items;
+  final List<GrassBagContextMenuQuickAction> quickActions;
+  final GrassBagGlassTier tier;
+  final bool reduceMotion;
+  final VoidCallback onRequestRemove;
+  final VoidCallback onDisposed;
+  final Offset? globalAnchor;
+  final Rect? targetRect;
+  final String? headerTitle;
+  final String? headerSubtitle;
+  final double? menuWidth;
+  final bool? preferAbove;
+  final Widget Function(BuildContext context)? liftedTriggerBuilder;
+  final bool interactiveScrub;
+  final int? scrubPointerId;
+  final Offset? initialFingerPosition;
+
+  @override
+  State<_GrassBagGlassContextMenuView> createState() =>
+      _GrassBagGlassContextMenuViewState();
+}
+
+class _GrassBagGlassContextMenuViewState
+    extends State<_GrassBagGlassContextMenuView>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  static const Curve _bloomCurve = _GrassBagSpringBloomCurve();
+
+  late final List<GlobalKey> _quickKeys;
+  late final List<GlobalKey> _rowKeys;
+  final GlobalKey _quickStripKey = GlobalKey();
+  final GlobalKey _listStackKey = GlobalKey();
+
+  bool _scrubActive = false;
+  int? _scrubPointerId;
+  late final bool _usingPointerRouter;
+  late Offset _initialFingerPos;
+  bool _scrubArmed = false;
+  bool _didPop = false;
+
+  int? _hoveredQuickIndex;
+  Rect? _hoveredQuickRect;
+  int? _hoveredRowIndex;
+  Rect? _hoveredRowRect;
+
+  late final AnimationController _controller;
+  late CurvedAnimation _scrimCurve;
+  late CurvedAnimation _springBloomAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _quickKeys = List<GlobalKey>.generate(widget.quickActions.length, (_) => GlobalKey());
+    _rowKeys = List<GlobalKey>.generate(widget.items.length, (_) => GlobalKey());
+    _scrubActive = widget.interactiveScrub || widget.scrubPointerId != null;
+    _scrubPointerId = widget.scrubPointerId;
+    _usingPointerRouter = _scrubActive;
+    _initialFingerPos = widget.initialFingerPosition ??
+        widget.targetRect?.center ??
+        widget.globalAnchor ??
+        Offset.zero;
+    _controller = AnimationController(
+      vsync: this,
+      duration: widget.reduceMotion
+          ? const Duration(milliseconds: 80)
+          : const Duration(milliseconds: 300),
+      reverseDuration: widget.reduceMotion
+          ? const Duration(milliseconds: 70)
+          : const Duration(milliseconds: 190),
+    );
+    _initAnimations();
+    _controller.forward();
+    WidgetsBinding.instance.addObserver(this);
+    HardwareKeyboard.instance.addHandler(_handleKeyEvent);
+    if (_usingPointerRouter) {
+      GestureBinding.instance.pointerRouter.addGlobalRoute(_handleGlobalPointer);
+    }
+  }
+
+  void _initAnimations() {
+    _scrimCurve = CurvedAnimation(
+      parent: _controller,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+    _springBloomAnim = CurvedAnimation(
+      parent: _controller,
+      curve: _bloomCurve,
+      reverseCurve: Curves.easeInCubic,
+    );
+  }
+
+  @override
+  Future<bool> didPopRoute() async {
+    if (!mounted || _didPop) return false;
+    _dismiss();
+    return true;
+  }
+
+  bool _handleKeyEvent(KeyEvent event) {
+    if (!mounted || _didPop) return false;
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+      _dismiss();
+      return true;
+    }
+    return false;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    if (_usingPointerRouter) {
+      GestureBinding.instance.pointerRouter.removeGlobalRoute(_handleGlobalPointer);
+    }
+    _scrimCurve.dispose();
+    _springBloomAnim.dispose();
+    _controller.dispose();
+    widget.onDisposed();
+    super.dispose();
+  }
+
+  void _beginClose({VoidCallback? onAfterStart}) {
+    if (_didPop) return;
+    _didPop = true;
+    _scrubActive = false;
+    _scrubPointerId = null;
+    if (mounted) {
+      setState(() {});
+    }
+    onAfterStart?.call();
+    _controller.reverse().whenComplete(() {
+      widget.onRequestRemove();
+    });
+  }
+
+  void _dismiss() {
+    if (_didPop || !mounted) return;
+    _beginClose();
+  }
+
+  void _activateRow(int index) {
+    if (_didPop || index < 0 || index >= widget.items.length) return;
+    final item = widget.items[index];
+    if (!item.enabled) return;
+    HapticFeedback.selectionClick();
+    _beginClose(onAfterStart: item.onTap);
+  }
+
+  void _activateQuickAction(int index) {
+    if (_didPop || index < 0 || index >= widget.quickActions.length) return;
+    final qa = widget.quickActions[index];
+    if (!qa.enabled) return;
+    HapticFeedback.selectionClick();
+    _beginClose(onAfterStart: qa.onTap);
+  }
+
+  void _handleGlobalPointer(PointerEvent event) {
+    if (!mounted || _didPop || !_scrubActive) return;
+    if (event is PointerDownEvent) {
+      // A new touch arrived after the menu opened -> normal tap mode, stop initial scrub!
+      _scrubActive = false;
+      _scrubPointerId = null;
+      return;
+    }
+    _scrubPointerId ??= event.pointer;
+    if (event.pointer != _scrubPointerId) return;
+    if (event is PointerMoveEvent) {
+      if (!_scrubArmed && (event.position - _initialFingerPos).distance >= 8.0) {
+        _scrubArmed = true;
+      }
+      if (_scrubArmed) {
+        _updateScrubAt(event.position);
+      }
+    } else if (event is PointerUpEvent) {
+      _scrubActive = false;
+      _scrubPointerId = null;
+      if (_scrubArmed) {
+        _updateScrubAt(event.position);
+        _commitScrubIfHovered();
+      } else {
+        _clearHover();
+      }
+    } else if (event is PointerCancelEvent) {
+      _scrubActive = false;
+      _scrubPointerId = null;
+      _clearHover();
+    }
+  }
+
+  void handleFallbackScrubMove(Offset globalPos) {
+    if (!mounted || _didPop || _usingPointerRouter) return;
+    if (!_scrubArmed && (globalPos - _initialFingerPos).distance >= 8.0) {
+      _scrubArmed = true;
+    }
+    if (_scrubArmed) {
+      _updateScrubAt(globalPos);
+    }
+  }
+
+  void handleFallbackScrubEnd(Offset globalPos) {
+    if (!mounted || _didPop || _usingPointerRouter) return;
+    if (_scrubArmed) {
+      _updateScrubAt(globalPos);
+      _commitScrubIfHovered();
+    } else {
+      _clearHover();
+    }
+  }
+
+  void _clearHover() {
+    if (!mounted) return;
+    if (_hoveredRowIndex != null || _hoveredQuickIndex != null) {
+      setState(() {
+        _hoveredRowIndex = null;
+        _hoveredQuickIndex = null;
+      });
+    }
+  }
+
+  Rect? _measureRelativeRect(GlobalKey itemKey, GlobalKey containerKey) {
+    final itemBox = itemKey.currentContext?.findRenderObject();
+    final hostBox = containerKey.currentContext?.findRenderObject();
+    if (itemBox is! RenderBox ||
+        hostBox is! RenderBox ||
+        !itemBox.hasSize ||
+        !hostBox.hasSize ||
+        !itemBox.attached ||
+        !hostBox.attached) {
+      return null;
+    }
+    final topLeft = itemBox.localToGlobal(Offset.zero, ancestor: hostBox);
+    return topLeft & itemBox.size;
+  }
+
+  void _setHoveredRow(int? index, {bool withHaptic = false}) {
+    if (!mounted) return;
+    if (index == null) {
+      if (_hoveredRowIndex != null) {
+        setState(() => _hoveredRowIndex = null);
+      }
+      return;
+    }
+    if (index < 0 || index >= widget.items.length || !widget.items[index].enabled) {
+      return;
+    }
+    final rect = _measureRelativeRect(_rowKeys[index], _listStackKey);
+    final changed = _hoveredRowIndex != index || _hoveredQuickIndex != null;
+    setState(() {
+      _hoveredQuickIndex = null;
+      _hoveredRowIndex = index;
+      if (rect != null) _hoveredRowRect = rect;
+    });
+    if (changed && withHaptic) {
+      HapticFeedback.selectionClick();
+    }
+  }
+
+  void _setHoveredQuick(int? index, {bool withHaptic = false}) {
+    if (!mounted) return;
+    if (index == null) {
+      if (_hoveredQuickIndex != null) {
+        setState(() => _hoveredQuickIndex = null);
+      }
+      return;
+    }
+    if (index < 0 ||
+        index >= widget.quickActions.length ||
+        !widget.quickActions[index].enabled) {
+      return;
+    }
+    final rect = _measureRelativeRect(_quickKeys[index], _quickStripKey);
+    final changed = _hoveredQuickIndex != index || _hoveredRowIndex != null;
+    setState(() {
+      _hoveredRowIndex = null;
+      _hoveredQuickIndex = index;
+      if (rect != null) _hoveredQuickRect = rect;
+    });
+    if (changed && withHaptic) {
+      HapticFeedback.selectionClick();
+    }
+  }
+
+  void _updateScrubAt(Offset globalPos) {
+    if (!_scrubArmed) return;
+    // 1. Check horizontal quick-action tiles first
+    for (var i = 0; i < _quickKeys.length; i++) {
+      if (!widget.quickActions[i].enabled) continue;
+      final box = _quickKeys[i].currentContext?.findRenderObject();
+      if (box is RenderBox && box.hasSize && box.attached) {
+        final p0 = box.localToGlobal(Offset.zero);
+        final p1 = box.localToGlobal(box.size.bottomRight(Offset.zero));
+        if ((p1.dx - p0.dx).abs() < 4.0 || (p1.dy - p0.dy).abs() < 4.0) {
+          continue;
+        }
+        final globalRect = Rect.fromPoints(p0, p1).inflate(4.0);
+        if (globalRect.contains(globalPos)) {
+          _setHoveredQuick(i, withHaptic: true);
+          return;
+        }
+      }
+    }
+    // 2. Check vertical menu rows
+    for (var i = 0; i < _rowKeys.length; i++) {
+      if (!widget.items[i].enabled) continue;
+      final box = _rowKeys[i].currentContext?.findRenderObject();
+      if (box is RenderBox && box.hasSize && box.attached) {
+        final p0 = box.localToGlobal(Offset.zero);
+        final p1 = box.localToGlobal(box.size.bottomRight(Offset.zero));
+        if ((p1.dx - p0.dx).abs() < 4.0 || (p1.dy - p0.dy).abs() < 4.0) {
+          continue;
+        }
+        final rawRect = Rect.fromPoints(p0, p1);
+        // Gentle horizontal grace margin so thumb scrubbing feels effortless like native iOS!
+        final hitRect = Rect.fromLTRB(
+          rawRect.left - 8.0,
+          rawRect.top,
+          rawRect.right + 8.0,
+          rawRect.bottom,
+        );
+        if (hitRect.contains(globalPos)) {
+          _setHoveredRow(i, withHaptic: true);
+          return;
+        }
+      }
+    }
+    _clearHover();
+  }
+
+  void _commitScrubIfHovered() {
+    if (!_scrubArmed) {
+      _clearHover();
+      return;
+    }
+    if (_hoveredQuickIndex != null) {
+      final idx = _hoveredQuickIndex!;
+      _clearHover();
+      _activateQuickAction(idx);
+      return;
+    }
+    if (_hoveredRowIndex != null) {
+      final idx = _hoveredRowIndex!;
+      _clearHover();
+      _activateRow(idx);
+      return;
+    }
+    _clearHover();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final media = MediaQuery.of(context);
+    final size = media.size;
+    final safePad = media.padding;
+    final effectiveBottom = math.max(safePad.bottom, media.viewInsets.bottom);
+    final textScale = media.textScaler.scale(1.0).clamp(1.0, 1.45);
+    final reduceMotion = MediaQuery.disableAnimationsOf(context);
+
+    final hasHeader = (widget.headerTitle != null && widget.headerTitle!.trim().isNotEmpty) ||
+        (widget.headerSubtitle != null && widget.headerSubtitle!.trim().isNotEmpty);
+    final hasQuick = widget.quickActions.isNotEmpty;
+
+    final double menuW = (widget.menuWidth ?? (hasQuick ? 256.0 : 244.0))
+        .clamp(210.0, math.max(210.0, size.width - 24.0))
+        .toDouble();
+
+    final estHeaderH = hasHeader
+        ? ((widget.headerSubtitle != null && widget.headerSubtitle!.trim().isNotEmpty)
+            ? 46.0
+            : 34.0)
+        : 0.0;
+    final estQuickH = hasQuick ? 68.0 : 0.0;
+    final estItemsH = widget.items.fold<double>(
+      14.0,
+      (acc, it) =>
+          acc +
+          (it.subtitle != null && it.subtitle!.isNotEmpty ? 54.0 : 44.0) +
+          (it.dividerBefore ? 7.0 : 0.0),
+    );
+    final estH = (estHeaderH + estQuickH + estItemsH) * textScale;
+
+    final targetRect = widget.targetRect;
+    final bool openDown;
+    final double left;
+    final double? topPos;
+    final double? bottomPos;
+    final double maxPlatterH;
+    final double alignX;
+
+    if (targetRect != null) {
+      final spaceAbove = math.max(0.0, targetRect.top - safePad.top - 22.0);
+      final spaceBelow =
+          math.max(0.0, (size.height - effectiveBottom) - targetRect.bottom - 22.0);
+      if (widget.preferAbove == true) {
+        openDown = spaceAbove < math.min(estH, 160.0) && spaceBelow > spaceAbove;
+      } else if (widget.preferAbove == false) {
+        openDown = spaceBelow >= math.min(estH, 160.0) || spaceBelow >= spaceAbove;
+      } else {
+        openDown = spaceBelow >= estH || spaceBelow >= spaceAbove;
+      }
+
+      // Natural iOS horizontal alignment: center if trigger is centered, else match nearest edge!
+      final triggerCenterX = targetRect.center.dx;
+      final nearCenter = (triggerCenterX - size.width * 0.5).abs() < 60.0;
+      final rawLeft = nearCenter
+          ? triggerCenterX - menuW * 0.5
+          : (triggerCenterX < size.width * 0.5
+              ? targetRect.left
+              : targetRect.right - menuW);
+      left = rawLeft.clamp(12.0, math.max(12.0, size.width - menuW - 12.0));
+      alignX = ((triggerCenterX - left) / menuW * 2.0 - 1.0).clamp(-0.92, 0.92);
+
+      if (openDown) {
+        topPos = (targetRect.bottom + 10.0).clamp(
+          safePad.top + 12.0,
+          math.max(safePad.top + 12.0, size.height - effectiveBottom - 130.0),
+        );
+        bottomPos = null;
+        maxPlatterH = math.max(120.0, size.height - effectiveBottom - topPos - 12.0);
+      } else {
+        bottomPos = (size.height - targetRect.top + 10.0).clamp(
+          effectiveBottom + 12.0,
+          math.max(effectiveBottom + 12.0, size.height - safePad.top - 130.0),
+        );
+        topPos = null;
+        maxPlatterH = math.max(120.0, size.height - bottomPos - safePad.top - 12.0);
+      }
+    } else {
+      final availH = math.max(120.0, size.height - safePad.top - effectiveBottom - 24.0);
+      final menuH = math.min(estH, availH);
+      final rawAnchor = widget.globalAnchor ?? Offset(size.width * 0.5, size.height * 0.45);
+      final openRight = rawAnchor.dx + menuW + 14 <= size.width;
+      openDown = widget.preferAbove == true
+          ? false
+          : (rawAnchor.dy + menuH + effectiveBottom + 18 <= size.height);
+      left = (openRight ? rawAnchor.dx - 16 : rawAnchor.dx - menuW + 16)
+          .clamp(12.0, math.max(12.0, size.width - menuW - 12.0));
+      if (openDown) {
+        topPos = (rawAnchor.dy + 6).clamp(
+          safePad.top + 12.0,
+          math.max(safePad.top + 12.0, size.height - effectiveBottom - menuH - 12.0),
+        );
+        bottomPos = null;
+      } else {
+        bottomPos = (size.height - rawAnchor.dy + 6).clamp(
+          effectiveBottom + 12.0,
+          math.max(effectiveBottom + 12.0, size.height - safePad.top - 120.0),
+        );
+        topPos = null;
+      }
+      maxPlatterH = availH - 12.0;
+      alignX = ((rawAnchor.dx - left) / menuW * 2.0 - 1.0).clamp(-0.92, 0.92);
+    }
+
+    final alignY = openDown ? -0.94 : 0.94;
+    final scrimColor =
+        t.isDark ? const Color(0x4E05080F) : const Color(0x1E0D1A2B);
+
+    final hoveredRowIsDestructive = _hoveredRowIndex != null &&
+        _hoveredRowIndex! < widget.items.length &&
+        widget.items[_hoveredRowIndex!].destructive;
+    final hoveredQuickIsDestructive = _hoveredQuickIndex != null &&
+        _hoveredQuickIndex! < widget.quickActions.length &&
+        widget.quickActions[_hoveredQuickIndex!].destructive;
+
+    final platterContent = Material(
+      type: MaterialType.transparency,
+      child: GrassBagGlass(
+        tier: widget.tier,
+        borderRadius: 26,
+        elevated: true,
+        useSheetSettings: true,
+        interactiveGlow: false,
+        clipBehavior: Clip.antiAlias,
+        padding: const EdgeInsets.symmetric(vertical: 7, horizontal: 7),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxPlatterH),
+          child: SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (hasHeader) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 5, 12, 7),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (widget.headerTitle != null &&
+                            widget.headerTitle!.trim().isNotEmpty)
+                          Text(
+                            widget.headerTitle!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 12.0,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: -0.1,
+                              color: t.text2,
+                            ),
+                          ),
+                        if (widget.headerSubtitle != null &&
+                            widget.headerSubtitle!.trim().isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 1.5),
+                            child: Text(
+                              widget.headerSubtitle!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w500,
+                                color: t.text3,
                               ),
                             ),
-                            Divider(height: 0.5, thickness: 0.5, indent: 8, endIndent: 8, color: dt.sep),
-                          ],
-                          for (var i = 0; i < items.length; i++) ...[
-                            if (items[i].dividerBefore && i > 0)
-                              Padding(
-                                padding: const EdgeInsets.symmetric(vertical: 3),
-                                child: Divider(height: 0.5, thickness: 0.5, indent: 8, endIndent: 8, color: dt.sep),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Divider(
+                    height: 0.5,
+                    thickness: 0.5,
+                    indent: 8,
+                    endIndent: 8,
+                    color: t.sep,
+                  ),
+                  const SizedBox(height: 4),
+                ],
+                if (hasQuick) ...[
+                  Stack(
+                    key: _quickStripKey,
+                    children: [
+                      if (_hoveredQuickRect != null)
+                        AnimatedPositioned(
+                          duration: GrassBagMotion.duration(
+                            context,
+                            const Duration(milliseconds: 145),
+                          ),
+                          curve: Curves.easeOutCubic,
+                          left: _hoveredQuickRect!.left,
+                          top: _hoveredQuickRect!.top,
+                          width: _hoveredQuickRect!.width,
+                          height: _hoveredQuickRect!.height,
+                          child: IgnorePointer(
+                            child: AnimatedOpacity(
+                              opacity: _hoveredQuickIndex != null ? 1.0 : 0.0,
+                              duration: GrassBagMotion.duration(
+                                context,
+                                const Duration(milliseconds: 110),
                               ),
-                            _GrassBagContextMenuRow(
-                              item: items[i],
-                              onSelect: () {
-                                Navigator.of(dialogCtx).pop();
-                                items[i].onTap();
-                              },
+                              child: _LiquidMenuSelectionLens(
+                                borderRadius: 16,
+                                destructive: hoveredQuickIsDestructive,
+                              ),
+                            ),
+                          ),
+                        ),
+                      Row(
+                        children: [
+                          for (var i = 0; i < widget.quickActions.length; i++) ...[
+                            if (i > 0) const SizedBox(width: 4),
+                            Expanded(
+                              child: _GrassBagContextMenuQuickTile(
+                                key: _quickKeys[i],
+                                action: widget.quickActions[i],
+                                activeHover: _hoveredQuickIndex == i,
+                                onHoverChanged: (hovering) {
+                                  if (hovering) {
+                                    _setHoveredQuick(i);
+                                  } else if (_hoveredQuickIndex == i) {
+                                    _setHoveredQuick(null);
+                                  }
+                                },
+                                onSelect: () => _activateQuickAction(i),
+                              ),
                             ),
                           ],
                         ],
                       ),
+                    ],
+                  ),
+                  if (widget.items.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Divider(
+                      height: 0.5,
+                      thickness: 0.5,
+                      indent: 8,
+                      endIndent: 8,
+                      color: t.sep,
+                    ),
+                    const SizedBox(height: 4),
+                  ],
+                ],
+                if (widget.items.isNotEmpty)
+                  Stack(
+                    key: _listStackKey,
+                    children: [
+                      if (_hoveredRowRect != null)
+                        AnimatedPositioned(
+                          duration: GrassBagMotion.duration(
+                            context,
+                            const Duration(milliseconds: 145),
+                          ),
+                          curve: Curves.easeOutCubic,
+                          left: 0,
+                          right: 0,
+                          top: _hoveredRowRect!.top,
+                          height: _hoveredRowRect!.height,
+                          child: IgnorePointer(
+                            child: AnimatedOpacity(
+                              opacity: _hoveredRowIndex != null ? 1.0 : 0.0,
+                              duration: GrassBagMotion.duration(
+                                context,
+                                const Duration(milliseconds: 110),
+                              ),
+                              child: _LiquidMenuSelectionLens(
+                                borderRadius: 16,
+                                destructive: hoveredRowIsDestructive,
+                              ),
+                            ),
+                          ),
+                        ),
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (var i = 0; i < widget.items.length; i++) ...[
+                            if (widget.items[i].dividerBefore && i > 0)
+                              Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 3.5),
+                                child: Divider(
+                                  height: 0.5,
+                                  thickness: 0.5,
+                                  indent: 10,
+                                  endIndent: 10,
+                                  color: t.sep,
+                                ),
+                              ),
+                            _GrassBagContextMenuRow(
+                              key: _rowKeys[i],
+                              item: widget.items[i],
+                              activeHover: _hoveredRowIndex == i,
+                              onHoverChanged: (hovering) {
+                                if (hovering) {
+                                  _setHoveredRow(i);
+                                } else if (_hoveredRowIndex == i) {
+                                  _setHoveredRow(null);
+                                }
+                              },
+                              onSelect: () => _activateRow(i),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    return IgnorePointer(
+      ignoring: _didPop,
+      child: Stack(
+        children: [
+          // 1. Whisper-clean iOS 27 dimming scrim
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _dismiss,
+              child: AnimatedBuilder(
+                animation: _scrimCurve,
+                builder: (_, __) => ColoredBox(
+                  color: scrimColor.withValues(alpha: scrimColor.a * _scrimCurve.value),
+                ),
+              ),
+            ),
+          ),
+
+          // 2. Lifted Trigger Spotlight floating above the scrim
+          if (targetRect != null && widget.liftedTriggerBuilder != null)
+            Positioned(
+              left: targetRect.left,
+              top: targetRect.top,
+              width: targetRect.width,
+              height: targetRect.height,
+              child: AnimatedBuilder(
+                animation: _springBloomAnim,
+                builder: (ctx, child) {
+                  final v = _springBloomAnim.value;
+                  final liftScale = reduceMotion ? 1.0 : (1.0 + 0.042 * v);
+                  final liftDy = reduceMotion ? 0.0 : (openDown ? -1.5 : 1.5) * v;
+                  return Transform(
+                    alignment: Alignment.center,
+                    transform: Matrix4.identity()
+                      ..translateByDouble(0.0, liftDy, 0.0, 1.0)
+                      ..scaleByDouble(liftScale, liftScale, 1.0, 1.0),
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(
+                          math.min(targetRect.width, targetRect.height) * 0.5,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(
+                              alpha: (t.isDark ? 0.44 : 0.16) * v.clamp(0.0, 1.0),
+                            ),
+                            blurRadius: 22.0,
+                            spreadRadius: -2.0,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: child,
+                    ),
+                  );
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _dismiss,
+                  child: Material(
+                    type: MaterialType.transparency,
+                    child: IgnorePointer(
+                      child: widget.liftedTriggerBuilder!(context),
                     ),
                   ),
                 ),
               ),
             ),
+
+          // 3. Anchored iOS 27 Liquid Glass Platter with spring bloom
+          Positioned(
+            left: left,
+            top: topPos,
+            bottom: bottomPos,
+            width: menuW,
+            child: AnimatedBuilder(
+              animation: _springBloomAnim,
+              child: GrassBagMaterializeTransition(
+                animation: _controller,
+                tier: widget.tier,
+                alignment: Alignment(alignX, alignY),
+                scaleFrom: 1.0,
+                contentSigma: 4.5,
+                child: platterContent,
+              ),
+              builder: (context, child) {
+                if (reduceMotion) return child!;
+                final s = 0.80 + 0.20 * _springBloomAnim.value;
+                final dy = (openDown ? -8.0 : 8.0) * (1.0 - _springBloomAnim.value.clamp(0.0, 1.15));
+                return Transform(
+                  alignment: Alignment(alignX, alignY),
+                  transform: Matrix4.identity()
+                    ..translateByDouble(0.0, dy, 0.0, 1.0)
+                    ..scaleByDouble(s, s, 1.0, 1.0),
+                  child: child,
+                );
+              },
+            ),
           ),
         ],
-      );
-    },
-    transitionBuilder: (_, __, ___, child) => child,
-  );
+      ),
+    );
+  }
+}
+
+/// Luminous translucent Apple iOS 27 sliding glass lens highlight pill gliding smoothly
+/// behind hovered/scrubbed rows and quick-action tiles (zero nested BackdropFilter!).
+class _LiquidMenuSelectionLens extends StatelessWidget {
+  const _LiquidMenuSelectionLens({
+    required this.borderRadius,
+    this.destructive = false,
+  });
+
+  final double borderRadius;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final fillColor = destructive
+        ? t.err.withValues(alpha: t.isDark ? 0.24 : 0.13)
+        : (t.isDark
+            ? Colors.white.withValues(alpha: 0.14)
+            : Colors.black.withValues(alpha: 0.075));
+    final rimColor = destructive
+        ? t.err.withValues(alpha: t.isDark ? 0.34 : 0.24)
+        : (t.isDark
+            ? Colors.white.withValues(alpha: 0.20)
+            : Colors.white.withValues(alpha: 0.65));
+    return DecoratedBox(
+      decoration: ShapeDecoration(
+        color: fillColor,
+        shape: RoundedSuperellipseBorder(
+          borderRadius: BorderRadius.circular(borderRadius),
+          side: BorderSide(color: rimColor, width: 0.55),
+        ),
+      ),
+    );
+  }
+}
+
+class _GrassBagContextMenuQuickTile extends StatefulWidget {
+  const _GrassBagContextMenuQuickTile({
+    super.key,
+    required this.action,
+    required this.activeHover,
+    required this.onHoverChanged,
+    required this.onSelect,
+  });
+
+  final GrassBagContextMenuQuickAction action;
+  final bool activeHover;
+  final ValueChanged<bool> onHoverChanged;
+  final VoidCallback onSelect;
+
+  @override
+  State<_GrassBagContextMenuQuickTile> createState() =>
+      _GrassBagContextMenuQuickTileState();
+}
+
+class _GrassBagContextMenuQuickTileState
+    extends State<_GrassBagContextMenuQuickTile> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    final a = widget.action;
+    final fg = !a.enabled
+        ? t.text3.withValues(alpha: 0.45)
+        : (a.destructive
+            ? t.err
+            : (a.selected ? (a.accentColor ?? t.primary) : (a.accentColor ?? t.text)));
+    final baseFill = a.selected
+        ? (a.accentColor ?? t.primary).withValues(alpha: t.isDark ? 0.18 : 0.10)
+        : (t.isDark
+            ? Colors.white.withValues(alpha: 0.055)
+            : Colors.black.withValues(alpha: 0.032));
+    final active = _pressed || widget.activeHover;
+
+    return Semantics(
+      button: true,
+      enabled: a.enabled,
+      selected: a.selected,
+      label: a.label,
+      child: MouseRegion(
+        cursor: a.enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        onEnter: (_) => widget.onHoverChanged(true),
+        onExit: (_) => widget.onHoverChanged(false),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: a.enabled
+              ? (_) {
+                  setState(() => _pressed = true);
+                  widget.onHoverChanged(true);
+                }
+              : null,
+          onTapUp: (_) => setState(() => _pressed = false),
+          onTapCancel: () {
+            setState(() => _pressed = false);
+            widget.onHoverChanged(false);
+          },
+          onTap: a.enabled ? widget.onSelect : null,
+          child: AnimatedScale(
+            scale: active && !MediaQuery.disableAnimationsOf(context) ? 0.96 : 1.0,
+            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 110)),
+            curve: Curves.easeOutCubic,
+            child: DecoratedBox(
+              decoration: ShapeDecoration(
+                color: widget.activeHover ? Colors.transparent : baseFill,
+                shape: RoundedSuperellipseBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  side: BorderSide(
+                    color: a.selected && !widget.activeHover
+                        ? (a.accentColor ?? t.primary).withValues(alpha: t.isDark ? 0.30 : 0.22)
+                        : Colors.transparent,
+                    width: 0.6,
+                  ),
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 9),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(a.icon, size: 18, color: fg),
+                    const SizedBox(height: 4),
+                    Text(
+                      a.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: a.selected || active ? FontWeight.w600 : FontWeight.w500,
+                        letterSpacing: -0.1,
+                        color: fg,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _GrassBagContextMenuRow extends StatefulWidget {
   const _GrassBagContextMenuRow({
+    super.key,
     required this.item,
+    required this.activeHover,
+    required this.onHoverChanged,
     required this.onSelect,
   });
 
   final GrassBagContextMenuItem item;
+  final bool activeHover;
+  final ValueChanged<bool> onHoverChanged;
   final VoidCallback onSelect;
 
   @override
@@ -5221,81 +6740,128 @@ class _GrassBagContextMenuRow extends StatefulWidget {
 
 class _GrassBagContextMenuRowState extends State<_GrassBagContextMenuRow> {
   bool _pressed = false;
-  bool _hovered = false;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     final item = widget.item;
-    final fg = item.destructive
-        ? t.err
-        : (item.selected ? t.primary : t.text);
-    final bg = _pressed
-        ? (item.destructive
-            ? t.err.withValues(alpha: t.isDark ? 0.22 : 0.12)
-            : (t.isDark ? Colors.white.withValues(alpha: 0.12) : Colors.black.withValues(alpha: 0.06)))
-        : (item.selected
-            ? t.primary.withValues(alpha: t.isDark ? 0.16 : 0.09)
-            : (_hovered
-                ? (t.isDark ? Colors.white.withValues(alpha: 0.07) : Colors.black.withValues(alpha: 0.035))
-                : Colors.transparent));
+    final accent = item.accentColor ?? t.primary;
+    final fg = !item.enabled
+        ? t.text3.withValues(alpha: 0.45)
+        : (item.destructive
+            ? t.err
+            : (item.selected ? accent : t.text));
+    final iconColor = !item.enabled
+        ? t.text3.withValues(alpha: 0.40)
+        : (item.destructive
+            ? t.err
+            : (item.selected
+                ? accent
+                : (item.accentColor ?? t.text.withValues(alpha: 0.86))));
+    final staticSelectedBg = item.selected && !widget.activeHover
+        ? accent.withValues(alpha: t.isDark ? 0.14 : 0.085)
+        : Colors.transparent;
+    final pressedOrScrubbed = _pressed || widget.activeHover;
 
     return Semantics(
       button: true,
+      enabled: item.enabled,
       selected: item.selected,
       label: item.label,
       child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _hovered = true),
-        onExit: (_) => setState(() => _hovered = false),
+        cursor: item.enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        onEnter: (_) => widget.onHoverChanged(true),
+        onExit: (_) => widget.onHoverChanged(false),
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTapDown: (_) => setState(() => _pressed = true),
+          onTapDown: item.enabled
+              ? (_) {
+                  setState(() => _pressed = true);
+                  widget.onHoverChanged(true);
+                }
+              : null,
           onTapUp: (_) => setState(() => _pressed = false),
-          onTapCancel: () => setState(() => _pressed = false),
-          onTap: () {
-            HapticFeedback.selectionClick();
-            widget.onSelect();
+          onTapCancel: () {
+            setState(() => _pressed = false);
+            widget.onHoverChanged(false);
           },
+          onTap: item.enabled ? widget.onSelect : null,
           child: AnimatedScale(
-            scale: _pressed && !MediaQuery.disableAnimationsOf(context) ? 0.98 : 1.0,
+            scale: pressedOrScrubbed && !MediaQuery.disableAnimationsOf(context)
+                ? 0.985
+                : 1.0,
             duration: GrassBagMotion.duration(context, const Duration(milliseconds: 110)),
             curve: Curves.easeOutCubic,
             child: AnimatedContainer(
               duration: GrassBagMotion.duration(context, const Duration(milliseconds: 110)),
               curve: Curves.easeOutCubic,
-              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9.5),
               decoration: ShapeDecoration(
-                color: bg,
+                color: staticSelectedBg,
                 shape: RoundedSuperellipseBorder(
                   borderRadius: BorderRadius.circular(16),
                   side: BorderSide(
-                    color: item.selected
-                        ? t.primary.withValues(alpha: t.isDark ? 0.32 : 0.22)
+                    color: item.selected && !widget.activeHover
+                        ? accent.withValues(alpha: t.isDark ? 0.28 : 0.20)
                         : Colors.transparent,
-                    width: 0.65,
+                    width: 0.6,
                   ),
                 ),
               ),
               child: Row(
                 children: [
-                  Icon(item.icon, size: 17, color: fg.withValues(alpha: 0.92)),
+                  SizedBox(
+                    width: 20,
+                    child: Center(
+                      child: Icon(item.icon, size: 17, color: iconColor),
+                    ),
+                  ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(
-                          item.label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: item.selected || item.destructive ? FontWeight.w600 : FontWeight.w500,
-                            letterSpacing: -0.15,
-                            color: fg,
-                          ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                item.label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: item.selected || item.destructive || widget.activeHover
+                                      ? FontWeight.w600
+                                      : FontWeight.w500,
+                                  letterSpacing: -0.15,
+                                  color: fg,
+                                ),
+                              ),
+                            ),
+                            if (item.badge != null && item.badge!.isNotEmpty) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 5.5,
+                                  vertical: 1.2,
+                                ),
+                                decoration: ShapeDecoration(
+                                  color: accent.withValues(alpha: t.isDark ? 0.18 : 0.11),
+                                  shape: const StadiumBorder(),
+                                ),
+                                child: Text(
+                                  item.badge!,
+                                  style: TextStyle(
+                                    fontSize: 9.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: accent,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                         if (item.subtitle != null && item.subtitle!.isNotEmpty)
                           Padding(
@@ -5304,15 +6870,22 @@ class _GrassBagContextMenuRowState extends State<_GrassBagContextMenuRow> {
                               item.subtitle!,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11, color: t.text3),
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: widget.activeHover ? t.text2 : t.text3,
+                              ),
                             ),
                           ),
                       ],
                     ),
                   ),
+                  if (item.trailing != null) ...[
+                    const SizedBox(width: 8),
+                    item.trailing!,
+                  ],
                   if (item.selected) ...[
                     const SizedBox(width: 8),
-                    Icon(CupertinoIcons.checkmark_alt, size: 15, color: t.primary),
+                    Icon(CupertinoIcons.checkmark_alt, size: 15.5, color: accent),
                   ],
                 ],
               ),

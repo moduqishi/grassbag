@@ -976,7 +976,7 @@ class TurnView extends ConsumerWidget {
             onDismiss: effectiveDismissLocal,
           ),
         ],
-        const SizedBox(height: 24),
+        const SizedBox(height: 18),
       ],
     );
 
@@ -3451,56 +3451,55 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
             final thinkTier = resolveAmbientGlassTier(context);
             final thinkSolid = thinkTier == GrassBagGlassTier.solid;
 
-            // 1. Live collapsed streaming whisper strip (borderless, zero scroll trapping!)
+            // 1. Live collapsed streaming whisper strip (ultra-compact ~2-line calm preview so
+            //    transitioning from thinking -> answer NEVER jolts the scroll viewport by 84px!)
             if (showLiveTicker) {
-              String tickerText = bodyText;
-              if (tickerText.length > 720) {
-                var cut = tickerText.length - 700;
+              String tickerText = bodyText.trimRight();
+              if (tickerText.length > 260) {
+                var cut = tickerText.length - 240;
                 final nl = tickerText.indexOf('\n', cut);
-                if (nl >= 0 && nl < tickerText.length - 100) {
+                if (nl >= 0 && nl < tickerText.length - 40) {
                   cut = nl + 1;
                 }
                 tickerText = '…${tickerText.substring(cut)}';
               }
               return Padding(
-                padding: const EdgeInsets.only(left: 10, top: 2, bottom: 8),
+                padding: const EdgeInsets.only(left: 10, top: 2, bottom: 6),
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: widget.onToggleExpand,
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(14),
+                    borderRadius: BorderRadius.circular(12),
                     child: Container(
-                      padding: const EdgeInsets.fromLTRB(12, 9, 12, 9),
+                      padding: const EdgeInsets.fromLTRB(11, 7, 11, 7),
                       decoration: BoxDecoration(
                         color: thinkSolid
                             ? t.fill1
                             : (t.isDark
-                                ? const Color(0xFF0E1724).withValues(alpha: 0.44)
-                                : Colors.white.withValues(alpha: 0.56)),
+                                ? const Color(0xFF0E1724).withValues(alpha: 0.40)
+                                : Colors.white.withValues(alpha: 0.52)),
                         border: Border(
                           left: BorderSide(
-                            color: t.primary.withValues(alpha: 0.72),
-                            width: 2.5,
+                            color: t.primary.withValues(alpha: 0.68),
+                            width: 2.2,
                           ),
                         ),
                       ),
                       child: ConstrainedBox(
-                        constraints: const BoxConstraints(maxHeight: 84),
+                        constraints: const BoxConstraints(maxHeight: 44),
                         child: RepaintBoundary(
                           child: ShaderMask(
                             blendMode: BlendMode.dstIn,
                             shaderCallback: (rect) => const LinearGradient(
                               begin: Alignment.topCenter,
                               end: Alignment.bottomCenter,
-                              stops: [0.0, 0.30, 1.0],
+                              stops: [0.0, 0.28, 1.0],
                               colors: [
                                 Colors.transparent,
                                 Colors.black,
                                 Colors.black,
                               ],
                             ).createShader(rect),
-                            // IgnorePointer + NeverScrollableScrollPhysics so the live preview
-                            // NEVER intercepts vertical chat scrolling!
                             child: IgnorePointer(
                               child: SingleChildScrollView(
                                 controller: _thinkScrollCtrl,
@@ -3508,9 +3507,9 @@ class _ThinkingStepRowState extends ConsumerState<_ThinkingStepRow> {
                                 child: Text(
                                   tickerText,
                                   style: TextStyle(
-                                    fontSize: 12.2,
-                                    height: 1.56,
-                                    color: t.text2.withValues(alpha: 0.90),
+                                    fontSize: 12.0,
+                                    height: 1.48,
+                                    color: t.text2.withValues(alpha: 0.88),
                                   ),
                                 ),
                               ),
@@ -5726,20 +5725,21 @@ class _AssistantBodyState extends State<_AssistantBody>
       return;
     }
 
-    // Smooth adaptive catch-up: crisp readable cadence at low lag, effortless acceleration
-    // for 300+ tok/s models, and rapid <120ms finish when streaming ends.
+    // Responsive, liquid token cadence inspired by ChatGPT iOS / Claude iOS / Cherry Studio:
+    // stays tightly locked (~45-70ms behind live stream) without erratic slow-fast-slow hiccups
+    // or sluggish post-stream catch-up tails!
     final charsPerSec = widget.isStreaming
-        ? (48.0 + lag * 6.5).clamp(48.0, 1200.0)
-        : (240.0 + lag * 16.0).clamp(240.0, 3200.0);
+        ? (105.0 + lag * 11.5).clamp(105.0, 2400.0)
+        : (420.0 + lag * 24.0).clamp(420.0, 4800.0);
     _charBudget += charsPerSec * dtSec;
     final step = _charBudget.floor();
     if (step <= 0) return;
 
-    // Adaptive setState pacing: 60Hz (16ms) for prose, 25Hz (40ms) when streaming a large
-    // unsettled code block / table tail (>400 chars) so 120Hz phones avoid redundant full-tail re-layout.
+    // Adaptive setState pacing: 60Hz (16ms) for crisp prose, 30Hz (33ms) for very long unsettled
+    // code/table tails (>500 chars) to avoid redundant full-tail re-layout on 120Hz displays.
     final unsettledLen = _revealedLen - _settledLen;
     final minEmitUs = widget.isStreaming
-        ? (unsettledLen > 400 ? 40000 : 15500)
+        ? (unsettledLen > 500 ? 33000 : 15500)
         : 15500;
     if (_lastEmitElapsed != null &&
         (elapsed - _lastEmitElapsed!).inMicroseconds < minEmitUs &&
@@ -5749,14 +5749,7 @@ class _AssistantBodyState extends State<_AssistantBody>
     _lastEmitElapsed = elapsed;
     _charBudget -= step;
 
-    var nextLen = (_revealedLen + step).clamp(0, targetLen);
-    // Never split a UTF-16 surrogate pair (emoji / rare CJK) mid-character!
-    if (nextLen > 0 && nextLen < targetLen) {
-      final cu = widget.text.codeUnitAt(nextLen - 1);
-      if (cu >= 0xD800 && cu <= 0xDBFF) {
-        nextLen++;
-      }
-    }
+    var nextLen = _snapRevealBoundary(widget.text, (_revealedLen + step).clamp(0, targetLen), targetLen);
     if (nextLen != _revealedLen) {
       _rememberRevealed(widget.turnId, nextLen);
       setState(() {
@@ -5767,6 +5760,48 @@ class _AssistantBodyState extends State<_AssistantBody>
       _revealedProgressByTurn.remove(widget.turnId);
       _stopTypeTicker();
     }
+  }
+
+  /// Snaps streaming frontier cleanly to UTF-16 surrogate pairs, paired Markdown delimiters
+  /// (`**`, `__`, `~~`, `$$`, `` `` ``), and short ASCII word tails (<=4 chars) so words &
+  /// inline formatting materialize smoothly without mid-word/mid-syntax flicker.
+  static int _snapRevealBoundary(String text, int rawNext, int targetLen) {
+    var next = rawNext.clamp(0, targetLen);
+    if (next <= 0 || next >= targetLen) return next;
+    // 1. Never split a UTF-16 surrogate pair (emoji / rare CJK).
+    final prevCu = text.codeUnitAt(next - 1);
+    if (prevCu >= 0xD800 && prevCu <= 0xDBFF) {
+      next++;
+      if (next >= targetLen) return targetLen;
+    }
+    // 2. Keep paired 2-char Markdown delimiters atomic (`**`, `__`, `~~`, `$$`, `` `` ``).
+    final cBefore = text.codeUnitAt(next - 1);
+    final cAt = text.codeUnitAt(next);
+    if (cBefore == cAt &&
+        (cBefore == 0x2A /* * */ ||
+            cBefore == 0x5F /* _ */ ||
+            cBefore == 0x7E /* ~ */ ||
+            cBefore == 0x24 /* $ */ ||
+            cBefore == 0x60 /* ` */)) {
+      next++;
+      if (next >= targetLen) return targetLen;
+    }
+    // 3. Snap short remaining ASCII word tail (<=4 alnum chars) so words pop cleanly whole.
+    bool isAsciiWord(int cu) =>
+        (cu >= 0x30 && cu <= 0x39) ||
+        (cu >= 0x41 && cu <= 0x5A) ||
+        (cu >= 0x61 && cu <= 0x7A);
+    if (isAsciiWord(text.codeUnitAt(next - 1)) && isAsciiWord(text.codeUnitAt(next))) {
+      var look = next;
+      final limit = math.min(targetLen, next + 4);
+      while (look < limit && isAsciiWord(text.codeUnitAt(look))) {
+        look++;
+      }
+      if (look >= targetLen || !isAsciiWord(text.codeUnitAt(look))) {
+        next = look;
+      }
+    }
+    return next;
   }
 
   static bool _isClosingFence(String trimmedLine, String fenceChar, int fenceLen) {
@@ -7817,13 +7852,16 @@ class _AssistantBodyState extends State<_AssistantBody>
         final recs = <TapGestureRecognizer>[];
         final w = RepaintBoundary(
           key: ValueKey('md-blk-$absIdx'),
-          child: _buildSingleBlockWidget(
-            absIdx,
-            blk,
-            t,
-            recs,
-            showCursor: wantsCursor,
-            isStreamingBlock: isStreamingRichBlock,
+          child: _StreamingBlockInkReveal(
+            animate: showCursor,
+            child: _buildSingleBlockWidget(
+              absIdx,
+              blk,
+              t,
+              recs,
+              showCursor: wantsCursor,
+              isStreamingBlock: isStreamingRichBlock,
+            ),
           ),
         );
         _tailCachedBlocks.add(
@@ -10910,11 +10948,12 @@ class _LiveStreamingCaretState extends State<_LiveStreamingCaret>
 
   @override
   Widget build(BuildContext context) {
+    final dotSize = (widget.height * 0.44).clamp(6.5, 8.5);
     return RepaintBoundary(
       child: Padding(
-        padding: const EdgeInsets.only(left: 2.5),
+        padding: const EdgeInsets.only(left: 3.5),
         child: SizedBox(
-          width: 2.5,
+          width: dotSize,
           height: widget.height,
           child: CustomPaint(
             painter: _StreamingCaretPainter(animation: _ctrl, color: widget.color),
@@ -10931,22 +10970,94 @@ class _StreamingCaretPainter extends CustomPainter {
 
   final Animation<double> animation;
   final Color color;
-  final Paint _paint = Paint();
+  final Paint _paint = Paint()..isAntiAlias = true;
 
   @override
   void paint(Canvas canvas, Size size) {
     final v = Curves.easeInOutSine.transform(animation.value);
-    _paint.color = color.withValues(alpha: 0.28 + 0.66 * v);
-    final rrect = RRect.fromRectAndRadius(
-      Offset.zero & size,
-      Radius.circular(size.width * 0.5),
-    );
-    canvas.drawRRect(rrect, _paint);
+    final baseR = size.width * 0.5;
+    final r = baseR * (0.86 + 0.14 * v);
+    final center = Offset(size.width * 0.5, size.height * 0.52);
+    _paint.color = color.withValues(alpha: 0.34 + 0.56 * v);
+    canvas.drawCircle(center, r, _paint);
   }
 
   @override
   bool shouldRepaint(covariant _StreamingCaretPainter oldDelegate) =>
       oldDelegate.color != color || oldDelegate.animation != animation;
+}
+
+/// Pure compositor-only soft ink-in reveal (opacity 0.28 -> 1.0 over 135ms) for newly minted
+/// Markdown blocks during live streaming — zero vertical shift, zero layout jitter, zero
+/// animation on historical/completed turns or under Reduce Motion!
+class _StreamingBlockInkReveal extends StatefulWidget {
+  const _StreamingBlockInkReveal({
+    required this.animate,
+    required this.child,
+  });
+
+  final bool animate;
+  final Widget child;
+
+  @override
+  State<_StreamingBlockInkReveal> createState() => _StreamingBlockInkRevealState();
+}
+
+class _StreamingBlockInkRevealState extends State<_StreamingBlockInkReveal>
+    with SingleTickerProviderStateMixin {
+  AnimationController? _ctrl;
+  CurvedAnimation? _curve;
+  bool _started = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.animate) {
+      _ctrl = AnimationController(
+        vsync: this,
+        duration: const Duration(milliseconds: 135),
+      );
+      _curve = CurvedAnimation(parent: _ctrl!, curve: Curves.easeOutCubic);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_started && _ctrl != null) {
+      _started = true;
+      if (MediaQuery.disableAnimationsOf(context)) {
+        _ctrl!.value = 1.0;
+      } else {
+        _ctrl!.forward();
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _curve?.dispose();
+    _ctrl?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final curve = _curve;
+    if (curve == null) return widget.child;
+    return AnimatedBuilder(
+      animation: curve,
+      child: widget.child,
+      builder: (_, child) {
+        final v = curve.value;
+        if (v >= 0.999) return child!;
+        return GrassBagControlledOpacity(
+          opacity: 0.28 + 0.72 * v,
+          child: child!,
+        );
+      },
+    );
+  }
 }
 
 /// Stateful inline Markdown image card with smooth shimmer placeholder, 180ms fade-in,
@@ -11023,7 +11134,11 @@ class _MarkdownImageCardState extends State<_MarkdownImageCard> {
       haptic: true,
       onTap: _hasError ? _retry : () => _openLightbox(context),
       child: AnimatedSize(
-        duration: GrassBagMotion.duration(context, const Duration(milliseconds: 210)),
+        duration: GrassBagMotion.duration(
+          context,
+          const Duration(milliseconds: 210),
+          reduced: const Duration(milliseconds: 1),
+        ),
         curve: Curves.easeOutCubic,
         alignment: Alignment.topLeft,
         child: Container(
@@ -11819,7 +11934,11 @@ class _QuietReplyAction extends StatelessWidget {
             ),
           ),
           child: AnimatedSize(
-            duration: GrassBagMotion.duration(context, const Duration(milliseconds: 180)),
+            duration: GrassBagMotion.duration(
+              context,
+              const Duration(milliseconds: 180),
+              reduced: const Duration(milliseconds: 1),
+            ),
             curve: Curves.easeOutCubic,
             alignment: Alignment.centerLeft,
             child: Row(

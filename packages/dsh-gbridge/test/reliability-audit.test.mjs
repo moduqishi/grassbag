@@ -8,6 +8,8 @@ import { test } from 'node:test';
 
 import { StreamHub } from '../lib/stream-hub.js';
 import { mountPhoneTools } from '../lib/phone-tools.js';
+import { applyLoopbackCors, isAllowedCorsOrigin, Router } from '../lib/http-util.js';
+import { registerChatAndInteractionsDomain } from '../lib/domains/chat.js';
 
 function createFakeWs() {
   const emitter = new EventEmitter();
@@ -200,4 +202,130 @@ test('P2.1: unified keepalive covers standalone background jobs and fallback tur
     await new Promise((resolve) => server.close(resolve));
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('P1.4: sessionAlwaysAllowed is committed only AFTER upstream respondRemoteEvent succeeds', async () => {
+  let failRespond = true;
+  const calls = [];
+  const fakeGateway = {
+    async respondRemoteEvent(clientId, eventId, outcome) {
+      calls.push({ clientId, eventId, outcome });
+      if (failRespond) throw new Error('upstream rpc disconnected');
+      return { ok: true };
+    },
+  };
+  const hub = new StreamHub({ bootId: 'boot-always-gate', gateway: fakeGateway });
+  try {
+    hub._eventsClientId = 'cli-1';
+    hub._handleHostEventFrame({
+      type: 'request',
+      eventId: 'evt-1',
+      event: 'approval/request',
+      agentId: 'sess-a',
+      request: { toolName: 'bash', command: 'ls -la' },
+    });
+    assert.equal(hub.pendingInteractions.size, 1);
+
+    // 1) Upstream failure MUST NOT populate sessionAlwaysAllowed and MUST leave interaction retryable
+    await assert.rejects(
+      () => hub.respondInteraction('evt-1', { decision: 'always' }),
+      /upstream rpc disconnected/,
+    );
+    assert.equal(hub.sessionAlwaysAllowed.has('sess-a'), false);
+    assert.equal(hub.pendingInteractions.has('evt-1'), true);
+
+    // 2) Upstream confirmation commits sessionAlwaysAllowed and auto-approves matching follow-up
+    failRespond = false;
+    const res = await hub.respondInteraction('evt-1', { decision: 'always' });
+    assert.equal(res.id, 'evt-1');
+    assert.equal(hub.sessionAlwaysAllowed.get('sess-a')?.has('bash'), true);
+
+    hub._handleHostEventFrame({
+      type: 'request',
+      eventId: 'evt-2',
+      event: 'approval/request',
+      agentId: 'sess-a',
+      request: { toolName: 'bash', command: 'pwd' },
+    });
+    assert.equal(hub.pendingInteractions.has('evt-2'), false);
+    assert.equal(calls.some((c) => c.eventId === 'evt-2' && c.outcome?.value === 'allowed-once'), true);
+  } finally {
+    hub.dispose();
+  }
+});
+
+test('B-3: applyLoopbackCors honors GB_ALLOWED_ORIGINS without allowing wildcards', () => {
+  const prev = process.env.GB_ALLOWED_ORIGINS;
+  process.env.GB_ALLOWED_ORIGINS = 'https://app.example.com/, *, https://studio.internal:8443';
+  try {
+    assert.equal(isAllowedCorsOrigin('https://app.example.com'), true);
+    assert.equal(isAllowedCorsOrigin('https://studio.internal:8443'), true);
+    assert.equal(isAllowedCorsOrigin('https://evil.example.net'), false);
+    assert.equal(isAllowedCorsOrigin('*'), false);
+
+    const headers = {};
+    const ok = applyLoopbackCors(
+      { headers: { origin: 'https://app.example.com', host: '127.0.0.1:3080' } },
+      { setHeader(k, v) { headers[k] = v; } },
+    );
+    assert.equal(ok, true);
+    assert.equal(headers['access-control-allow-origin'], 'https://app.example.com');
+    assert.equal(headers['access-control-allow-credentials'], 'true');
+
+    const crossPortHeaders = {};
+    const okLoop = applyLoopbackCors(
+      { headers: { origin: 'http://localhost:8080', host: '127.0.0.1:3080' } },
+      { setHeader(k, v) { crossPortHeaders[k] = v; } },
+    );
+    assert.equal(okLoop, true);
+    assert.equal(crossPortHeaders['access-control-allow-credentials'], undefined);
+  } finally {
+    if (prev === undefined) delete process.env.GB_ALLOWED_ORIGINS;
+    else process.env.GB_ALLOWED_ORIGINS = prev;
+  }
+});
+
+test('B-1: POST /sessions surfaces setupWarnings instead of swallowing post-create failures', async () => {
+  const router = new Router();
+  const gateway = {
+    has: (ep) => ['session/create', 'session/selectModel', 'commands/execute'].includes(ep),
+    async call(ep) {
+      if (ep === 'session/create') return { sessionId: 'sess-warn-1', title: 'New' };
+      if (ep === 'session/selectModel') throw new Error('model quota exhausted');
+      if (ep === 'commands/execute') throw new Error('preset locked');
+      return {};
+    },
+  };
+  registerChatAndInteractionsDomain(router, { ctx: {}, gateway, hub: { publish() {} }, normalizer: {} });
+
+  const req = new EventEmitter();
+  req.method = 'POST';
+  req.url = '/sessions';
+  let statusCode = 0;
+  let bodyText = '';
+  const res = {
+    writableEnded: false,
+    writeHead(code) { statusCode = code; },
+    end(chunk) {
+      bodyText = String(chunk || '');
+      this.writableEnded = true;
+    },
+  };
+  const match = router.match('POST', '/sessions');
+  assert.equal(match.kind, 'match');
+  const promise = match.route.handler(req, res, { params: match.params, searchParams: new URLSearchParams(), peer: null });
+  req.emit('data', Buffer.from(JSON.stringify({
+    provider: 'deepseek',
+    model: 'deepseek-reasoner',
+    permission: 'workspace-write',
+  })));
+  req.emit('end');
+  await promise;
+
+  assert.equal(statusCode, 201);
+  const parsed = JSON.parse(bodyText);
+  assert.equal(parsed.session.sessionId, 'sess-warn-1');
+  assert.ok(Array.isArray(parsed.warnings) && parsed.warnings.length >= 2);
+  assert.ok(parsed.warnings.some((w) => w.step === 'model' && w.message.includes('quota')));
+  assert.ok(parsed.warnings.some((w) => w.step === 'permission' && w.message.includes('locked')));
 });

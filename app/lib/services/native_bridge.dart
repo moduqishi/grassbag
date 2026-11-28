@@ -648,6 +648,35 @@ class GrassBagNativeBridge {
         '仅 Android 原生环境支持加密归档导出',
       );
 
+  Future<Map<String, dynamic>> listEncryptedBackups() =>
+      _safeInvokeMap(
+        'runtime.listBackups',
+        null,
+        '仅 Android 原生环境支持管理本机加密备份',
+      );
+
+  Future<Map<String, dynamic>> previewEncryptedBackup(String path, String passphrase) =>
+      _safeInvokeMap(
+        'runtime.previewBackup',
+        {'path': path, 'passphrase': passphrase},
+        '仅 Android 原生环境支持校验加密备份',
+      );
+
+  Future<Map<String, dynamic>> restoreEncryptedBackup(String path, String passphrase) =>
+      _safeInvokeMap(
+        'runtime.restoreBackup',
+        {'path': path, 'passphrase': passphrase},
+        '仅 Android 原生环境支持恢复加密备份',
+      );
+
+  Future<bool> shareBackupFile(String path, String filename) async {
+    return (await _safeInvoke<bool>('runtime.shareBackupFile', {
+          'path': path,
+          'filename': filename,
+        })) ==
+        true;
+  }
+
   // Real local Android shell sessions for xterm
   Future<Map<String, dynamic>> startLocalShellDetailed(
     String tabId, {
@@ -839,8 +868,43 @@ class GrassBagNativeBridge {
     await _safeInvoke<bool>('service.stop');
   }
 
-  Future<void> postAlertNotification(String title, String text) async {
-    await _safeInvoke<bool>('service.notify', {'title': title, 'text': text});
+  Future<void> postAlertNotification(
+    String title,
+    String text, {
+    String? tag,
+    String? kind,
+    String? hostId,
+    String? sessionId,
+    String? interactionId,
+    String? jobId,
+  }) async {
+    await _safeInvoke<bool>('service.notify', {
+      'title': title,
+      'text': text,
+      if (tag != null && tag.isNotEmpty) 'tag': tag,
+      if (kind != null && kind.isNotEmpty) 'kind': kind,
+      if (hostId != null && hostId.isNotEmpty) 'hostId': hostId,
+      if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+      if (interactionId != null && interactionId.isNotEmpty) 'interactionId': interactionId,
+      if (jobId != null && jobId.isNotEmpty) 'jobId': jobId,
+    });
+  }
+
+  Future<void> cancelAlertNotification(String tag) async {
+    if (tag.trim().isEmpty) return;
+    await _safeInvoke<bool>('service.cancelNotify', {'tag': tag.trim()});
+  }
+
+  Future<Map<String, String>?> takePendingNotification() async {
+    final res = await _safeInvoke<Map<Object?, Object?>>('service.takePendingNotification');
+    if (res == null || res.isEmpty) return null;
+    final out = <String, String>{};
+    res.forEach((k, v) {
+      final key = k?.toString() ?? '';
+      final val = v?.toString() ?? '';
+      if (key.isNotEmpty && val.isNotEmpty) out[key] = val;
+    });
+    return out.isEmpty ? null : out;
   }
 
   // System Permissions & Deep Links

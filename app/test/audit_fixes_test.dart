@@ -330,4 +330,130 @@ void main() {
       expect(await File(saved).exists(), isTrue);
     });
   });
+
+  group('Audit Pass 2: P1-1, P1-4, B-2, and C-2 regressions', () {
+    test('P1-1: offline sendPrompt returns false so draft is preserved and records persisted outbox entry', () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      GrassBagStorage.instance.resetCacheForTest();
+      addTearDown(GrassBagStorage.instance.resetCacheForTest);
+
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final ctrl = container.read(appProvider.notifier);
+
+      final sent = await ctrl.sendPrompt('离线待确认消息');
+      expect(sent, isFalse, reason: 'Offline send must return false so composer preserves draft');
+      final outbox = await GrassBagStorage.instance.loadPendingOutbox();
+      expect(outbox.any((e) => e['text'] == '离线待确认消息'), isTrue);
+    });
+
+    test('P1-4: public cleartext http:// diagnosis fails closed before transmitting credentials', () async {
+      expect(GrassBagController.isPublicCleartextHttpUri(Uri.parse('http://example.com:3080')), isTrue);
+      expect(GrassBagController.isPublicCleartextHttpUri(Uri.parse('https://example.com:3080')), isFalse);
+      expect(GrassBagController.isPublicCleartextHttpUri(Uri.parse('http://192.168.1.50:3080')), isFalse);
+      expect(GrassBagController.isPublicCleartextHttpUri(Uri.parse('http://100.64.0.9:3080')), isFalse);
+      expect(GrassBagController.isPublicCleartextHttpUri(Uri.parse('http://127.0.0.1:3080')), isFalse);
+
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final ctrl = container.read(appProvider.notifier);
+
+      final diag = await ctrl.diagnoseRemoteHost(
+        'http://public.example.com:3080',
+        token: 'super-secret-token',
+      );
+      expect(diag.kind, RemoteDiagnosisKind.insecurePublicHttp);
+      expect(diag.canConnectNow, isFalse);
+    });
+
+    test('B-2: importConfigJson merges hosts by default and previewImportConfigJson reports accurate diff', () {
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final ctrl = container.read(appProvider.notifier);
+
+      final existing = ctrl.addRemoteHost(
+        'http://192.168.50.10:3080',
+        name: 'Office Mac',
+        token: 'tok-office',
+        autoProbe: false,
+        silent: true,
+      )!;
+      final incomingSnapshot = jsonEncode({
+        'prefs': {'isDark': true},
+        'hosts': [
+          {
+            'id': 'remote-new-1',
+            'isLocal': false,
+            'name': 'Lab Linux',
+            'address': 'http://192.168.50.20:3080',
+          },
+        ],
+      });
+
+      final preview = ctrl.previewImportConfigJson(incomingSnapshot);
+      expect(preview, isNotNull);
+      expect(preview!['addedHosts'], 1);
+      expect(preview['updatedHosts'], 0);
+      expect(preview['preservedExistingHosts'], 1);
+
+      expect(ctrl.importConfigJson(incomingSnapshot), isTrue);
+      final afterMerge = container.read(appProvider).hosts;
+      expect(afterMerge.any((h) => h.id == existing.id && h.token == 'tok-office'), isTrue);
+      expect(afterMerge.any((h) => h.id == 'remote-new-1'), isTrue);
+
+      // Explicit replaceHosts: true removes unlisted remote hosts when local host is included
+      final replaceSnapshot = jsonEncode({
+        'hosts': [
+          {'id': 'local', 'isLocal': true, 'name': '本机', 'address': 'unix:///tmp/local.sock'},
+          {'id': 'remote-only', 'isLocal': false, 'name': 'Only Box', 'address': 'http://192.168.50.30:3080'},
+        ],
+      });
+      expect(ctrl.importConfigJson(replaceSnapshot, replaceHosts: true), isTrue);
+      final afterReplace = container.read(appProvider).hosts;
+      expect(afterReplace.any((h) => h.id == existing.id), isFalse);
+      expect(afterReplace.any((h) => h.id == 'remote-only'), isTrue);
+    });
+
+    test('C-2: handleNotificationOpened routes across host/session and opens JobsPage for job alerts', () async {
+      final container = ProviderContainer();
+      addTearDown(container.dispose);
+      final ctrl = container.read(appProvider.notifier);
+
+      final remote = ctrl.addRemoteHost(
+        'http://192.168.50.42:3080',
+        name: 'Build Box',
+        token: 'tok-build',
+        autoProbe: false,
+        silent: true,
+      )!;
+      expect(container.read(appProvider).activeHostId, 'local');
+
+      // 1) Job notification switches host and signals JobsPage
+      final prevJobSignal = container.read(appProvider).openJobsSignal;
+      await ctrl.handleNotificationOpened({
+        'kind': 'job',
+        'hostId': remote.id,
+        'jobId': 'job-99',
+      });
+      expect(container.read(appProvider).activeHostId, remote.id);
+      expect(container.read(appProvider).openJobsSignal, prevJobSignal + 1);
+
+      // 2) Same-host interaction notification selects target session
+      ctrl.state = container.read(appProvider).copyWith(
+        sessions: const [
+          ChatSessionItem(id: 'sess-1', title: 'One', group: '今天'),
+          ChatSessionItem(id: 'sess-2', title: 'Two', group: '今天'),
+        ],
+        activeSessionId: 'sess-1',
+      );
+      await ctrl.handleNotificationOpened({
+        'kind': 'interaction',
+        'hostId': remote.id,
+        'sessionId': 'sess-2',
+        'interactionId': 'int-42',
+      });
+      expect(container.read(appProvider).activeSessionId, 'sess-2');
+    });
+  });
 }

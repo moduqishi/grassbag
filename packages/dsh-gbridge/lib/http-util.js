@@ -68,23 +68,42 @@ export function isLoopbackOrigin(origin) {
   return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
 
+function getExplicitAllowedOrigins() {
+  const raw = process.env.GB_ALLOWED_ORIGINS || '';
+  if (!raw.trim()) return [];
+  return raw
+    .split(',')
+    .map((s) => s.trim().replace(/\/+$/, ''))
+    .filter((s) => s.length > 0 && s !== '*' && /^https?:\/\//i.test(s));
+}
+
+export function isAllowedCorsOrigin(origin) {
+  if (typeof origin !== 'string' || !origin) return false;
+  const cleaned = origin.trim().replace(/\/+$/, '');
+  if (isLoopbackOrigin(cleaned)) return true;
+  const allowlist = getExplicitAllowedOrigins();
+  return allowlist.some((allowed) => allowed.toLowerCase() === cleaned.toLowerCase());
+}
+
 export function applyLoopbackCors(req, res) {
   const origin = req.headers?.origin;
-  if (!isLoopbackOrigin(origin)) return false;
-  res.setHeader('access-control-allow-origin', origin);
+  if (!isAllowedCorsOrigin(origin)) return false;
+  const cleanedOrigin = origin.trim().replace(/\/+$/, '');
+  res.setHeader('access-control-allow-origin', cleanedOrigin);
   res.setHeader('vary', 'Origin');
-  // Only expose credentialed cookies to exact same-origin requests; cross-port localhost
-  // frontends must authenticate via `Authorization: Bearer` to prevent cross-port CSRF.
+  // Only expose credentialed cookies to exact same-host requests (or explicitly configured
+  // GB_ALLOWED_ORIGINS reverse-proxy origins); cross-port localhost frontends use Bearer auth.
   let sameHost = false;
   const hostHeader = String(req.headers?.host || '').trim().toLowerCase();
   if (hostHeader) {
     try {
-      sameHost = new URL(origin).host.toLowerCase() === hostHeader;
+      sameHost = new URL(cleanedOrigin).host.toLowerCase() === hostHeader;
     } catch (_invalidOrigin) {
       sameHost = false;
     }
   }
-  if (sameHost) {
+  const explicitlyAllowed = !isLoopbackOrigin(cleanedOrigin);
+  if (sameHost || explicitlyAllowed) {
     res.setHeader('access-control-allow-credentials', 'true');
   }
   res.setHeader('access-control-allow-headers', 'Authorization, Content-Type');

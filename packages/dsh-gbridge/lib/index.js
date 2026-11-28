@@ -25,6 +25,7 @@ import { mountPhoneTools } from './phone-tools.js';
 import { repairLegacyInlineImageSessions } from './session-image-repair.js';
 import { buildQrPathData, encodeQrMatrix } from './qr-svg.js';
 import { renderPairingDashboardHtml } from './pairing-ui.js';
+import { startMdnsAdvertiser } from './mdns.js';
 import { detectDshVersion, registerMetaDomain } from './domains/meta.js';
 import { registerChatAndInteractionsDomain } from './domains/chat.js';
 import { registerWorkspaceDomain } from './domains/workspace.js';
@@ -286,6 +287,7 @@ export function startLanBridgeListener(core, {
   surface = 'desktop',
   logger = console,
   getPairingSnapshot,
+  verifyPairCode,
   onListening,
 } = {}) {
   const bearerToken = resolveOrCreateLanToken(token);
@@ -307,6 +309,7 @@ export function startLanBridgeListener(core, {
     existing.surface = surface;
     existing.logger = logger;
     existing.getPairingSnapshot = getPairingSnapshot;
+    existing.verifyPairCode = verifyPairCode;
     const bound = existing.server.address();
     const boundPort = typeof bound === 'object' && bound ? bound.port : existing.boundPort;
     logger?.info?.(`[gbridge] LAN bridge hot-swapped on ${host}:${boundPort}`);
@@ -341,6 +344,7 @@ export function startLanBridgeListener(core, {
     surface,
     logger,
     getPairingSnapshot,
+    verifyPairCode,
     server: null,
     boundPort: preferredPort,
     preferredPort,
@@ -432,7 +436,28 @@ export function startLanBridgeListener(core, {
       }
 
       const qToken = parsedUrl.searchParams.get('token');
+      const qPairCode = (
+        parsedUrl.searchParams.get('p') ||
+        parsedUrl.searchParams.get('pair') ||
+        parsedUrl.searchParams.get('pairCode') ||
+        ''
+      ).trim();
+      if (qPairCode && typeof entry.verifyPairCode === 'function') {
+        const pairCheck = entry.verifyPairCode(qPairCode, { touchConnecting: false });
+        if (!pairCheck.ok) {
+          res.writeHead(401, {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-gbridge-error': 'gbridge/pairing_code_expired',
+          });
+          res.end(renderLoginHtml('当前配对二维码已过期或已刷新，请在电脑端重新扫码。'));
+          return;
+        }
+      }
       if (qToken && safeEqualString(qToken.trim(), entry.bearerToken)) {
+        if (qPairCode && typeof entry.verifyPairCode === 'function') {
+          entry.verifyPairCode(qPairCode, { touchConnecting: true });
+        }
         issueCookieRedirect();
         return;
       }
@@ -975,6 +1000,127 @@ export function createPairingController(ctx, core, config = {}) {
   let lanWanted = false;
   let lanOpChain = Promise.resolve();
   let disposed = false;
+  let mdnsHandle = null;
+  const mdnsEnabled = config.mdns !== false && process.env.GBRIDGE_MDNS !== '0' && !udsPath;
+
+  const PAIRING_CODE_TTL_MS = Number.isFinite(Number(config.pairingCodeTtlMs)) && Number(config.pairingCodeTtlMs) >= 1000
+    ? Number(config.pairingCodeTtlMs)
+    : 10 * 60 * 1000;
+  const expiredPairCodes = new Set();
+  const createFreshPairingSession = () => {
+    const now = Date.now();
+    return {
+      code: randomBytes(6).toString('hex'),
+      status: 'waiting', // 'waiting' | 'connecting' | 'connected'
+      createdAt: now,
+      expiresAt: now + PAIRING_CODE_TTL_MS,
+      connectedAt: null,
+      deviceLabel: null,
+      clientConnId: null,
+    };
+  };
+  let pairingSession = createFreshPairingSession();
+
+  const retirePairingCode = (code) => {
+    if (!code) return;
+    expiredPairCodes.add(code);
+    if (expiredPairCodes.size > 64) {
+      const oldest = expiredPairCodes.values().next().value;
+      if (oldest !== undefined) expiredPairCodes.delete(oldest);
+    }
+  };
+
+  const rotatePairingSession = () => {
+    retirePairingCode(pairingSession.code);
+    pairingSession = createFreshPairingSession();
+    qrCache.clear();
+    return pairingSession;
+  };
+
+  const ensureActivePairingSession = () => {
+    if (pairingSession.status === 'waiting' && Date.now() > pairingSession.expiresAt) {
+      rotatePairingSession();
+    }
+    return pairingSession;
+  };
+
+  const inferDeviceLabel = (clientId) => {
+    const raw = String(clientId || '').toLowerCase();
+    if (raw.includes('ios') || raw.includes('iphone')) return '你的 iPhone';
+    if (raw.includes('ipad')) return '你的 iPad';
+    if (raw.includes('web')) return '你的浏览器';
+    return '你的手机';
+  };
+
+  const verifyPairCode = (rawCode, { touchConnecting = false } = {}) => {
+    const code = String(rawCode || '').trim();
+    if (!code) return { ok: true };
+    const now = Date.now();
+    if (safeEqualString(code, pairingSession.code) && now <= pairingSession.expiresAt) {
+      if (touchConnecting && pairingSession.status === 'waiting') {
+        pairingSession.status = 'connecting';
+      }
+      return { ok: true };
+    }
+    return { ok: false, expired: true };
+  };
+
+  const prevOnClientWelcomed = core.hub.onClientWelcomed;
+  core.hub.onClientWelcomed = (client, msg) => {
+    if (typeof prevOnClientWelcomed === 'function') {
+      try { prevOnClientWelcomed(client, msg); } catch (_) {}
+    }
+    if (disposed || client?.mode === 'uds') return;
+    const msgCode = typeof msg?.pairCode === 'string' ? msg.pairCode.trim() : '';
+    const now = Date.now();
+    const matchedCode = msgCode &&
+      safeEqualString(msgCode, pairingSession.code) &&
+      now <= pairingSession.expiresAt;
+    const matchedConnecting = !msgCode &&
+      pairingSession.status === 'connecting' &&
+      now <= pairingSession.expiresAt;
+    if (matchedCode || matchedConnecting) {
+      pairingSession.status = 'connected';
+      pairingSession.connectedAt = now;
+      pairingSession.clientConnId = client.id;
+      pairingSession.deviceLabel = inferDeviceLabel(msg?.clientId || client.clientId);
+    }
+  };
+
+  const syncMdnsAdvertisement = () => {
+    if (!mdnsEnabled || disposed) return;
+    const wsInfo = inspectWebServerBinding(ctx);
+    const lanBound = lanHandle?.address?.();
+    const lanPort = (lanBound && typeof lanBound === 'object') ? lanBound.port : null;
+    const lanListening = Boolean(lanHandle?.isListening?.() && lanPort);
+    const activePort = (wsInfo.isRemotelyReachable && !lanListening)
+      ? wsInfo.port
+      : (lanListening ? lanPort : (wsInfo.isRemotelyReachable ? wsInfo.port : null));
+    if (!activePort) {
+      if (mdnsHandle) {
+        try { mdnsHandle.dispose(); } catch (err) { ignoreCleanupError(err); }
+        mdnsHandle = null;
+      }
+      return;
+    }
+    const mdnsPayload = {
+      hostName: hostname() || 'DSH',
+      port: activePort,
+      surface,
+      dshVersion: detectDshVersion(ctx),
+      bridgeVersion: core.version,
+      requiresAuth: true,
+    };
+    if (!mdnsHandle) {
+      mdnsHandle = startMdnsAdvertiser({
+        ...mdnsPayload,
+        getIpv4List: () => listReachableNetworkInterfaces().map((item) => item.ip),
+        logger,
+      });
+    } else {
+      mdnsHandle.update(mdnsPayload);
+    }
+  };
 
   const runLanOp = (fn) => {
     const next = lanOpChain.then(fn, fn);
@@ -1021,6 +1167,7 @@ export function createPairingController(ctx, core, config = {}) {
     if (prev) {
       try { await prev.dispose({ immediate }); } catch (err) { ignoreCleanupError(err); }
     }
+    syncMdnsAdvertisement();
   });
 
   const stopLanIfDisabled = (immediate = true) => runLanOp(async () => {
@@ -1031,6 +1178,7 @@ export function createPairingController(ctx, core, config = {}) {
     if (prev) {
       try { await prev.dispose({ immediate }); } catch (err) { ignoreCleanupError(err); }
     }
+    syncMdnsAdvertisement();
   });
 
   const startLan = (portOverride, { deferPrevDispose = false, onDeferredDispose } = {}) => runLanOp(async () => {
@@ -1060,6 +1208,7 @@ export function createPairingController(ctx, core, config = {}) {
       surface,
       logger,
       getPairingSnapshot: () => getSnapshot(),
+      verifyPairCode,
     });
     if (disposed) {
       try { await nextHandle.dispose({ immediate: true }); } catch (err) { ignoreCleanupError(err); }
@@ -1070,6 +1219,7 @@ export function createPairingController(ctx, core, config = {}) {
     }
     lanHandle = nextHandle;
     await nextHandle.ready;
+    syncMdnsAdvertisement();
     if (canDeferPrev) {
       if (typeof onDeferredDispose === 'function') {
         onDeferredDispose(() => {
@@ -1086,7 +1236,7 @@ export function createPairingController(ctx, core, config = {}) {
   });
 
   const qrCache = new Map();
-  const buildEndpoints = (port, tokenForUrl) => {
+  const buildEndpoints = (port, tokenForUrl, pairCode) => {
     if (!port) return [];
     const rawHostLabel = (hostname() || 'DSH').trim();
     const hostLabel = rawHostLabel.length > 24 ? rawHostLabel.slice(0, 24) : rawHostLabel;
@@ -1096,15 +1246,18 @@ export function createPairingController(ctx, core, config = {}) {
       const qs = new URLSearchParams();
       if (tokenForUrl) qs.set('token', tokenForUrl);
       if (hostLabel) qs.set('name', hostLabel);
+      if (pairCode) qs.set('p', pairCode);
       const url = qs.toString() ? `${base}/?${qs.toString()}` : base;
       const pairQs = new URLSearchParams({ url: base });
       if (tokenForUrl) pairQs.set('token', tokenForUrl);
       if (hostLabel) pairQs.set('name', hostLabel);
+      if (pairCode) pairQs.set('p', pairCode);
       const pairUri = `grassbag://pair?${pairQs.toString()}`;
       let qrUrl = url;
       if (Buffer.byteLength(qrUrl, 'utf8') > 200) {
         const compactQs = new URLSearchParams();
         if (tokenForUrl) compactQs.set('token', tokenForUrl);
+        if (pairCode) compactQs.set('p', pairCode);
         qrUrl = compactQs.toString() ? `${base}/?${compactQs.toString()}` : base;
       }
       let qr = qrCache.get(qrUrl) ?? null;
@@ -1135,10 +1288,12 @@ export function createPairingController(ctx, core, config = {}) {
   };
 
   const getSnapshot = () => {
+    const activePair = ensureActivePairingSession();
     const wsInfo = inspectWebServerBinding(ctx);
     const lanBound = lanHandle?.address?.();
     const lanPort = (lanBound && typeof lanBound === 'object') ? lanBound.port : null;
     const lanListening = Boolean(lanHandle?.isListening?.() && lanPort);
+    const lanError = lanHandle?.error?.() ?? null;
 
     let mode = 'loopback-only';
     let activePort = null;
@@ -1160,7 +1315,17 @@ export function createPairingController(ctx, core, config = {}) {
       activeToken = resolveSharedWebToken();
     }
 
-    const endpoints = buildEndpoints(activePort, activeToken);
+    if (activePort && !mdnsHandle && mdnsEnabled && !disposed) {
+      syncMdnsAdvertisement();
+    }
+
+    const endpoints = buildEndpoints(activePort, activeToken, activePair.code);
+    const activeDeviceConnected = Boolean(
+      activePair.clientConnId && core.hub.clients.has(activePair.clientConnId),
+    );
+    const effectivePairStatus = (lanWanted && !lanListening && lanError)
+      ? 'error'
+      : activePair.status;
 
     return {
       v: 1,
@@ -1177,6 +1342,14 @@ export function createPairingController(ctx, core, config = {}) {
       canRotateToken: mode === 'lan-bridge',
       token: activeToken,
       connectedClients: core.hub.clients.size,
+      pairingSession: {
+        code: activePair.code,
+        status: effectivePairStatus,
+        expiresAt: activePair.expiresAt,
+        connectedAt: activePair.connectedAt,
+        deviceLabel: activePair.deviceLabel,
+        activeDeviceConnected,
+      },
       webServer: {
         available: wsInfo.available,
         host: wsInfo.host,
@@ -1190,7 +1363,7 @@ export function createPairingController(ctx, core, config = {}) {
         host: lanHost,
         port: lanPort,
         preferredPort,
-        error: lanHandle?.error?.() ?? null,
+        error: lanError,
       },
       endpoints,
       primaryEndpoint: endpoints[0] ?? null,
@@ -1199,9 +1372,14 @@ export function createPairingController(ctx, core, config = {}) {
 
   const applyAction = async (body = {}, { deferLanStop = false, deferPrevDispose = false, onDeferredDispose } = {}) => {
     const action = String(body?.action || '').trim();
+    if (action === 'newPairingCode') {
+      rotatePairingSession();
+      return getSnapshot();
+    }
     if (action === 'rotateToken') {
       lanToken = persistRotatedLanToken();
       if (lanHandle) lanHandle.setToken(lanToken);
+      rotatePairingSession();
       // Immediately revoke active LAN WebSocket sessions so rotated-out devices must re-authorize.
       try { core.hub.disconnectByMode('lan', 4001, 'token rotated'); } catch (err) { logSuppressed(logger, 'pairing', err, { detail: 'disconnectByMode(lan) failed on token rotation' }); }
       return getSnapshot();
@@ -1217,7 +1395,7 @@ export function createPairingController(ctx, core, config = {}) {
         const snap = getSnapshot();
         const sharedOk = Boolean(snap.webServer?.isRemotelyReachable);
         const sharedToken = resolveSharedWebToken();
-        const sharedEndpoints = sharedOk ? buildEndpoints(snap.webServer.port, sharedToken) : [];
+        const sharedEndpoints = sharedOk ? buildEndpoints(snap.webServer.port, sharedToken, pairingSession.code) : [];
         return {
           ...snap,
           mode: sharedOk ? 'shared-webserver' : 'loopback-only',
@@ -1256,11 +1434,17 @@ export function createPairingController(ctx, core, config = {}) {
     startLan,
     stopLan,
     stopLanIfDisabled,
+    verifyPairCode,
+    rotatePairingSession,
     getSnapshot,
     applyAction,
     dispose: () => {
       disposed = true;
       lanWanted = false;
+      if (mdnsHandle) {
+        try { mdnsHandle.dispose(); } catch (err) { ignoreCleanupError(err); }
+        mdnsHandle = null;
+      }
       if (lanHandle) {
         try { lanHandle.dispose({ immediate: false }); } catch (err) { ignoreCleanupError(err); }
         lanHandle = null;

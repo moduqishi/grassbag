@@ -907,6 +907,13 @@ class GrassBagNativeBridge {
     return out.isEmpty ? null : out;
   }
 
+  /// Returns and clears any pending `grassbag://pair?...` deep link received on launch.
+  Future<String?> takePendingPairLink() async {
+    final res = await _safeInvoke<String>('pairing.takePendingLink');
+    final trimmed = res?.trim() ?? '';
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
   // System Permissions & Deep Links
   Future<NativePermissionsStatus?> getPermissionsStatus() async {
     final res = await _safeInvoke<Map<Object?, Object?>>('permissions.status');

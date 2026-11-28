@@ -14,14 +14,17 @@ import '../../theme/grassbag_theme.dart';
 import '../web/remote_web_login_page.dart';
 import 'qr_pair_scanner_page.dart';
 
-/// Unified, frictionless Remote DSH Host connector shared by Onboarding, Quick Connect Sheet,
-/// and Settings:
-/// - 1-tap QR code scan (`扫码连接`) matching `dsh-gbridge` Desktop/Web native QR pairing UI
-/// - Auto-scans LAN on mount with 1-tap connect for discovered open DSH hosts
-/// - Smart clipboard paste (recognizes `grassbag://pair?...`, `dsh web: http://.../?token=...`, bare IPs, and tokens)
-/// - Preserves freshly minted 30-day session cookies across diagnose -> connect (never burns a one-time token twice!)
-/// - Non-destructive pre-flight diagnosis: never hijacks activeHostId when unreachable or awaiting auth
-/// - Clean 2-tab Official Accelerated Plugin (Zero Port Conflict + QR UI) + Zero-Plugin CLI guide
+/// Unified "连接电脑" pairing flow shared by Onboarding, Top Bar, Settings, and Deep Links:
+/// - First screen asks what the user has right now:
+///   1) Scan QR code on computer (when camera available)
+///   2) Paste pairing / `dsh web` link (always visible)
+///   3) Prepare computer guide -> choose "我用 DSH Desktop" or "我已运行 dsh web"
+/// - Stays in place after scanning / pasting, displaying target computer name and live progress:
+///   `正在连接 → 正在授权 → 正在打开会话` with Cancel support.
+/// - Commits host switch ONLY after both real-time WebSocket handshake and sessions API pass,
+///   then presents "打开会话" as the primary action.
+/// - Preserves original session, drafts, and pairing input on failure, highlighting ONE
+///   actionable recovery CTA plus collapsible technical details.
 class RemoteHostConnectCard extends ConsumerStatefulWidget {
   const RemoteHostConnectCard({
     super.key,
@@ -30,48 +33,82 @@ class RemoteHostConnectCard extends ConsumerStatefulWidget {
     this.showHeader = true,
     this.initiallyShowGuide = false,
     this.autoScanLan = true,
+    this.autoLaunchScanner = false,
+    this.confirmBeforeConnect = false,
     this.embeddedInSheet = false,
     this.initialInput,
+    this.initialToken,
+    this.initialPairCode,
+    this.initialName,
+    this.initialAllowBadCerts = false,
     this.initialDiagnosis,
+    this.onDraftChanged,
+    this.onDiagnosisChanged,
   });
 
-  /// Official 1-line CLI command installing `dsh-gbridge.tgz` via China GitHub mirror (zero port conflict!).
+  /// Official 1-line CLI command installing `dsh-gbridge.tgz` via China GitHub mirror.
   static const String acceleratedInstallCommand =
       'dsh plugin add $kOfficialGbridgeAcceleratedUrl';
 
-  /// Shared Desktop GUI 1-tap AI prompt used across Onboarding, Quick Connect, Auth Sheet, and Host Detail.
-  /// Installs our official zero-conflict `dsh-gbridge` plugin via GitHub mirror directly into the
-  /// running DeepSeek Harness instance (NO slow second `dsh web` process, NO port conflict, shows QR UI!).
+  /// Short guide URL meant to be opened on a computer browser where copy buttons live.
+  static const String desktopShortGuideUrl = kOfficialDesktopPairingGuideUrl;
+
+  /// Shared Desktop GUI 1-tap AI prompt used across pairing help, Auth Sheet, and Host Detail.
   static const String desktopGuiPrompt = '''请帮我安装并启用 GrassBag 官方连接助手插件（零端口冲突、无需另开第二套 dsh web 服务，安装后会在桌面端左侧出现「手机连接」二维码面板）：
 1. 请直接使用当前 DeepSeek Harness 的插件管理能力（或本机 dsh CLI）安装官方加速包：
    $kOfficialGbridgeAcceleratedUrl
    （若主加速源下载失败，可自动改用备用源 $kOfficialGbridgeDirectUrl ）
 2. 插件启用后会自动复用当前运行的 DSH 实例（桌面端自动在 3081+ 零冲突端口开启局域网桥接，dsh web 直接复用原端口），无需额外启动新的 dsh web 进程；
-3. 安装完成后，请查看本机局域网 IPv4 地址与 ~/.dsh/gbridge-lan-token（或直接在左侧栏点开「手机连接」显示二维码），把配对链接发给我即可用手机 GrassBag 扫码或一键连接。''';
+3. 安装完成后，请在左侧栏点开「手机连接」显示配对二维码，或把配对链接发给我即可用手机 GrassBag 扫码连接。''';
 
-  /// Called after a host is added (and connected when [connectImmediately] is true).
+  /// Called when the user confirms opening the newly connected host (or immediately when
+  /// [connectImmediately] is false and host is saved).
   final ValueChanged<ManagedHost>? onConnectedHost;
 
-  /// If true, switches immediately to the newly connected host.
+  /// If true, switches to the newly verified host upon real-time + sessions verification.
   final bool connectImmediately;
 
-  /// Whether to render the card's title row ("直连远程 DSH 设备").
+  /// Whether to render the card's title row ("连接电脑").
   final bool showHeader;
 
-  /// Whether to expand the Desktop/CLI setup guide initially.
+  /// Whether to expand the preparation guide initially.
   final bool initiallyShowGuide;
 
-  /// Whether to automatically trigger a lightweight LAN scan when this card opens.
+  /// Whether to automatically trigger a lightweight background LAN/mDNS scan on native platforms.
   final bool autoScanLan;
+
+  /// When true, opens the QR scanner immediately after mount while keeping this pairing sheet open.
+  final bool autoLaunchScanner;
+
+  /// When true (e.g. opened from a `grassbag://pair?...` deep link), displays target computer
+  /// confirmation first before starting the connection.
+  final bool confirmBeforeConnect;
 
   /// When rendered inside a modal sheet, omits the redundant outer GrassBagCard chrome.
   final bool embeddedInSheet;
 
-  /// Optional prefilled URL/token/pair string (e.g. forwarded from a failed QR quick-connect).
+  /// Optional prefilled URL/token/pair string.
   final String? initialInput;
 
-  /// Optional prefilled diagnosis from a failed QR quick-connect so user sees exact remediation.
+  /// Optional prefilled token/pairCode/name/TLS flags preserved across step transitions.
+  final String? initialToken;
+  final String? initialPairCode;
+  final String? initialName;
+  final bool initialAllowBadCerts;
+
+  /// Optional prefilled diagnosis from an earlier attempt.
   final RemoteHostDiagnosis? initialDiagnosis;
+
+  /// Notifies parent when the user edits address/token/name/TLS flags so state survives step switches.
+  final void Function({
+    required String address,
+    required String token,
+    required String name,
+    required bool allowBadCerts,
+  })? onDraftChanged;
+
+  /// Notifies parent whenever diagnosis updates or clears.
+  final ValueChanged<RemoteHostDiagnosis?>? onDiagnosisChanged;
 
   @override
   ConsumerState<RemoteHostConnectCard> createState() => _RemoteHostConnectCardState();
@@ -86,17 +123,31 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
 
   bool _showAdvanced = false;
   late bool _showGuide;
-  int _guideTab = 0; // 0: 桌面端 (免命令), 1: 命令行 (dsh web)
+  int _guideTab = 0; // 0: 我用 DSH Desktop, 1: 我已运行 dsh web
+  bool _showCliCommands = false;
+  bool _showDesktopAdvancedCopy = false;
   int _cliOsTab = 0; // 0: macOS, 1: Windows, 2: Linux
   bool _allowBadCerts = false;
   bool _allowInsecurePublicHttp = false;
   bool _obscureToken = true;
-  bool _connecting = false;
-  bool _hasScannedLan = false;
-  bool _hadAddrText = false;
+  bool _explicitEmptyScan = false;
+  bool _awaitingDeepLinkConfirm = false;
+  bool _showTechnicalDetail = false;
+  String? _pairCode;
   String? _capturedCookie;
   String? _selectedLanAddr;
   RemoteHostDiagnosis? _diagnosis;
+
+  PairingStage _stage = PairingStage.idle;
+  String? _targetComputerName;
+  ManagedHost? _verifiedHost;
+  int? _verifiedSessionCount;
+  int _connectRunGen = 0;
+
+  bool get _isPairingInProgress =>
+      _stage == PairingStage.connecting ||
+      _stage == PairingStage.authorizing ||
+      _stage == PairingStage.openingSession;
 
   bool get _supportsInAppWebLogin =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -107,8 +158,111 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
           defaultTargetPlatform == TargetPlatform.iOS ||
           defaultTargetPlatform == TargetPlatform.macOS);
 
+  bool get _supportsLanDiscovery {
+    if (kIsWeb) return false;
+    final isLiveApp = WidgetsBinding.instance is WidgetsFlutterBinding;
+    return GrassBagNativeBridge.instance.isPluginVerified ||
+        (GrassBagNativeBridge.instance.isAndroidNative && isLiveApp);
+  }
+
+  void _emitDraftChanged() {
+    widget.onDraftChanged?.call(
+      address: _addrCtrl.text,
+      token: _tokenCtrl.text,
+      name: _nameCtrl.text,
+      allowBadCerts: _allowBadCerts,
+    );
+  }
+
+  void _setDiagnosisState(RemoteHostDiagnosis? diag) {
+    _diagnosis = diag;
+    _showTechnicalDetail = false;
+    widget.onDiagnosisChanged?.call(diag);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _showGuide = widget.initiallyShowGuide;
+    _allowBadCerts = widget.initialAllowBadCerts;
+    if (widget.initialInput != null && widget.initialInput!.trim().isNotEmpty) {
+      final parsed = parseRemoteHostInput(widget.initialInput!.trim());
+      if (parsed != null) {
+        _addrCtrl.text = parsed.address;
+        if (parsed.token != null && parsed.token!.isNotEmpty) {
+          _tokenCtrl.text = parsed.token!;
+        }
+        if (parsed.pairCode != null && parsed.pairCode!.isNotEmpty) {
+          _pairCode = parsed.pairCode;
+        }
+        if (parsed.suggestedName != null && parsed.suggestedName!.isNotEmpty) {
+          _nameCtrl.text = parsed.suggestedName!;
+          _targetComputerName = parsed.suggestedName;
+        }
+      } else {
+        _addrCtrl.text = widget.initialInput!.trim();
+      }
+    }
+    if (widget.initialToken != null &&
+        widget.initialToken!.trim().isNotEmpty &&
+        _tokenCtrl.text.trim().isEmpty) {
+      _tokenCtrl.text = widget.initialToken!.trim();
+    }
+    if (widget.initialPairCode != null &&
+        widget.initialPairCode!.trim().isNotEmpty &&
+        (_pairCode == null || _pairCode!.isEmpty)) {
+      _pairCode = widget.initialPairCode!.trim();
+    }
+    if (widget.initialName != null &&
+        widget.initialName!.trim().isNotEmpty &&
+        _nameCtrl.text.trim().isEmpty) {
+      _nameCtrl.text = widget.initialName!.trim();
+      _targetComputerName = widget.initialName!.trim();
+    }
+    if (widget.confirmBeforeConnect && _addrCtrl.text.trim().isNotEmpty) {
+      _awaitingDeepLinkConfirm = true;
+    } else if (_tokenCtrl.text.trim().isNotEmpty ||
+        _nameCtrl.text.trim().isNotEmpty ||
+        _allowBadCerts) {
+      _showAdvanced = true;
+    }
+    if (widget.initialDiagnosis != null) {
+      _diagnosis = widget.initialDiagnosis;
+      _stage = widget.initialDiagnosis!.canConnectNow
+          ? PairingStage.idle
+          : PairingStage.failed;
+    }
+    if (widget.autoScanLan && _supportsLanDiscovery && !widget.confirmBeforeConnect) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final state = ref.read(appProvider);
+        if (!state.scanningLan && state.discoveredLanHosts.isEmpty) {
+          unawaited(ref.read(appProvider.notifier).scanLanForHosts(silent: true));
+        }
+      });
+    }
+    if (widget.autoLaunchScanner && _supportsQrScan) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          unawaited(_scanQrCode());
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _connectRunGen++;
+    _addrCtrl.dispose();
+    _nameCtrl.dispose();
+    _tokenCtrl.dispose();
+    _addrFocus.dispose();
+    _tokenFocus.dispose();
+    super.dispose();
+  }
+
   Future<void> _scanQrCode() async {
-    if (_connecting) return;
+    if (_isPairingInProgress) return;
     final raw = await Navigator.of(context).push<String>(
       GrassBagPageRoute<String>(
         builder: (_) => const QrPairScannerPage(),
@@ -122,100 +276,60 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     final parsed = parseRemoteHostInput(text);
     if (parsed == null) {
       _addrCtrl.text = text;
-      _hadAddrText = text.trim().isNotEmpty;
       setState(() {
         _capturedCookie = null;
-        _diagnosis = null;
+        _pairCode = null;
+        _awaitingDeepLinkConfirm = false;
+        _verifiedHost = null;
+        _stage = PairingStage.failed;
+        _setDiagnosisState(const RemoteHostDiagnosis(
+          kind: RemoteDiagnosisKind.invalidAddress,
+          title: '未识别到有效连接链接',
+          message: '请扫描电脑端「手机连接」二维码，或粘贴完整的 `http://.../?token=...` 连接链接。',
+        ));
       });
-      ref.read(appProvider.notifier).showToast('已填入$sourceLabel内容，请核对地址格式', tone: ToastTone.info);
+      _emitDraftChanged();
       return;
     }
     final addrChanged = _addrCtrl.text.trim() != parsed.address;
     _addrCtrl.text = parsed.address;
-    _hadAddrText = parsed.address.trim().isNotEmpty;
     if (parsed.token != null && parsed.token!.isNotEmpty) {
       _tokenCtrl.text = parsed.token!;
     } else if (addrChanged) {
       _tokenCtrl.clear();
     }
-    if (_nameCtrl.text.trim().isEmpty && parsed.suggestedName != null) {
-      _nameCtrl.text = parsed.suggestedName!;
+    _pairCode = parsed.pairCode;
+    if (parsed.suggestedName != null && parsed.suggestedName!.isNotEmpty) {
+      if (addrChanged || _nameCtrl.text.trim().isEmpty) {
+        _nameCtrl.text = parsed.suggestedName!;
+      }
+      _targetComputerName = parsed.suggestedName;
+    } else {
+      _targetComputerName = parsed.address;
     }
     setState(() {
       if (addrChanged) _capturedCookie = null;
       _selectedLanAddr = null;
-      _diagnosis = null;
+      _awaitingDeepLinkConfirm = false;
+      _verifiedHost = null;
+      _verifiedSessionCount = null;
+      _stage = PairingStage.idle;
+      _setDiagnosisState(null);
     });
-    if (parsed.token != null && parsed.token!.isNotEmpty) {
-      ref.read(appProvider.notifier).showToast('已识别$sourceLabel配对信息，正在一键接入…', tone: ToastTone.ok);
-      await _connectNow();
-    } else {
-      ref.read(appProvider.notifier).showToast('已识别远程地址，正在检测连通性…', tone: ToastTone.ok);
-      await _diagnoseOnly();
-    }
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _showGuide = widget.initiallyShowGuide;
-    if (widget.initialInput != null && widget.initialInput!.trim().isNotEmpty) {
-      final parsed = parseRemoteHostInput(widget.initialInput!.trim());
-      if (parsed != null) {
-        _addrCtrl.text = parsed.address;
-        if (parsed.token != null && parsed.token!.isNotEmpty) {
-          _tokenCtrl.text = parsed.token!;
-        }
-        if (parsed.suggestedName != null && parsed.suggestedName!.isNotEmpty) {
-          _nameCtrl.text = parsed.suggestedName!;
-        }
-      } else {
-        _addrCtrl.text = widget.initialInput!.trim();
-      }
-    }
-    _hadAddrText = _addrCtrl.text.trim().isNotEmpty;
-    if (widget.initialDiagnosis != null) {
-      _diagnosis = widget.initialDiagnosis;
-    }
-    final isLiveApp = WidgetsBinding.instance is WidgetsFlutterBinding;
-    final canAutoScan = !kIsWeb &&
-        (GrassBagNativeBridge.instance.isPluginVerified ||
-            (GrassBagNativeBridge.instance.isAndroidNative && isLiveApp));
-    if (widget.autoScanLan && canAutoScan) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        final state = ref.read(appProvider);
-        if (!state.scanningLan && state.discoveredLanHosts.isEmpty) {
-          setState(() => _hasScannedLan = true);
-          unawaited(ref.read(appProvider.notifier).scanLanForHosts(silent: true));
-        } else if (state.discoveredLanHosts.isNotEmpty) {
-          setState(() => _hasScannedLan = true);
-        }
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _addrCtrl.dispose();
-    _nameCtrl.dispose();
-    _tokenCtrl.dispose();
-    _addrFocus.dispose();
-    _tokenFocus.dispose();
-    super.dispose();
+    _emitDraftChanged();
+    await _connectNow();
   }
 
   Future<void> _pasteFromClipboard() async {
+    if (_isPairingInProgress) return;
     final data = await Clipboard.getData(Clipboard.kTextPlain);
     if (!mounted) return;
     final text = data?.text?.trim() ?? '';
     if (text.isEmpty) {
-      ref.read(appProvider.notifier).showToast('剪贴板为空，请先在电脑端复制链接或令牌', tone: ToastTone.info);
+      ref.read(appProvider.notifier).showToast('剪贴板为空，请先在电脑端复制配对链接或启动链接', tone: ToastTone.info);
       return;
     }
     final parsed = parseRemoteHostInput(text);
-    // Treat as a bare token (including JWTs / dotted tokens!) ONLY when it does NOT parse as a
-    // host URL/IP and the user already has a host address entered.
     final looksBareToken = _addrCtrl.text.trim().isNotEmpty &&
         parsed == null &&
         !text.contains('://') &&
@@ -225,66 +339,35 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
       _tokenCtrl.text = text;
       setState(() {
         _showAdvanced = true;
-        _diagnosis = null;
+        _awaitingDeepLinkConfirm = false;
+        _stage = PairingStage.idle;
+        _setDiagnosisState(null);
       });
-      ref.read(appProvider.notifier).showToast('已填入访问令牌，正在验证并连接…', tone: ToastTone.ok);
+      _emitDraftChanged();
       await _connectNow();
       return;
     }
     await _applyParsedRemoteText(text, sourceLabel: '剪贴板');
   }
 
-  Future<RemoteHostDiagnosis?> _diagnoseOnly() async {
-    final raw = _addrCtrl.text.trim();
-    if (raw.isEmpty) {
-      _addrFocus.requestFocus();
-      ref.read(appProvider.notifier).showToast('请先输入远程地址或粘贴启动链接', tone: ToastTone.warn);
-      return null;
-    }
-    if (_connecting) return _diagnosis;
-    setState(() => _connecting = true);
-    try {
-      final diag = await ref.read(appProvider.notifier).diagnoseRemoteHost(
-            raw,
-            token: _tokenCtrl.text.trim().isEmpty ? null : _tokenCtrl.text.trim(),
-            cookie: _capturedCookie,
-            allowBadCertificates: _allowBadCerts,
-            allowInsecurePublicHttp: _allowInsecurePublicHttp,
-          );
-      if (!mounted) return diag;
-      _applyDiagnosisFields(diag, raw);
-      if (diag.needsWebOrTokenAuth) {
-        setState(() => _showAdvanced = true);
-      }
-      return diag;
-    } finally {
-      if (mounted) setState(() => _connecting = false);
-    }
-  }
-
-  void _applyDiagnosisFields(RemoteHostDiagnosis diag, String raw) {
-    if (diag.normalizedAddress != null && diag.normalizedAddress != raw) {
-      _addrCtrl.text = diag.normalizedAddress!;
-    }
-    if (diag.extractedToken != null &&
-        diag.extractedToken!.isNotEmpty &&
-        _tokenCtrl.text.trim().isEmpty) {
-      _tokenCtrl.text = diag.extractedToken!;
-    }
-    if (diag.capturedCookie != null && diag.capturedCookie!.isNotEmpty) {
-      _capturedCookie = diag.capturedCookie;
-    }
-    setState(() => _diagnosis = diag);
+  void _cancelPairing() {
+    if (!_isPairingInProgress) return;
+    _connectRunGen++;
+    setState(() {
+      _stage = PairingStage.idle;
+      _setDiagnosisState(null);
+    });
+    ref.read(appProvider.notifier).showToast('已取消连接，原对话未受影响', tone: ToastTone.info);
   }
 
   Future<void> _openInAppWebLogin() async {
     final parsed = parseRemoteHostInput(_addrCtrl.text.trim());
     if (parsed == null) {
-      ref.read(appProvider.notifier).showToast('请先填写远程主机地址', tone: ToastTone.warn);
+      ref.read(appProvider.notifier).showToast('请先填写或粘贴电脑连接链接', tone: ToastTone.warn);
       return;
     }
     final displayName =
-        _nameCtrl.text.trim().isNotEmpty ? _nameCtrl.text.trim() : (parsed.suggestedName ?? '远程主机');
+        _nameCtrl.text.trim().isNotEmpty ? _nameCtrl.text.trim() : (parsed.suggestedName ?? '远程电脑');
     final cookie = await Navigator.of(context).push<String>(
       GrassBagPageRoute<String>(
         builder: (_) => RemoteWebLoginPage(
@@ -296,132 +379,152 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     );
     if (!mounted || cookie == null || cookie.trim().isEmpty) return;
     setState(() => _capturedCookie = cookie.trim());
-    ref.read(appProvider.notifier).showToast('已获取 30 天免密登录凭证，正在接入…', tone: ToastTone.ok);
     await _connectNow();
   }
 
+  void _applyDiagnosisFields(RemoteHostDiagnosis diag, String raw) {
+    if (diag.normalizedAddress != null && diag.normalizedAddress != raw) {
+      _addrCtrl.text = diag.normalizedAddress!;
+    }
+    if (diag.extractedToken != null &&
+        diag.extractedToken!.isNotEmpty &&
+        _tokenCtrl.text.trim().isEmpty) {
+      _tokenCtrl.text = diag.extractedToken!;
+    }
+    if (diag.extractedPairCode != null && diag.extractedPairCode!.isNotEmpty) {
+      _pairCode = diag.extractedPairCode;
+    }
+    if (diag.capturedCookie != null && diag.capturedCookie!.isNotEmpty) {
+      _capturedCookie = diag.capturedCookie;
+    }
+    if (diag.hostName != null && diag.hostName!.trim().isNotEmpty) {
+      _targetComputerName = diag.hostName!.trim();
+    }
+    _setDiagnosisState(diag);
+    _emitDraftChanged();
+  }
+
   Future<void> _connectNow() async {
-    if (_connecting) return;
+    if (_isPairingInProgress) return;
     final raw = _addrCtrl.text.trim();
     if (raw.isEmpty) {
       _addrFocus.requestFocus();
-      ref.read(appProvider.notifier).showToast('请先输入远程地址或粘贴启动链接', tone: ToastTone.warn);
+      ref.read(appProvider.notifier).showToast('请先扫码，或粘贴电脑上的连接链接', tone: ToastTone.warn);
       return;
     }
-    setState(() => _connecting = true);
-    try {
-      final ctrl = ref.read(appProvider.notifier);
-      final tokenText = _tokenCtrl.text.trim();
-      if (!widget.connectImmediately) {
-        final diag = await ctrl.diagnoseRemoteHost(
-          raw,
-          token: tokenText.isEmpty ? null : tokenText,
-          cookie: _capturedCookie,
-          allowBadCertificates: _allowBadCerts,
-          allowInsecurePublicHttp: _allowInsecurePublicHttp,
-        );
-        if (!mounted) return;
-        _applyDiagnosisFields(diag, raw);
-        if (diag.canConnectNow && diag.normalizedAddress != null) {
-          final created = ctrl.addRemoteHost(
-            diag.normalizedAddress!,
-            name: _nameCtrl.text.trim(),
-            token: diag.extractedToken ?? (tokenText.isEmpty ? null : tokenText),
-            cookie: diag.capturedCookie ?? _capturedCookie,
-            allowBadCertificates: _allowBadCerts,
-            autoProbe: true,
-          );
-          if (created != null) {
-            _resetForm();
-            widget.onConnectedHost?.call(created);
-          }
-        } else if (diag.needsWebOrTokenAuth) {
-          setState(() => _showAdvanced = true);
-          if (diag.kind != RemoteDiagnosisKind.htmlLoginPage) {
-            _tokenFocus.requestFocus();
-          }
-        }
-        return;
-      }
+    final parsed = parseRemoteHostInput(raw);
+    final initialComputer = _nameCtrl.text.trim().isNotEmpty
+        ? _nameCtrl.text.trim()
+        : (parsed?.suggestedName ?? raw);
+    final myGen = ++_connectRunGen;
 
-      // Non-destructive 1-tap connect: diagnoses first, preserves newly minted session cookie,
-      // and NEVER switches activeHostId if unreachable or awaiting auth!
-      final outcome = await ctrl.connectRemoteInput(
-        raw,
-        name: _nameCtrl.text.trim(),
-        token: tokenText.isEmpty ? null : tokenText,
-        cookie: _capturedCookie,
-        allowBadCertificates: _allowBadCerts,
-        allowInsecurePublicHttp: _allowInsecurePublicHttp,
-      );
-      if (!mounted) return;
+    setState(() {
+      _awaitingDeepLinkConfirm = false;
+      _verifiedHost = null;
+      _verifiedSessionCount = null;
+      _targetComputerName = initialComputer;
+      _stage = PairingStage.connecting;
+      _setDiagnosisState(null);
+    });
+
+    final ctrl = ref.read(appProvider.notifier);
+    final tokenText = _tokenCtrl.text.trim();
+
+    final outcome = await ctrl.connectRemoteInput(
+      raw,
+      name: _nameCtrl.text.trim().isEmpty ? null : _nameCtrl.text.trim(),
+      token: tokenText.isEmpty ? null : tokenText,
+      pairCode: _pairCode,
+      cookie: _capturedCookie,
+      allowBadCertificates: _allowBadCerts,
+      allowInsecurePublicHttp: _allowInsecurePublicHttp,
+      switchOnSuccess: widget.connectImmediately,
+      isCancelled: () => !mounted || _connectRunGen != myGen,
+      onStageChanged: (nextStage, {String? computerName}) {
+        if (!mounted || _connectRunGen != myGen) return;
+        setState(() {
+          _stage = nextStage;
+          if (computerName != null && computerName.trim().isNotEmpty) {
+            _targetComputerName = computerName.trim();
+          }
+        });
+      },
+    );
+
+    if (!mounted || _connectRunGen != myGen) return;
+    if (outcome.cancelled) {
+      setState(() {
+        _stage = PairingStage.idle;
+      });
+      return;
+    }
+
+    setState(() {
       _applyDiagnosisFields(outcome.diagnosis, raw);
       if (outcome.connected && outcome.host != null) {
-        _resetForm();
-        widget.onConnectedHost?.call(outcome.host!);
-      } else if (outcome.diagnosis.needsWebOrTokenAuth) {
-        setState(() => _showAdvanced = true);
-        if (outcome.diagnosis.kind != RemoteDiagnosisKind.htmlLoginPage) {
-          _tokenFocus.requestFocus();
+        _verifiedHost = outcome.host;
+        _verifiedSessionCount = outcome.sessionCount;
+        _targetComputerName = outcome.host!.name;
+        _stage = PairingStage.ready;
+      } else {
+        _stage = PairingStage.failed;
+        if (outcome.diagnosis.kind == RemoteDiagnosisKind.needsAuth) {
+          _showAdvanced = true;
         }
       }
-    } finally {
-      if (mounted) setState(() => _connecting = false);
-    }
-  }
-
-  void _resetForm() {
-    _addrCtrl.clear();
-    _nameCtrl.clear();
-    _tokenCtrl.clear();
-    setState(() {
-      _capturedCookie = null;
-      _diagnosis = null;
-      _selectedLanAddr = null;
     });
   }
 
   Future<void> _onTapLanHost(DiscoveredLanHost h) async {
+    if (_isPairingInProgress) return;
     final changed = _addrCtrl.text.trim() != h.address;
     _addrCtrl.text = h.address;
     _nameCtrl.text = h.name;
+    _targetComputerName = h.name;
     setState(() {
       if (changed) {
         _capturedCookie = null;
         _tokenCtrl.clear();
+        _pairCode = null;
       }
       _selectedLanAddr = h.address;
-      _diagnosis = null;
+      _awaitingDeepLinkConfirm = false;
+      _verifiedHost = null;
+      _stage = PairingStage.idle;
+      _setDiagnosisState(null);
     });
-    if (!h.requiresAuth && h.isDsh) {
-      await _connectNow();
-    } else {
-      await _diagnoseOnly();
-      if (mounted && _diagnosis?.needsWebOrTokenAuth == true) {
-        setState(() => _showAdvanced = true);
-        if (_diagnosis?.kind != RemoteDiagnosisKind.htmlLoginPage) {
-          _tokenFocus.requestFocus();
-        }
-      }
-    }
+    _emitDraftChanged();
+    await _connectNow();
   }
 
-  void _copyCommand(String cmd) {
-    Clipboard.setData(ClipboardData(text: cmd));
-    ref.read(appProvider.notifier).showToast('已复制启动命令到剪贴板', tone: ToastTone.ok);
+  void _focusReplaceLink() {
+    setState(() {
+      _stage = PairingStage.idle;
+      _setDiagnosisState(null);
+    });
+    _addrFocus.requestFocus();
+    _addrCtrl.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _addrCtrl.text.length,
+    );
+  }
+
+  void _copyText(String content, String toastMsg) {
+    Clipboard.setData(ClipboardData(text: content));
+    ref.read(appProvider.notifier).showToast(toastMsg, tone: ToastTone.ok);
   }
 
   (String label, String cmd) get _currentCliCommand => switch (_cliOsTab) {
         0 => (
-            'macOS 终端（自动检测当前网卡 IP）',
+            'macOS 终端（自动绑定当前网卡 IP）',
             r'dsh web --host $(ipconfig getifaddr $(route -n get default 2>/dev/null | awk "/interface:/{print \$2}" | head -n1) 2>/dev/null || ipconfig getifaddr en0) --no-open',
           ),
         1 => (
-            'Windows PowerShell（自动检测默认出口 IP）',
+            'Windows PowerShell（自动绑定当前网卡 IP）',
             r'$ip=(Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1 | Get-NetIPAddress -AddressFamily IPv4).IPAddress; dsh web --host $ip --no-open',
           ),
         _ => (
-            'Linux 终端（自动检测默认路由 IP）',
+            'Linux 终端（自动绑定当前网卡 IP）',
             r'dsh web --host $(ip -4 route get 1.1.1.1 | awk "{for(i=1;i<=NF;i++) if(\$i==\"src\") {print \$(i+1); exit}}") --no-open',
           ),
       };
@@ -444,93 +547,116 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     final body = Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-          if (widget.showHeader) ...[
-            Row(
-              children: [
-                GrassBagSquircleIcon(
-                  icon: CupertinoIcons.desktopcomputer,
-                  color: t.primary,
-                  size: 36,
-                  iconSize: 17,
-                ),
-                const SizedBox(width: 11),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '直连远程电脑 / 服务器',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w600,
-                          color: t.text,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '支持扫码秒连官方插件 · 也支持免插件直连原版 DSH',
-                        style: TextStyle(fontSize: 11.5, color: t.text3),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-          ],
-
-          // Quick-Action Top Bar: 1-tap QR Scan — single primary CTA hierarchy per viewport
-          if (_supportsQrScan) ...[
-            if (_addrCtrl.text.trim().isEmpty && _selectedLanAddr == null && diag == null)
-              GrassBagPrimaryGlassButton(
-                label: '扫码连接',
-                icon: CupertinoIcons.qrcode_viewfinder,
-                height: 42,
-                tier: slice.glassTier,
-                insideGlass: true,
-                enabled: !_connecting,
-                onTap: _connecting ? null : _scanQrCode,
-              )
-            else
-              GrassBagSecondaryGlassButton(
-                label: '改用扫码连接',
-                icon: CupertinoIcons.qrcode_viewfinder,
-                height: 40,
-                tier: slice.glassTier,
-                insideGlass: true,
-                accentForeground: true,
-                enabled: !_connecting,
-                onTap: _connecting ? null : _scanQrCode,
+        if (widget.showHeader) ...[
+          Row(
+            children: [
+              GrassBagSquircleIcon(
+                icon: CupertinoIcons.desktopcomputer,
+                color: t.primary,
+                size: 36,
+                iconSize: 17,
               ),
-            const SizedBox(height: 11),
-          ],
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '连接电脑',
+                      style: TextStyle(
+                        fontSize: 15.5,
+                        fontWeight: FontWeight.w700,
+                        color: t.text,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '按你手里已有的信息扫码或粘贴链接，确认可打开会话后再切换',
+                      style: TextStyle(fontSize: 11.5, color: t.text3),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+        ],
 
-          // LAN Auto-Discovery Live Radar Strip
-          if (!kIsWeb) ...[
-            _LanRadarStrip(
-              scanning: slice.scanningLan,
-              hasScanned: _hasScannedLan,
-              hosts: slice.discoveredLanHosts,
-              selectedAddr: _selectedLanAddr,
-              busy: _connecting,
-              onRescan: () {
-                setState(() => _hasScannedLan = true);
-                ctrl.scanLanForHosts();
-              },
-              onSelectHost: _onTapLanHost,
-              onOpenGuide: () => setState(() {
-                _showGuide = true;
-                _guideTab = 0;
-              }),
+        // -------------------------------------------------------------------
+        // A. Deep-link confirmation gate ("先展示目标电脑再继续")
+        // -------------------------------------------------------------------
+        if (_awaitingDeepLinkConfirm && _stage == PairingStage.idle) ...[
+          _DeepLinkConfirmCard(
+            computerName: _targetComputerName ?? _addrCtrl.text.trim(),
+            address: _addrCtrl.text.trim(),
+            tier: slice.glassTier,
+            onConfirm: _connectNow,
+            onCancel: () {
+              setState(() {
+                _awaitingDeepLinkConfirm = false;
+              });
+            },
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // -------------------------------------------------------------------
+        // B. Live in-place pairing progress stepper (stays on page after scan!)
+        // -------------------------------------------------------------------
+        if (_isPairingInProgress) ...[
+          _PairingProgressCard(
+            computerName: _targetComputerName ?? _addrCtrl.text.trim(),
+            address: _addrCtrl.text.trim(),
+            stage: _stage,
+            tier: slice.glassTier,
+            onCancel: _cancelPairing,
+          ),
+        ]
+        // -------------------------------------------------------------------
+        // C. Verified Ready state — ONLY after WS handshake + sessions API pass
+        // -------------------------------------------------------------------
+        else if (_stage == PairingStage.ready && _verifiedHost != null) ...[
+          _PairingReadyCard(
+            host: _verifiedHost!,
+            sessionCount: _verifiedSessionCount,
+            message: diag?.message ?? '实时连接与会话列表已就绪，可以开始对话。',
+            tier: slice.glassTier,
+            onOpenSession: () {
+              final host = _verifiedHost!;
+              widget.onConnectedHost?.call(host);
+            },
+          ),
+        ]
+        // -------------------------------------------------------------------
+        // D. Normal / Recovery first-screen pairing actions
+        // -------------------------------------------------------------------
+        else ...[
+          // Action 1: Scan QR code on computer (mobile / macOS camera devices)
+          if (_supportsQrScan && diag == null) ...[
+            GrassBagPrimaryGlassButton(
+              key: const ValueKey('pair-scan-qr-btn'),
+              label: '扫电脑上的二维码',
+              icon: CupertinoIcons.qrcode_viewfinder,
+              height: 44,
+              tier: slice.glassTier,
+              insideGlass: true,
+              onTap: _scanQrCode,
             ),
-            const SizedBox(height: 11),
+            Padding(
+              padding: const EdgeInsets.only(top: 4, left: 4, bottom: 10),
+              child: Text(
+                '电脑已经显示二维码时直接扫，扫完后在此页等待连接完成',
+                style: TextStyle(fontSize: 11.5, color: t.text3),
+              ),
+            ),
           ],
 
-          // Smart Address / One-Line Link Input + Integrated Clipboard Paste Pill
+          // Action 2: Always-visible Paste Link bar & smart input
           GrassBagTextField(
+            key: const ValueKey('pair-link-input'),
             controller: _addrCtrl,
             focusNode: _addrFocus,
-            placeholder: '粘贴 dsh web: http://... 链接，或输入 IP:端口',
+            placeholder: '粘贴电脑配对链接或 dsh web 启动链接',
             insideGlass: true,
             monospace: true,
             keyboardType: TextInputType.url,
@@ -546,21 +672,17 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                     onTap: () {
                       _addrCtrl.clear();
                       _tokenCtrl.clear();
-                      _hadAddrText = false;
-                      if (_diagnosis != null ||
-                          _capturedCookie != null ||
-                          _selectedLanAddr != null) {
-                        setState(() {
-                          _capturedCookie = null;
-                          _selectedLanAddr = null;
-                          _diagnosis = null;
-                        });
-                      } else {
-                        setState(() {});
-                      }
+                      _pairCode = null;
+                      _capturedCookie = null;
+                      _selectedLanAddr = null;
+                      setState(() {
+                        _stage = PairingStage.idle;
+                        _setDiagnosisState(null);
+                      });
+                      _emitDraftChanged();
                     },
                     child: Tooltip(
-                      message: '清空地址',
+                      message: '清空链接',
                       child: SizedBox(
                         width: 34,
                         height: 34,
@@ -578,11 +700,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 return Padding(
                   padding: const EdgeInsets.only(right: 5),
                   child: GrassBagSpringTap(
+                    key: const ValueKey('pair-paste-link-btn'),
                     enablePointerGlow: false,
                     haptic: true,
-                    onTap: () {
-                      if (!_connecting) _pasteFromClipboard();
-                    },
+                    onTap: _pasteFromClipboard,
                     child: GrassBagFresnelGlassSurface(
                       borderRadius: 10,
                       innerWell: true,
@@ -595,7 +716,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                           Icon(CupertinoIcons.doc_on_clipboard, size: 12.5, color: t.primary),
                           const SizedBox(width: 4),
                           Text(
-                            '粘贴',
+                            '粘贴连接链接',
                             style: TextStyle(
                               fontSize: 11.5,
                               fontWeight: FontWeight.w600,
@@ -609,52 +730,124 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 );
               },
             ),
-            onChanged: (v) {
-              final hasText = v.trim().isNotEmpty;
-              final toggledEmpty = hasText != _hadAddrText;
-              _hadAddrText = hasText;
-              if (_diagnosis != null || _capturedCookie != null || _selectedLanAddr != null) {
+            onChanged: (_) {
+              _emitDraftChanged();
+              if (_diagnosis != null ||
+                  _capturedCookie != null ||
+                  _selectedLanAddr != null ||
+                  _pairCode != null) {
                 setState(() {
                   _capturedCookie = null;
                   _selectedLanAddr = null;
-                  _diagnosis = null;
+                  _pairCode = null;
+                  _stage = PairingStage.idle;
+                  _setDiagnosisState(null);
                 });
-              } else if (_supportsQrScan && toggledEmpty) {
+              } else {
                 setState(() {});
               }
             },
             onSubmitted: (_) => _connectNow(),
           ),
 
-          // Collapsible Advanced Options (Custom Name, Token, Self-signed TLS)
-          const SizedBox(height: 6),
+          // Primary Connect CTA when user typed/pasted a link (and no failure banner overriding primary CTA)
+          if (diag == null && _addrCtrl.text.trim().isNotEmpty && !_awaitingDeepLinkConfirm) ...[
+            const SizedBox(height: 10),
+            GrassBagPrimaryGlassButton(
+              key: const ValueKey('pair-connect-submit-btn'),
+              label: '连接这台电脑',
+              icon: CupertinoIcons.arrow_right_circle_fill,
+              height: 44,
+              tier: slice.glassTier,
+              insideGlass: true,
+              onTap: _connectNow,
+            ),
+          ] else if (diag == null && !_supportsQrScan && !_awaitingDeepLinkConfirm) ...[
+            const SizedBox(height: 10),
+            GrassBagPrimaryGlassButton(
+              key: const ValueKey('pair-paste-primary-btn'),
+              label: '粘贴连接链接并连接',
+              icon: CupertinoIcons.doc_on_clipboard,
+              height: 44,
+              tier: slice.glassTier,
+              insideGlass: true,
+              onTap: _pasteFromClipboard,
+            ),
+          ],
+
+          // Live Failure Recovery Banner (single primary actionable CTA + collapsible tech details)
+          if (diag != null && _stage == PairingStage.failed) ...[
+            const SizedBox(height: 10),
+            GrassBagStatusBanner(
+              key: const ValueKey('pair-failure-banner'),
+              tone: diag.kind == RemoteDiagnosisKind.selfDevice ||
+                      diag.needsWebOrTokenAuth
+                  ? GrassBagBannerTone.warn
+                  : GrassBagBannerTone.error,
+              icon: diag.needsWebOrTokenAuth
+                  ? CupertinoIcons.lock_shield_fill
+                  : (diag.kind == RemoteDiagnosisKind.selfDevice
+                      ? CupertinoIcons.info_circle_fill
+                      : CupertinoIcons.exclamationmark_triangle_fill),
+              title: diag.title,
+              message: diag.message,
+              padding: const EdgeInsets.all(12),
+              borderRadius: 16,
+              action: _buildSingleCtaFailureActions(diag, slice.glassTier),
+            ),
+          ],
+
+          // Nearby Devices — ONLY displayed on native platforms when scanning OR results exist
+          // (or when an explicit rescan returned empty, highlighting "扫码或粘贴链接")
+          if (_supportsLanDiscovery &&
+              (slice.discoveredLanHosts.isNotEmpty ||
+                  slice.scanningLan ||
+                  _explicitEmptyScan)) ...[
+            const SizedBox(height: 11),
+            _NearbyDevicesSection(
+              scanning: slice.scanningLan,
+              hosts: slice.discoveredLanHosts,
+              selectedAddr: _selectedLanAddr,
+              tier: slice.glassTier,
+              onRescan: () {
+                setState(() => _explicitEmptyScan = true);
+                ctrl.scanLanForHosts(silent: true);
+              },
+              onSelectHost: _onTapLanHost,
+              onScanOrPaste: _supportsQrScan ? _scanQrCode : _pasteFromClipboard,
+            ),
+          ],
+
+          // Action 3: "电脑上还没有链接？" + Collapsible Manual / Advanced Options row
+          const SizedBox(height: 8),
           Row(
             children: [
               Expanded(
                 child: GestureDetector(
+                  key: const ValueKey('pair-prepare-guide-btn'),
                   behavior: HitTestBehavior.opaque,
-                  onTap: () => setState(() => _showAdvanced = !_showAdvanced),
+                  onTap: () => setState(() => _showGuide = !_showGuide),
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 2),
+                    padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Icon(
-                          _showAdvanced
-                              ? CupertinoIcons.chevron_down
-                              : CupertinoIcons.chevron_right,
-                          size: 11.5,
-                          color: t.text3,
+                          CupertinoIcons.desktopcomputer,
+                          size: 13.5,
+                          color: t.primary,
                         ),
-                        const SizedBox(width: 4),
+                        const SizedBox(width: 5),
                         Flexible(
                           child: Text(
-                            _tokenCtrl.text.trim().isNotEmpty
-                                ? '高级选项（已填 Token）'
-                                : '名称 / Token / 证书选项',
+                            _showGuide ? '收起电脑准备说明' : '电脑上还没有链接？',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 12, color: t.text3),
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: t.primary,
+                            ),
                           ),
                         ),
                       ],
@@ -663,26 +856,25 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                 ),
               ),
               GestureDetector(
+                key: const ValueKey('pair-advanced-toggle'),
                 behavior: HitTestBehavior.opaque,
-                onTap: () => setState(() => _showGuide = !_showGuide),
+                onTap: () => setState(() => _showAdvanced = !_showAdvanced),
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 5, horizontal: 4),
+                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(
-                        CupertinoIcons.question_circle,
-                        size: 13,
-                        color: t.primary,
+                        _showAdvanced
+                            ? CupertinoIcons.chevron_down
+                            : CupertinoIcons.chevron_right,
+                        size: 11.5,
+                        color: t.text3,
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        _showGuide ? '收起引导' : '如何获取电脑链接？',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                          color: t.primary,
-                        ),
+                        _tokenCtrl.text.trim().isNotEmpty ? '高级选项（已填令牌）' : '高级选项',
+                        style: TextStyle(fontSize: 12, color: t.text3),
                       ),
                     ],
                   ),
@@ -691,6 +883,7 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
             ],
           ),
 
+          // Collapsible Manual / Advanced Options (Token, Name, Self-signed TLS, Manual LAN scan)
           if (_showAdvanced)
             Padding(
               padding: const EdgeInsets.only(top: 6, bottom: 4),
@@ -700,14 +893,22 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                   GrassBagTextField(
                     controller: _tokenCtrl,
                     focusNode: _tokenFocus,
-                    placeholder: '访问令牌 Token（选填，留空或走网页登录）',
+                    placeholder: '访问令牌 Token（选填，二维码或完整链接已自动包含）',
                     insideGlass: true,
                     monospace: true,
                     obscureText: _obscureToken,
                     textInputAction: TextInputAction.done,
                     fontSize: 13,
                     padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
-                    onChanged: (_) => setState(() => _diagnosis = null),
+                    onChanged: (_) {
+                      _emitDraftChanged();
+                      if (_diagnosis != null) {
+                        setState(() {
+                          _stage = PairingStage.idle;
+                          _setDiagnosisState(null);
+                        });
+                      }
+                    },
                     onSubmitted: (_) => _connectNow(),
                     suffix: GestureDetector(
                       behavior: HitTestBehavior.opaque,
@@ -728,9 +929,10 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                   const SizedBox(height: 8),
                   GrassBagTextField(
                     controller: _nameCtrl,
-                    placeholder: '备注名称（选填，例如：办公室 Mac）',
+                    placeholder: '电脑备注名（选填，例如：办公室 Mac）',
                     insideGlass: true,
                     textInputAction: TextInputAction.done,
+                    onChanged: (_) => _emitDraftChanged(),
                     onSubmitted: (_) => _connectNow(),
                     fontSize: 13,
                     padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
@@ -738,10 +940,13 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                   const SizedBox(height: 8),
                   GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: () => setState(() {
-                      _allowBadCerts = !_allowBadCerts;
-                      _diagnosis = null;
-                    }),
+                    onTap: () {
+                      setState(() {
+                        _allowBadCerts = !_allowBadCerts;
+                        _setDiagnosisState(null);
+                      });
+                      _emitDraftChanged();
+                    },
                     child: Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
                       child: Row(
@@ -756,216 +961,48 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
                           GrassBagGlassSwitch(
                             value: _allowBadCerts,
                             tier: slice.glassTier,
-                            onChanged: (v) => setState(() {
-                              _allowBadCerts = v;
-                              _diagnosis = null;
-                            }),
+                            onChanged: (v) {
+                              setState(() {
+                                _allowBadCerts = v;
+                                _setDiagnosisState(null);
+                              });
+                              _emitDraftChanged();
+                            },
                           ),
                         ],
                       ),
                     ),
                   ),
+                  if (_supportsLanDiscovery &&
+                      slice.discoveredLanHosts.isEmpty &&
+                      !slice.scanningLan) ...[
+                    const SizedBox(height: 6),
+                    GrassBagSecondaryGlassButton(
+                      label: '扫描同局域网附近电脑',
+                      icon: CupertinoIcons.antenna_radiowaves_left_right,
+                      height: 36,
+                      tier: slice.glassTier,
+                      insideGlass: true,
+                      onTap: () {
+                        setState(() => _explicitEmptyScan = true);
+                        ctrl.scanLanForHosts(silent: true);
+                      },
+                    ),
+                  ],
                 ],
               ),
             ),
 
-          // Live inline diagnosis result banner (only shown when actionable!)
-          if (diag != null) ...[
-            const SizedBox(height: 10),
-            GrassBagStatusBanner(
-              tone: diag.canConnectNow
-                  ? GrassBagBannerTone.ok
-                  : (diag.needsWebOrTokenAuth || diag.kind == RemoteDiagnosisKind.selfDevice
-                      ? GrassBagBannerTone.info
-                      : (diag.kind == RemoteDiagnosisKind.unreachable ||
-                              diag.kind == RemoteDiagnosisKind.invalidAddress
-                          ? GrassBagBannerTone.error
-                          : GrassBagBannerTone.warn)),
-              icon: diag.canConnectNow
-                  ? CupertinoIcons.checkmark_circle_fill
-                  : (diag.needsWebOrTokenAuth
-                      ? CupertinoIcons.lock_shield_fill
-                      : (diag.kind == RemoteDiagnosisKind.selfDevice
-                          ? CupertinoIcons.info_circle_fill
-                          : CupertinoIcons.exclamationmark_triangle_fill)),
-              title: diag.title,
-              message: diag.message,
-              padding: const EdgeInsets.all(12),
-              borderRadius: 16,
-              action: _buildDiagnosisActions(diag, slice.glassTier),
-            ),
-          ],
-
-          // Single crystal-clear primary Connect CTA — always above the guide!
-          // When QR scan is the active hero (empty input), keep Connect as crisp accent secondary
-          // so only one Primary button leads the eye at any moment.
-          const SizedBox(height: 12),
-          if (_supportsQrScan &&
-              _addrCtrl.text.trim().isEmpty &&
-              _selectedLanAddr == null &&
-              diag == null)
-            GrassBagSecondaryGlassButton(
-              label: _connecting ? '正在检测并连接…' : '连接远程设备',
-              icon: CupertinoIcons.arrow_right_circle_fill,
-              height: 44,
-              tier: slice.glassTier,
-              insideGlass: true,
-              accentForeground: true,
-              enabled: !_connecting,
-              onTap: _connecting ? null : _connectNow,
-            )
-          else
-            GrassBagPrimaryGlassButton(
-              label: _connecting
-                  ? '正在检测并连接…'
-                  : (diag?.canConnectNow == true
-                      ? (diag!.kind == RemoteDiagnosisKind.readyDirect ? '免插件立即接入' : '立即接入设备')
-                      : (diag?.needsWebOrTokenAuth == true && _tokenCtrl.text.trim().isNotEmpty
-                          ? '验证令牌并连接'
-                          : '连接远程设备')),
-              icon: CupertinoIcons.arrow_right_circle_fill,
-              height: 44,
-              tier: slice.glassTier,
-              insideGlass: true,
-              enabled: !_connecting,
-              onTap: _connecting ? null : _connectNow,
-            ),
-
-          // Clean 2-tab Setup Guide positioned below the primary CTA so actions stay above the fold.
-          // Avoid AnimatedSize so toggling inside a GrassBagGlass sheet does a single layout pass
-          // instead of 22 consecutive glass backdrop rebakes.
+          // Preparation Guide: first choose "我用 DSH Desktop" or "我已运行 dsh web"
           if (_showGuide)
             Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: GrassBagSheetSection(
-                borderRadius: 16,
-                padding: const EdgeInsets.all(12),
-                children: [
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _GuideSegmentPill(
-                            label: '官方插件（扫码推荐）',
-                            selected: _guideTab == 0,
-                            onTap: () => setState(() => _guideTab = 0),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: _GuideSegmentPill(
-                            label: '免插件直连（dsh web）',
-                            selected: _guideTab == 1,
-                            onTap: () => setState(() => _guideTab = 1),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    if (_guideTab == 0) ...[
-                      const _CompactStepRow(
-                        step: '1',
-                        text: '在电脑端 DeepSeek Harness 安装 GrassBag 官方插件（国内镜像加速，零额外服务、零端口冲突）：',
-                      ),
-                      const SizedBox(height: 7),
-                      _CommandCopyRow(
-                        label: '终端一键安装（或在桌面端「插件 → 添加插件」直接粘贴 .tgz 地址）',
-                        command: RemoteHostConnectCard.acceleratedInstallCommand,
-                        onCopy: _copyCommand,
-                      ),
-                      const SizedBox(height: 8),
-                      const _CompactStepRow(
-                        step: '2',
-                        text: '启用后桌面端左侧栏出现「手机连接」并立即弹出配对二维码，点击上方「扫码连接」1 秒接入。',
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: GrassBagSecondaryGlassButton(
-                              label: '复制加速包地址',
-                              icon: CupertinoIcons.link,
-                              height: 36,
-                              padding: const EdgeInsets.symmetric(horizontal: 8),
-                              tier: slice.glassTier,
-                              insideGlass: true,
-                              accentForeground: true,
-                              onTap: () {
-                                Clipboard.setData(
-                                  const ClipboardData(text: kOfficialGbridgeAcceleratedUrl),
-                                );
-                                ctrl.showToast('已复制 .tgz 加速地址，可直接粘贴到 DSH 插件安装框',
-                                    tone: ToastTone.ok);
-                              },
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: GrassBagSecondaryGlassButton(
-                              label: '复制 AI 安装指令',
-                              icon: CupertinoIcons.sparkles,
-                              height: 36,
-                              padding: const EdgeInsets.symmetric(horizontal: 8),
-                              tier: slice.glassTier,
-                              insideGlass: true,
-                              accentForeground: true,
-                              onTap: () {
-                                Clipboard.setData(
-                                  const ClipboardData(text: RemoteHostConnectCard.desktopGuiPrompt),
-                                );
-                                ctrl.showToast('已复制 AI 安装指令，发给电脑端 DSH 即可自动安装',
-                                    tone: ToastTone.ok);
-                              },
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 9),
-                      Text(
-                        '官方插件直接复用运行中的 DSH 实例：dsh web 共享原端口不另开服务，桌面端自动避让冲突端口并支持实时切换。',
-                        style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
-                      ),
-                    ] else ...[
-                      // Clean 1-command OS switcher
-                      Row(
-                        children: [
-                          for (final (idx, osName) in [
-                            (0, 'macOS'),
-                            (1, 'Windows'),
-                            (2, 'Linux'),
-                          ]) ...[
-                            if (idx > 0) const SizedBox(width: 6),
-                            Expanded(
-                              child: _OsChip(
-                                label: osName,
-                                selected: _cliOsTab == idx,
-                                onTap: () => setState(() => _cliOsTab = idx),
-                              ),
-                            ),
-                          ],
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      _CommandCopyRow(
-                        label: _currentCliCommand.$1,
-                        command: _currentCliCommand.$2,
-                        onCopy: _copyCommand,
-                      ),
-                      const SizedBox(height: 7),
-                      Text(
-                        '无需任何插件：原版 dsh web 与桌面端共享全部会话与模型；首次粘贴启动链接后自动保持 30 天登录态。',
-                        style: TextStyle(fontSize: 11, height: 1.4, color: t.text3),
-                      ),
-                    ],
-                  ],
-                ),
-                ],
-              ),
+              padding: const EdgeInsets.only(top: 10),
+              child: _buildPreparationGuide(t, slice.glassTier),
             ),
         ],
-      );
+      ],
+    );
+
     if (widget.embeddedInSheet) return body;
     return GrassBagCard(
       borderRadius: 24,
@@ -974,182 +1011,824 @@ class _RemoteHostConnectCardState extends ConsumerState<RemoteHostConnectCard> {
     );
   }
 
-  Widget? _buildDiagnosisActions(RemoteHostDiagnosis diag, GrassBagGlassTier tier) {
-    // Primary Connect CTA sits directly below the banner — never render a duplicate connect button!
-    if (diag.canConnectNow) return null;
-
-    if (diag.kind == RemoteDiagnosisKind.selfDevice) {
-      if (_showGuide) return null;
-      return GrassBagSecondaryGlassButton(
-        label: '查看电脑端开启步骤',
-        icon: CupertinoIcons.sparkles,
-        height: 34,
-        tier: tier,
-        insideGlass: true,
-        accentForeground: true,
-        onTap: () => setState(() {
-          _showGuide = true;
-          _guideTab = 0;
-        }),
-      );
-    }
-    if (diag.needsWebOrTokenAuth) {
-      final isHtmlProxy = diag.kind == RemoteDiagnosisKind.htmlLoginPage;
-      return Row(
-        children: [
-          if (isHtmlProxy && _supportsInAppWebLogin) ...[
-            Expanded(
-              child: GrassBagPrimaryGlassButton(
-                label: '网页登录',
-                icon: CupertinoIcons.globe,
-                height: 36,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
+  Widget _buildPreparationGuide(GrassBagTokens t, GrassBagGlassTier tier) {
+    return GrassBagSheetSection(
+      borderRadius: 16,
+      padding: const EdgeInsets.all(12),
+      children: [
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '你电脑上现在打开的是哪一种？',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: t.text,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _GuideSegmentPill(
+                    key: const ValueKey('pair-guide-desktop-tab'),
+                    label: '我用 DSH Desktop',
+                    selected: _guideTab == 0,
+                    onTap: () => setState(() => _guideTab = 0),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _GuideSegmentPill(
+                    key: const ValueKey('pair-guide-dshweb-tab'),
+                    label: '我已运行 dsh web',
+                    selected: _guideTab == 1,
+                    onTap: () => setState(() => _guideTab = 1),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 11),
+            if (_guideTab == 0) ...[
+              const _CompactStepRow(
+                step: '1',
+                text: '已安装助手：在电脑端 DSH Desktop 左侧栏点开「手机连接」，直接扫描屏幕上的二维码。',
+              ),
+              const SizedBox(height: 8),
+              const _CompactStepRow(
+                step: '2',
+                text: '还没装助手：在电脑浏览器打开简短指南，按「插件 → 添加插件 → 手机连接」三步完成（复制按钮都在电脑页上）。',
+              ),
+              const SizedBox(height: 10),
+              GrassBagSecondaryGlassButton(
+                key: const ValueKey('pair-copy-desktop-guide-btn'),
+                label: '复制电脑端操作指南链接',
+                icon: CupertinoIcons.compass,
+                height: 38,
                 tier: tier,
                 insideGlass: true,
-                enabled: !_connecting,
-                onTap: _connecting ? null : _openInAppWebLogin,
+                accentForeground: true,
+                onTap: () => _copyText(
+                  RemoteHostConnectCard.desktopShortGuideUrl,
+                  '已复制指南链接，发到电脑浏览器打开即可一键复制安装',
+                ),
+              ),
+              const SizedBox(height: 6),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => setState(() => _showDesktopAdvancedCopy = !_showDesktopAdvancedCopy),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _showDesktopAdvancedCopy
+                            ? CupertinoIcons.chevron_down
+                            : CupertinoIcons.chevron_right,
+                        size: 11,
+                        color: t.text3,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '或者直接复制插件包地址 / AI 安装指令',
+                        style: TextStyle(fontSize: 11.5, color: t.text3),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (_showDesktopAdvancedCopy) ...[
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '复制插件包地址',
+                        icon: CupertinoIcons.link,
+                        height: 34,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        tier: tier,
+                        insideGlass: true,
+                        onTap: () => _copyText(
+                          kOfficialGbridgeAcceleratedUrl,
+                          '已复制插件包 .tgz 地址',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: GrassBagSecondaryGlassButton(
+                        label: '复制 AI 指令',
+                        icon: CupertinoIcons.sparkles,
+                        height: 34,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        tier: tier,
+                        insideGlass: true,
+                        onTap: () => _copyText(
+                          RemoteHostConnectCard.desktopGuiPrompt,
+                          '已复制 AI 安装指令',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ] else ...[
+              const _CompactStepRow(
+                step: '1',
+                text: '直接找到电脑终端打印的 `http://<局域网IP>:<端口>/?token=...` 启动链接（免装任何插件）。',
+              ),
+              const SizedBox(height: 7),
+              const _CompactStepRow(
+                step: '2',
+                text: '把链接发到手机，点上方「粘贴连接链接」即可直接打开电脑会话（自动保持 30 天登录态）。',
+              ),
+              const SizedBox(height: 8),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => setState(() => _showCliCommands = !_showCliCommands),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _showCliCommands
+                            ? CupertinoIcons.chevron_down
+                            : CupertinoIcons.chevron_right,
+                        size: 11,
+                        color: t.primary,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _showCliCommands ? '收起局域网启动命令' : '链接是 127.0.0.1？查看局域网启动命令',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w500,
+                          color: t.primary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (_showCliCommands) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    for (final (idx, osName) in [
+                      (0, 'macOS'),
+                      (1, 'Windows'),
+                      (2, 'Linux'),
+                    ]) ...[
+                      if (idx > 0) const SizedBox(width: 6),
+                      Expanded(
+                        child: _OsChip(
+                          label: osName,
+                          selected: _cliOsTab == idx,
+                          onTap: () => setState(() => _cliOsTab = idx),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 8),
+                _CommandCopyRow(
+                  label: _currentCliCommand.$1,
+                  command: _currentCliCommand.$2,
+                  onCopy: (cmd) => _copyText(cmd, '已复制启动命令到剪贴板'),
+                ),
+              ],
+            ],
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Renders ONE clear primary recovery CTA tailored to the exact failure cause,
+  /// plus optional collapsible technical details so raw errors never confuse users.
+  Widget _buildSingleCtaFailureActions(RemoteHostDiagnosis diag, GrassBagGlassTier tier) {
+    final t = GrassBagTokens.of(context);
+    final rawTech = diag.technicalDetail?.trim();
+    final hasTechDetail =
+        rawTech != null && rawTech.isNotEmpty && rawTech != diag.message.trim();
+
+    late final Widget primaryCta;
+    Widget? secondaryRow;
+
+    switch (diag.kind) {
+      case RemoteDiagnosisKind.selfDevice:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: '换成电脑上的连接链接',
+          icon: CupertinoIcons.arrow_2_squarepath,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _focusReplaceLink,
+        );
+        secondaryRow = Row(
+          children: [
+            if (_supportsQrScan) ...[
+              Expanded(
+                child: GrassBagSecondaryGlassButton(
+                  label: '扫电脑二维码',
+                  icon: CupertinoIcons.qrcode_viewfinder,
+                  height: 34,
+                  tier: tier,
+                  insideGlass: true,
+                  onTap: _scanQrCode,
+                ),
+              ),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '查看电脑准备说明',
+                icon: CupertinoIcons.question_circle,
+                height: 34,
+                tier: tier,
+                insideGlass: true,
+                onTap: () => setState(() => _showGuide = true),
+              ),
+            ),
+          ],
+        );
+      case RemoteDiagnosisKind.pairingCodeExpired:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: _supportsQrScan ? '扫描新二维码' : '粘贴新连接链接',
+          icon: _supportsQrScan
+              ? CupertinoIcons.qrcode_viewfinder
+              : CupertinoIcons.doc_on_clipboard,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _supportsQrScan ? _scanQrCode : _pasteFromClipboard,
+        );
+        if (_supportsQrScan) {
+          secondaryRow = GrassBagSecondaryGlassButton(
+            label: '改为粘贴最新链接',
+            icon: CupertinoIcons.doc_on_clipboard,
+            height: 34,
+            tier: tier,
+            insideGlass: true,
+            onTap: _pasteFromClipboard,
+          );
+        }
+      case RemoteDiagnosisKind.realtimeFailed:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: '重新连接',
+          icon: CupertinoIcons.refresh,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _connectNow,
+        );
+        secondaryRow = GrassBagSecondaryGlassButton(
+          label: '修改连接链接',
+          icon: CupertinoIcons.pencil,
+          height: 34,
+          tier: tier,
+          insideGlass: true,
+          onTap: _focusReplaceLink,
+        );
+      case RemoteDiagnosisKind.htmlLoginPage:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: _supportsInAppWebLogin ? '完成网页登录' : '粘贴连接链接',
+          icon: _supportsInAppWebLogin
+              ? CupertinoIcons.globe
+              : CupertinoIcons.doc_on_clipboard,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _supportsInAppWebLogin ? _openInAppWebLogin : _pasteFromClipboard,
+        );
+      case RemoteDiagnosisKind.needsAuth:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: _tokenCtrl.text.trim().isNotEmpty
+              ? '重新连接'
+              : (_supportsQrScan ? '扫描新二维码' : '粘贴含授权的连接链接'),
+          icon: _tokenCtrl.text.trim().isNotEmpty
+              ? CupertinoIcons.refresh
+              : (_supportsQrScan
+                  ? CupertinoIcons.qrcode_viewfinder
+                  : CupertinoIcons.doc_on_clipboard),
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _tokenCtrl.text.trim().isNotEmpty
+              ? _connectNow
+              : (_supportsQrScan ? _scanQrCode : _pasteFromClipboard),
+        );
+        secondaryRow = Row(
+          children: [
+            if (_supportsInAppWebLogin) ...[
+              Expanded(
+                child: GrassBagSecondaryGlassButton(
+                  label: '网页登录',
+                  icon: CupertinoIcons.globe,
+                  height: 34,
+                  tier: tier,
+                  insideGlass: true,
+                  onTap: _openInAppWebLogin,
+                ),
+              ),
+              const SizedBox(width: 8),
+            ],
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '手动填写令牌',
+                icon: CupertinoIcons.lock,
+                height: 34,
+                tier: tier,
+                insideGlass: true,
+                onTap: () {
+                  setState(() => _showAdvanced = true);
+                  _tokenFocus.requestFocus();
+                },
+              ),
+            ),
+          ],
+        );
+      case RemoteDiagnosisKind.selfSignedTls:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: '信任自签名证书并连接',
+          icon: CupertinoIcons.checkmark_shield_fill,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: () {
+            setState(() => _allowBadCerts = true);
+            _connectNow();
+          },
+        );
+      case RemoteDiagnosisKind.insecurePublicHttp:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: '改用 HTTPS 连接',
+          icon: CupertinoIcons.lock_shield_fill,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: () {
+            final cur = _addrCtrl.text.trim();
+            if (cur.toLowerCase().startsWith('http://')) {
+              _addrCtrl.text = 'https://${cur.substring(7)}';
+            }
+            setState(() => _allowInsecurePublicHttp = false);
+            _connectNow();
+          },
+        );
+        secondaryRow = GrassBagSecondaryGlassButton(
+          label: '仍以明文继续',
+          icon: CupertinoIcons.exclamationmark_triangle,
+          height: 34,
+          tier: tier,
+          insideGlass: true,
+          onTap: () {
+            setState(() => _allowInsecurePublicHttp = true);
+            _connectNow();
+          },
+        );
+      case RemoteDiagnosisKind.invalidAddress:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: _supportsQrScan ? '扫码或粘贴链接' : '粘贴连接链接',
+          icon: _supportsQrScan
+              ? CupertinoIcons.qrcode_viewfinder
+              : CupertinoIcons.doc_on_clipboard,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: _supportsQrScan ? _scanQrCode : _pasteFromClipboard,
+        );
+      case RemoteDiagnosisKind.untrustedHost:
+      case RemoteDiagnosisKind.unreachable:
+      case RemoteDiagnosisKind.readyGbridge:
+      case RemoteDiagnosisKind.readyDirect:
+        primaryCta = GrassBagPrimaryGlassButton(
+          key: const ValueKey('pair-failure-primary-cta'),
+          label: diag.isLoopbackTarget ? '换成电脑上的连接链接' : '重新连接',
+          icon: diag.isLoopbackTarget
+              ? CupertinoIcons.arrow_2_squarepath
+              : CupertinoIcons.refresh,
+          height: 38,
+          tier: tier,
+          insideGlass: true,
+          onTap: diag.isLoopbackTarget ? _focusReplaceLink : _connectNow,
+        );
+        secondaryRow = Row(
+          children: [
+            Expanded(
+              child: GrassBagSecondaryGlassButton(
+                label: '修改地址',
+                icon: CupertinoIcons.pencil,
+                height: 34,
+                tier: tier,
+                insideGlass: true,
+                onTap: _focusReplaceLink,
               ),
             ),
             const SizedBox(width: 8),
             Expanded(
               child: GrassBagSecondaryGlassButton(
-                label: '粘贴链接',
-                icon: CupertinoIcons.doc_on_clipboard,
-                height: 36,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
+                label: _showGuide ? '已展开说明' : '查看连接引导',
+                icon: CupertinoIcons.question_circle,
+                height: 34,
                 tier: tier,
                 insideGlass: true,
-                enabled: !_connecting,
-                onTap: _connecting ? null : _pasteFromClipboard,
+                onTap: () => setState(() => _showGuide = true),
               ),
             ),
-          ] else ...[
-            Expanded(
-              child: GrassBagPrimaryGlassButton(
-                label: '粘贴链接',
-                icon: CupertinoIcons.doc_on_clipboard,
-                height: 36,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                tier: tier,
-                insideGlass: true,
-                enabled: !_connecting,
-                onTap: _connecting ? null : _pasteFromClipboard,
+          ],
+        );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (diag.suggestedCommand != null && diag.suggestedCommand!.isNotEmpty) ...[
+          _CommandCopyRow(
+            label: '在电脑端启动命令',
+            command: diag.suggestedCommand!,
+            onCopy: (cmd) => _copyText(cmd, '已复制启动命令'),
+          ),
+          const SizedBox(height: 8),
+        ],
+        primaryCta,
+        if (secondaryRow != null) ...[
+          const SizedBox(height: 7),
+          secondaryRow,
+        ],
+        if (hasTechDetail) ...[
+          const SizedBox(height: 8),
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => setState(() => _showTechnicalDetail = !_showTechnicalDetail),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _showTechnicalDetail
+                        ? CupertinoIcons.chevron_down
+                        : CupertinoIcons.chevron_right,
+                    size: 11.5,
+                    color: t.text3,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _showTechnicalDetail ? '收起技术详情' : '查看技术详情',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: t.text3),
+                  ),
+                ],
               ),
             ),
-            if (_supportsInAppWebLogin) ...[
-              const SizedBox(width: 8),
-              Expanded(
-                child: GrassBagSecondaryGlassButton(
-                  label: '网页登录',
-                  icon: CupertinoIcons.globe,
-                  height: 36,
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  tier: tier,
-                  insideGlass: true,
-                  enabled: !_connecting,
-                  onTap: _connecting ? null : _openInAppWebLogin,
+          ),
+          if (_showTechnicalDetail) ...[
+            const SizedBox(height: 6),
+            GrassBagFresnelGlassSurface(
+              borderRadius: 10,
+              innerWell: true,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              child: Text(
+                rawTech,
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                  height: 1.35,
+                  color: t.text2,
                 ),
               ),
-            ],
+            ),
           ],
         ],
-      );
-    }
-    if (diag.kind == RemoteDiagnosisKind.insecurePublicHttp) {
-      return Row(
-        children: [
-          Expanded(
-            child: GrassBagPrimaryGlassButton(
-              label: '改用 HTTPS 连接',
-              icon: CupertinoIcons.lock_shield_fill,
-              height: 34,
-              tier: tier,
-              insideGlass: true,
-              enabled: !_connecting,
-              onTap: _connecting
-                  ? null
-                  : () {
-                      final cur = _addrCtrl.text.trim();
-                      if (cur.toLowerCase().startsWith('http://')) {
-                        _addrCtrl.text = 'https://${cur.substring(7)}';
-                      }
-                      setState(() => _allowInsecurePublicHttp = false);
-                      _connectNow();
-                    },
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: GrassBagSecondaryGlassButton(
-              label: '仍以明文继续',
-              icon: CupertinoIcons.exclamationmark_triangle,
-              height: 34,
-              tier: tier,
-              insideGlass: true,
-              enabled: !_connecting,
-              onTap: _connecting
-                  ? null
-                  : () {
-                      setState(() => _allowInsecurePublicHttp = true);
-                      _connectNow();
-                    },
-            ),
-          ),
-        ],
-      );
-    }
-    if (diag.kind == RemoteDiagnosisKind.selfSignedTls) {
-      return GrassBagPrimaryGlassButton(
-        label: '信任自签名证书并连接',
-        icon: CupertinoIcons.checkmark_shield_fill,
-        height: 34,
-        tier: tier,
-        insideGlass: true,
-        enabled: !_connecting,
-        onTap: _connecting
-            ? null
-            : () {
-                setState(() => _allowBadCerts = true);
-                _connectNow();
-              },
-      );
-    }
-    if (diag.suggestedCommand != null && diag.suggestedCommand!.isNotEmpty) {
-      return _CommandCopyRow(
-        label: '在远程电脑运行后重试',
-        command: diag.suggestedCommand!,
-        onCopy: _copyCommand,
-      );
-    }
-    return null;
+      ],
+    );
   }
 }
 
-class _LanRadarStrip extends StatelessWidget {
-  const _LanRadarStrip({
-    required this.scanning,
-    required this.hasScanned,
-    required this.hosts,
-    required this.selectedAddr,
-    required this.busy,
-    required this.onRescan,
-    required this.onSelectHost,
-    required this.onOpenGuide,
+class _DeepLinkConfirmCard extends StatelessWidget {
+  const _DeepLinkConfirmCard({
+    required this.computerName,
+    required this.address,
+    required this.tier,
+    required this.onConfirm,
+    required this.onCancel,
   });
 
-  final bool scanning;
-  final bool hasScanned;
-  final List<DiscoveredLanHost> hosts;
-  final String? selectedAddr;
-  final bool busy;
-  final VoidCallback onRescan;
-  final ValueChanged<DiscoveredLanHost> onSelectHost;
-  final VoidCallback onOpenGuide;
+  final String computerName;
+  final String address;
+  final GrassBagGlassTier tier;
+  final VoidCallback onConfirm;
+  final VoidCallback onCancel;
 
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
     return GrassBagFresnelGlassSurface(
+      key: const ValueKey('pair-deeplink-confirm-card'),
+      borderRadius: 18,
+      innerWell: true,
+      tintColor: t.primarySoft,
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              GrassBagSquircleIcon(
+                icon: CupertinoIcons.desktopcomputer,
+                color: t.primary,
+                size: 38,
+                iconSize: 18,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '确认连接到「$computerName」',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                        color: t.text,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      address,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11.5,
+                        color: t.text2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          GrassBagPrimaryGlassButton(
+            key: const ValueKey('pair-deeplink-confirm-btn'),
+            label: '连接「$computerName」',
+            icon: CupertinoIcons.link,
+            height: 42,
+            tier: tier,
+            insideGlass: true,
+            onTap: onConfirm,
+          ),
+          const SizedBox(height: 7),
+          GrassBagSecondaryGlassButton(
+            label: '先不连接，改用其他方式',
+            height: 36,
+            tier: tier,
+            insideGlass: true,
+            onTap: onCancel,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PairingProgressCard extends StatelessWidget {
+  const _PairingProgressCard({
+    required this.computerName,
+    required this.address,
+    required this.stage,
+    required this.tier,
+    required this.onCancel,
+  });
+
+  final String computerName;
+  final String address;
+  final PairingStage stage;
+  final GrassBagGlassTier tier;
+  final VoidCallback onCancel;
+
+  int get _activeIdx => switch (stage) {
+        PairingStage.connecting => 0,
+        PairingStage.authorizing => 1,
+        PairingStage.openingSession => 2,
+        _ => 0,
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    const steps = ['正在连接', '正在授权', '正在打开会话'];
+    final activeIdx = _activeIdx;
+
+    return GrassBagFresnelGlassSurface(
+      key: const ValueKey('pair-progress-card'),
+      borderRadius: 18,
+      innerWell: true,
+      tintColor: t.primarySoft.withValues(alpha: 0.72),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              GrassBagSquircleIcon(
+                icon: CupertinoIcons.desktopcomputer,
+                color: t.primary,
+                size: 38,
+                iconSize: 18,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      computerName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                        color: t.text,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      address,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11.5,
+                        color: t.text3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          for (int i = 0; i < steps.length; i++) ...[
+            if (i > 0) const SizedBox(height: 7),
+            Row(
+              children: [
+                SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: Center(
+                    child: i < activeIdx
+                        ? Icon(CupertinoIcons.checkmark_circle_fill, size: 15, color: t.ok)
+                        : (i == activeIdx
+                            ? GrassBagActivityIndicator(radius: 6.5, color: t.primary)
+                            : Icon(CupertinoIcons.circle, size: 13, color: t.text3)),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  steps[i],
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: i == activeIdx ? FontWeight.w600 : FontWeight.w500,
+                    color: i < activeIdx
+                        ? t.ok
+                        : (i == activeIdx ? t.text : t.text3),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 12),
+          GrassBagSecondaryGlassButton(
+            key: const ValueKey('pair-cancel-btn'),
+            label: '取消',
+            icon: CupertinoIcons.xmark,
+            height: 38,
+            tier: tier,
+            insideGlass: true,
+            onTap: onCancel,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PairingReadyCard extends StatelessWidget {
+  const _PairingReadyCard({
+    required this.host,
+    required this.sessionCount,
+    required this.message,
+    required this.tier,
+    required this.onOpenSession,
+  });
+
+  final ManagedHost host;
+  final int? sessionCount;
+  final String message;
+  final GrassBagGlassTier tier;
+  final VoidCallback onOpenSession;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    return GrassBagFresnelGlassSurface(
+      key: const ValueKey('pair-ready-card'),
+      borderRadius: 18,
+      innerWell: true,
+      tintColor: t.okSoft,
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              GrassBagSquircleIcon(
+                icon: CupertinoIcons.checkmark_alt,
+                color: t.ok,
+                size: 38,
+                iconSize: 18,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '已连接到「${host.name}」',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: t.text,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      message,
+                      style: TextStyle(fontSize: 12, height: 1.35, color: t.text2),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          GrassBagPrimaryGlassButton(
+            key: const ValueKey('pair-open-session-btn'),
+            label: '打开会话',
+            icon: CupertinoIcons.chat_bubble_2_fill,
+            height: 44,
+            tier: tier,
+            insideGlass: true,
+            onTap: onOpenSession,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NearbyDevicesSection extends StatelessWidget {
+  const _NearbyDevicesSection({
+    required this.scanning,
+    required this.hosts,
+    required this.selectedAddr,
+    required this.tier,
+    required this.onRescan,
+    required this.onSelectHost,
+    required this.onScanOrPaste,
+  });
+
+  final bool scanning;
+  final List<DiscoveredLanHost> hosts;
+  final String? selectedAddr;
+  final GrassBagGlassTier tier;
+  final VoidCallback onRescan;
+  final ValueChanged<DiscoveredLanHost> onSelectHost;
+  final VoidCallback onScanOrPaste;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = GrassBagTokens.of(context);
+    return GrassBagFresnelGlassSurface(
+      key: const ValueKey('pair-nearby-section'),
       borderRadius: 16,
       innerWell: true,
       padding: const EdgeInsets.all(11),
@@ -1166,18 +1845,20 @@ class _LanRadarStrip extends StatelessWidget {
                 )
               else
                 Icon(
-                  hosts.isNotEmpty ? CupertinoIcons.wifi : CupertinoIcons.antenna_radiowaves_left_right,
+                  hosts.isNotEmpty
+                      ? CupertinoIcons.wifi
+                      : CupertinoIcons.antenna_radiowaves_left_right,
                   size: 14,
-                  color: hosts.isNotEmpty ? t.ok : t.primary,
+                  color: hosts.isNotEmpty ? t.ok : t.text3,
                 ),
               const SizedBox(width: 7),
               Expanded(
                 child: Text(
                   scanning
-                      ? '正在搜索同局域网 DSH 设备…'
+                      ? '正在查找附近电脑…'
                       : (hosts.isNotEmpty
-                          ? '已发现 ${hosts.length} 台局域网设备 · 点击直连'
-                          : (hasScanned ? '同局域网暂未发现开放端口的设备' : '局域网自动发现')),
+                          ? '发现 ${hosts.length} 台附近电脑'
+                          : '没有发现附近设备'),
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -1191,9 +1872,9 @@ class _LanRadarStrip extends StatelessWidget {
                 enabled: !scanning,
                 onTap: onRescan,
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                   child: Text(
-                    scanning ? '扫描中' : '重新扫描',
+                    scanning ? '查找中' : '重新查找',
                     style: TextStyle(
                       fontSize: 11.5,
                       fontWeight: FontWeight.w600,
@@ -1211,38 +1892,19 @@ class _LanRadarStrip extends StatelessWidget {
               _LanHostTile(
                 host: hosts[i],
                 selected: selectedAddr == hosts[i].address,
-                busy: busy,
                 onTap: () => onSelectHost(hosts[i]),
               ),
             ],
-          ] else if (hasScanned && !scanning) ...[
-            const SizedBox(height: 5),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '电脑端默认仅监听本机回环，开启共享后可被自动发现。',
-                    style: TextStyle(fontSize: 11, height: 1.35, color: t.text3),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                GrassBagSpringTap(
-                  enablePointerGlow: false,
-                  haptic: true,
-                  onTap: onOpenGuide,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                    child: Text(
-                      '开启引导',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: t.primary,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+          ] else if (!scanning) ...[
+            const SizedBox(height: 8),
+            GrassBagSecondaryGlassButton(
+              label: '扫码或粘贴链接',
+              icon: CupertinoIcons.qrcode_viewfinder,
+              height: 34,
+              tier: tier,
+              insideGlass: true,
+              accentForeground: true,
+              onTap: onScanOrPaste,
             ),
           ],
         ],
@@ -1255,13 +1917,11 @@ class _LanHostTile extends StatelessWidget {
   const _LanHostTile({
     required this.host,
     required this.selected,
-    required this.busy,
     required this.onTap,
   });
 
   final DiscoveredLanHost host;
   final bool selected;
-  final bool busy;
   final VoidCallback onTap;
 
   @override
@@ -1271,12 +1931,11 @@ class _LanHostTile extends StatelessWidget {
     return GrassBagSpringTap(
       enablePointerGlow: false,
       haptic: true,
-      enabled: !busy,
       onTap: onTap,
       child: GrassBagFresnelGlassSurface(
         borderRadius: 14,
         innerWell: !selected,
-        interactive: !busy,
+        interactive: true,
         tintColor: selected ? t.primarySoft : null,
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
         child: Row(
@@ -1302,8 +1961,7 @@ class _LanHostTile extends StatelessWidget {
                     ),
                   ),
                   Text(
-                    '${host.address} · ${host.latencyMs}ms'
-                    '${host.isDesktop ? ' · 桌面桥接' : (host.hasGbridge ? ' · 增强助手' : (host.isDsh ? ' · 原生直连' : ''))}',
+                    '${host.address} · ${host.latencyMs}ms',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1322,7 +1980,7 @@ class _LanHostTile extends StatelessWidget {
               tintColor: oneTapReady ? t.okSoft : t.primarySoft,
               padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
               child: Text(
-                oneTapReady ? '一键直连' : '授权接入',
+                oneTapReady ? '连接' : '连接并授权',
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
@@ -1339,6 +1997,7 @@ class _LanHostTile extends StatelessWidget {
 
 class _GuideSegmentPill extends StatelessWidget {
   const _GuideSegmentPill({
+    super.key,
     required this.label,
     required this.selected,
     required this.onTap,
@@ -1361,7 +2020,7 @@ class _GuideSegmentPill extends StatelessWidget {
         elevated: selected,
         interactive: true,
         tintColor: selected ? t.primarySoft : null,
-        padding: const EdgeInsets.symmetric(vertical: 7),
+        padding: const EdgeInsets.symmetric(vertical: 7.5),
         alignment: Alignment.center,
         child: Text(
           label,
@@ -1449,7 +2108,7 @@ class _CompactStepRow extends StatelessWidget {
         Expanded(
           child: Text(
             text,
-            style: TextStyle(fontSize: 11.5, height: 1.42, color: t.text2),
+            style: TextStyle(fontSize: 12, height: 1.4, color: t.text2),
           ),
         ),
       ],
@@ -1471,53 +2130,56 @@ class _CommandCopyRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = GrassBagTokens.of(context);
-    return Tooltip(
-      message: '点击复制命令',
-      child: GrassBagSpringTap(
-        enablePointerGlow: false,
-        haptic: true,
-        pressedScale: 0.985,
-        onTap: () => onCopy(command),
-        child: GrassBagFresnelGlassSurface(
-          borderRadius: 12,
-          innerWell: true,
-          interactive: true,
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(label, style: TextStyle(fontSize: 10.5, color: t.text3)),
-                    const SizedBox(height: 2),
-                    Text(
-                      command,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                        height: 1.35,
-                        color: t.text,
-                      ),
-                    ),
-                  ],
+    return GrassBagFresnelGlassSurface(
+      borderRadius: 12,
+      innerWell: true,
+      padding: const EdgeInsets.fromLTRB(10, 8, 6, 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: t.text3),
                 ),
-              ),
-              const SizedBox(width: 8),
-              GrassBagFresnelGlassSurface(
-                borderRadius: 10,
+                const SizedBox(height: 3),
+                Text(
+                  command,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    height: 1.35,
+                    color: t.text,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 6),
+          Tooltip(
+            message: '复制命令',
+            child: GrassBagSpringTap(
+              enablePointerGlow: false,
+              haptic: true,
+              onTap: () => onCopy(command),
+              child: GrassBagFresnelGlassSurface(
+                borderRadius: 9,
                 innerWell: true,
+                interactive: true,
                 tintColor: t.primarySoft,
                 width: 32,
                 height: 32,
                 alignment: Alignment.center,
-                child: Icon(CupertinoIcons.doc_on_doc, size: 14, color: t.primary),
+                child: Icon(CupertinoIcons.doc_on_doc, size: 13.5, color: t.primary),
               ),
-            ],
+            ),
           ),
-        ),
+        ],
       ),
     );
   }

@@ -7,6 +7,7 @@ class HostEndpoint {
     required this.baseUri,
     this.token,
     this.cookie,
+    this.pairCode,
   }) : unixSocketPath = null;
 
   const HostEndpoint.unix({
@@ -14,12 +15,14 @@ class HostEndpoint {
     required String this.token,
   })  : unixSocketPath = socketPath,
         baseUri = null,
-        cookie = null;
+        cookie = null,
+        pairCode = null;
 
   final Uri? baseUri;
   final String? unixSocketPath;
   final String? token;
   final String? cookie;
+  final String? pairCode;
 
   bool get isUnixSocket => unixSocketPath != null;
 

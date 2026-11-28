@@ -13,7 +13,14 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.drawable.ColorDrawable
 import android.media.ExifInterface
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -84,6 +91,11 @@ class GrassBagBridgePlugin(private val activity: Activity) :
     private var pendingCameraFile: File? = null
     @Volatile
     private var pendingNotificationPayload: Map<String, String>? = null
+    @Volatile
+    private var pendingPairLinkUri: String? = null
+    @Volatile
+    private var lastObservedNetworkHandle: Long? = null
+    private var wifiNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private val runtimeListener: (String, Map<String, Any?>) -> Unit = { type, payload ->
         sendEvent(type, payload)
     }
@@ -184,6 +196,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         GrassBagAccessibilityService.addStateListener(a11yStateListener)
         SafetyGate.addEmergencyStopListener(emergencyStopListener)
         SafetyGate.addPauseListener(pauseStateListener)
+        registerNetworkChangeCallback()
         bgPool.execute {
             try {
                 SafetyGate.init(activity.applicationContext)
@@ -237,6 +250,7 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         GrassBagAccessibilityService.removeStateListener(a11yStateListener)
         SafetyGate.removeEmergencyStopListener(emergencyStopListener)
         SafetyGate.removePauseListener(pauseStateListener)
+        unregisterNetworkChangeCallback()
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
         eventChannel?.setStreamHandler(null)
@@ -281,6 +295,24 @@ class GrassBagBridgePlugin(private val activity: Activity) :
 
     fun handleNotificationIntent(intent: Intent?) {
         if (intent == null) return
+        // Handle `grassbag://pair?...` deep links from system camera / chat apps FIRST.
+        val dataUri = intent.data
+        if (dataUri != null &&
+            dataUri.scheme.equals("grassbag", ignoreCase = true) &&
+            dataUri.host.equals("pair", ignoreCase = true)
+        ) {
+            val rawUri = dataUri.toString().trim()
+            intent.data = null
+            if (rawUri.isNotEmpty()) {
+                if (eventSink != null && !detached) {
+                    sendEvent("pairing.deeplink", mapOf("uri" to rawUri))
+                } else {
+                    synchronized(lifecycleLock) {
+                        pendingPairLinkUri = rawUri
+                    }
+                }
+            }
+        }
         val kind = intent.getStringExtra(GrassBagEngineService.EXTRA_NOTIFY_KIND)?.trim() ?: ""
         val hostId = intent.getStringExtra(GrassBagEngineService.EXTRA_HOST_ID)?.trim() ?: ""
         val sessionId = intent.getStringExtra(GrassBagEngineService.EXTRA_SESSION_ID)?.trim() ?: ""
@@ -792,6 +824,14 @@ class GrassBagBridgePlugin(private val activity: Activity) :
                     current
                 }
                 replySafe(result) { it.success(payload) }
+            }
+            "pairing.takePendingLink" -> {
+                val uri = synchronized(lifecycleLock) {
+                    val current = pendingPairLinkUri
+                    pendingPairLinkUri = null
+                    current
+                }
+                replySafe(result) { it.success(uri) }
             }
 
             // Permissions status & OS settings deep links (off UI thread: avoids 6+ Binder IPCs on UI Looper!)
@@ -1831,8 +1871,172 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         }
     }
 
+    private fun registerNetworkChangeCallback() {
+        runCatching {
+            val cm = activity.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return
+            unregisterNetworkChangeCallback()
+            val initialHandle = cm.activeNetwork?.networkHandle
+            lastObservedNetworkHandle = initialHandle
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    val h = network.networkHandle
+                    val prev = lastObservedNetworkHandle
+                    lastObservedNetworkHandle = h
+                    if (prev != null && prev != h) {
+                        sendEvent("network.changed", mapOf("reason" to "switched"))
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    if (lastObservedNetworkHandle == network.networkHandle) {
+                        lastObservedNetworkHandle = null
+                    }
+                    sendEvent("network.changed", mapOf("reason" to "lost"))
+                }
+            }
+            cm.registerNetworkCallback(req, cb)
+            wifiNetworkCallback = cb
+        }
+    }
+
+    private fun unregisterNetworkChangeCallback() {
+        val cb = wifiNetworkCallback ?: return
+        wifiNetworkCallback = null
+        runCatching {
+            val cm = activity.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.unregisterNetworkCallback(cb)
+        }
+    }
+
+    /**
+     * Discovers GrassBag desktop/web bridges advertising `_grassbag._tcp.` over mDNS / DNS-SD,
+     * finding their ACTUAL dynamically allocated port (even when :3081 was occupied and fell back
+     * to :3082..:3099 or an ephemeral port).
+     */
+    private fun discoverMdnsHosts(selfIps: Set<String>): List<Map<String, Any>> {
+        val out = java.util.Collections.synchronizedList(ArrayList<Map<String, Any>>())
+        val nsd = activity.applicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
+            ?: return emptyList()
+        val wifiMgr = activity.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val multicastLock = runCatching {
+            wifiMgr?.createMulticastLock("grassbag_mdns_scan")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.getOrNull()
+
+        val resolveQueue = java.util.concurrent.LinkedBlockingQueue<NsdServiceInfo>()
+        val seenNames = java.util.Collections.synchronizedSet(HashSet<String>())
+        val stopFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        val startedLatch = CountDownLatch(1)
+
+        val discoveryListener = object : NsdManager.DiscoveryListener {
+            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
+                startedLatch.countDown()
+            }
+            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {}
+            override fun onDiscoveryStarted(serviceType: String?) {
+                startedLatch.countDown()
+            }
+            override fun onDiscoveryStopped(serviceType: String?) {}
+            override fun onServiceFound(serviceInfo: NsdServiceInfo?) {
+                if (serviceInfo == null || stopFlag.get()) return
+                val svcType = serviceInfo.serviceType ?: ""
+                if (!svcType.contains("_grassbag._tcp", ignoreCase = true)) return
+                val key = serviceInfo.serviceName ?: return
+                if (seenNames.add(key)) {
+                    resolveQueue.offer(serviceInfo)
+                }
+            }
+            override fun onServiceLost(serviceInfo: NsdServiceInfo?) {}
+        }
+
+        // Single-threaded serial resolver avoids Android NsdManager.FAILURE_ALREADY_ACTIVE on API < 34.
+        val resolverThread = Thread({
+            val deadline = System.currentTimeMillis() + 1850L
+            while (!stopFlag.get() && System.currentTimeMillis() < deadline) {
+                val remMs = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+                val next = runCatching {
+                    resolveQueue.poll(minOf(remMs, 250L), java.util.concurrent.TimeUnit.MILLISECONDS)
+                }.getOrNull() ?: continue
+                val resolveLatch = CountDownLatch(1)
+                var resolvedInfo: NsdServiceInfo? = null
+                @Suppress("DEPRECATION")
+                runCatching {
+                    nsd.resolveService(next, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
+                            resolveLatch.countDown()
+                        }
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
+                            resolvedInfo = serviceInfo
+                            resolveLatch.countDown()
+                        }
+                    })
+                }.onFailure { resolveLatch.countDown() }
+                runCatching { resolveLatch.await(700L, java.util.concurrent.TimeUnit.MILLISECONDS) }
+                val info = resolvedInfo ?: continue
+                val port = info.port
+                @Suppress("DEPRECATION")
+                val hostAddr = info.host?.hostAddress?.substringBefore('%')?.trim() ?: ""
+                if (port <= 0 || hostAddr.isEmpty() || hostAddr in selfIps ||
+                    hostAddr.startsWith("127.") || hostAddr == "0.0.0.0" || hostAddr.contains(':')
+                ) {
+                    continue
+                }
+                val attrs = info.attributes
+                fun attr(k: String): String? =
+                    attrs?.get(k)?.let { String(it, Charsets.UTF_8).trim() }?.takeIf { it.isNotEmpty() }
+                val baseUrl = "http://$hostAddr:$port"
+                val t0 = System.currentTimeMillis()
+                val meta = probeLanDshHost(baseUrl)
+                val ms = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+                val advertisedHost = attr("host") ?: info.serviceName?.replace(Regex("\\s*\\(\\d+\\)$"), "")?.trim()
+                val surface = meta.surface ?: attr("surface") ?: "desktop"
+                val dshVer = meta.dshVersion ?: attr("dsh")?.takeIf { it != "unknown" }
+                val displayName = when {
+                    !advertisedHost.isNullOrEmpty() -> advertisedHost
+                    surface == "desktop" -> "DSH 桌面端 ($hostAddr)"
+                    else -> "局域网主机 $hostAddr:$port"
+                }
+                val row = LinkedHashMap<String, Any>()
+                row["name"] = displayName
+                row["address"] = baseUrl
+                row["latencyMs"] = ms
+                row["isDsh"] = true
+                row["hasGbridge"] = true
+                row["requiresAuth"] = meta.requiresAuth || (attr("auth") != "0")
+                row["surface"] = surface
+                if (dshVer != null) row["dshVersion"] = dshVer
+                out.add(row)
+            }
+        }, "grassbag-mdns-resolver").apply { isDaemon = true }
+
+        try {
+            nsd.discoverServices("_grassbag._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+            runCatching { startedLatch.await(500L, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            resolverThread.start()
+            runCatching { Thread.sleep(1550L) }
+        } catch (_: Throwable) {
+        } finally {
+            stopFlag.set(true)
+            runCatching { nsd.stopServiceDiscovery(discoveryListener) }
+            runCatching { resolverThread.join(450L) }
+            runCatching { if (multicastLock?.isHeld == true) multicastLock.release() }
+        }
+        return synchronized(out) { ArrayList(out) }
+    }
+
     private fun runLanScanInternal(port: Int): List<Map<String, Any>> {
         val selfIps = collectAllLocalDeviceIps()
+        val mdnsFuture = java.util.concurrent.CompletableFuture.supplyAsync(
+            { discoverMdnsHosts(selfIps) },
+            bgPool
+        )
         val portsToScan = if (port == 3080) listOf(3080, 3081) else listOf(port)
         val candidates = LinkedHashSet<String>()
         val isEmulator = Build.FINGERPRINT.contains("generic", true) ||
@@ -1946,12 +2150,27 @@ class GrassBagBridgePlugin(private val activity: Activity) :
         } finally {
             runCatching { scanPool.shutdownNow() }
         }
-        val snapshot = synchronized(discovered) {
-            discovered.filter { row ->
-                val addr = row["address"]?.toString() ?: ""
-                val host = runCatching { Uri.parse(addr).host?.lowercase() }.getOrNull() ?: ""
-                host.isNotEmpty() && host !in selfIps && !host.startsWith("127.") && host != "0.0.0.0"
+        val mdnsHosts = runCatching {
+            mdnsFuture.get(2400L, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrDefault(emptyList())
+        val mergedByAddr = LinkedHashMap<String, Map<String, Any>>()
+        // Prefer mDNS records first because they carry the true advertised hostname and dynamic port.
+        for (row in mdnsHosts) {
+            val addr = row["address"]?.toString()?.trim()?.lowercase() ?: continue
+            if (addr.isNotEmpty()) mergedByAddr[addr] = row
+        }
+        synchronized(discovered) {
+            for (row in discovered) {
+                val addr = row["address"]?.toString()?.trim()?.lowercase() ?: continue
+                if (addr.isNotEmpty() && !mergedByAddr.containsKey(addr)) {
+                    mergedByAddr[addr] = row
+                }
             }
+        }
+        val snapshot = mergedByAddr.values.filter { row ->
+            val addr = row["address"]?.toString() ?: ""
+            val host = runCatching { Uri.parse(addr).host?.lowercase() }.getOrNull() ?: ""
+            host.isNotEmpty() && host !in selfIps && !host.startsWith("127.") && host != "0.0.0.0"
         }
         return snapshot.sortedWith(
             compareByDescending<Map<String, Any>> { it["isDsh"] == true }

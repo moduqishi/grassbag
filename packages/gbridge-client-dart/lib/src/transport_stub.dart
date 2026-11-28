@@ -18,6 +18,7 @@ class GbridgeHttpTransport {
   final void Function(String cookieHeader)? onCookieUpdated;
 
   String? get cookieHeader => null;
+  String? get lastAuthErrorCode => null;
   void setCookieHeader(String? cookie) {}
   void evictDshAuthCookies() {}
   void resetConnectionPool() {}

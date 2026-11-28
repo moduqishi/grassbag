@@ -784,10 +784,18 @@ class _SettingsNavList extends ConsumerWidget {
       ),
     ];
 
+    final hostDisconnected = !state.isDshConnected ||
+        !curHost.isConnectedUsable ||
+        state.hostHasError(curHost) ||
+        curHost.needsAuth;
+    final hostItem = deviceItems.first;
+    final otherDeviceItems = deviceItems.skip(1).toList(growable: false);
+
     final groups = [
+      if (hostDisconnected) ('连接与主机', [hostItem]),
       if (dynamicDshCore.isNotEmpty) ('DSH 核心设置', dynamicDshCore),
       if (dynamicDshCaps.isNotEmpty) ('DSH 能力与扩展', dynamicDshCaps),
-      ('连接与本机', deviceItems),
+      ('连接与本机', hostDisconnected ? otherDeviceItems : deviceItems),
     ];
 
     final accountSearchHaystack =
@@ -839,88 +847,104 @@ class _SettingsNavList extends ConsumerWidget {
         const SizedBox(height: 16),
 
         // Translucent iOS 26/27 Account & Host Overview Hero Card
+        // Account row and Host Status pill are INDEPENDENT tap targets so tapping
+        // "本机 · 未连接" always opens Host Management instead of Account & Balance!
         if (accountMatchesSearch) ...[
-          GrassBagSpringTap(
-            onTap: () => onSelect(SettingsSection.account),
-            pressedScale: 0.98,
-            haptic: true,
-            child: GrassBagCard(
-              borderRadius: 26,
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        width: 46,
-                        height: 46,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.14 : 0.18)!,
-                              t.primary,
-                              Color.lerp(t.primary, Colors.black, 0.08)!,
+          GrassBagCard(
+            borderRadius: 26,
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                GrassBagSpringTap(
+                  key: const ValueKey('settings-hero-account-row'),
+                  onTap: () => onSelect(SettingsSection.account),
+                  pressedScale: 0.985,
+                  enablePointerGlow: false,
+                  haptic: true,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 46,
+                          height: 46,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                              colors: [
+                                Color.lerp(t.primaryHi, Colors.white, t.isDark ? 0.14 : 0.18)!,
+                                t.primary,
+                                Color.lerp(t.primary, Colors.black, 0.08)!,
+                              ],
+                              stops: const [0.0, 0.56, 1.0],
+                            ),
+                            shape: BoxShape.circle,
+                            boxShadow: [
+                              BoxShadow(
+                                color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.24),
+                                blurRadius: 10,
+                                offset: const Offset(0, 3),
+                              ),
                             ],
-                            stops: const [0.0, 0.56, 1.0],
                           ),
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(
-                              color: t.primary.withValues(alpha: t.isDark ? 0.34 : 0.24),
-                              blurRadius: 10,
-                              offset: const Offset(0, 3),
+                          alignment: Alignment.center,
+                          child: Text(
+                            'DS',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: -0.3,
+                              color: t.onPrimary,
                             ),
-                          ],
-                        ),
-                        alignment: Alignment.center,
-                        child: Text(
-                          'DS',
-                          style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: -0.3,
-                            color: t.onPrimary,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'DeepSeek 账号',
-                              style: TextStyle(
-                                fontSize: 16,
-                                fontWeight: FontWeight.w600,
-                                letterSpacing: -0.25,
-                                color: t.text,
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'DeepSeek 账号',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
+                                  letterSpacing: -0.25,
+                                  color: t.text,
+                                ),
                               ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              '${state.accountSummaryLabel} · ${state.providerCredentials.where((p) => p.configured).length} 个渠道已就绪',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontFeatures: const [FontFeature.tabularFigures()],
-                                color: t.text2,
+                              const SizedBox(height: 2),
+                              Text(
+                                '${state.accountSummaryLabel} · ${state.providerCredentials.where((p) => p.configured).length} 个渠道已就绪',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontFeatures: const [FontFeature.tabularFigures()],
+                                  color: t.text2,
+                                ),
                               ),
-                            ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                      if (!isSplit)
-                        Icon(CupertinoIcons.chevron_right, size: 15, color: t.text3),
-                    ],
+                        if (!isSplit)
+                          Icon(CupertinoIcons.chevron_right, size: 15, color: t.text3),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 12),
-                  GrassBagFresnelGlassSurface(
+                ),
+                const SizedBox(height: 11),
+                GrassBagSpringTap(
+                  key: const ValueKey('settings-hero-host-pill'),
+                  onTap: () => onSelect(SettingsSection.hosts),
+                  pressedScale: 0.985,
+                  enablePointerGlow: false,
+                  haptic: true,
+                  child: GrassBagFresnelGlassSurface(
                     borderRadius: 14,
                     innerWell: true,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    interactive: true,
+                    tintColor: hostDisconnected ? t.warnSoft : null,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
                     child: Row(
                       children: [
                         GrassBagStatusDot(
@@ -930,7 +954,7 @@ class _SettingsNavList extends ConsumerWidget {
                               ? t.ok
                               : (curHost.needsAuth || state.hostIsConnecting(curHost)
                                   ? t.primary
-                                  : (state.hostHasError(curHost) ? t.err : t.text3)),
+                                  : (state.hostHasError(curHost) ? t.err : t.warn)),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
@@ -945,24 +969,28 @@ class _SettingsNavList extends ConsumerWidget {
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                              color: t.text2,
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              color: hostDisconnected ? t.text : t.text2,
                             ),
                           ),
                         ),
-                        if (!isSplit) ...[
-                          const SizedBox(width: 8),
-                          Text(
-                            '${state.accent.label} · ${state.glassTier.label}',
-                            style: TextStyle(fontSize: 11.5, color: t.text3),
+                        const SizedBox(width: 8),
+                        Text(
+                          hostDisconnected ? '去连接主机' : '主机管理',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.primary,
                           ),
-                        ],
+                        ),
+                        const SizedBox(width: 2),
+                        Icon(CupertinoIcons.chevron_right, size: 12.5, color: t.primary),
                       ],
                     ),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
           SizedBox(height: isSplit ? 10 : 18),
@@ -1947,12 +1975,12 @@ class _SettingsDetailBody extends ConsumerWidget {
             ],
             Padding(
               padding: const EdgeInsets.only(left: 14, bottom: 8),
-              child: Text('添加远程主机', style: TextStyle(fontSize: 12, color: t.text3)),
+              child: Text('连接电脑', style: TextStyle(fontSize: 12, color: t.text3)),
             ),
             RemoteHostConnectCard(
               connectImmediately: true,
-              showHeader: true,
-              initiallyShowGuide: remotes.isEmpty,
+              showHeader: false,
+              initiallyShowGuide: false,
               onConnectedHost: (added) {
                 if (added.isConnectedUsable && Navigator.of(context).canPop()) {
                   Navigator.of(context).popUntil((r) => r.isFirst);

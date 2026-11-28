@@ -129,9 +129,13 @@ class GbridgeHttpTransport {
             req.headers.set(HttpHeaders.cookieHeader, _cookieHeader!);
           }
           final res = await req.close().timeout(remaining());
+          final errHeader = res.headers.value('x-gbridge-error')?.trim();
           await _drainResponseWithTimeout(res, remaining());
           if (res.statusCode == 401 || res.statusCode == 403) {
             sawAuthRejection = true;
+            if (errHeader != null && errHeader.isNotEmpty) {
+              _lastAuthErrorCode = errHeader;
+            }
             return false;
           }
           if (res.statusCode < 200 || res.statusCode >= 400) return false;
@@ -145,7 +149,13 @@ class GbridgeHttpTransport {
         }
       }
 
-      if (await attempt('/', {'token': token})) {
+      _lastAuthErrorCode = null;
+      final pairCode = endpoint.pairCode?.trim();
+      final rootQuery = <String, String>{
+        'token': token,
+        if (pairCode != null && pairCode.isNotEmpty) 'p': pairCode,
+      };
+      if (await attempt('/', rootQuery)) {
         _lastAuthExchangeRejected = false;
         return true;
       }
@@ -154,7 +164,12 @@ class GbridgeHttpTransport {
         return true;
       }
       if (DateTime.now().isBefore(deadline)) {
-        if (await attempt('/connect', {'token': token, 'interactions': 'answer'})) {
+        final connectQuery = <String, String>{
+          'token': token,
+          'interactions': 'answer',
+          if (pairCode != null && pairCode.isNotEmpty) 'p': pairCode,
+        };
+        if (await attempt('/connect', connectQuery)) {
           _lastAuthExchangeRejected = false;
           return true;
         }
@@ -177,6 +192,10 @@ class GbridgeHttpTransport {
   }
 
   bool _lastAuthExchangeRejected = false;
+  String? _lastAuthErrorCode;
+
+  /// Optional structured auth error code reported during token exchange (e.g. `gbridge/pairing_code_expired`).
+  String? get lastAuthErrorCode => _lastAuthErrorCode;
 
   /// Evict only stale DSH/gbridge session cookies while preserving reverse-proxy / SSO cookies
   /// (e.g. Cloudflare Access, Authelia) so token re-exchange can still pass through the proxy.
@@ -645,7 +664,16 @@ class GbridgeHttpTransport {
       return await _connectWsWithTimeout(wsUri, buildAuthHeaders(), timeout);
     } on WebSocketException catch (e) {
       WebSocketException lastWsErr = e;
-      if (!endpoint.isUnixSocket && (endpoint.token?.isNotEmpty ?? false)) {
+      final initialMsgLower = e.message.toLowerCase();
+      final isLikelyWsAuthFailure = initialMsgLower.contains('http status code: 401') ||
+          initialMsgLower.contains('http status code: 403') ||
+          initialMsgLower.contains('http status code: 302') ||
+          initialMsgLower.contains('http status code: 303') ||
+          usedCookie == null ||
+          usedCookie.isEmpty;
+      if (!endpoint.isUnixSocket &&
+          isLikelyWsAuthFailure &&
+          (endpoint.token?.isNotEmpty ?? false)) {
         final exchanged = await exchangeAuthToken();
         if (exchanged) {
           try {
@@ -1101,12 +1129,14 @@ class GbridgeStreamClient {
       );
 
       _sentHelloChannels = Set<String>.of(_channels);
+      final pairCode = _transport.endpoint.pairCode?.trim();
       _sendJson({
         'op': 'hello',
         'v': 1,
         'clientId': clientId,
         'coalesceMs': coalesceMs,
         'channels': _sentHelloChannels.toList(growable: false),
+        if (pairCode != null && pairCode.isNotEmpty) 'pairCode': pairCode,
         if (_lastBootId != null) 'lastBootId': _lastBootId,
         if (_lastBootId != null) 'resumeFromSeq': _lastSeq,
       });

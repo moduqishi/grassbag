@@ -831,14 +831,17 @@ void main() {
       expect(exported, isNot(contains('SECRET_SHOULD_STRIP')));
       expect(exported, isNot(contains('?token=')));
 
-      // Offline send renders honest notice turn WITHOUT creating a pending-session-* ghost in state.sessions!
+      // Offline send preserves single editable draft + persistent unsent notice + outbox
+      // WITHOUT creating a pending-session-* ghost or duplicate turn bubble!
       final initialSessionCount = container.read(appProvider).sessions.length;
-      await ctrl.sendPrompt('离线测试消息');
+      final offlineSent = await ctrl.sendPrompt('离线测试消息');
       final afterOffline = container.read(appProvider);
+      expect(offlineSent, isFalse);
       expect(afterOffline.sessions.length, initialSessionCount);
       expect(afterOffline.sessions.any((s) => s.id.startsWith('pending-session-')), isFalse);
-      expect(afterOffline.turns, isNotEmpty);
-      expect(afterOffline.isEmptyChat, isFalse);
+      expect(afterOffline.turns, isEmpty);
+      expect(afterOffline.offlineUnsentNotice, isNotNull);
+      expect(afterOffline.pendingOutbox.any((e) => e.text == '离线测试消息'), isTrue);
 
       // cancelStreaming clears pending approval & question takeovers cleanly
       // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member

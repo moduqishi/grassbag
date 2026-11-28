@@ -667,6 +667,16 @@ export class StreamHub {
         }
         const replayChannelSet = new Set([...client.channels, ...requestedChannels]);
         client.welcomed = true;
+        client.pairCode = typeof msg.pairCode === 'string' && msg.pairCode.trim()
+          ? msg.pairCode.trim().slice(0, 64)
+          : null;
+        if (typeof this.onClientWelcomed === 'function') {
+          try {
+            this.onClientWelcomed(client, msg);
+          } catch (err) {
+            logSuppressed(this.logger, 'stream-hub', err, { level: 'debug', detail: 'onClientWelcomed callback failed' });
+          }
+        }
 
         const oldestRingSeq = this.ringHead < this.ring.length ? this.ring[this.ringHead].seq : this.seq + 1;
         const oldestDurableSeq = this.durableRingHead < this.durableRing.length

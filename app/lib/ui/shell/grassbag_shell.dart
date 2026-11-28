@@ -23,6 +23,7 @@ import '../chat/chat_empty_state.dart';
 import '../chat/composer_bar.dart';
 import '../chat/turn_process_widget.dart';
 import '../common/grassbag_sheets.dart';
+import '../common/pending_inbox_sheet.dart';
 import '../detail/session_detail_page.dart';
 import '../drawer/sessions_drawer.dart';
 import '../features/all_features_page.dart';
@@ -144,6 +145,19 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
     if (initialDraft.isNotEmpty) {
       _composerCtrl.text = initialDraft;
     }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final pendingUri = ref.read(appProvider.notifier).consumePendingPairDeepLink();
+      if (pendingUri != null && pendingUri.isNotEmpty) {
+        _dismissKeyboardAndPopovers();
+        showPairComputerSheet(
+          context,
+          initialInput: pendingUri,
+          confirmBeforeConnect: true,
+          onOpenHostSettings: () => _openSettings(initialSection: SettingsSection.hosts),
+        );
+      }
+    });
   }
 
   @override
@@ -1018,21 +1032,14 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
         !s.hasAvailableModels &&
         !s.hydratingDomains) {
       // Preserve the tapped suggestion in the composer so the user does not lose it after configuring a model!
-      if (_composerCtrl.text.trim().isEmpty) {
-        _composerCtrl.value = TextEditingValue(
-          text: prompt,
-          selection: TextSelection.collapsed(offset: prompt.length),
-        );
-      }
+      _prefillComposer(prompt);
       ctrl.showToast('请先登录 DeepSeek 或添加 API Key 模型渠道', tone: ToastTone.info);
       _openSettings(initialSection: SettingsSection.model);
       return;
     }
-    if (_composerCtrl.text.trim().isNotEmpty || s.pendingAttachments.isNotEmpty) {
-      _prefillComposer(prompt);
-      return;
-    }
-    ctrl.sendPrompt(prompt, includePendingAttachments: false);
+    // Always prefill the composer uniformly so the user can review prompt, active workspace,
+    // and target host before deciding to send.
+    _prefillComposer(prompt);
   }
 
   void _openTerminal() {
@@ -1607,6 +1614,26 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
       }
     });
 
+    // Open the unified "连接电脑" pairing sheet whenever a `grassbag://pair?...` deep link
+    // arrives from the system camera or chat app, showing target computer details BEFORE connecting!
+    ref.listen<String?>(appProvider.select((s) => s.pendingPairDeepLinkUri), (prev, next) {
+      if (next != null && next.isNotEmpty && next != prev) {
+        final uri = ref.read(appProvider.notifier).consumePendingPairDeepLink();
+        if (uri != null && uri.isNotEmpty) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            _dismissKeyboardAndPopovers();
+            showPairComputerSheet(
+              context,
+              initialInput: uri,
+              confirmBeforeConnect: true,
+              onOpenHostSettings: () => _openSettings(initialSection: SettingsSection.hosts),
+            );
+          });
+        }
+      }
+    });
+
     // ULTRA-NARROW SHELL SELECTOR: GrassBagShell NEVER watches `s.turns` or `s.isStreaming`!
     // During an entire 2,000-token stream, GrassBagShell, Top Liquid Glass chrome,
     // ChatComposerDock, Sidebar, and collapsed Workbench experience ZERO rebuilds!
@@ -1963,7 +1990,10 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                             final leftChromeW = showTopLeftBtn
                                 ? ((isTab && !shellSlice.tabletSidebarOpen) ? 108.0 : 54.0)
                                 : 0.0;
-                            final rightChromeW = showTopRightBtn ? 54.0 : 0.0;
+                            final showInChatSearchBtn =
+                                !shellSlice.isEmptyChat && shellSlice.hasActiveSession;
+                            final rightChromeW = (showInChatSearchBtn ? 50.0 : 0.0) +
+                                (showTopRightBtn ? 54.0 : 0.0);
                             final showStackedHeader = !shellSlice.isEmptyChat &&
                                 (shellSlice.activeWorkspaceName.isNotEmpty ||
                                     !shellSlice.hostIsLocal ||
@@ -2246,6 +2276,27 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                 ),
                                 if (!hideCenterTitle && rightChromeW < leftChromeW)
                                   SizedBox(width: leftChromeW - rightChromeW),
+                                if (showInChatSearchBtn) ...[
+                                  const SizedBox(width: 8),
+                                  SizedBox(
+                                    width: 42,
+                                    height: 44,
+                                    child: Center(
+                                      child: GrassBagGlassCircleButton(
+                                        key: const ValueKey('top-inchat-search-btn'),
+                                        icon: CupertinoIcons.search,
+                                        iconSize: 18,
+                                        size: 42,
+                                        useOwnLayer: false,
+                                        tooltip: '搜索本对话',
+                                        tier: shellSlice.glassTier,
+                                        onTap: _inChatSearchOpen
+                                            ? _closeInChatSearch
+                                            : _openInChatSearch,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                                 if (showTopRightBtn) ...[
                                   const SizedBox(width: 10),
                                   SizedBox(
@@ -2340,6 +2391,13 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
                                   },
                                   onStep: _stepInChatSearchMatch,
                                   onClose: _closeInChatSearch,
+                                  onLoadedOlderMatches: (matches) {
+                                    if (!mounted) return;
+                                    setState(() => _inChatSearchCursor = 0);
+                                    if (matches.isNotEmpty) {
+                                      _jumpToTurnById(matches.first);
+                                    }
+                                  },
                                 ),
                               ),
                             ),
@@ -2852,6 +2910,25 @@ class _GrassBagShellState extends ConsumerState<GrassBagShell>
 
                 // Compact background-session approval alert pill (isolated ConsumerWidget!)
                 _BackgroundApprovalBannerPill(tier: shellSlice.glassTier),
+
+                // Consolidated Pending Inbox pill when failed jobs / background questions /
+                // multi-session pending items need attention!
+                _PendingInboxBannerPill(
+                  tier: shellSlice.glassTier,
+                  onOpenInbox: () => unawaited(
+                    showPendingInboxSheet(
+                      context,
+                      ref,
+                      onOpenJobs: () => Navigator.of(context).push(
+                        GrassBagPageRoute<void>(builder: (_) => const JobsPage()),
+                      ),
+                      onOpenHosts: () => _openSettings(
+                        initialSection: SettingsSection.hosts,
+                        hostDetailId: shellSlice.hostId,
+                      ),
+                    ),
+                  ),
+                ),
 
                 // In-App Live Phone-Control Floating Pill stacked cleanly inside the same
                 // measured Column so it NEVER overlaps another top status banner at any font scale!
@@ -5544,7 +5621,8 @@ class _BackgroundApprovalBannerPillState
   }
 }
 
-/// Compact floating Liquid Glass In-Chat Search bar (`Cmd/Ctrl+F` or header menu).
+/// Compact floating Liquid Glass In-Chat Search bar (`Cmd/Ctrl+F`, visible top search button, or header menu).
+/// Explicitly displays loaded search scope and offers 1-tap "加载更早继续搜" when older turns exist.
 class _InChatSearchBar extends ConsumerWidget {
   const _InChatSearchBar({
     required this.controller,
@@ -5556,6 +5634,7 @@ class _InChatSearchBar extends ConsumerWidget {
     required this.onChanged,
     required this.onStep,
     required this.onClose,
+    this.onLoadedOlderMatches,
   });
 
   final TextEditingController controller;
@@ -5567,10 +5646,21 @@ class _InChatSearchBar extends ConsumerWidget {
   final ValueChanged<String> onChanged;
   final ValueChanged<int> onStep;
   final VoidCallback onClose;
+  final ValueChanged<List<String>>? onLoadedOlderMatches;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final turns = ref.watch(appProvider.select((s) => s.turns));
+    final slice = ref.watch(
+      appProvider.select(
+        (s) => (
+          turns: s.turns,
+          hasMoreTurns: s.hasMoreTurns,
+          loadingOlderTurns: s.loadingOlderTurns,
+        ),
+      ),
+    );
+    final ctrl = ref.read(appProvider.notifier);
+    final turns = slice.turns;
     final matches = computeMatches(turns, query);
     final t = GrassBagTokens.of(context);
     final hasQuery = query.trim().isNotEmpty;
@@ -5579,107 +5669,267 @@ class _InChatSearchBar extends ConsumerWidget {
         : (matches.isEmpty
             ? '0 / 0'
             : '${(cursor % matches.length) + 1} / ${matches.length}');
+    final placeholder = slice.hasMoreTurns
+        ? '在已加载的 ${turns.length} 轮中搜索…'
+        : '搜索本对话全部 ${turns.length} 轮…';
     return GrassBagGlass(
       tier: tier,
       borderRadius: 20,
       elevated: true,
       interactiveGlow: false,
       padding: const EdgeInsets.fromLTRB(10, 4, 6, 4),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Icon(CupertinoIcons.search, size: 15, color: t.text3),
-          const SizedBox(width: 8),
-          Expanded(
-            child: CupertinoTextField(
-              controller: controller,
-              focusNode: focusNode,
-              placeholder: '搜索本对话内容…',
-              placeholderStyle: TextStyle(fontSize: 13, color: t.text3),
-              style: TextStyle(fontSize: 13.5, color: t.text),
-              decoration: const BoxDecoration(),
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              textInputAction: TextInputAction.search,
-              onChanged: onChanged,
-              onSubmitted: (_) => onStep(1),
-            ),
-          ),
-          AnimatedSize(
-            duration: GrassBagMotion.duration(
-              context,
-              const Duration(milliseconds: 160),
-              reduced: const Duration(milliseconds: 1),
-            ),
-            curve: Curves.easeOutCubic,
-            alignment: Alignment.centerRight,
-            child: hasQuery
-                ? Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const SizedBox(width: 6),
-                      Text(
-                        countLabel,
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                          color: matches.isEmpty ? t.err : t.text3,
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Tooltip(
-                        message: '上一条匹配',
-                        child: GrassBagSpringTap(
-                          enabled: matches.isNotEmpty,
-                          onTap: () => onStep(-1),
-                          child: SizedBox(
-                            width: 30,
-                            height: 30,
-                            child: Center(
-                              child: Icon(
-                                CupertinoIcons.chevron_up,
-                                size: 14,
-                                color: matches.isEmpty ? t.text3.withValues(alpha: 0.4) : t.text2,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                      Tooltip(
-                        message: '下一条匹配',
-                        child: GrassBagSpringTap(
-                          enabled: matches.isNotEmpty,
-                          onTap: () => onStep(1),
-                          child: SizedBox(
-                            width: 30,
-                            height: 30,
-                            child: Center(
-                              child: Icon(
-                                CupertinoIcons.chevron_down,
-                                size: 14,
-                                color: matches.isEmpty ? t.text3.withValues(alpha: 0.4) : t.text2,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  )
-                : const SizedBox.shrink(),
-          ),
-          Tooltip(
-            message: '关闭搜索',
-            child: GrassBagSpringTap(
-              onTap: onClose,
-              child: SizedBox(
-                width: 32,
-                height: 32,
-                child: Center(
-                  child: Icon(CupertinoIcons.xmark, size: 13.5, color: t.text2),
+          Row(
+            children: [
+              Icon(CupertinoIcons.search, size: 15, color: t.text3),
+              const SizedBox(width: 8),
+              Expanded(
+                child: CupertinoTextField(
+                  controller: controller,
+                  focusNode: focusNode,
+                  placeholder: placeholder,
+                  placeholderStyle: TextStyle(fontSize: 13, color: t.text3),
+                  style: TextStyle(fontSize: 13.5, color: t.text),
+                  decoration: const BoxDecoration(),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  textInputAction: TextInputAction.search,
+                  onChanged: onChanged,
+                  onSubmitted: (_) => onStep(1),
                 ),
+              ),
+              AnimatedSize(
+                duration: GrassBagMotion.duration(
+                  context,
+                  const Duration(milliseconds: 160),
+                  reduced: const Duration(milliseconds: 1),
+                ),
+                curve: Curves.easeOutCubic,
+                alignment: Alignment.centerRight,
+                child: hasQuery
+                    ? Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(width: 6),
+                          Text(
+                            countLabel,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                              color: matches.isEmpty ? t.err : t.text3,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Tooltip(
+                            message: '上一条匹配',
+                            child: GrassBagSpringTap(
+                              enabled: matches.isNotEmpty,
+                              onTap: () => onStep(-1),
+                              child: SizedBox(
+                                width: 30,
+                                height: 30,
+                                child: Center(
+                                  child: Icon(
+                                    CupertinoIcons.chevron_up,
+                                    size: 14,
+                                    color: matches.isEmpty ? t.text3.withValues(alpha: 0.4) : t.text2,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Tooltip(
+                            message: '下一条匹配',
+                            child: GrassBagSpringTap(
+                              enabled: matches.isNotEmpty,
+                              onTap: () => onStep(1),
+                              child: SizedBox(
+                                width: 30,
+                                height: 30,
+                                child: Center(
+                                  child: Icon(
+                                    CupertinoIcons.chevron_down,
+                                    size: 14,
+                                    color: matches.isEmpty ? t.text3.withValues(alpha: 0.4) : t.text2,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      )
+                    : const SizedBox.shrink(),
+              ),
+              Tooltip(
+                message: '关闭搜索',
+                child: GrassBagSpringTap(
+                  onTap: onClose,
+                  child: SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: Center(
+                      child: Icon(CupertinoIcons.xmark, size: 13.5, color: t.text2),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (slice.hasMoreTurns || hasQuery) ...[
+            Divider(height: 0.5, color: t.sep),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(2, 5, 4, 3),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      slice.hasMoreTurns
+                          ? '检索范围：已加载的 ${turns.length} 轮（不含更早记录）'
+                          : '检索范围：已含本对话全部 ${turns.length} 轮',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 11, color: t.text3),
+                    ),
+                  ),
+                  if (slice.hasMoreTurns) ...[
+                    const SizedBox(width: 8),
+                    GrassBagSpringTap(
+                      key: const ValueKey('inchat-search-load-older-btn'),
+                      enabled: !slice.loadingOlderTurns,
+                      pressedScale: 0.94,
+                      enablePointerGlow: false,
+                      haptic: true,
+                      onTap: () async {
+                        await ctrl.loadOlderTurns();
+                        final updated = ref.read(appProvider).turns;
+                        if (hasQuery) {
+                          final nextMatches = computeMatches(updated, query);
+                          onLoadedOlderMatches?.call(nextMatches);
+                        }
+                      },
+                      child: GrassBagFresnelGlassSurface(
+                        isPill: true,
+                        innerWell: true,
+                        interactive: true,
+                        tintColor: t.primarySoft,
+                        padding: const EdgeInsets.symmetric(horizontal: 8.5, vertical: 3.5),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (slice.loadingOlderTurns) ...[
+                              GrassBagActivityIndicator(radius: 5.5, color: t.primary),
+                              const SizedBox(width: 5),
+                            ],
+                            Text(
+                              slice.loadingOlderTurns ? '加载中…' : '继续查找更早记录',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: t.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Compact floating pill surfacing the consolidated Pending Inbox whenever failed jobs,
+/// pending interactions, or unconfirmed drafts need user action.
+class _PendingInboxBannerPill extends ConsumerWidget {
+  const _PendingInboxBannerPill({
+    required this.tier,
+    required this.onOpenInbox,
+  });
+
+  final GrassBagGlassTier tier;
+  final VoidCallback onOpenInbox;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final slice = ref.watch(
+      appProvider.select(
+        (s) => (
+          pendingInteractions: s.pendingInteractions.length,
+          failedJobs: s.failedJobs.length,
+          unsentCount: s.unsentOutboxForActiveHost.length,
+          hasInlineUnsentStrip: s.offlineUnsentNotice != null && !s.isDshConnected,
+          hasActiveTakeover: s.pendingApprovalCommand != null ||
+              s.activeQuestion != null ||
+              s.activeCordisRequest != null,
+          activePendingCount: s.activePendingInteractionCount,
+        ),
+      ),
+    );
+    // Avoid duplicating when the ONLY pending item is already displayed inline in the composer
+    // (single active takeover card or inline offline-unsent strip).
+    final backgroundInteractions =
+        (slice.pendingInteractions - (slice.hasActiveTakeover ? slice.activePendingCount : 0))
+            .clamp(0, 999);
+    final actionableOutsideComposer = backgroundInteractions +
+        slice.failedJobs +
+        (slice.hasInlineUnsentStrip ? 0 : slice.unsentCount);
+    if (actionableOutsideComposer <= 0) return const SizedBox.shrink();
+
+    final t = GrassBagTokens.of(context);
+    final parts = <String>[
+      if (backgroundInteractions > 0) '$backgroundInteractions 待确认',
+      if (slice.failedJobs > 0) '${slice.failedJobs} 任务失败',
+      if (!slice.hasInlineUnsentStrip && slice.unsentCount > 0) '${slice.unsentCount} 未发送',
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 440),
+          child: GrassBagSpringTap(
+            key: const ValueKey('top-pending-inbox-pill'),
+            onTap: onOpenInbox,
+            pressedScale: 0.97,
+            enablePointerGlow: false,
+            haptic: true,
+            child: GrassBagGlass(
+              tier: tier,
+              borderRadius: 999,
+              elevated: true,
+              interactiveGlow: false,
+              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(CupertinoIcons.tray_fill, size: 14, color: t.warn),
+                  const SizedBox(width: 7),
+                  Flexible(
+                    child: Text(
+                      '待处理收件箱 · ${parts.join(' / ')}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: t.text,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                ],
               ),
             ),
           ),
-        ],
+        ),
       ),
     );
   }

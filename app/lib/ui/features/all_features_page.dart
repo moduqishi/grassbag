@@ -7,6 +7,7 @@ import '../../state/app_state.dart';
 import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../common/pending_inbox_sheet.dart';
 import 'jobs_page.dart';
 import 'plugins_center_page.dart';
 import 'schedules_page.dart';
@@ -142,6 +143,30 @@ class AllFeaturesPage extends ConsumerWidget {
       _FeatureSectionSpec(
         title: '工作台与会话',
         tiles: [
+          _FeatureTileSpec(
+            icon: CupertinoIcons.tray_fill,
+            color: state.pendingInboxCount > 0 ? t.warn : t.primary,
+            title: '待处理收件箱',
+            subtitle: state.pendingInboxCount > 0
+                ? '待审批、待回答、失败任务与未发送消息'
+                : '集中查看审批、提问、失败任务与未发送草稿',
+            badgeText: state.pendingInboxCount > 0
+                ? '${state.pendingInboxCount} 项待处理'
+                : null,
+            badgeColor: t.warn,
+            badgeBg: t.warnSoft,
+            onTap: () {
+              showPendingInboxSheet(
+                context,
+                ref,
+                onOpenJobs: () => pushOrCall(onOpenJobs, (_) => const JobsPage()),
+                onOpenHosts: () {
+                  navigator.pop();
+                  onOpenHosts();
+                },
+              );
+            },
+          ),
           _FeatureTileSpec(
             icon: CupertinoIcons.folder_fill,
             color: t.primary,

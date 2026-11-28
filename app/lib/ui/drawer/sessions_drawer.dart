@@ -10,6 +10,7 @@ import '../../theme/grassbag_glass.dart';
 import '../../theme/grassbag_mascot.dart';
 import '../../theme/grassbag_theme.dart';
 import '../common/grassbag_sheets.dart';
+import '../common/pending_inbox_sheet.dart';
 
 /// Refined `dsh-Go × macOS` Left Sidebar (Phone: rounded frosted drawer · Tablet: docked sidebar).
 class SessionsSidebar extends ConsumerStatefulWidget {
@@ -1145,6 +1146,74 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
           ),
         ),
 
+        // Compact Pending Inbox entry (consolidates pending approvals, questions, failed jobs, & unsent drafts!)
+        Builder(
+          builder: (inboxCtx) {
+            final inboxCount = ref.watch(appProvider.select((s) => s.pendingInboxCount));
+            if (inboxCount <= 0) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(14, 2, 14, 8),
+              child: GrassBagSpringTap(
+                key: const ValueKey('drawer-pending-inbox-btn'),
+                pressedScale: 0.985,
+                enablePointerGlow: false,
+                haptic: true,
+                onTap: () {
+                  widget.onCloseDrawer?.call();
+                  unawaited(
+                    showPendingInboxSheet(
+                      inboxCtx,
+                      ref,
+                      onOpenHosts: widget.onOpenHostsSettings,
+                    ),
+                  );
+                },
+                child: GrassBagFresnelGlassSurface(
+                  borderRadius: 14,
+                  innerWell: true,
+                  interactive: true,
+                  tintColor: t.warnSoft,
+                  padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(CupertinoIcons.tray_fill, size: 15, color: t.warn),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '待处理收件箱',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.w600,
+                            color: t.text,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: t.warn.withValues(alpha: t.isDark ? 0.28 : 0.16),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          '$inboxCount 项',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                            color: t.warn,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                      Icon(CupertinoIcons.chevron_right, size: 12, color: t.text3),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+
         // Compact offline / auth banner when cached sessions are still displayed
         GrassBagSmoothDisclosure(
           expanded: flatItems.isNotEmpty &&
@@ -1766,6 +1835,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               const SizedBox(width: 6),
               _FooterIconButton(
                 icon: CupertinoIcons.square_grid_2x2_fill,
+                label: '功能',
                 tooltip: '全部功能',
                 isTabletDocked: widget.isTabletDocked,
                 onTap: () {
@@ -1776,6 +1846,7 @@ class _SessionsSidebarState extends ConsumerState<SessionsSidebar> {
               const SizedBox(width: 6),
               _FooterIconButton(
                 icon: CupertinoIcons.gear_solid,
+                label: '设置',
                 tooltip: '设置',
                 showBadge: state.localHost.hasLocalUpdates || state.hasUnignoredAppUpdate,
                 isTabletDocked: widget.isTabletDocked,
@@ -2330,11 +2401,13 @@ class _FooterIconButton extends StatelessWidget {
     required this.icon,
     required this.tooltip,
     required this.onTap,
+    this.label,
     this.showBadge = false,
     this.isTabletDocked = false,
   });
 
   final IconData icon;
+  final String? label;
   final String tooltip;
   final VoidCallback onTap;
   final bool showBadge;
@@ -2345,24 +2418,46 @@ class _FooterIconButton extends StatelessWidget {
     final t = GrassBagTokens.of(context);
     final ambientTier = resolveAmbientGlassTier(context);
     final isSolid = ambientTier == GrassBagGlassTier.solid;
+    final hasLabel = label != null && label!.trim().isNotEmpty;
     final Widget orb = GrassBagSpringTap(
       onTap: onTap,
-      pressedScale: 0.90,
+      pressedScale: 0.92,
       enablePointerGlow: false,
       haptic: true,
       child: Container(
-        width: 36,
         height: 36,
+        padding: EdgeInsets.symmetric(horizontal: hasLabel ? 10 : 0),
+        constraints: BoxConstraints(minWidth: hasLabel ? 48 : 36),
         alignment: Alignment.center,
         decoration: ShapeDecoration(
           color: t.isDark
               ? Colors.white.withValues(alpha: isSolid ? 0.10 : 0.10)
               : (isSolid ? const Color(0x11162E42) : Colors.black.withValues(alpha: 0.055)),
-          shape: CircleBorder(
-            side: isSolid ? BorderSide(color: t.sep, width: 0.65) : BorderSide.none,
-          ),
+          shape: hasLabel
+              ? StadiumBorder(
+                  side: isSolid ? BorderSide(color: t.sep, width: 0.65) : BorderSide.none,
+                )
+              : CircleBorder(
+                  side: isSolid ? BorderSide(color: t.sep, width: 0.65) : BorderSide.none,
+                ),
         ),
-        child: Icon(icon, size: 18, color: t.text2),
+        child: hasLabel
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 15, color: t.text2),
+                  const SizedBox(width: 4),
+                  Text(
+                    label!,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w500,
+                      color: t.text2,
+                    ),
+                  ),
+                ],
+              )
+            : Icon(icon, size: 18, color: t.text2),
       ),
     );
     return Tooltip(

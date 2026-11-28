@@ -88,7 +88,7 @@ test('zero-conflict port prober skips busy port and binds cleanly with port-scop
     });
     assert.equal(uiRes.status, 200);
     const uiHtml = await uiRes.text();
-    assert.ok(uiHtml.includes('GrassBag 手机扫码配对'));
+    assert.ok(uiHtml.includes('GrassBag 手机连接'));
 
     const pairRes = await fetch(`http://127.0.0.1:${info.port}/gbridge/v1/pairing`, {
       headers: { cookie: cookieHeader },

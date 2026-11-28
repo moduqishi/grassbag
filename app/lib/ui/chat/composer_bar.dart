@@ -378,7 +378,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _hasText = widget.controller.text.trim().isNotEmpty;
     widget.controller.addListener(_onTextChanged);
     widget.focusNode.addListener(_onFocusChanged);
-    widget.focusNode.onKeyEvent = _handleComposerKeyEvent;
     widget.plusOpenNotifier?.addListener(_onExternalPlusChanged);
     widget.suggestionsOpenNotifier?.addListener(_onExternalSuggestionsChanged);
   }
@@ -393,11 +392,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     }
     if (oldWidget.focusNode != widget.focusNode) {
       oldWidget.focusNode.removeListener(_onFocusChanged);
-      if (oldWidget.focusNode.onKeyEvent == _handleComposerKeyEvent) {
-        oldWidget.focusNode.onKeyEvent = null;
-      }
       widget.focusNode.addListener(_onFocusChanged);
-      widget.focusNode.onKeyEvent = _handleComposerKeyEvent;
     }
     if (oldWidget.plusOpenNotifier != widget.plusOpenNotifier) {
       oldWidget.plusOpenNotifier?.removeListener(_onExternalPlusChanged);
@@ -415,9 +410,6 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
     _draftSyncTimer?.cancel();
     widget.controller.removeListener(_onTextChanged);
     widget.focusNode.removeListener(_onFocusChanged);
-    if (widget.focusNode.onKeyEvent == _handleComposerKeyEvent) {
-      widget.focusNode.onKeyEvent = null;
-    }
     widget.plusOpenNotifier?.removeListener(_onExternalPlusChanged);
     widget.suggestionsOpenNotifier?.removeListener(_onExternalSuggestionsChanged);
     _suggestionTickNotifier.dispose();
@@ -950,8 +942,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               accentColor: t.dusk,
               onTap: () {
                 unawaited(() async {
-                  await ctrl.setPlanMode(true);
-                  if (mounted) await _submit();
+                  final ok = await ctrl.setPlanMode(true);
+                  if (!mounted) return;
+                  if (!ok) {
+                    ctrl.showToast('切换计划模式失败，本次未发送（已保留草稿）', tone: ToastTone.warn);
+                    return;
+                  }
+                  await _submit();
                 }());
               },
             )
@@ -962,8 +959,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
               icon: CupertinoIcons.bolt_fill,
               onTap: () {
                 unawaited(() async {
-                  await ctrl.setPlanMode(false);
-                  if (mounted) await _submit();
+                  final ok = await ctrl.setPlanMode(false);
+                  if (!mounted) return;
+                  if (!ok) {
+                    ctrl.showToast('退出计划模式失败，本次未发送（已保留草稿）', tone: ToastTone.warn);
+                    return;
+                  }
+                  await _submit();
                 }());
               },
             ),
@@ -1734,6 +1736,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
             hostDirectMode: host.directMode,
             hostNeedsAuth: host.needsAuth,
             routableProvidersCount: s.routableProviders.length,
+            offlineUnsentNotice: s.offlineUnsentNotice,
           );
         },
       ),
@@ -2855,7 +2858,15 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                 if (!state.isEmptyChat && !state.isStreaming) {
                                                   HapticFeedback.mediumImpact();
                                                   unawaited(() async {
-                                                    await ctrl.setPlanMode(false);
+                                                    final ok = await ctrl.setPlanMode(false);
+                                                    if (!mounted) return;
+                                                    if (!ok) {
+                                                      ctrl.showToast(
+                                                        '退出计划模式失败，未开始执行，请稍后重试',
+                                                        tone: ToastTone.warn,
+                                                      );
+                                                      return;
+                                                    }
                                                     await ctrl.sendPrompt('请按上述方案开始执行。');
                                                   }());
                                                 }
@@ -3096,6 +3107,95 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                 child: Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
+                                  if (state.offlineUnsentNotice != null && !state.isDshConnected)
+                                    Padding(
+                                      key: const ValueKey('composer-offline-unsent-strip'),
+                                      padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
+                                      child: GrassBagFresnelGlassSurface(
+                                        borderRadius: 14,
+                                        innerWell: true,
+                                        tintColor: t.warnSoft,
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 6,
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Icon(
+                                              CupertinoIcons.exclamationmark_circle_fill,
+                                              size: 14,
+                                              color: t.warn,
+                                            ),
+                                            const SizedBox(width: 7),
+                                            Expanded(
+                                              child: Text(
+                                                state.offlineUnsentNotice!,
+                                                maxLines: 2,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 11.5,
+                                                  fontWeight: FontWeight.w500,
+                                                  height: 1.3,
+                                                  color: t.text,
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 6),
+                                            GrassBagSpringTap(
+                                              key: const ValueKey('composer-offline-connect-btn'),
+                                              enablePointerGlow: false,
+                                              haptic: true,
+                                              onTap: () {
+                                                widget.focusNode.unfocus();
+                                                if (widget.onOpenHostSettings != null) {
+                                                  widget.onOpenHostSettings!();
+                                                } else {
+                                                  showHostQuickSheet(context, ref);
+                                                }
+                                              },
+                                              child: GrassBagFresnelGlassSurface(
+                                                isPill: true,
+                                                innerWell: true,
+                                                interactive: true,
+                                                tintColor: t.primary.withValues(alpha: 0.90),
+                                                padding: const EdgeInsets.symmetric(
+                                                  horizontal: 10,
+                                                  vertical: 5,
+                                                ),
+                                                child: Text(
+                                                  '连接主机',
+                                                  style: TextStyle(
+                                                    fontSize: 11.5,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: t.onPrimary,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 2),
+                                            Tooltip(
+                                              message: '收起未发送提示',
+                                              excludeFromSemantics: true,
+                                              child: GestureDetector(
+                                                behavior: HitTestBehavior.opaque,
+                                                onTap: ctrl.dismissOfflineUnsentNotice,
+                                                child: SizedBox(
+                                                  width: 28,
+                                                  height: 28,
+                                                  child: Center(
+                                                    child: Icon(
+                                                      CupertinoIcons.xmark,
+                                                      size: 12.5,
+                                                      color: t.text3,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
                                   if (widget.editingContextNotifier != null)
                                     ValueListenableBuilder<EditingMessageContext?>(
                                       valueListenable: widget.editingContextNotifier!,
@@ -3722,10 +3822,14 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               controller: _inputScrollCtrl,
                                               radius: const Radius.circular(3),
                                               thickness: 2.5,
-                                              child: TextField(
-                                                scrollController: _inputScrollCtrl,
-                                                controller: widget.controller,
-                                                focusNode: widget.focusNode,
+                                              child: Focus(
+                                                canRequestFocus: false,
+                                                skipTraversal: true,
+                                                onKeyEvent: _handleComposerKeyEvent,
+                                                child: TextField(
+                                                  scrollController: _inputScrollCtrl,
+                                                  controller: widget.controller,
+                                                  focusNode: widget.focusNode,
                                               minLines: 1,
                                               maxLines: effectiveTextMaxLines,
                                               keyboardType: TextInputType.multiline,
@@ -3808,6 +3912,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   contentPadding:
                                                       const EdgeInsets.symmetric(vertical: 4),
                                                   border: InputBorder.none,
+                                                ),
                                                 ),
                                               ),
                                             ),
@@ -4272,6 +4377,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                               () {
                                 final isStopOrb = (state.isStreaming || state.isStopping) && !hasText;
                                 final isFollowUpSend = state.isStreaming && hasText;
+                                final isOfflineDraft = !state.isDshConnected && !state.isStreaming;
                                 final showPrimarySpinner = _submitting && !isStopOrb;
                                 final orbInteractive = !state.isStopping &&
                                     (hasText || state.isStreaming || state.speechConfigured);
@@ -4280,7 +4386,9 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                     : (!state.isStopping &&
                                         !_submitting &&
                                         (hasText || state.speechConfigured));
-                                final primaryActive = (hasText && !state.isStopping) || showPrimarySpinner;
+                                final primaryActive =
+                                    (hasText && !state.isStopping && !isOfflineDraft) ||
+                                    showPrimarySpinner;
                                 final sendIcon = (isFollowUpSend && state.busyEnterMode == 'steer')
                                     ? CupertinoIcons.arrow_turn_down_right
                                     : CupertinoIcons.arrow_up;
@@ -4288,11 +4396,13 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                     ? (state.isStopping ? '正在停止生成…' : '停止生成')
                                     : (state.isStopping
                                         ? '正在停止上一轮生成…'
-                                        : (isFollowUpSend
-                                            ? (state.busyEnterMode == 'steer' ? '插话发送' : '排队发送')
-                                            : (hasText
-                                                ? '发送消息'
-                                                : (state.speechConfigured ? '语音输入' : '发送消息'))));
+                                        : (isOfflineDraft && hasText
+                                            ? '主机未连接 · 点击保留草稿并提示连接'
+                                            : (isFollowUpSend
+                                                ? (state.busyEnterMode == 'steer' ? '插话发送' : '排队发送')
+                                                : (hasText
+                                                    ? '发送消息'
+                                                    : (state.speechConfigured ? '语音输入' : '发送消息')))));
                                 final effectiveTier =
                                     resolveEffectiveGlassTier(context, state.glassTier);
                                 final orbChild = AnimatedSwitcher(
@@ -4342,7 +4452,7 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                                   ? (isFollowUpSend ? 15.5 : 17)
                                                   : (isStopOrb ? 14 : 16.5),
                                               color: hasText
-                                                  ? t.onPrimary
+                                                  ? (isOfflineDraft ? t.warn : t.onPrimary)
                                                   : isStopOrb
                                                       ? t.err
                                                       : (state.speechConfigured
@@ -4382,15 +4492,17 @@ class _ChatComposerDockState extends ConsumerState<ChatComposerDock>
                                               ]
                                             : (isStopOrb
                                                 ? [t.errSoft, t.errSoft]
-                                                : (t.isDark
-                                                    ? [
-                                                        Colors.white.withValues(alpha: 0.11),
-                                                        Colors.white.withValues(alpha: 0.09),
-                                                      ]
-                                                    : [
-                                                        Colors.black.withValues(alpha: 0.06),
-                                                        Colors.black.withValues(alpha: 0.05),
-                                                      ])),
+                                                : (hasText && isOfflineDraft
+                                                    ? [t.warnSoft, t.warnSoft]
+                                                    : (t.isDark
+                                                        ? [
+                                                            Colors.white.withValues(alpha: 0.11),
+                                                            Colors.white.withValues(alpha: 0.09),
+                                                          ]
+                                                        : [
+                                                            Colors.black.withValues(alpha: 0.06),
+                                                            Colors.black.withValues(alpha: 0.05),
+                                                          ]))),
                                       ),
                                       shape: BoxShape.circle,
                                       border: isSolid && !primaryActive

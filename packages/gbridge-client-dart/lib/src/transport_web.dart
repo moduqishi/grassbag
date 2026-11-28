@@ -205,13 +205,28 @@ class GbridgeHttpTransport {
       return _authExchangeFuture!;
     }
     Future<bool> run() async {
+      _lastAuthErrorCode = null;
       try {
-        final uri = endpoint.resolveHttpUri('/', {'token': token});
+        final pairCode = endpoint.pairCode?.trim();
+        final uri = endpoint.resolveHttpUri('/', {
+          'token': token,
+          if (pairCode != null && pairCode.isNotEmpty) 'p': pairCode,
+        });
         final init = JSObject();
         init.setProperty('method'.toJS, 'GET'.toJS);
         init.setProperty('credentials'.toJS, 'include'.toJS);
         final fetched = await _fetchWithAbort(uri, init);
         final status = (fetched.response.getProperty<JSNumber>('status'.toJS)).toDartInt;
+        if (status == 401 || status == 403) {
+          try {
+            final headersObj = fetched.response.getProperty<JSObject?>('headers'.toJS);
+            final errHdr = headersObj?.callMethod<JSAny?>('get'.toJS, 'x-gbridge-error'.toJS);
+            if (errHdr != null && errHdr.isA<JSString>()) {
+              final v = (errHdr as JSString).toDart.trim();
+              if (v.isNotEmpty) _lastAuthErrorCode = v;
+            }
+          } catch (_) {}
+        }
         _abortQuietly(fetched.abortCtrl);
         return status >= 200 && status < 400;
       } catch (_) {
@@ -230,6 +245,11 @@ class GbridgeHttpTransport {
     }
     return future;
   }
+
+  String? _lastAuthErrorCode;
+
+  /// Optional structured auth error code reported during token exchange (e.g. `gbridge/pairing_code_expired`).
+  String? get lastAuthErrorCode => _lastAuthErrorCode;
 
   String _credentialsModeFor(Uri targetUri, {bool forceInclude = false}) {
     if (forceInclude) return 'include';
@@ -747,12 +767,14 @@ class GbridgeStreamClient {
         ((JSAny? _) {
           if (epoch != _connEpoch) return;
           _sentHelloChannels = Set<String>.of(_channels);
+          final pairCode = _transport.endpoint.pairCode?.trim();
           _sendJson({
             'op': 'hello',
             'v': 1,
             'clientId': clientId,
             'coalesceMs': coalesceMs,
             'channels': _sentHelloChannels.toList(growable: false),
+            if (pairCode != null && pairCode.isNotEmpty) 'pairCode': pairCode,
             if (_lastBootId != null) 'lastBootId': _lastBootId,
             if (_lastBootId != null) 'resumeFromSeq': _lastSeq,
           });

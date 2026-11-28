@@ -5,11 +5,11 @@
  * and `dsh web` browsers. Uses ONLY pre-seeded `react` + official DSH CSS theme tokens
  * (`--dsw-alias-*`), so it works natively in Light & Dark themes with ZERO runtime dependencies.
  *
- * Contributes 4 official DSH UI surfaces:
- *   1. `sidebar.panellist` (`id: 'gbridge'`) + `main` (`key: 'gbridge'`): Dedicated pairing dashboard
- *   2. `plugins.bundle.activation` (`key: 'dsh-gbridge'`): Instant QR pairing dialog on plugin enable
- *   3. `plugins.bundle.config` (`key: 'dsh-gbridge'`): Embedded QR & LAN bridge settings inside Plugin Details
- *   4. `settings.section` + `settings.section.icon` (`id: 'gbridge'`): Settings tab for mobile pairing
+ * Focused pairing flow:
+ * - Default view shows ONLY: recommended QR code, copy pairing link, and live per-pairing
+ *   status ("等待手机扫码" / "正在连接你的手机…" / "已连接到你的手机" / explicit LAN error + Retry).
+ * - Secondary controls (other NICs, port, token copy/rotate, pause LAN, WS count) are tucked
+ *   cleanly inside a collapsible "更多" drawer.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-gbridge',
@@ -133,9 +133,10 @@ window.__ModuleLoader__.load({
 
     function QrCodeBox(props) {
       var qr = props.qr;
-      var boxSize = props.size || 200;
+      var boxSize = props.size || 208;
       var zh = props.zh;
       var loading = Boolean(props.loading);
+      var hasLanErr = Boolean(props.hasLanError);
       if (!qr || !qr.pathData || !qr.viewBoxSize) {
         return h(
           'div',
@@ -143,21 +144,24 @@ window.__ModuleLoader__.load({
             style: {
               width: boxSize + 'px',
               height: boxSize + 'px',
-              borderRadius: '16px',
+              borderRadius: '18px',
               background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.08))',
               border: '1px dashed var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               textAlign: 'center',
-              padding: '16px',
-              fontSize: '12px',
-              color: 'var(--dsw-alias-label-tertiary, #64748b)',
+              padding: '18px',
+              fontSize: '12.5px',
+              lineHeight: 1.5,
+              color: hasLanErr ? '#ef4444' : 'var(--dsw-alias-label-tertiary, #64748b)',
             },
           },
           loading
-            ? (zh ? '正在加载配对二维码…' : 'Loading pairing QR code…')
-            : (zh ? '开启局域网桥接后将在此显示扫码二维码' : 'Enable LAN Bridge to display QR code')
+            ? (zh ? '正在准备配对二维码…' : 'Preparing QR code…')
+            : hasLanErr
+              ? (zh ? '局域网服务未启动，请先点击右侧重试' : 'LAN listener failed. Retry on the right.')
+              : (zh ? '开启手机配对后将在此显示二维码' : 'Enable pairing to show QR code')
         );
       }
       return h(
@@ -165,14 +169,14 @@ window.__ModuleLoader__.load({
         {
           style: {
             background: '#ffffff',
-            borderRadius: '18px',
-            padding: '12px',
+            borderRadius: '20px',
+            padding: '14px',
             border: '1px solid rgba(15,23,42,0.10)',
-            boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
+            boxShadow: '0 10px 28px rgba(0,0,0,0.07)',
             display: 'inline-flex',
             flexDirection: 'column',
             alignItems: 'center',
-            gap: '8px',
+            gap: '9px',
           },
         },
         h(
@@ -191,12 +195,12 @@ window.__ModuleLoader__.load({
           'div',
           {
             style: {
-              fontSize: '11.5px',
+              fontSize: '12px',
               fontWeight: 500,
               color: '#475569',
             },
           },
-          zh ? '手机打开 GrassBag → 扫码连接' : 'Open GrassBag on phone → Scan QR'
+          zh ? '手机打开 GrassBag → 连接电脑 → 扫码' : 'Open GrassBag on phone → Scan QR'
         )
       );
     }
@@ -216,6 +220,9 @@ window.__ModuleLoader__.load({
       var selTuple = useState(0);
       var selectedIdx = selTuple[0];
       var setSelectedIdx = selTuple[1];
+      var moreTuple = useState(false);
+      var showMore = moreTuple[0];
+      var setShowMore = moreTuple[1];
       var toastTuple = useState('');
       var toast = toastTuple[0];
       var setToast = toastTuple[1];
@@ -271,7 +278,8 @@ window.__ModuleLoader__.load({
       useEffect(function () {
         mountedRef.current = true;
         reload(false);
-        var timer = setInterval(function () { reload(true); }, 10000);
+        // Poll every 3s while visible so the computer confirms "已连接到你的手机" promptly.
+        var timer = setInterval(function () { reload(true); }, 3000);
         return function () {
           mountedRef.current = false;
           clearInterval(timer);
@@ -323,24 +331,16 @@ window.__ModuleLoader__.load({
       var isShared = data && data.mode === 'shared-webserver';
       var lanActive = data && data.mode === 'lan-bridge' && data.lan && data.lan.listening;
       var isReachable = Boolean(isShared || lanActive);
-
-      var statusText = !data
-        ? (zh ? '正在检测网络状态…' : 'Detecting network…')
-        : isShared
-          ? (zh
-              ? '复用当前 DSH Web 端口 :' + (data.activePort || '--') + ' · 零额外端口'
-              : 'Sharing DSH Web port :' + (data.activePort || '--') + ' · Zero extra port')
-          : lanActive
-            ? (zh
-                ? '内置零冲突局域网桥接 · 端口 :' + data.lan.port + (data.portConflictAvoided ? '（已自动避让冲突端口）' : '')
-                : 'Built-in LAN Bridge · Port :' + data.lan.port)
-            : (zh ? '局域网桥接未开启（仅本机回环）' : 'LAN Bridge paused (loopback only)');
+      var lanError = (data && data.lan && !data.lan.listening && data.lan.error) ? String(data.lan.error) : '';
+      var ps = (data && data.pairingSession) ? data.pairingSession : null;
+      var pairStatus = lanError ? 'error' : ((ps && ps.status) || 'waiting');
+      var pairedLabel = (ps && ps.deviceLabel) || (zh ? '你的手机' : 'your phone');
 
       var cardStyle = {
         background: 'var(--dsw-alias-settings-card-fill, var(--dsw-alias-bg-layer-1, rgba(127,127,127,0.05)))',
         border: '1px solid var(--dsw-alias-settings-card-stroke, var(--dsw-alias-border-l2, rgba(127,127,127,0.18)))',
         borderRadius: 'var(--dsw-radius-xl, 18px)',
-        padding: compact ? '16px' : '22px',
+        padding: compact ? '18px' : '24px',
         fontFamily: 'var(--dsw-font-family, -apple-system, BlinkMacSystemFont, sans-serif)',
         color: 'var(--dsw-alias-label-primary, inherit)',
       };
@@ -349,23 +349,60 @@ window.__ModuleLoader__.load({
         return {
           display: 'inline-flex',
           alignItems: 'center',
+          justifyContent: 'center',
           gap: '6px',
-          padding: '8px 14px',
+          padding: '9px 15px',
           borderRadius: 'var(--dsw-radius-md, 10px)',
           border: primary ? 'none' : '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.24))',
           background: primary ? '#0f766e' : 'var(--dsw-alias-bg-layer-2, transparent)',
           color: primary ? '#ffffff' : 'var(--dsw-alias-label-primary, inherit)',
-          fontSize: '12.5px',
+          fontSize: '13px',
           fontWeight: 600,
           cursor: busy ? 'default' : 'pointer',
           opacity: busy ? 0.6 : 1,
         };
       };
 
+      // Live per-pairing status banner
+      var statusBannerBg = 'rgba(15,118,110,0.10)';
+      var statusBannerFg = accentInk;
+      var statusHeadline = zh ? '等待手机扫码连接' : 'Waiting for your phone to scan';
+      var statusDetail = zh
+        ? '扫码完成后，这里会自动更新为已连接状态。'
+        : 'This panel will confirm automatically once your phone connects.';
+      if (!data && !errorMsg) {
+        statusHeadline = zh ? '正在准备配对…' : 'Preparing pairing…';
+        statusDetail = zh ? '正在检查本机网络与连接服务。' : 'Checking local network and pairing service.';
+      } else if (lanError) {
+        statusBannerBg = 'rgba(220,38,38,0.12)';
+        statusBannerFg = '#ef4444';
+        statusHeadline = zh ? '局域网监听启动失败' : 'Failed to start LAN listener';
+        statusDetail = lanError;
+      } else if (!isReachable) {
+        statusBannerBg = 'rgba(217,119,6,0.12)';
+        statusBannerFg = '#d97706';
+        statusHeadline = zh ? '手机配对已暂停' : 'Mobile pairing paused';
+        statusDetail = zh ? '重新开启后即可生成二维码供手机扫码。' : 'Enable pairing to show a scannable QR code.';
+      } else if (pairStatus === 'connected') {
+        statusBannerBg = 'rgba(21,128,61,0.14)';
+        statusBannerFg = '#16a34a';
+        statusHeadline = zh ? ('已连接到' + pairedLabel) : ('Connected to ' + pairedLabel);
+        statusDetail = zh
+          ? '手机已成功建立实时会话连接，现在可以直接在手机上对话。'
+          : 'Your phone is connected and ready to open sessions.';
+      } else if (pairStatus === 'connecting') {
+        statusBannerBg = 'rgba(14,165,233,0.14)';
+        statusBannerFg = isDarkUi ? '#38bdf8' : '#0284c7';
+        statusHeadline = zh ? '正在连接你的手机…' : 'Connecting to your phone…';
+        statusDetail = zh
+          ? '已识别扫码请求，正在完成实时通道握手。'
+          : 'Scan detected, completing live handshake.';
+      }
+
       return h(
         'div',
         { style: cardStyle },
-        // Header row
+        // Clean Header
         h(
           'div',
           {
@@ -374,8 +411,7 @@ window.__ModuleLoader__.load({
               alignItems: 'center',
               justifyContent: 'space-between',
               gap: '12px',
-              flexWrap: 'wrap',
-              marginBottom: '16px',
+              marginBottom: '18px',
             },
           },
           h(
@@ -403,42 +439,15 @@ window.__ModuleLoader__.load({
               null,
               h(
                 'div',
-                { style: { fontSize: compact ? '15px' : '17px', fontWeight: 700 } },
-                zh ? 'GrassBag 手机扫码配对' : 'GrassBag Mobile Pairing'
+                { style: { fontSize: compact ? '15.5px' : '17.5px', fontWeight: 700 } },
+                zh ? 'GrassBag 手机连接' : 'GrassBag Mobile Pairing'
               ),
               h(
                 'div',
                 { style: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary, #64748b)', marginTop: '2px' } },
-                data
-                  ? ((data.hostName || 'DSH') + ' · dsh-gbridge v' + data.bridgeVersion + ' · ' + (zh ? '已连设备 ' : 'Connected ') + (data.connectedClients || 0))
-                  : (zh ? '官方零冲突连接助手' : 'Official zero-conflict companion')
+                data ? (data.hostName || 'DSH') : (zh ? '手机配对面板' : 'Mobile pairing panel')
               )
             )
-          ),
-          h(
-            'span',
-            {
-              style: {
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '6px',
-                padding: '5px 11px',
-                borderRadius: '999px',
-                fontSize: '12px',
-                fontWeight: 600,
-                background: isReachable ? 'rgba(21,128,61,0.14)' : 'rgba(217,119,6,0.14)',
-                color: isReachable ? '#16a34a' : '#d97706',
-              },
-            },
-            h('span', {
-              style: {
-                width: '7px',
-                height: '7px',
-                borderRadius: '50%',
-                background: 'currentColor',
-              },
-            }),
-            statusText
           )
         ),
 
@@ -448,111 +457,100 @@ window.__ModuleLoader__.load({
               {
                 style: {
                   padding: '10px 12px',
-                  borderRadius: '10px',
+                  borderRadius: '12px',
                   background: 'rgba(220,38,38,0.10)',
                   color: '#ef4444',
                   fontSize: '12.5px',
-                  marginBottom: '12px',
+                  marginBottom: '14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '10px',
                 },
               },
-              (zh ? '读取配对状态失败：' : 'Pairing status error: ') + errorMsg
+              h('span', null, (zh ? '读取配对状态失败：' : 'Pairing status error: ') + errorMsg),
+              h(
+                'button',
+                { type: 'button', style: btnStyle(false), onClick: function () { reload(false); } },
+                zh ? '重试' : 'Retry'
+              )
             )
           : null,
 
-        // Main grid: QR code + Details & Controls
+        // Focused Main Grid: Recommended QR + Live Status + Copy Link
         h(
           'div',
           {
             style: {
               display: 'flex',
               flexWrap: 'wrap',
-              gap: '20px',
-              alignItems: 'flex-start',
+              gap: '22px',
+              alignItems: 'center',
             },
           },
-          h(QrCodeBox, { qr: activeEp && activeEp.qr, size: compact ? 176 : 204, zh: zh, loading: !data && !errorMsg }),
+          h(QrCodeBox, {
+            qr: activeEp && activeEp.qr,
+            size: compact ? 180 : 210,
+            zh: zh,
+            loading: !data && !errorMsg,
+            hasLanError: Boolean(lanError),
+          }),
           h(
             'div',
-            { style: { flex: '1 1 260px', minWidth: '240px' } },
-            // Network interface pills
-            endpoints.length > 0
-              ? h(
-                  'div',
-                  { style: { marginBottom: '12px' } },
-                  h(
-                    'div',
-                    { style: { fontSize: '11.5px', fontWeight: 600, color: 'var(--dsw-alias-label-tertiary, #64748b)', marginBottom: '6px' } },
-                    zh ? '选择局域网 / Tailscale 地址' : 'Select LAN / Tailscale Address'
-                  ),
-                  h(
-                    'div',
-                    { style: { display: 'flex', flexWrap: 'wrap', gap: '6px' } },
-                    endpoints.map(function (ep, idx) {
-                      var active = idx === safeIdx;
-                      return h(
-                        'button',
-                        {
-                          key: ep.ip + ':' + ep.iface,
-                          type: 'button',
-                          onClick: function () { setSelectedIdx(idx); },
-                          style: {
-                            padding: '5px 10px',
-                            borderRadius: '9px',
-                            fontSize: '12px',
-                            fontWeight: 600,
-                            cursor: 'pointer',
-                            border: active
-                              ? ('1px solid ' + accentInk)
-                              : '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.22))',
-                            background: active ? accentSoft : 'transparent',
-                            color: active ? accentInk : 'var(--dsw-alias-label-secondary, inherit)',
-                          },
-                        },
-                        (ep.label || ep.iface) + ' · ' + ep.ip
-                      );
-                    })
-                  )
-                )
-              : null,
-
-            // Pairing URL box
+            { style: { flex: '1 1 250px', minWidth: '230px' } },
+            // Live pairing confirmation card
             h(
               'div',
               {
                 style: {
-                  padding: '10px 12px',
-                  borderRadius: '12px',
-                  border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.2))',
-                  background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.05))',
-                  marginBottom: '12px',
+                  padding: '12px 14px',
+                  borderRadius: '14px',
+                  background: statusBannerBg,
+                  marginBottom: '14px',
                 },
               },
               h(
                 'div',
-                { style: { fontSize: '11px', fontWeight: 600, color: 'var(--dsw-alias-label-tertiary, #64748b)', marginBottom: '4px' } },
-                zh ? '配对链接（扫码自动识别，也可复制粘贴）' : 'Pairing URL (scan QR or paste in GrassBag)'
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    color: statusBannerFg,
+                  },
+                },
+                h('span', {
+                  style: {
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    background: 'currentColor',
+                    flexShrink: 0,
+                  },
+                }),
+                statusHeadline
               ),
               h(
                 'div',
                 {
                   style: {
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    marginTop: '5px',
                     fontSize: '12px',
-                    wordBreak: 'break-all',
                     lineHeight: 1.45,
+                    color: 'var(--dsw-alias-label-secondary, #475569)',
                   },
                 },
-                activeEp
-                  ? activeEp.url
-                  : (zh ? '暂未检测到局域网连接入口，请点击下方「开启局域网桥接」' : 'No LAN endpoint active yet. Enable LAN Bridge below.')
+                statusDetail
               )
             ),
 
-            // Action buttons
+            // Primary action(s): Copy Pairing Link (or Retry on LAN error / Enable if paused)
             h(
               'div',
-              { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
-              activeEp
+              { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' } },
+              lanError
                 ? h(
                     'button',
                     {
@@ -560,16 +558,42 @@ window.__ModuleLoader__.load({
                       disabled: busy,
                       style: btnStyle(true),
                       onClick: function () {
-                        copyTextSafe(activeEp.url).then(
-                          function () { notify(zh ? '已复制配对链接到剪贴板' : 'Pairing link copied'); },
-                          function () { notify(zh ? '复制失败，请手动选中复制' : 'Copy failed'); }
-                        );
+                        runAction({ action: 'setLanEnabled', enabled: true }, zh ? '已重新启动局域网连接服务' : 'LAN listener restarted');
                       },
                     },
-                    zh ? '复制配对链接' : 'Copy Pairing Link'
+                    zh ? '重试启动' : 'Retry'
                   )
-                : null,
-              data && data.token
+                : (!isReachable && data && !isShared)
+                  ? h(
+                      'button',
+                      {
+                        type: 'button',
+                        disabled: busy,
+                        style: btnStyle(true),
+                        onClick: function () {
+                          runAction({ action: 'setLanEnabled', enabled: true }, zh ? '已开启手机配对' : 'Pairing enabled');
+                        },
+                      },
+                      zh ? '开启手机配对' : 'Enable Pairing'
+                    )
+                  : activeEp
+                    ? h(
+                        'button',
+                        {
+                          type: 'button',
+                          disabled: busy,
+                          style: btnStyle(true),
+                          onClick: function () {
+                            copyTextSafe(activeEp.url).then(
+                              function () { notify(zh ? '已复制配对链接，可直接粘贴到手机 GrassBag' : 'Pairing link copied'); },
+                              function () { notify(zh ? '复制失败，请手动选中复制' : 'Copy failed'); }
+                            );
+                          },
+                        },
+                        zh ? '复制配对链接' : 'Copy Pairing Link'
+                      )
+                    : null,
+              pairStatus === 'connected'
                 ? h(
                     'button',
                     {
@@ -577,115 +601,22 @@ window.__ModuleLoader__.load({
                       disabled: busy,
                       style: btnStyle(false),
                       onClick: function () {
-                        copyTextSafe(data.token).then(
-                          function () { notify(zh ? '已复制访问令牌' : 'Token copied'); },
-                          function () { notify(zh ? '复制失败' : 'Copy failed'); }
-                        );
+                        runAction({ action: 'newPairingCode' }, zh ? '已刷新二维码，等待新设备扫码' : 'Fresh QR code ready');
                       },
                     },
-                    zh ? '复制令牌' : 'Copy Token'
-                  )
-                : null,
-              data && (data.canRotateToken !== undefined ? data.canRotateToken : data.mode === 'lan-bridge')
-                ? h(
-                    'button',
-                    {
-                      type: 'button',
-                      disabled: busy,
-                      style: btnStyle(false),
-                      onClick: function () {
-                        runAction({ action: 'rotateToken' }, zh ? '已重置令牌并更新二维码' : 'Token rotated');
-                      },
-                    },
-                    zh ? '重置令牌' : 'Rotate Token'
-                  )
-                : null,
-              data && !isShared
-                ? h(
-                    'button',
-                    {
-                      type: 'button',
-                      disabled: busy,
-                      style: btnStyle(!(data.lan && data.lan.enabled)),
-                      onClick: function () {
-                        var nextEnabled = !(data.lan && data.lan.enabled);
-                        runAction(
-                          { action: 'setLanEnabled', enabled: nextEnabled },
-                          nextEnabled
-                            ? (zh ? '已开启零冲突局域网桥接' : 'LAN Bridge enabled')
-                            : (zh ? '已暂停局域网桥接' : 'LAN Bridge paused')
-                        );
-                      },
-                    },
-                    data.lan && data.lan.enabled
-                      ? (zh ? '暂停局域网桥接' : 'Pause LAN Bridge')
-                      : (zh ? '开启局域网桥接' : 'Enable LAN Bridge')
+                    zh ? '配对新设备' : 'Pair Another Device'
                   )
                 : null,
               h(
                 'button',
                 {
                   type: 'button',
-                  disabled: busy,
-                  style: btnStyle(false),
-                  onClick: function () { reload(false); },
+                  style: Object.assign({}, btnStyle(false), { padding: '9px 12px' }),
+                  onClick: function () { setShowMore(function (v) { return !v; }); },
                 },
-                zh ? '刷新状态' : 'Refresh'
+                showMore ? (zh ? '收起更多' : 'Less') : (zh ? '更多' : 'More')
               )
             ),
-
-            // Optional zero-conflict port selector for Desktop / loopback LAN Bridge
-            !compact && data && !isShared && data.lan && data.lan.enabled
-              ? h(
-                  'div',
-                  {
-                    style: {
-                      marginTop: '12px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '8px',
-                      flexWrap: 'wrap',
-                      fontSize: '12px',
-                      color: 'var(--dsw-alias-label-secondary, #475569)',
-                    },
-                  },
-                  h('span', null, zh ? '桥接端口（冲突自动顺延）：' : 'Bridge Port (auto-avoids conflict):'),
-                  h('input', {
-                    type: 'number',
-                    min: 1024,
-                    max: 65535,
-                    value: portInput,
-                    onChange: function (e) { setPortInput(e.target.value); },
-                    style: {
-                      width: '88px',
-                      padding: '5px 8px',
-                      borderRadius: '8px',
-                      border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
-                      background: 'var(--dsw-alias-bg-layer-1, transparent)',
-                      color: 'var(--dsw-alias-label-primary, inherit)',
-                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                      fontSize: '12px',
-                    },
-                  }),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      disabled: busy,
-                      style: btnStyle(false),
-                      onClick: function () {
-                        var p = Number(portInput);
-                        if (!Number.isInteger(p) || p < 1024 || p > 65535) {
-                          notify(zh ? '请输入 1024-65535 之间的端口号' : 'Enter a port between 1024 and 65535');
-                          return;
-                        }
-                        runAction({ action: 'setLanPort', port: p }, zh ? '已切换监听端口' : 'Port updated');
-                      },
-                    },
-                    zh ? '应用端口' : 'Apply Port'
-                  )
-                )
-              : null,
 
             toast
               ? h(
@@ -704,23 +635,218 @@ window.__ModuleLoader__.load({
           )
         ),
 
-        // Compact guidance footer
-        h(
-          'div',
-          {
-            style: {
-              marginTop: '14px',
-              paddingTop: '12px',
-              borderTop: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.16))',
-              fontSize: '12px',
-              lineHeight: 1.55,
-              color: 'var(--dsw-alias-label-tertiary, #64748b)',
-            },
-          },
-          zh
-            ? '无需另开第二套 dsh web 服务：本插件直接复用当前 DeepSeek Harness 实例的全部会话、模型与工作区；在 dsh web 下直接共享现有端口，在桌面端自动避让冲突端口。'
-            : 'No duplicate dsh web process needed: shares this running DeepSeek Harness instance directly, reuses dsh web port when reachable, and auto-avoids port conflicts on Desktop.'
-        )
+        // Collapsible "更多" drawer: NIC switcher, custom port, copy/rotate token, pause LAN, technical metadata
+        showMore
+          ? h(
+              'div',
+              {
+                style: {
+                  marginTop: '18px',
+                  paddingTop: '16px',
+                  borderTop: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.16))',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '12px',
+                },
+              },
+              endpoints.length > 1
+                ? h(
+                    'div',
+                    null,
+                    h(
+                      'div',
+                      { style: { fontSize: '11.5px', fontWeight: 600, color: 'var(--dsw-alias-label-tertiary, #64748b)', marginBottom: '6px' } },
+                      zh ? '切换网卡地址（默认已推荐当前局域网地址）' : 'Switch Network Adapter'
+                    ),
+                    h(
+                      'div',
+                      { style: { display: 'flex', flexWrap: 'wrap', gap: '6px' } },
+                      endpoints.map(function (ep, idx) {
+                        var active = idx === safeIdx;
+                        return h(
+                          'button',
+                          {
+                            key: ep.ip + ':' + ep.iface,
+                            type: 'button',
+                            onClick: function () { setSelectedIdx(idx); },
+                            style: {
+                              padding: '5px 10px',
+                              borderRadius: '9px',
+                              fontSize: '12px',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              border: active
+                                ? ('1px solid ' + accentInk)
+                                : '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.22))',
+                              background: active ? accentSoft : 'transparent',
+                              color: active ? accentInk : 'var(--dsw-alias-label-secondary, inherit)',
+                            },
+                          },
+                          (ep.label || ep.iface) + ' · ' + ep.ip
+                        );
+                      })
+                    )
+                  )
+                : null,
+
+              activeEp
+                ? h(
+                    'div',
+                    {
+                      style: {
+                        padding: '9px 11px',
+                        borderRadius: '10px',
+                        border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.2))',
+                        background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.05))',
+                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                        fontSize: '11.5px',
+                        wordBreak: 'break-all',
+                      },
+                    },
+                    activeEp.url
+                  )
+                : null,
+
+              h(
+                'div',
+                { style: { display: 'flex', flexWrap: 'wrap', gap: '8px' } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    disabled: busy,
+                    style: btnStyle(false),
+                    onClick: function () {
+                      runAction({ action: 'newPairingCode' }, zh ? '已刷新二维码' : 'QR code refreshed');
+                    },
+                  },
+                  zh ? '刷新二维码' : 'Refresh QR'
+                ),
+                data && data.token
+                  ? h(
+                      'button',
+                      {
+                        type: 'button',
+                        disabled: busy,
+                        style: btnStyle(false),
+                        onClick: function () {
+                          copyTextSafe(data.token).then(
+                            function () { notify(zh ? '已复制访问令牌' : 'Token copied'); },
+                            function () { notify(zh ? '复制失败' : 'Copy failed'); }
+                          );
+                        },
+                      },
+                      zh ? '复制令牌' : 'Copy Token'
+                    )
+                  : null,
+                data && (data.canRotateToken !== undefined ? data.canRotateToken : data.mode === 'lan-bridge')
+                  ? h(
+                      'button',
+                      {
+                        type: 'button',
+                        disabled: busy,
+                        style: btnStyle(false),
+                        onClick: function () {
+                          runAction({ action: 'rotateToken' }, zh ? '已重置令牌并更新二维码' : 'Token rotated');
+                        },
+                      },
+                      zh ? '重置令牌' : 'Rotate Token'
+                    )
+                  : null,
+                data && !isShared
+                  ? h(
+                      'button',
+                      {
+                        type: 'button',
+                        disabled: busy,
+                        style: btnStyle(false),
+                        onClick: function () {
+                          var nextEnabled = !(data.lan && data.lan.enabled);
+                          runAction(
+                            { action: 'setLanEnabled', enabled: nextEnabled },
+                            nextEnabled
+                              ? (zh ? '已开启局域网桥接' : 'LAN Bridge enabled')
+                              : (zh ? '已暂停局域网桥接' : 'LAN Bridge paused')
+                          );
+                        },
+                      },
+                      data.lan && data.lan.enabled
+                        ? (zh ? '暂停局域网桥接' : 'Pause LAN Bridge')
+                        : (zh ? '开启局域网桥接' : 'Enable LAN Bridge')
+                    )
+                  : null
+              ),
+
+              !compact && data && !isShared && data.lan && data.lan.enabled
+                ? h(
+                    'div',
+                    {
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
+                        flexWrap: 'wrap',
+                        fontSize: '12px',
+                        color: 'var(--dsw-alias-label-secondary, #475569)',
+                      },
+                    },
+                    h('span', null, zh ? '监听端口（冲突自动顺延）：' : 'Port (auto-avoids conflict):'),
+                    h('input', {
+                      type: 'number',
+                      min: 1024,
+                      max: 65535,
+                      value: portInput,
+                      onChange: function (e) { setPortInput(e.target.value); },
+                      style: {
+                        width: '88px',
+                        padding: '5px 8px',
+                        borderRadius: '8px',
+                        border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
+                        background: 'var(--dsw-alias-bg-layer-1, transparent)',
+                        color: 'var(--dsw-alias-label-primary, inherit)',
+                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                        fontSize: '12px',
+                      },
+                    }),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        disabled: busy,
+                        style: btnStyle(false),
+                        onClick: function () {
+                          var p = Number(portInput);
+                          if (!Number.isInteger(p) || p < 1024 || p > 65535) {
+                            notify(zh ? '请输入 1024-65535 之间的端口号' : 'Enter a port between 1024 and 65535');
+                            return;
+                          }
+                          runAction({ action: 'setLanPort', port: p }, zh ? '已切换监听端口' : 'Port updated');
+                        },
+                      },
+                      zh ? '应用端口' : 'Apply Port'
+                    )
+                  )
+                : null,
+
+              data
+                ? h(
+                    'div',
+                    {
+                      style: {
+                        fontSize: '11.5px',
+                        color: 'var(--dsw-alias-label-tertiary, #64748b)',
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: '12px',
+                      },
+                    },
+                    h('span', null, (zh ? '端口：' : 'Port: ') + (data.activePort || '--')),
+                    h('span', null, (zh ? '当前在线连接数：' : 'Active streams: ') + (data.connectedClients || 0)),
+                    h('span', null, 'dsh-gbridge v' + data.bridgeVersion)
+                  )
+                : null
+            )
+          : null
       );
     }
 
@@ -729,7 +855,7 @@ window.__ModuleLoader__.load({
         'div',
         {
           style: {
-            maxWidth: '820px',
+            maxWidth: '760px',
             margin: '0 auto',
             padding: '28px 24px 48px',
             width: '100%',

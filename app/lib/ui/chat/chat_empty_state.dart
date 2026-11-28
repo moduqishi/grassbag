@@ -186,7 +186,9 @@ class ChatEmptyState extends ConsumerWidget {
     ];
     void handleStarterTap(int i) {
       final item = suggestions[i];
-      if (item.$6 && onPrefillSuggestion != null) {
+      // Uniformly prefill the composer so the user always sees the instruction, active workspace,
+      // and target host before deciding to send (never auto-sending some cards silently!).
+      if (onPrefillSuggestion != null) {
         onPrefillSuggestion!(item.$5);
       } else {
         onSuggestionTap(item.$5);

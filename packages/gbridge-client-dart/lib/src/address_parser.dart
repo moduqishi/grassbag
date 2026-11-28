@@ -16,6 +16,7 @@ class ParsedRemoteHostInput {
     required this.address,
     this.token,
     this.suggestedName,
+    this.pairCode,
     this.wasAutoPorted = false,
     this.wasExtractedFromText = false,
   });
@@ -28,6 +29,10 @@ class ParsedRemoteHostInput {
 
   /// Suggested human-readable display name (hostname/IP).
   final String? suggestedName;
+
+  /// Optional short-lived pairing session code (`?p=` / `?pairCode=`) used for per-pairing
+  /// confirmation on the computer's pairing panel and expiry detection.
+  final String? pairCode;
 
   /// True when `:3080` default DSH port was inferred for a bare IP/localhost.
   final bool wasAutoPorted;
@@ -74,6 +79,10 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     if (innerUrl != null && innerUrl.isNotEmpty) {
       final innerTok = pairUri?.queryParameters['token']?.trim();
       final innerName = pairUri?.queryParameters['name']?.trim();
+      final innerPair = (pairUri?.queryParameters['p'] ??
+              pairUri?.queryParameters['pair'] ??
+              pairUri?.queryParameters['pairCode'])
+          ?.trim();
       final nested = parseRemoteHostInput(
         innerUrl,
         explicitToken: (explicitToken != null && explicitToken.trim().isNotEmpty)
@@ -88,6 +97,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
           suggestedName: (innerName != null && innerName.isNotEmpty)
               ? innerName
               : nested.suggestedName,
+          pairCode: (innerPair != null && innerPair.isNotEmpty) ? innerPair : nested.pairCode,
           wasAutoPorted: nested.wasAutoPorted,
           wasExtractedFromText: true,
         );
@@ -104,6 +114,8 @@ ParsedRemoteHostInput? parseRemoteHostInput(
         if (rawUrl != null && rawUrl.isNotEmpty) {
           final jsonTok = decoded['token']?.toString().trim();
           final jsonName = (decoded['name'] ?? decoded['hostName'])?.toString().trim();
+          final jsonPair =
+              (decoded['p'] ?? decoded['pair'] ?? decoded['pairCode'])?.toString().trim();
           final nested = parseRemoteHostInput(
             rawUrl,
             explicitToken: (explicitToken != null && explicitToken.trim().isNotEmpty)
@@ -118,6 +130,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
               suggestedName: (jsonName != null && jsonName.isNotEmpty)
                   ? jsonName
                   : nested.suggestedName,
+              pairCode: (jsonPair != null && jsonPair.isNotEmpty) ? jsonPair : nested.pairCode,
               wasAutoPorted: nested.wasAutoPorted,
               wasExtractedFromText: true,
             );
@@ -226,9 +239,14 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     autoPorted = true;
   }
 
-  // 4) Extract `?token=` & optional `?name=` from query parameters and strip them from the stored address.
+  // 4) Extract `?token=`, optional `?name=`, and optional `?p=`/`?pairCode=` from query parameters
+  //    and strip them from the stored address.
   final queryToken = parsed.queryParameters['token']?.trim();
   final queryName = parsed.queryParameters['name']?.trim();
+  final queryPairCode = (parsed.queryParameters['p'] ??
+          parsed.queryParameters['pair'] ??
+          parsed.queryParameters['pairCode'])
+      ?.trim();
   final resolvedToken = (explicitToken != null && explicitToken.trim().isNotEmpty)
       ? explicitToken.trim()
       : (queryToken != null && queryToken.isNotEmpty)
@@ -240,6 +258,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     final lowerPath = parsed.path.toLowerCase();
     final hasHttpScheme = urlMatches.isNotEmpty;
     final hasDshSignal = (resolvedToken != null && resolvedToken.isNotEmpty) ||
+        (queryPairCode != null && queryPairCode.isNotEmpty) ||
         _isLocalOrIpHost(parsed.host) ||
         hadExplicitPort ||
         lowerPath.contains('/gbridge') ||
@@ -251,7 +270,10 @@ ParsedRemoteHostInput? parseRemoteHostInput(
 
   final remainingQuery = Map<String, String>.from(parsed.queryParameters)
     ..remove('token')
-    ..remove('name');
+    ..remove('name')
+    ..remove('p')
+    ..remove('pair')
+    ..remove('pairCode');
   var cleanPath = parsed.path == '/' ? '' : parsed.path.replaceFirst(RegExp(r'/+$'), '');
   if (cleanPath == '/connect' ||
       cleanPath == '/gbridge/ui' ||
@@ -278,6 +300,7 @@ ParsedRemoteHostInput? parseRemoteHostInput(
     address: cleanUri.toString(),
     token: resolvedToken,
     suggestedName: (queryName != null && queryName.isNotEmpty) ? queryName : parsed.host,
+    pairCode: (queryPairCode != null && queryPairCode.isNotEmpty) ? queryPairCode : null,
     wasAutoPorted: autoPorted,
     wasExtractedFromText: extractedFromText,
   );

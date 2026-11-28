@@ -169,15 +169,26 @@ class WorkspaceItem {
       );
 }
 
+enum PairingStage {
+  idle,
+  connecting,
+  authorizing,
+  openingSession,
+  ready,
+  failed,
+}
+
 enum RemoteDiagnosisKind {
   readyGbridge,
   readyDirect,
   needsAuth,
+  pairingCodeExpired,
   htmlLoginPage,
   untrustedHost,
   selfSignedTls,
   insecurePublicHttp,
   selfDevice,
+  realtimeFailed,
   unreachable,
   invalidAddress,
 }
@@ -188,32 +199,42 @@ class RemoteHostDiagnosis {
     required this.kind,
     required this.title,
     required this.message,
+    this.technicalDetail,
     this.normalizedAddress,
     this.extractedToken,
+    this.extractedPairCode,
     this.capturedCookie,
+    this.hostName,
     this.dshVersion,
     this.latencyMs,
     this.hostAuthority,
     this.hasGbridge = false,
+    this.isLoopbackTarget = false,
     this.suggestedCommand,
   });
 
   final RemoteDiagnosisKind kind;
   final String title;
   final String message;
+  final String? technicalDetail;
   final String? normalizedAddress;
   final String? extractedToken;
+  final String? extractedPairCode;
   final String? capturedCookie;
+  final String? hostName;
   final String? dshVersion;
   final int? latencyMs;
   final String? hostAuthority;
   final bool hasGbridge;
+  final bool isLoopbackTarget;
   final String? suggestedCommand;
 
   bool get canConnectNow =>
       kind == RemoteDiagnosisKind.readyGbridge || kind == RemoteDiagnosisKind.readyDirect;
   bool get needsWebOrTokenAuth =>
-      kind == RemoteDiagnosisKind.needsAuth || kind == RemoteDiagnosisKind.htmlLoginPage;
+      kind == RemoteDiagnosisKind.needsAuth ||
+      kind == RemoteDiagnosisKind.pairingCodeExpired ||
+      kind == RemoteDiagnosisKind.htmlLoginPage;
 }
 
 @immutable
@@ -222,11 +243,69 @@ class RemoteConnectOutcome {
     required this.diagnosis,
     this.host,
     this.connected = false,
+    this.cancelled = false,
+    this.sessionCount,
   });
 
   final RemoteHostDiagnosis diagnosis;
   final ManagedHost? host;
   final bool connected;
+  final bool cancelled;
+  final int? sessionCount;
+}
+
+@immutable
+class PendingOutboxItem {
+  const PendingOutboxItem({
+    required this.id,
+    required this.hostId,
+    required this.sessionId,
+    required this.text,
+    this.mode = 'auto',
+    this.status = 'unsent',
+    this.errorMessage,
+    this.updatedAtMs = 0,
+  });
+
+  factory PendingOutboxItem.fromMap(Map<String, dynamic> map) {
+    return PendingOutboxItem(
+      id: map['id']?.toString() ?? '',
+      hostId: map['hostId']?.toString() ?? '',
+      sessionId: map['sessionId']?.toString() ?? '',
+      text: map['text']?.toString() ?? '',
+      mode: map['mode']?.toString() ?? 'auto',
+      status: map['status']?.toString() ?? 'unsent',
+      errorMessage: map['errorMessage']?.toString(),
+      updatedAtMs: (map['updatedAtMs'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  final String id;
+  final String hostId;
+  final String sessionId;
+  final String text;
+  final String mode;
+  final String status;
+  final String? errorMessage;
+  final int updatedAtMs;
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is PendingOutboxItem &&
+        other.id == id &&
+        other.hostId == hostId &&
+        other.sessionId == sessionId &&
+        other.text == text &&
+        other.mode == mode &&
+        other.status == status &&
+        other.errorMessage == errorMessage &&
+        other.updatedAtMs == updatedAtMs;
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(id, hostId, sessionId, text, mode, status, errorMessage, updatedAtMs);
 }
 
 @immutable
@@ -907,6 +986,10 @@ class GrassBagAppState {
     this.focusComposerSignal = 0,
     this.draftHydratedSignal = 0,
     this.openJobsSignal = 0,
+    this.pendingInteractions = const [],
+    this.pendingOutbox = const [],
+    this.offlineUnsentNotice,
+    this.pendingPairDeepLinkUri,
   });
 
   final bool isDark;
@@ -1070,6 +1153,24 @@ class GrassBagAppState {
   final int focusComposerSignal;
   final int draftHydratedSignal;
   final int openJobsSignal;
+  final List<PendingInteraction> pendingInteractions;
+  final List<PendingOutboxItem> pendingOutbox;
+  final String? offlineUnsentNotice;
+  final String? pendingPairDeepLinkUri;
+
+  List<BackgroundJobRecord> get failedJobs => jobs
+      .where((j) {
+        final st = j.status.toLowerCase();
+        return st.contains('fail') || st.contains('error');
+      })
+      .toList(growable: false);
+
+  List<PendingOutboxItem> get unsentOutboxForActiveHost => pendingOutbox
+      .where((o) => o.hostId == activeHostId && o.status != 'sending')
+      .toList(growable: false);
+
+  int get pendingInboxCount =>
+      pendingInteractions.length + failedJobs.length + unsentOutboxForActiveHost.length;
 
   String get appVersionLabel => '$appVersion ($appBuildNumber)';
 
@@ -1622,6 +1723,12 @@ class GrassBagAppState {
     int? focusComposerSignal,
     int? draftHydratedSignal,
     int? openJobsSignal,
+    List<PendingInteraction>? pendingInteractions,
+    List<PendingOutboxItem>? pendingOutbox,
+    String? offlineUnsentNotice,
+    bool clearOfflineUnsentNotice = false,
+    String? pendingPairDeepLinkUri,
+    bool clearPendingPairDeepLinkUri = false,
   }) {
     return GrassBagAppState(
       isDark: isDark ?? this.isDark,
@@ -1806,6 +1913,14 @@ class GrassBagAppState {
       focusComposerSignal: focusComposerSignal ?? this.focusComposerSignal,
       draftHydratedSignal: draftHydratedSignal ?? this.draftHydratedSignal,
       openJobsSignal: openJobsSignal ?? this.openJobsSignal,
+      pendingInteractions: pendingInteractions ?? this.pendingInteractions,
+      pendingOutbox: pendingOutbox ?? this.pendingOutbox,
+      offlineUnsentNotice: clearOfflineUnsentNotice
+          ? null
+          : (offlineUnsentNotice ?? this.offlineUnsentNotice),
+      pendingPairDeepLinkUri: clearPendingPairDeepLinkUri
+          ? null
+          : (pendingPairDeepLinkUri ?? this.pendingPairDeepLinkUri),
     );
   }
 }
@@ -2563,6 +2678,45 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   List<Map<String, dynamic>> get pendingOutboxEntries =>
       List<Map<String, dynamic>>.unmodifiable(_pendingOutbox);
 
+  void _syncOutboxState() {
+    if (!mounted) return;
+    final items = _pendingOutbox
+        .map(PendingOutboxItem.fromMap)
+        .where((i) => i.id.isNotEmpty && i.text.trim().isNotEmpty)
+        .toList(growable: false);
+    if (!listEquals(items, state.pendingOutbox)) {
+      state = state.copyWith(pendingOutbox: items);
+    }
+  }
+
+  void dismissOfflineUnsentNotice() {
+    if (state.offlineUnsentNotice != null) {
+      state = state.copyWith(clearOfflineUnsentNotice: true);
+    }
+  }
+
+  void dismissOutboxEntry(String id) {
+    _clearOutboxEntry(id);
+    if (state.unsentOutboxForActiveHost.isEmpty && state.offlineUnsentNotice != null) {
+      state = state.copyWith(clearOfflineUnsentNotice: true);
+    }
+  }
+
+  void restoreOutboxEntryToDraft(PendingOutboxItem item) {
+    final targetSid = item.sessionId.isEmpty ? null : item.sessionId;
+    if (item.hostId.isNotEmpty &&
+        item.hostId != state.activeHostId &&
+        state.hosts.any((h) => h.id == item.hostId)) {
+      unawaited(switchHost(item.hostId));
+    }
+    if (targetSid != null && targetSid != state.activeSessionId) {
+      selectSession(targetSid);
+    }
+    setComposerDraftForScope(item.hostId.isNotEmpty ? item.hostId : state.activeHostId, targetSid, item.text);
+    bumpDraftHydratedSignal();
+    showToast('已将未发送消息恢复到输入框', tone: ToastTone.info);
+  }
+
   void _recordOutboxEntry({
     required String id,
     required String hostId,
@@ -2587,6 +2741,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     while (_pendingOutbox.length > 30) {
       _pendingOutbox.removeAt(0);
     }
+    _syncOutboxState();
     unawaited(GrassBagStorage.instance.savePendingOutbox(List<Map<String, dynamic>>.from(_pendingOutbox)));
   }
 
@@ -2594,6 +2749,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final before = _pendingOutbox.length;
     _pendingOutbox.removeWhere((e) => e['id'] == id);
     if (_pendingOutbox.length != before) {
+      _syncOutboxState();
       unawaited(GrassBagStorage.instance.savePendingOutbox(List<Map<String, dynamic>>.from(_pendingOutbox)));
     }
   }
@@ -2638,6 +2794,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
     }
     if (dirty) {
+      _syncOutboxState();
       unawaited(GrassBagStorage.instance.savePendingOutbox(List<Map<String, dynamic>>.from(_pendingOutbox)));
     }
     if (restoredAny && state.activeHostId == hostId && state.activeSessionId == sessionId) {
@@ -2745,9 +2902,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     final hostLower = uri.host.toLowerCase();
     final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
     if (isAndroid && isLoopbackHost(hostLower) && port != 13080) {
-      return '127.0.0.1 / localhost 仅代表设备自身，手机无法通过回环地址访问电脑；请改填电脑的局域网 IP（如 192.168.x.x）或按下方桌面端引导开启远程连接。';
+      return '$hostLower 指的是这台手机自己，不是你的电脑。请换成电脑上显示的局域网连接链接，或直接扫描电脑上的二维码。';
     }
-    return '该地址指向当前设备本机，无需添加为远程主机；请直接切换到「本机」使用内置环境。';
+    return '该地址指向当前设备本机，无需作为远程电脑添加。若要连接另一台电脑，请换成那台电脑上的连接链接。';
   }
 
   /// True only while the given [client] is still the currently bound live host client.
@@ -3035,6 +3192,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           _pendingOutbox.add(Map<String, dynamic>.from(item));
         }
       }
+      _syncOutboxState();
     }
     if (savedContexts != null && savedContexts.isNotEmpty) {
       for (final entry in savedContexts.entries) {
@@ -3390,12 +3548,23 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
             showToast('已急停手机操控并终止对应操控任务', tone: ToastTone.warn);
           } else if (evt.type == 'notification.opened') {
             unawaited(handleNotificationOpened(evt.data));
+          } else if (evt.type == 'pairing.deeplink') {
+            final uri = evt.data['uri']?.toString().trim() ?? '';
+            if (uri.isNotEmpty) {
+              enqueuePairDeepLink(uri);
+            }
+          } else if (evt.type == 'network.changed') {
+            clearDiscoveredLanHosts();
           }
         });
         unawaited(() async {
           final launchPayload = await GrassBagNativeBridge.instance.takePendingNotification();
           if (launchPayload != null && launchPayload.isNotEmpty && mounted) {
             await handleNotificationOpened(launchPayload);
+          }
+          final launchPairLink = await GrassBagNativeBridge.instance.takePendingPairLink();
+          if (launchPairLink != null && launchPairLink.isNotEmpty && mounted) {
+            enqueuePairDeepLink(launchPairLink);
           }
         }());
       } catch (_) {
@@ -4246,6 +4415,30 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     return res;
   }
 
+  /// Clears cached nearby LAN hosts (e.g. immediately after Wi-Fi / network switch).
+  void clearDiscoveredLanHosts() {
+    if (!mounted || state.discoveredLanHosts.isEmpty) return;
+    state = state.copyWith(discoveredLanHosts: const []);
+  }
+
+  /// Queues an incoming `grassbag://pair?...` deep link so the UI opens the unified
+  /// Connect Computer pairing sheet showing target computer details BEFORE connecting.
+  void enqueuePairDeepLink(String rawUri) {
+    final trimmed = rawUri.trim();
+    if (!mounted || trimmed.isEmpty) return;
+    state = state.copyWith(pendingPairDeepLinkUri: trimmed);
+  }
+
+  /// Consumes and clears any queued `grassbag://pair?...` deep link.
+  String? consumePendingPairDeepLink() {
+    final cur = state.pendingPairDeepLinkUri;
+    if (cur == null || cur.isEmpty) return null;
+    if (mounted) {
+      state = state.copyWith(clearPendingPairDeepLinkUri: true);
+    }
+    return cur;
+  }
+
   Future<void> scanLanForHosts({int port = 3080, bool silent = false}) async {
     if (state.scanningLan) return;
     if (kIsWeb) {
@@ -4790,6 +4983,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       clearPendingApproval: true,
       clearActiveQuestion: true,
       clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
       pendingAttachments: _restorePendingAttachmentsForScope(state.activeHostId, null),
       queuedMessages: const [],
       workspaceFiles: const [],
@@ -4945,6 +5139,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       clearPendingApproval: true,
       clearActiveQuestion: true,
       clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
       pendingAttachments: isChangingSession
           ? _restorePendingAttachmentsForScope(state.activeHostId, sessionId)
           : state.pendingAttachments,
@@ -6738,6 +6933,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       clearPendingApproval: true,
       clearActiveQuestion: true,
       clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
       pendingAttachments: const [],
       queuedMessages: const [],
       sessionRenderGen: state.sessionRenderGen + 1,
@@ -7460,7 +7656,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     }
   }
 
-  Future<void> setPlanMode(bool enabled) async {
+  Future<bool> setPlanMode(bool enabled) async {
     final client = _liveClient;
     final prev = state.planMode;
     state = state.copyWith(planMode: enabled);
@@ -7471,15 +7667,16 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           sid,
           command: enabled ? '/plan on' : '/plan off',
         );
-        if (!_isStillLive(client)) return;
+        if (!_isStillLive(client)) return false;
       } catch (e) {
-        if (!_isStillLive(client)) return;
+        if (!_isStillLive(client)) return false;
         state = state.copyWith(planMode: prev);
         showError('切换计划模式失败', error: e);
-        return;
+        return false;
       }
     }
     showToast(enabled ? '已开启计划模式' : '已关闭计划模式', tone: ToastTone.info);
+    return true;
   }
 
   ModelCatalogEntry? _findModelEntry(String providerId, String modelId) {
@@ -11144,9 +11341,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         return false;
       }
 
-      // Disconnected offline honest notice: render a single crisp `_TurnErrorCard`
-      // WITHOUT polluting the sidebar with an undeletable 404 `pending-session-*` ghost,
-      // and return `false` + persist outbox so the composer preserves the user's draft!
+      // Disconnected offline honest notice: keep ONLY ONE editable draft in the composer
+      // (zero duplicate user bubble / competing 5-button error card!), persist the unsent outbox
+      // entry, and display a persistent "未发送" status strip whose primary CTA opens Host Connect!
       if (sendClient == null && sendBootstrap == null) {
         _recordOutboxEntry(
           id: turnId,
@@ -11154,28 +11351,19 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
           sessionId: state.activeSessionId ?? '',
           text: trimmed,
           mode: mode,
-          status: 'failed',
+          status: 'unsent',
           errorMessage: 'host_offline',
         );
-        final offlineTurn = initialTurn.copyWith(
-          status: 'error',
-          errorCode: 'host_offline',
-          errorMessage: '当前尚未连接到运行中的 DSH 引擎，请先在「主机与环境」连接本机或远程主机后重试。',
-          steps: const [],
-          assistantText: '',
-        );
-        final offlineTurns = [...state.turns, offlineTurn];
-        _turnReducer.replaceAll(offlineTurns);
         state = state.copyWith(
-          turns: offlineTurns,
+          offlineUnsentNotice: '未发送 · 尚未连接到运行中的 DSH 引擎，已保留草稿',
           clearSessionLoadError: true,
           isStreaming: false,
           sendStage: SendStage.idle,
-          scrollSignal: state.scrollSignal + 1,
-          streamTick: state.streamTick + 1,
         );
-        showToast('尚未连接 DSH 主机，已保留草稿并等待重连', tone: ToastTone.warn);
         return false;
+      }
+      if (state.offlineUnsentNotice != null) {
+        state = state.copyWith(clearOfflineUnsentNotice: true);
       }
 
       final isBrandNewSession = state.activeSessionId == null;
@@ -12075,6 +12263,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       clearPendingApproval: true,
       clearActiveQuestion: true,
       clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
       draftHydratedSignal: restoredQueueToDraft ? state.draftHydratedSignal + 1 : state.draftHydratedSignal,
     );
     _recomputeVisibleInteractions();
@@ -12371,7 +12560,13 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         break;
       }
     }
+    final allPendingList = List<PendingInteraction>.unmodifiable(_pendingInteractionsById.values);
+    final pendingListChanged = allPendingList.length != state.pendingInteractions.length ||
+        [for (final i in allPendingList) i.id].join(',') !=
+            [for (final i in state.pendingInteractions) i.id].join(',');
+
     if (!sessionsPendingChanged &&
+        !pendingListChanged &&
         state.pendingApprovalInteractionId == approvalId &&
         state.pendingApprovalCommand == approvalCmd &&
         state.pendingApprovalToolName == approvalToolName &&
@@ -12393,6 +12588,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
 
     state = state.copyWith(
       sessions: updatedSessions,
+      pendingInteractions: allPendingList,
       pendingApprovalInteractionId: approvalId,
       pendingApprovalCommand: approvalCmd,
       pendingApprovalToolName: approvalToolName,
@@ -12404,6 +12600,59 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       activeCordisRequest: cordisReq,
       clearActiveCordisRequest: cordisReq == null,
     );
+  }
+
+  /// Resolves a specific pending approval interaction directly (e.g. from the Pending Inbox sheet).
+  Future<bool> resolveInteractionById(String interactionId, String action) async {
+    final backup = _pendingInteractionsById[interactionId];
+    if (backup == null) return false;
+    final client = _liveClient;
+    final mutSeq = ++_interactionMutationSeq;
+    _pendingInteractionsById.remove(interactionId);
+    _recomputeVisibleInteractions();
+    if (client != null) {
+      try {
+        await client.respondInteraction(interactionId, decision: action);
+        if (!_isStillLive(client)) return false;
+      } catch (e) {
+        if (!_isStillLive(client)) return false;
+        if (_isInteractionAlreadySettledError(e)) {
+          unawaited(
+            GrassBagNativeBridge.instance.cancelAlertNotification('interaction:$interactionId'),
+          );
+          showToast('该审批请求已在其他端处理或已过期', tone: ToastTone.info);
+          return true;
+        }
+        if (_interactionMutationSeq == mutSeq &&
+            !_pendingInteractionsById.containsKey(interactionId)) {
+          _interactionMutationSeq++;
+          _pendingInteractionsById[interactionId] = backup;
+          _recomputeVisibleInteractions();
+        }
+        showError('提交审批决定失败', error: e);
+        return false;
+      }
+    }
+    unawaited(
+      GrassBagNativeBridge.instance.cancelAlertNotification('interaction:$interactionId'),
+    );
+    if (!mounted) return true;
+    showToast(
+      action == 'deny' ? '已拒绝该操作' : (action == 'always' ? '本对话已自动允许同类操作' : '已允许并执行该操作'),
+      tone: action == 'deny' ? ToastTone.warn : ToastTone.ok,
+    );
+    return true;
+  }
+
+  /// Jumps directly from the Pending Inbox to the session hosting [item] and focuses it.
+  void openInboxInteraction(PendingInteraction item) {
+    _preferredInteractionId = item.id;
+    final sid = item.sessionId ?? item.payload['sessionId']?.toString();
+    if (sid != null && sid.isNotEmpty && sid != state.activeSessionId) {
+      selectSession(sid);
+    } else {
+      _recomputeVisibleInteractions();
+    }
   }
 
   static String _formatApprovalPrompt(Map<String, dynamic> payload) {
@@ -12736,6 +12985,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       clearPendingApproval: true,
       clearActiveQuestion: true,
       clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
+      pendingInteractions: const [],
       clearLiveCapabilities: true,
       clearAccountSnapshot: true,
       clearUpdateCheck: true,
@@ -12914,11 +13165,12 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     );
   }
 
-  static ({String code, String message}) _classifyConnectionError(
+  static ({String code, String message, String? technicalDetail}) _classifyConnectionError(
     Object err, {
     required String address,
   }) {
-    final lower = err.toString().toLowerCase();
+    final rawDetail = err.toString().trim();
+    final lower = rawDetail.toLowerCase();
     final uri = Uri.tryParse(address);
     final hostLabel = uri?.host.isNotEmpty == true ? uri!.host : address;
     final portSuffix = (uri != null && uri.hasPort && uri.port != 80 && uri.port != 443)
@@ -12931,6 +13183,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       return (
         code: 'tls_cert',
         message: 'HTTPS 证书未受系统信任（可能为自签名证书）。可开启「信任自签名证书」后重试。',
+        technicalDetail: rawDetail,
       );
     }
     if (err is GbridgeException) {
@@ -12938,34 +13191,67 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         return (
           code: 'html_proxy',
           message: '目标返回了网页登录认证页（如反向代理或 SSO 网关），可直接在 App 内网页登录同步凭证。',
+          technicalDetail: rawDetail,
+        );
+      }
+      if (err.code == 'gbridge/pairing_code_expired') {
+        return (
+          code: 'pairing_code_expired',
+          message: '电脑可以连通，但当前配对码已过期或已刷新。请在电脑端重新显示二维码后再扫描。',
+          technicalDetail: rawDetail,
         );
       }
       if (err.status == 401) {
         return (
           code: 'needs_auth',
           message: '远程 DSH 需要一次鉴权（完成后自动保存 30 天免密凭证，重启远程 DSH 亦无需重填）。',
+          technicalDetail: rawDetail,
         );
       }
       if (err.status == 403) {
         return (
           code: 'untrusted_host',
           message: '远程 DSH 拒绝了 Host 请求头（HTTP 403）。请在远程主机使用 `dsh web --host $hostLabel$portSuffix` 或 `--trusted-host $hostLabel` 启动。',
+          technicalDetail: rawDetail,
         );
       }
     }
-    if (lower.contains('connection refused') ||
+    final isBrowserFetchFail = lower.contains('failed to fetch') ||
+        lower.contains('load failed') ||
+        lower.contains('networkerror') ||
+        lower.contains('xmlhttprequest') ||
+        lower.contains('clientexception');
+    final isSocketUnreach = lower.contains('connection refused') ||
         lower.contains('failed host lookup') ||
         lower.contains('network is unreachable') ||
         lower.contains('no route to host') ||
         lower.contains('timed out') ||
         lower.contains('timeoutexception') ||
-        lower.contains('socketexception')) {
+        lower.contains('socketexception') ||
+        isBrowserFetchFail;
+    if (isSocketUnreach) {
+      final isLoopbackTarget = isLoopbackHost(hostLabel);
+      if (isLoopbackTarget) {
+        final msg = kIsWeb
+            ? '$address 指向当前打开浏览器的这台设备本身，且未收到响应。如果你要连接另一台电脑，请换成那台电脑上的局域网连接链接；如果就在同一台电脑上使用，请确认本机已运行 dsh web 且端口一致。'
+            : '$address 指向当前设备自身，而不是你的电脑。请换成电脑上的局域网连接链接，或直接扫描电脑上的二维码。';
+        return (
+          code: 'loopback_unreachable',
+          message: msg,
+          technicalDetail: rawDetail,
+        );
+      }
       return (
         code: 'unreachable',
-        message: '无法连通 $address。原版 `dsh web` 默认仅监听本机 127.0.0.1，请在远程电脑改用 `dsh web --host <局域网IP>` 启动。',
+        message: '暂时无法连上 $address。请确认目标电脑已开启连接服务、地址与端口填写无误，且两台设备网络互通。',
+        technicalDetail: rawDetail,
       );
     }
-    return (code: 'error', message: formatReadableError(err));
+    return (
+      code: 'error',
+      message: formatReadableError(err),
+      technicalDetail: rawDetail,
+    );
   }
 
   /// Returns true when [uri] uses cleartext `http://` targeting a public (non-loopback,
@@ -13008,6 +13294,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
   Future<RemoteHostDiagnosis> diagnoseRemoteHost(
     String rawInput, {
     String? token,
+    String? pairCode,
     String? cookie,
     bool allowBadCertificates = false,
     bool allowInsecurePublicHttp = false,
@@ -13016,23 +13303,28 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     if (parsed == null) {
       return const RemoteHostDiagnosis(
         kind: RemoteDiagnosisKind.invalidAddress,
-        title: '地址格式无效',
-        message: '请输入 IP、域名，或直接粘贴远程电脑终端打印的 `dsh web: http://...` 整行链接。',
+        title: '链接或地址格式无效',
+        message: '请粘贴电脑上的配对链接、`dsh web` 启动链接，或输入 `IP:端口`。',
       );
     }
 
     final uri = Uri.parse(parsed.address);
+    final isLoopback = isLoopbackHost(uri.host);
     await _refreshDeviceLocalIps();
     final selfGuidance = selfDeviceGuidanceForUri(uri);
     if (selfGuidance != null) {
       return RemoteHostDiagnosis(
         kind: RemoteDiagnosisKind.selfDevice,
-        title: isLoopbackHost(uri.host) ? '不能使用回环地址连接远程电脑' : '这是当前设备本机地址',
+        title: isLoopback ? '这个地址指向当前设备自己' : '这个地址指向当前设备自己',
         message: selfGuidance,
         normalizedAddress: parsed.address,
+        hostName: parsed.suggestedName,
+        isLoopbackTarget: isLoopback,
       );
     }
     final effectiveToken = parsed.token;
+    final effectivePairCode =
+        (pairCode != null && pairCode.trim().isNotEmpty) ? pairCode.trim() : parsed.pairCode;
     String? mintedCookie = (cookie != null && cookie.trim().isNotEmpty) ? cookie.trim() : null;
     // Security boundary: NEVER transmit credentials (token or cookie) over public cleartext HTTP
     // before the user explicitly confirms or switches to HTTPS!
@@ -13043,14 +13335,21 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
         message: '检测到公网地址 ${uri.host} 使用未加密的 http://，已阻止在首次诊断时明文发送 Token 或 Cookie。建议改用 https://（或 Tailscale / 局域网），如确需明文测试请点击确认后继续。',
         normalizedAddress: parsed.address,
         extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
         capturedCookie: mintedCookie,
+        hostName: parsed.suggestedName,
       );
     }
     final sw = Stopwatch()..start();
     GbridgeClient? client;
     try {
       client = GbridgeClient(
-        HostEndpoint.http(baseUri: uri, token: effectiveToken, cookie: mintedCookie),
+        HostEndpoint.http(
+          baseUri: uri,
+          token: effectiveToken,
+          cookie: mintedCookie,
+          pairCode: effectivePairCode,
+        ),
         timeout: const Duration(seconds: 10),
         allowBadCertificates: allowBadCertificates,
         autoReconnect: false,
@@ -13072,6 +13371,7 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       // If a stale DSH cookie failed auth while we have a fresh token, evict only DSH auth cookies
       // (preserving reverse-proxy SSO cookies) and retry token exchange once!
       if (probe is HostProbeNeedsAuth &&
+          !probe.isPairingCodeExpired &&
           !exchangedTokenThisAttempt &&
           effectiveToken != null &&
           effectiveToken.isNotEmpty) {
@@ -13088,200 +13388,740 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
       sw.stop();
       final ms = sw.elapsedMilliseconds.clamp(1, 99999);
-      if (probe is HostProbeFull) {
-        return RemoteHostDiagnosis(
-          kind: RemoteDiagnosisKind.readyGbridge,
-          title: '连接就绪 · 增强模式',
-          message: '检测到 DSH ${probe.capabilities.dshVersion} 与连接助手 v${probe.capabilities.bridgeVersion}（${ms}ms），可立即使用全部功能。',
-          normalizedAddress: parsed.address,
-          extractedToken: effectiveToken,
-          capturedCookie: mintedCookie,
-          dshVersion: probe.capabilities.dshVersion,
-          latencyMs: ms,
-          hasGbridge: true,
-        );
-      }
-      if (probe is HostProbeVanillaDirect) {
-        return RemoteHostDiagnosis(
-          kind: RemoteDiagnosisKind.readyDirect,
-          title: '连接就绪 · 原生免插件直连',
-          message: '检测到原版 DSH ${probe.dshVersion}（${ms}ms），无需安装任何插件即可直接对话、管理模型、工作区与终端。',
-          normalizedAddress: parsed.address,
-          extractedToken: effectiveToken,
-          capturedCookie: mintedCookie,
-          dshVersion: probe.dshVersion,
-          latencyMs: ms,
-          hasGbridge: false,
-        );
-      }
-      if (probe is HostProbeNeedsAuth) {
-        final verLabel = probe.dshVersion != null ? 'DSH ${probe.dshVersion}' : '远程服务';
-        if (probe.isHtmlLoginPage) {
-          return RemoteHostDiagnosis(
-            kind: RemoteDiagnosisKind.htmlLoginPage,
-            title: '检测到网页登录认证',
-            message: '$verLabel 位于登录网关或反向代理后方，点击下方「App 内网页登录」即可自动同步凭证，无需手动填 Token。',
-            normalizedAddress: parsed.address,
-            extractedToken: effectiveToken,
-            capturedCookie: mintedCookie,
-            dshVersion: probe.dshVersion,
-            latencyMs: ms,
-            hasGbridge: probe.hasGbridge,
-          );
-        }
-        return RemoteHostDiagnosis(
-          kind: RemoteDiagnosisKind.needsAuth,
-          title: '已发现 $verLabel · 请完成一次授权',
-          message: '远程服务在线（${ms}ms），免装插件即可使用。请粘贴一次电脑端生成的启动链接（含 ?token=）或输入 Token，授权成功后 30 天内自动免填连接。',
-          normalizedAddress: parsed.address,
-          extractedToken: effectiveToken,
-          capturedCookie: mintedCookie,
-          dshVersion: probe.dshVersion,
-          latencyMs: ms,
-          hasGbridge: probe.hasGbridge,
-        );
-      }
-      if (probe is HostProbeUntrustedHost) {
-        final isIp = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(uri.host);
-        final portFlag = uri.hasPort && uri.port != 3080 ? ' --port ${uri.port}' : '';
-        final cmd = isIp
-            ? 'dsh web --host ${uri.host}$portFlag'
-            : 'dsh web --trusted-host ${probe.hostAuthority}$portFlag';
-        return RemoteHostDiagnosis(
-          kind: RemoteDiagnosisKind.untrustedHost,
-          title: '远程 DSH 拒绝了访问主机名 (HTTP 403)',
-          message: '原版 DSH 的安全校验未放行 `${probe.hostAuthority}`。请在远程主机使用下方命令启动即可直连：',
-          normalizedAddress: parsed.address,
-          extractedToken: effectiveToken,
-          capturedCookie: mintedCookie,
-          dshVersion: probe.dshVersion,
-          latencyMs: ms,
-          hostAuthority: probe.hostAuthority,
-          suggestedCommand: cmd,
-        );
-      }
-      return RemoteHostDiagnosis(
-        kind: RemoteDiagnosisKind.readyDirect,
-        title: '检测到远程 DSH 服务',
-        message: '已探测到目标主机（${ms}ms），可直接添加并连接。',
-        normalizedAddress: parsed.address,
-        extractedToken: effectiveToken,
-        capturedCookie: mintedCookie,
+      return _diagnosisFromProbe(
+        probe,
+        parsed: parsed,
+        uri: uri,
+        effectiveToken: effectiveToken,
+        effectivePairCode: effectivePairCode,
+        mintedCookie: mintedCookie,
         latencyMs: ms,
       );
     } catch (e) {
       sw.stop();
-      final classified = _classifyConnectionError(e, address: parsed.address);
-      final isIp = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(uri.host);
-      final portFlag = uri.hasPort && uri.port != 3080 ? ' --port ${uri.port}' : '';
-      final cmd = isIp
-          ? 'dsh web --host ${uri.host}$portFlag'
-          : 'dsh web --host <局域网IP>$portFlag';
-      return RemoteHostDiagnosis(
-        kind: switch (classified.code) {
-          'tls_cert' => RemoteDiagnosisKind.selfSignedTls,
-          'html_proxy' => RemoteDiagnosisKind.htmlLoginPage,
-          'needs_auth' => RemoteDiagnosisKind.needsAuth,
-          'untrusted_host' => RemoteDiagnosisKind.untrustedHost,
-          _ => RemoteDiagnosisKind.unreachable,
-        },
-        title: switch (classified.code) {
-          'tls_cert' => 'HTTPS 自签名证书拦截',
-          'html_proxy' => '检测到网页登录认证页',
-          'needs_auth' => '需要一次鉴权',
-          'untrusted_host' => '远程 DSH Host 校验拒绝 (403)',
-          _ => '无法连通目标主机',
-        },
-        message: classified.message,
-        normalizedAddress: parsed.address,
-        extractedToken: effectiveToken,
-        suggestedCommand: classified.code == 'unreachable' || classified.code == 'untrusted_host'
-            ? cmd
-            : null,
+      return _diagnosisFromError(
+        e,
+        parsed: parsed,
+        uri: uri,
+        effectiveToken: effectiveToken,
+        effectivePairCode: effectivePairCode,
       );
     } finally {
       await client?.dispose();
     }
   }
 
-  /// High-level 1-tap remote connection orchestrator:
-  /// 1. Runs a non-destructive `diagnoseRemoteHost` FIRST without switching `activeHostId` or
-  ///    tearing down the user's current session.
-  /// 2. Preserves any freshly minted 30-day session cookie (`diag.capturedCookie`) so one-time
-  ///    `?token=` links are NEVER exchanged/burned twice!
-  /// 3. Only saves & switches to the remote host once ready (or when `saveIfNeedsAuth` is set
-  ///    for immediate in-app WebView login).
+  RemoteHostDiagnosis _diagnosisFromProbe(
+    HostProbeResult probe, {
+    required ParsedRemoteHostInput parsed,
+    required Uri uri,
+    required String? effectiveToken,
+    required String? effectivePairCode,
+    required String? mintedCookie,
+    required int latencyMs,
+  }) {
+    final isLoopback = isLoopbackHost(uri.host);
+    if (probe is HostProbeFull) {
+      final hostName = probe.capabilities.host.name.trim().isNotEmpty
+          ? probe.capabilities.host.name.trim()
+          : parsed.suggestedName;
+      return RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.readyGbridge,
+        title: '已连接到「${hostName ?? parsed.address}」',
+        message: 'DSH ${probe.capabilities.dshVersion} · 增强连接助手 v${probe.capabilities.bridgeVersion}（${latencyMs}ms）',
+        normalizedAddress: parsed.address,
+        extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: hostName,
+        dshVersion: probe.capabilities.dshVersion,
+        latencyMs: latencyMs,
+        hasGbridge: true,
+        isLoopbackTarget: isLoopback,
+      );
+    }
+    if (probe is HostProbeVanillaDirect) {
+      return RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.readyDirect,
+        title: '已连接到「${parsed.suggestedName ?? parsed.address}」',
+        message: '原版 DSH ${probe.dshVersion}（${latencyMs}ms）· 免插件直连',
+        normalizedAddress: parsed.address,
+        extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: parsed.suggestedName,
+        dshVersion: probe.dshVersion,
+        latencyMs: latencyMs,
+        hasGbridge: false,
+        isLoopbackTarget: isLoopback,
+      );
+    }
+    if (probe is HostProbeNeedsAuth) {
+      final verLabel = probe.dshVersion != null ? 'DSH ${probe.dshVersion}' : '电脑端服务';
+      if (probe.isPairingCodeExpired) {
+        return RemoteHostDiagnosis(
+          kind: RemoteDiagnosisKind.pairingCodeExpired,
+          title: '配对二维码已失效',
+          message: '电脑可以连通，但这个配对码已过期或被刷新。请在电脑端重新显示二维码后扫描。',
+          normalizedAddress: parsed.address,
+          extractedToken: effectiveToken,
+          extractedPairCode: effectivePairCode,
+          capturedCookie: mintedCookie,
+          hostName: parsed.suggestedName,
+          dshVersion: probe.dshVersion,
+          latencyMs: latencyMs,
+          hasGbridge: true,
+          isLoopbackTarget: isLoopback,
+        );
+      }
+      if (probe.isHtmlLoginPage) {
+        return RemoteHostDiagnosis(
+          kind: RemoteDiagnosisKind.htmlLoginPage,
+          title: '需要完成网页登录认证',
+          message: '$verLabel 位于登录网关或反向代理后方，请先完成网页登录后再继续连接。',
+          normalizedAddress: parsed.address,
+          extractedToken: effectiveToken,
+          extractedPairCode: effectivePairCode,
+          capturedCookie: mintedCookie,
+          hostName: parsed.suggestedName,
+          dshVersion: probe.dshVersion,
+          latencyMs: latencyMs,
+          hasGbridge: probe.hasGbridge,
+          isLoopbackTarget: isLoopback,
+        );
+      }
+      final hasPairCode = effectivePairCode != null && effectivePairCode.isNotEmpty;
+      final hadCredentials = (effectiveToken != null && effectiveToken.isNotEmpty) || hasPairCode;
+      return RemoteHostDiagnosis(
+        kind: hasPairCode
+            ? RemoteDiagnosisKind.pairingCodeExpired
+            : RemoteDiagnosisKind.needsAuth,
+        title: hadCredentials ? '配对码或令牌已失效' : '已找到 $verLabel，需要授权',
+        message: hadCredentials
+            ? '电脑可以连通，但当前链接里的配对码或令牌未被接受。请从电脑端重新扫码，或粘贴最新的连接链接。'
+            : '电脑端服务在线（${latencyMs}ms）。请扫描电脑上的二维码，或粘贴包含授权信息的完整启动链接。',
+        normalizedAddress: parsed.address,
+        extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: parsed.suggestedName,
+        dshVersion: probe.dshVersion,
+        latencyMs: latencyMs,
+        hasGbridge: probe.hasGbridge,
+        isLoopbackTarget: isLoopback,
+      );
+    }
+    if (probe is HostProbeUntrustedHost) {
+      final isIp = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(uri.host);
+      final portFlag = uri.hasPort && uri.port != 3080 ? ' --port ${uri.port}' : '';
+      final cmd = isLoopback
+          ? null
+          : (isIp
+              ? 'dsh web --host ${uri.host}$portFlag'
+              : 'dsh web --trusted-host ${probe.hostAuthority}$portFlag');
+      return RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.untrustedHost,
+        title: '电脑端拒绝了当前访问地址 (HTTP 403)',
+        message: '原版 DSH 未放行访问主机名 `${probe.hostAuthority}`。请在电脑上用局域网 IP 启动 `dsh web` 后重试。',
+        normalizedAddress: parsed.address,
+        extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: parsed.suggestedName,
+        dshVersion: probe.dshVersion,
+        latencyMs: latencyMs,
+        hostAuthority: probe.hostAuthority,
+        isLoopbackTarget: isLoopback,
+        suggestedCommand: cmd,
+      );
+    }
+    return RemoteHostDiagnosis(
+      kind: RemoteDiagnosisKind.readyDirect,
+      title: '检测到电脑端 DSH 服务',
+      message: '已探测到目标电脑（${latencyMs}ms），可继续建立会话连接。',
+      normalizedAddress: parsed.address,
+      extractedToken: effectiveToken,
+      extractedPairCode: effectivePairCode,
+      capturedCookie: mintedCookie,
+      hostName: parsed.suggestedName,
+      latencyMs: latencyMs,
+      isLoopbackTarget: isLoopback,
+    );
+  }
+
+  RemoteHostDiagnosis _diagnosisFromError(
+    Object err, {
+    required ParsedRemoteHostInput parsed,
+    required Uri uri,
+    required String? effectiveToken,
+    required String? effectivePairCode,
+  }) {
+    final isLoopback = isLoopbackHost(uri.host);
+    final classified = _classifyConnectionError(err, address: parsed.address);
+    final isIp = RegExp(r'^(\d{1,3}\.){3}\d{1,3}$').hasMatch(uri.host);
+    final portFlag = uri.hasPort && uri.port != 3080 ? ' --port ${uri.port}' : '';
+    final cmd = (!isLoopback && classified.code == 'untrusted_host')
+        ? (isIp
+            ? 'dsh web --host ${uri.host}$portFlag'
+            : 'dsh web --host <局域网IP>$portFlag')
+        : null;
+    final kind = switch (classified.code) {
+      'tls_cert' => RemoteDiagnosisKind.selfSignedTls,
+      'html_proxy' => RemoteDiagnosisKind.htmlLoginPage,
+      'pairing_code_expired' => RemoteDiagnosisKind.pairingCodeExpired,
+      'needs_auth' => RemoteDiagnosisKind.needsAuth,
+      'untrusted_host' => RemoteDiagnosisKind.untrustedHost,
+      'loopback_unreachable' => RemoteDiagnosisKind.selfDevice,
+      _ => RemoteDiagnosisKind.unreachable,
+    };
+    return RemoteHostDiagnosis(
+      kind: kind,
+      title: switch (classified.code) {
+        'tls_cert' => 'HTTPS 证书未受信任',
+        'html_proxy' => '需要完成网页登录认证',
+        'pairing_code_expired' => '配对二维码已失效',
+        'needs_auth' => '需要授权连接',
+        'untrusted_host' => '电脑端拒绝了当前访问地址 (HTTP 403)',
+        'loopback_unreachable' => kIsWeb ? '这个地址指向当前浏览器所在设备' : '这个地址指向当前设备自己',
+        _ => '暂时连不上目标电脑',
+      },
+      message: classified.message,
+      technicalDetail: classified.technicalDetail,
+      normalizedAddress: parsed.address,
+      extractedToken: effectiveToken,
+      extractedPairCode: effectivePairCode,
+      hostName: parsed.suggestedName,
+      isLoopbackTarget: isLoopback,
+      suggestedCommand: cmd,
+    );
+  }
+
+  /// Atomic staged pairing & connection orchestrator:
+  /// 1. Parses input and validates self-device / cleartext-HTTP guards WITHOUT touching the user's
+  ///    current host, active session, or composer drafts.
+  /// 2. Creates an isolated staging [GbridgeClient], exchanges token / pairCode once (preserving
+  ///    any freshly minted 30-day session cookie), and probes host capabilities (`authorizing`).
+  /// 3. Verifies BOTH real-time WebSocket handshake (`stream.connect()`) AND sessions API
+  ///    (`listSessions()`) on the staging client (`openingSession`) BEFORE ever saving or
+  ///    switching `activeHostId`.
+  /// 4. If real-time handshake, sessions verification, or user cancellation fails at any stage,
+  ///    disposes the staging client and leaves the original host, session, and drafts 100% intact!
   Future<RemoteConnectOutcome> connectRemoteInput(
     String rawInput, {
     String? name,
     String? token,
+    String? pairCode,
     String? cookie,
     bool allowBadCertificates = false,
     bool allowInsecurePublicHttp = false,
     bool saveIfNeedsAuth = false,
+    bool switchOnSuccess = true,
+    void Function(PairingStage stage, {String? computerName})? onStageChanged,
+    bool Function()? isCancelled,
   }) async {
-    final diag = await diagnoseRemoteHost(
-      rawInput,
-      token: token,
-      cookie: cookie,
-      allowBadCertificates: allowBadCertificates,
-      allowInsecurePublicHttp: allowInsecurePublicHttp,
-    );
-    if (!mounted) {
+    bool cancelled() => !mounted || (isCancelled?.call() == true);
+
+    final parsed = parseRemoteHostInput(rawInput, explicitToken: token);
+    if (parsed == null) {
+      const diag = RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.invalidAddress,
+        title: '链接或地址格式无效',
+        message: '请粘贴电脑上的配对链接、`dsh web` 启动链接，或输入 `IP:端口`。',
+      );
+      onStageChanged?.call(PairingStage.failed);
+      return const RemoteConnectOutcome(diagnosis: diag, connected: false);
+    }
+
+    final initialName = (name != null && name.trim().isNotEmpty)
+        ? name.trim()
+        : (parsed.suggestedName ?? parsed.address);
+    onStageChanged?.call(PairingStage.connecting, computerName: initialName);
+
+    final uri = Uri.parse(parsed.address);
+    final isLoopback = isLoopbackHost(uri.host);
+    await _refreshDeviceLocalIps();
+    if (cancelled()) {
+      return RemoteConnectOutcome(
+        diagnosis: RemoteHostDiagnosis(
+          kind: RemoteDiagnosisKind.unreachable,
+          title: '已取消连接',
+          message: '已取消本次连接，原对话未受影响。',
+          normalizedAddress: parsed.address,
+          hostName: initialName,
+        ),
+        connected: false,
+        cancelled: true,
+      );
+    }
+    final selfGuidance = selfDeviceGuidanceForUri(uri);
+    if (selfGuidance != null) {
+      final diag = RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.selfDevice,
+        title: '这个地址指向当前设备自己',
+        message: selfGuidance,
+        normalizedAddress: parsed.address,
+        hostName: initialName,
+        isLoopbackTarget: isLoopback,
+      );
+      onStageChanged?.call(PairingStage.failed, computerName: initialName);
       return RemoteConnectOutcome(diagnosis: diag, connected: false);
     }
-    final targetAddress = diag.normalizedAddress;
-    if (targetAddress == null) {
+
+    final effectiveToken = parsed.token;
+    final effectivePairCode =
+        (pairCode != null && pairCode.trim().isNotEmpty) ? pairCode.trim() : parsed.pairCode;
+    String? mintedCookie = (cookie != null && cookie.trim().isNotEmpty) ? cookie.trim() : null;
+
+    if (!allowInsecurePublicHttp && isPublicCleartextHttpUri(uri)) {
+      final diag = RemoteHostDiagnosis(
+        kind: RemoteDiagnosisKind.insecurePublicHttp,
+        title: '公网明文 HTTP 风险拦截',
+        message: '检测到公网地址 ${uri.host} 使用未加密的 http://，已阻止在首次连接时明文发送 Token 或 Cookie。建议改用 https://（或 Tailscale / 局域网），如确需明文测试请确认后继续。',
+        normalizedAddress: parsed.address,
+        extractedToken: effectiveToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: initialName,
+      );
+      onStageChanged?.call(PairingStage.failed, computerName: initialName);
       return RemoteConnectOutcome(diagnosis: diag, connected: false);
     }
-    if (diag.canConnectNow) {
+
+    final sw = Stopwatch()..start();
+    GbridgeClient? stagingClient;
+    var handedOff = false;
+    var passedPreflight = false;
+    String resolvedName = initialName;
+
+    try {
+      stagingClient = GbridgeClient(
+        HostEndpoint.http(
+          baseUri: uri,
+          token: effectiveToken,
+          cookie: mintedCookie,
+          pairCode: effectivePairCode,
+        ),
+        timeout: const Duration(seconds: 12),
+        allowBadCertificates: allowBadCertificates,
+        autoReconnect: true,
+        onCookieUpdated: (c) {
+          final clean = c.trim();
+          if (clean.isNotEmpty) mintedCookie = clean;
+        },
+      );
+
+      onStageChanged?.call(PairingStage.authorizing, computerName: resolvedName);
+      var exchangedTokenThisAttempt = false;
+      if ((mintedCookie == null || mintedCookie!.isEmpty) &&
+          effectiveToken != null &&
+          effectiveToken.isNotEmpty) {
+        exchangedTokenThisAttempt = true;
+        try {
+          await stagingClient.exchangeAuthToken(effectiveToken);
+        } catch (_) {}
+      }
+      if (cancelled()) {
+        return RemoteConnectOutcome(
+          diagnosis: RemoteHostDiagnosis(
+            kind: RemoteDiagnosisKind.unreachable,
+            title: '已取消连接',
+            message: '已取消本次连接，原对话未受影响。',
+            normalizedAddress: parsed.address,
+            hostName: resolvedName,
+          ),
+          connected: false,
+          cancelled: true,
+        );
+      }
+
+      var probe = await stagingClient.probeHost();
+      if (probe is HostProbeNeedsAuth &&
+          !probe.isPairingCodeExpired &&
+          !exchangedTokenThisAttempt &&
+          effectiveToken != null &&
+          effectiveToken.isNotEmpty) {
+        stagingClient.transport.evictDshAuthCookies();
+        mintedCookie = stagingClient.transport.cookieHeader;
+        try {
+          await stagingClient.exchangeAuthToken(effectiveToken);
+        } catch (_) {}
+        if (cancelled()) {
+          return RemoteConnectOutcome(
+            diagnosis: RemoteHostDiagnosis(
+              kind: RemoteDiagnosisKind.unreachable,
+              title: '已取消连接',
+              message: '已取消本次连接，原对话未受影响。',
+              normalizedAddress: parsed.address,
+              hostName: resolvedName,
+            ),
+            connected: false,
+            cancelled: true,
+          );
+        }
+        probe = await stagingClient.probeHost();
+      }
+      final liveCookie = stagingClient.transport.cookieHeader?.trim();
+      if (liveCookie != null && liveCookie.isNotEmpty) {
+        mintedCookie = liveCookie;
+      }
+      sw.stop();
+      final ms = sw.elapsedMilliseconds.clamp(1, 99999);
+
+      final probeDiag = _diagnosisFromProbe(
+        probe,
+        parsed: parsed,
+        uri: uri,
+        effectiveToken: effectiveToken,
+        effectivePairCode: effectivePairCode,
+        mintedCookie: mintedCookie,
+        latencyMs: ms,
+      );
+      if (probeDiag.hostName != null && probeDiag.hostName!.trim().isNotEmpty) {
+        resolvedName = (name != null && name.trim().isNotEmpty)
+            ? name.trim()
+            : probeDiag.hostName!.trim();
+      }
+
+      if (probe is! HostProbeFull && probe is! HostProbeVanillaDirect) {
+        if (saveIfNeedsAuth && probeDiag.needsWebOrTokenAuth) {
+          final saved = addRemoteHost(
+            parsed.address,
+            name: resolvedName,
+            token: probeDiag.extractedToken ?? token,
+            cookie: probeDiag.capturedCookie ?? cookie,
+            allowBadCertificates: allowBadCertificates,
+            autoProbe: false,
+            silent: true,
+          );
+          onStageChanged?.call(PairingStage.failed, computerName: resolvedName);
+          return RemoteConnectOutcome(diagnosis: probeDiag, host: saved, connected: false);
+        }
+        onStageChanged?.call(PairingStage.failed, computerName: resolvedName);
+        return RemoteConnectOutcome(diagnosis: probeDiag, connected: false);
+      }
+
+      passedPreflight = true;
+      final isDirect = probe is HostProbeVanillaDirect;
+      final Capabilities caps;
+      if (probe is HostProbeFull) {
+        caps = probe.capabilities;
+      } else {
+        caps = stagingClient.enableVanillaDirectMode(
+          dshVersion: (probe as HostProbeVanillaDirect).dshVersion,
+          hostName: resolvedName,
+        );
+      }
+
+      // Stage 3: Verify BOTH real-time WebSocket handshake AND sessions list BEFORE
+      // ever saving or switching activeHostId!
+      onStageChanged?.call(PairingStage.openingSession, computerName: resolvedName);
+      final welcome = await stagingClient.stream.connect().timeout(const Duration(seconds: 12));
+      if (cancelled()) {
+        return RemoteConnectOutcome(
+          diagnosis: RemoteHostDiagnosis(
+            kind: RemoteDiagnosisKind.unreachable,
+            title: '已取消连接',
+            message: '已取消本次连接，原对话未受影响。',
+            normalizedAddress: parsed.address,
+            hostName: resolvedName,
+          ),
+          connected: false,
+          cancelled: true,
+        );
+      }
+
+      final liveSessions = await stagingClient.listSessions().timeout(const Duration(seconds: 12));
+      if (cancelled()) {
+        return RemoteConnectOutcome(
+          diagnosis: RemoteHostDiagnosis(
+            kind: RemoteDiagnosisKind.unreachable,
+            title: '已取消连接',
+            message: '已取消本次连接，原对话未受影响。',
+            normalizedAddress: parsed.address,
+            hostName: resolvedName,
+          ),
+          connected: false,
+          cancelled: true,
+        );
+      }
+
+      // BOTH real-time handshake AND sessions API succeeded! Now atomically save & commit.
       final saved = addRemoteHost(
-        targetAddress,
-        name: name,
-        token: diag.extractedToken ?? token,
-        cookie: diag.capturedCookie ?? cookie,
+        parsed.address,
+        name: resolvedName,
+        token: probeDiag.extractedToken ?? token,
+        cookie: probeDiag.capturedCookie ?? cookie,
         allowBadCertificates: allowBadCertificates,
         autoProbe: false,
         silent: true,
       );
       if (saved == null) {
-        return RemoteConnectOutcome(diagnosis: diag, connected: false);
+        onStageChanged?.call(PairingStage.failed, computerName: resolvedName);
+        return RemoteConnectOutcome(diagnosis: probeDiag, connected: false);
       }
-      await switchHost(saved.id, awaitConnect: true);
-      if (!mounted) {
-        return RemoteConnectOutcome(diagnosis: diag, host: saved, connected: false);
-      }
-      final latest = state.hosts.firstWhere((h) => h.id == saved.id, orElse: () => saved);
-      if (latest.online) {
-        showToast(
-          latest.bridged
-              ? '已接入「${latest.name}」（增强模式 · ${latest.latency}）'
-              : '已接入「${latest.name}」（原生免插件直连 · ${latest.latency}）',
+      final latLabel = '${ms}ms';
+      if (switchOnSuccess) {
+        handedOff = true;
+        await _commitVerifiedRemoteHost(
+          saved,
+          stagingClient,
+          caps,
+          isDirect: isDirect,
+          latencyLabel: latLabel,
+          initialWelcome: welcome,
+          preloadedSessions: liveSessions,
+        );
+      } else {
+        // Saved without switching: mark host metadata verified and dispose staging client.
+        state = state.copyWith(
+          hosts: [
+            for (final h in state.hosts)
+              h.id == saved.id
+                  ? h.copyWith(
+                      bridged: !isDirect,
+                      directMode: isDirect,
+                      online: true,
+                      latency: latLabel,
+                      dshVersion: caps.dshVersion,
+                      helperVersion: isDirect ? null : caps.bridgeVersion,
+                      clearLastError: true,
+                    )
+                  : h,
+          ],
         );
       }
+      final latest = state.hosts.firstWhere((h) => h.id == saved.id, orElse: () => saved);
+      final readyDiag = RemoteHostDiagnosis(
+        kind: probeDiag.kind,
+        title: '已连接到「${latest.name}」',
+        message: liveSessions.isNotEmpty
+            ? '已建立实时连接，可立即打开 ${liveSessions.length} 条会话或开始新对话（$latLabel）。'
+            : '已建立实时连接，可以开始在这台电脑上对话（$latLabel）。',
+        normalizedAddress: parsed.address,
+        extractedToken: probeDiag.extractedToken,
+        extractedPairCode: effectivePairCode,
+        capturedCookie: mintedCookie,
+        hostName: latest.name,
+        dshVersion: caps.dshVersion,
+        latencyMs: ms,
+        hasGbridge: !isDirect,
+        isLoopbackTarget: isLoopback,
+      );
+      onStageChanged?.call(PairingStage.ready, computerName: latest.name);
       return RemoteConnectOutcome(
-        diagnosis: diag,
+        diagnosis: readyDiag,
         host: latest,
-        connected: latest.online,
+        connected: true,
+        sessionCount: liveSessions.length,
       );
+    } catch (e) {
+      sw.stop();
+      if (cancelled()) {
+        return RemoteConnectOutcome(
+          diagnosis: RemoteHostDiagnosis(
+            kind: RemoteDiagnosisKind.unreachable,
+            title: '已取消连接',
+            message: '已取消本次连接，原对话未受影响。',
+            normalizedAddress: parsed.address,
+            hostName: resolvedName,
+          ),
+          connected: false,
+          cancelled: true,
+        );
+      }
+      final RemoteHostDiagnosis failDiag;
+      if (passedPreflight) {
+        final lower = e.toString().toLowerCase();
+        final isAuthErr = (e is GbridgeException && (e.status == 401 || e.status == 403)) ||
+            lower.contains('401') ||
+            lower.contains('unauthorized');
+        if (isAuthErr) {
+          failDiag = RemoteHostDiagnosis(
+            kind: effectivePairCode != null && effectivePairCode.isNotEmpty
+                ? RemoteDiagnosisKind.pairingCodeExpired
+                : RemoteDiagnosisKind.needsAuth,
+            title: '授权校验未通过',
+            message: '电脑可以连通，但实时连接阶段授权被拒绝。原对话和当前输入均已保留，请重新扫码或更新链接。',
+            technicalDetail: e.toString().trim(),
+            normalizedAddress: parsed.address,
+            extractedToken: effectiveToken,
+            extractedPairCode: effectivePairCode,
+            capturedCookie: mintedCookie,
+            hostName: resolvedName,
+            isLoopbackTarget: isLoopback,
+          );
+        } else {
+          failDiag = RemoteHostDiagnosis(
+            kind: RemoteDiagnosisKind.realtimeFailed,
+            title: '实时连接未能建立',
+            message: '已连通「$resolvedName」，但实时通道或会话接口未能正常打开。你原来的对话与草稿都已保留，可直接重试。',
+            technicalDetail: e.toString().trim(),
+            normalizedAddress: parsed.address,
+            extractedToken: effectiveToken,
+            extractedPairCode: effectivePairCode,
+            capturedCookie: mintedCookie,
+            hostName: resolvedName,
+            isLoopbackTarget: isLoopback,
+          );
+        }
+      } else {
+        failDiag = _diagnosisFromError(
+          e,
+          parsed: parsed,
+          uri: uri,
+          effectiveToken: effectiveToken,
+          effectivePairCode: effectivePairCode,
+        );
+      }
+      onStageChanged?.call(PairingStage.failed, computerName: resolvedName);
+      return RemoteConnectOutcome(diagnosis: failDiag, connected: false);
+    } finally {
+      if (!handedOff && stagingClient != null) {
+        unawaited(stagingClient.dispose().catchError((_) {}));
+      }
     }
-    if (saveIfNeedsAuth && diag.needsWebOrTokenAuth) {
-      final saved = addRemoteHost(
-        targetAddress,
-        name: name,
-        token: diag.extractedToken ?? token,
-        cookie: diag.capturedCookie ?? cookie,
-        allowBadCertificates: allowBadCertificates,
-        autoProbe: false,
-        silent: true,
-      );
-      return RemoteConnectOutcome(
-        diagnosis: diag,
-        host: saved,
-        connected: false,
-      );
+  }
+
+  /// Atomically transitions from the previous host to an already-verified [stagingClient]
+  /// whose WebSocket handshake AND sessions list have already succeeded.
+  Future<void> _commitVerifiedRemoteHost(
+    ManagedHost target,
+    GbridgeClient stagingClient,
+    Capabilities caps, {
+    required bool isDirect,
+    required String latencyLabel,
+    required WelcomeInfo initialWelcome,
+    required List<SessionSummary> preloadedSessions,
+  }) async {
+    final hostId = target.id;
+    final isSameHostReconnect = state.activeHostId == hostId;
+    final prevActiveSessionId = state.activeSessionId;
+    if (!isSameHostReconnect || state.pendingAttachments.isNotEmpty || prevActiveSessionId != null) {
+      _stashPendingAttachmentsForScope(state.activeHostId, prevActiveSessionId);
+      _stashQueuedMessagesForScope(state.activeHostId, prevActiveSessionId);
+      _saveCurrentHostContext(hostIdOverride: state.activeHostId);
     }
-    return RemoteConnectOutcome(diagnosis: diag, connected: false);
+    final gen = ++_hostConnectGen;
+    _modelSelectionGen++;
+    _lastAutoSyncedDefaultKey = null;
+    _hostProbeGen[hostId] = (_hostProbeGen[hostId] ?? 0) + 1;
+    _streamRunId++;
+    _userNavigatedSinceHostBind = false;
+    _detachLiveClientsSync();
+
+    final mappedSessions = _mapSessionSummaries(preloadedSessions);
+    state = state.copyWith(
+      activeHostId: hostId,
+      clearActiveSession: true,
+      clearParentSession: true,
+      clearSidebarWorkspaceFilter: true,
+      clearPendingApproval: true,
+      clearActiveQuestion: true,
+      clearActiveCordisRequest: true,
+      clearOfflineUnsentNotice: true,
+      pendingInteractions: const [],
+      clearAccountSnapshot: true,
+      clearUpdateCheck: true,
+      clearTurnsNextCursor: true,
+      clearSessionLoadError: true,
+      clearMarketError: true,
+      checkingUpdate: false,
+      hasMoreTurns: false,
+      loadingOlderTurns: false,
+      searchingMarket: false,
+      speechConfigured: false,
+      accountSigningIn: false,
+      turnProcessOpen: !state.autoFoldSteps,
+      activeWorkspace: '',
+      activePresetId: 'standard',
+      activePermissionId: 'workspace-write',
+      planMode: false,
+      slashCommands: kDefaultSlashCommands,
+      activeModelProvider: '',
+      activeModelId: '',
+      modelName: '未连接模型',
+      modelShort: '未连接',
+      modelEffort: '',
+      modelEffortId: '',
+      presets: kPresetOptions,
+      permissionTiers: kPermissionTiers,
+      searchQuery: '',
+      searchSnippets: const {},
+      filter: SessionFilter.all,
+      sessions: mappedSessions,
+      loadingSessions: false,
+      hydratingDomains: true,
+      initialDomainsHydrated: false,
+      workspaces: const [],
+      turns: const [],
+      turnFeedback: const {},
+      stepTranslations: const {},
+      translatedStepIds: const {},
+      translatingStepIds: const {},
+      expandedTurnProcessIds: const {},
+      collapsedTurnProcessIds: const {},
+      expandedStepIds: const {},
+      pendingAttachments: _restorePendingAttachmentsForScope(
+        hostId,
+        isSameHostReconnect ? prevActiveSessionId : null,
+      ),
+      workspaceFiles: const [],
+      workspaceCurrentPath: '',
+      workspaceDiffs: const [],
+      activeDiffScope: 'uncommitted',
+      todos: const [],
+      goals: const [],
+      subagents: const [],
+      jobs: const [],
+      schedules: const [],
+      marketPlugins: const [],
+      dynamicCordis: const [],
+      modelGroups: const [],
+      routableProviders: const [],
+      providerCredentials: const [],
+      dshNamespaces: const [],
+      dshSettingsSections: const [],
+      dshDynamicOptions: const {},
+      engineSchema: const {},
+      engineValues: const {},
+      mcpServers: const [],
+      plugins: const [],
+      sduiSurfaces: const [],
+      sduiViews: const {},
+      queuedMessages: const [],
+      toolOutputCache: const {},
+      engineLogs: const [],
+      sessionTelemetry: const SessionTelemetry(),
+      loadingSession: false,
+      isStreaming: false,
+      isStopping: false,
+      streamStalled: false,
+      sendStage: SendStage.idle,
+      uploadDoneCount: 0,
+      uploadTotalCount: 0,
+      activePendingInteractionCount: 0,
+      contextPct: 0,
+      contextUsedK: 0,
+      contextMaxK: 128,
+      contextBreakdown: const {},
+      connectionPhase: ConnectionPhase.connected,
+      sessionRenderGen: state.sessionRenderGen + 1,
+      newChatSignal: state.newChatSignal + 1,
+    );
+    _persistPrefs();
+
+    await _bindFullLiveClient(
+      stagingClient,
+      hostId,
+      caps,
+      gen: gen,
+      isDirect: isDirect,
+      latencyLabel: latencyLabel,
+      restoreLastSession: true,
+      alreadyConnected: true,
+      initialWelcome: initialWelcome,
+      hasPreloadedSessions: true,
+    );
   }
 
   /// Probe a non-active host without touching `_liveClient` or the active host's sessions.
@@ -13661,6 +14501,9 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     bool isDirect = false,
     String? latencyLabel,
     bool restoreLastSession = true,
+    bool alreadyConnected = false,
+    WelcomeInfo? initialWelcome,
+    bool hasPreloadedSessions = false,
   }) async {
     if (!mounted || (gen != null && gen != _hostConnectGen)) {
       await client.dispose();
@@ -13674,7 +14517,14 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       }
     }
     _liveClient = client;
-    _hadInitialWelcome = false;
+    _hadInitialWelcome = alreadyConnected && initialWelcome != null;
+    if (alreadyConnected && initialWelcome != null) {
+      _interactionMutationSeq++;
+      _pendingInteractionsById
+        ..clear()
+        ..addEntries(initialWelcome.pendingInteractions.map((item) => MapEntry(item.id, item)));
+      _recomputeVisibleInteractions();
+    }
     final hostEnvLabel = caps.host.isLocalAndroid
         ? null
         : (isDirect
@@ -13689,8 +14539,8 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
     state = state.copyWith(
       activeHostId: hostId,
       liveCapabilities: caps,
-      connectionPhase: ConnectionPhase.connecting,
-      loadingSessions: true,
+      connectionPhase: alreadyConnected ? ConnectionPhase.connected : ConnectionPhase.connecting,
+      loadingSessions: !hasPreloadedSessions,
       hydratingDomains: true,
       initialDomainsHydrated: false,
       hosts: [
@@ -13874,16 +14724,24 @@ class GrassBagController extends StateNotifier<GrassBagAppState> {
       if (!mounted || !identical(_liveClient, client)) return;
       _handleLiveStreamFrame(client, frame);
     });
-    unawaited(
-      client.stream.connect().then((_) {
-        if (!mounted || !identical(_liveClient, client)) return;
-        client.stream.subscribe('host');
-        final activeSid = state.activeSessionId;
-        if (activeSid != null && !activeSid.startsWith('pending-session-')) {
-          client.stream.subscribe('session:$activeSid');
-        }
-      }).catchError((_) {}),
-    );
+    if (alreadyConnected) {
+      client.stream.subscribe('host');
+      final activeSid = state.activeSessionId;
+      if (activeSid != null && !activeSid.startsWith('pending-session-')) {
+        client.stream.subscribe('session:$activeSid');
+      }
+    } else {
+      unawaited(
+        client.stream.connect().then((_) {
+          if (!mounted || !identical(_liveClient, client)) return;
+          client.stream.subscribe('host');
+          final activeSid = state.activeSessionId;
+          if (activeSid != null && !activeSid.startsWith('pending-session-')) {
+            client.stream.subscribe('session:$activeSid');
+          }
+        }).catchError((_) {}),
+      );
+    }
   }
 
   List<ChatSessionItem> _mapSessionSummaries(List<SessionSummary> liveSessions) {

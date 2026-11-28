@@ -50,6 +50,12 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
   bool _bootstrapping = false;
   bool _finishing = false;
   bool _expandRemoteCardWhenConnected = false;
+  // Preserved across PageView step transitions so navigating Step 2 <-> Step 3 never wipes user input!
+  String _savedRemoteInput = '';
+  String _savedRemoteToken = '';
+  String _savedRemoteName = '';
+  bool _savedRemoteAllowBadCerts = false;
+  RemoteHostDiagnosis? _savedRemoteDiagnosis;
 
   bool get _isAndroidDevice =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -416,26 +422,47 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
     bool isWide,
     GrassBagGlassTier tier,
   ) {
-    final features = [
-      (
-        icon: CupertinoIcons.cube_box_fill,
-        color: t.primary,
-        title: '本机独立 Linux 运行环境',
-        desc: '按需下载 Ubuntu 与 DeepSeek Harness 核心，部署完成后可离线写代码、跑工具链。',
-      ),
-      (
-        icon: CupertinoIcons.desktopcomputer,
-        color: t.ok,
-        title: '免插件直连电脑与服务器',
-        desc: '自动发现同局域网 Mac / PC，一条链接 30 天免密同步全部会话。',
-      ),
-      (
-        icon: CupertinoIcons.hand_draw_fill,
-        color: t.warn,
-        title: '原生终端与手机安全操控',
-        desc: '融合多标签终端、文件对比与安全护栏，让 AI 真正替你落地执行。',
-      ),
-    ];
+    final features = _isAndroidDevice
+        ? [
+            (
+              icon: CupertinoIcons.cube_box_fill,
+              color: t.primary,
+              title: '本机独立 Linux 运行环境',
+              desc: '按需下载 Ubuntu 与 DeepSeek Harness 核心，部署完成后可离线写代码、跑工具链。',
+            ),
+            (
+              icon: CupertinoIcons.desktopcomputer,
+              color: t.ok,
+              title: '免插件直连电脑与服务器',
+              desc: '自动发现同局域网 Mac / PC，一条链接 30 天免密同步全部会话。',
+            ),
+            (
+              icon: CupertinoIcons.hand_draw_fill,
+              color: t.warn,
+              title: '原生终端与手机安全操控',
+              desc: '融合多标签终端、文件对比与安全护栏，让 AI 真正替你落地执行。',
+            ),
+          ]
+        : [
+            (
+              icon: CupertinoIcons.desktopcomputer,
+              color: t.primary,
+              title: '免插件直连 DeepSeek Harness',
+              desc: '填入电脑或服务器上的 `dsh web` 地址即可直接接入，无需额外安装插件。',
+            ),
+            (
+              icon: CupertinoIcons.sparkles,
+              color: t.ok,
+              title: '统一接入多渠道 AI 模型',
+              desc: '支持 DeepSeek 官方账号一键登录，以及 OpenAI、Anthropic 与自定义中转站。',
+            ),
+            (
+              icon: CupertinoIcons.chevron_left_slash_chevron_right,
+              color: t.warn,
+              title: '流式对话、终端与审批护栏',
+              desc: '实时查看工具调用、代码差异与多标签终端，高危操作清晰审批确认。',
+            ),
+          ];
 
     return SingleChildScrollView(
       physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
@@ -489,7 +516,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               ),
               const SizedBox(height: 8),
               Text(
-                '装进口袋里的全能开发与执行代理\n三步完成配置，立即开启原生液态玻璃体验',
+                _isAndroidDevice
+                    ? '装进口袋里的全能开发与执行代理\n按「连主机 → 配模型 → 开始对话」三步完成准备'
+                    : '跨设备连接 DeepSeek Harness 的统一工作台\n按「连主机 → 验证模型 → 开始对话」三步完成准备',
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 14,
@@ -612,7 +641,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               ),
               const SizedBox(height: 6),
               Text(
-                '可在手机本机独立部署，也可随时直连电脑上的 DeepSeek Harness',
+                _isAndroidDevice
+                    ? '可在手机本机独立部署，也可随时免插件直连电脑上的 DeepSeek Harness'
+                    : '选择连接本机运行的 dsh web，或输入局域网 / 服务器上的远程主机地址',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 13, height: 1.42, color: t.text2),
               ),
@@ -623,13 +654,15 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                 children: [
                   Expanded(
                     child: _ModeChoiceCard(
-                      icon: CupertinoIcons.device_phone_portrait,
-                      title: '本机独立运行',
+                      icon: _isAndroidDevice
+                          ? CupertinoIcons.device_phone_portrait
+                          : CupertinoIcons.device_laptop,
+                      title: _isAndroidDevice ? '本机独立运行' : '连接本机服务',
                       subtitle: _isAndroidDevice
                           ? (localReady
                               ? '已就绪 · 离线可用'
                               : (isRemoteThin ? '按需下载 · 约 $downloadSizeLabel' : '内置 Ubuntu · 离线可用'))
-                          : '本地 DSH 服务',
+                          : '127.0.0.1:3080',
                       badge: localReady ? '已就绪' : (_isAndroidDevice ? '推荐' : null),
                       badgeOk: localReady,
                       selected: _selectedMode == 0,
@@ -933,6 +966,25 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                                 connectImmediately: true,
                                 initiallyShowGuide: false,
                                 autoScanLan: !remoteConnected,
+                                initialInput: _savedRemoteInput.isEmpty ? null : _savedRemoteInput,
+                                initialToken: _savedRemoteToken.isEmpty ? null : _savedRemoteToken,
+                                initialName: _savedRemoteName.isEmpty ? null : _savedRemoteName,
+                                initialAllowBadCerts: _savedRemoteAllowBadCerts,
+                                initialDiagnosis: _savedRemoteDiagnosis,
+                                onDraftChanged: ({
+                                  required String address,
+                                  required String token,
+                                  required String name,
+                                  required bool allowBadCerts,
+                                }) {
+                                  _savedRemoteInput = address;
+                                  _savedRemoteToken = token;
+                                  _savedRemoteName = name;
+                                  _savedRemoteAllowBadCerts = allowBadCerts;
+                                },
+                                onDiagnosisChanged: (diag) {
+                                  _savedRemoteDiagnosis = diag;
+                                },
                                 onConnectedHost: (_) => _goToPage(2),
                               ),
                           ],
@@ -1015,7 +1067,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               ),
               const SizedBox(height: 16),
               Text(
-                allReady ? '一切准备就绪' : '最后一步：接入 AI 模型',
+                allReady
+                    ? '一切准备就绪'
+                    : (envReady ? '最后一步：接入 AI 模型' : '先连接主机，再配置模型'),
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   fontSize: 24,
@@ -1028,7 +1082,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
               Text(
                 allReady
                     ? '运行环境与模型均已就绪，现在就可以开始高效对话与执行任务。'
-                    : '登录 DeepSeek 官方账号或填入任意兼容 API Key，也可稍后在设置中补充。',
+                    : (envReady
+                        ? '登录 DeepSeek 官方账号或填入任意兼容 API Key，也可稍后在设置中补充。'
+                        : '模型凭据与渠道保存在目标主机中，连接主机后即可一键登录 DeepSeek 或添加 API Key。'),
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 13, height: 1.45, color: t.text2),
               ),
@@ -1104,20 +1160,33 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       child: Divider(height: 0.5, color: t.sep),
                     ),
 
-                    // 2. Model Provider Row + 1-Tap Quick Actions
+                    // 2. Model Provider Row + 1-Tap Quick Actions (ONLY actionable once a host is connected!)
                     _ReadyStatusRow(
                       done: modelReady,
                       icon: CupertinoIcons.sparkles,
                       title: modelReady
                           ? 'AI 模型已就绪（$routableCount 个渠道）'
-                          : '配置 AI 模型凭证',
+                          : (envReady ? '配置 AI 模型凭证' : '待连接主机后配置 AI 模型'),
                       subtitle: modelReady
                           ? (selectedModel.isNotEmpty
                               ? '默认模型：$selectedModel'
                               : '支持随时在对话底部切换模型与思考深度')
-                          : '支持 DeepSeek 官方一键登录、OpenAI / Anthropic / 自定义中转站',
+                          : (envReady
+                              ? '支持 DeepSeek 官方一键登录、OpenAI / Anthropic / 自定义中转站'
+                              : '当前尚未连上主机，无法写入或校验模型密钥；请先返回连接主机，或直接进入首页'),
                     ),
-                    if (!modelReady) ...[
+                    if (!modelReady && !envReady) ...[
+                      const SizedBox(height: 11),
+                      GrassBagPrimaryGlassButton(
+                        label: '先连接主机',
+                        icon: CupertinoIcons.arrow_left_circle_fill,
+                        height: 40,
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        tier: tier,
+                        insideGlass: true,
+                        onTap: () => _goToPage(1),
+                      ),
+                    ] else if (!modelReady && envReady) ...[
                       const SizedBox(height: 11),
                       LayoutBuilder(
                         builder: (context, constraints) {
@@ -1128,15 +1197,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                             padding: const EdgeInsets.symmetric(horizontal: 10),
                             tier: tier,
                             insideGlass: true,
-                            onTap: envReady
-                                ? () => launchDeepSeekSignInFlow(context, ref)
-                                : () {
-                                    ref.read(appProvider.notifier).showToast(
-                                          '请先完成运行环境部署或连接远程主机',
-                                          tone: ToastTone.info,
-                                        );
-                                    _goToPage(1);
-                                  },
+                            onTap: () => launchDeepSeekSignInFlow(context, ref),
                           );
                           final apiBtn = GrassBagSecondaryGlassButton(
                             label: 'API Key / 中转',
@@ -1146,15 +1207,7 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                             tier: tier,
                             insideGlass: true,
                             accentForeground: true,
-                            onTap: envReady
-                                ? _openModelSettings
-                                : () {
-                                    ref.read(appProvider.notifier).showToast(
-                                          '请先完成运行环境部署或连接远程主机',
-                                          tone: ToastTone.info,
-                                        );
-                                    _goToPage(1);
-                                  },
+                            onTap: _openModelSettings,
                           );
                           if (constraints.maxWidth < 316) {
                             return Column(
@@ -1354,7 +1407,9 @@ class _OnboardingPageState extends ConsumerState<OnboardingPage>
                       onTap: _finishing ? null : _finishOnboarding,
                     )
                   : GrassBagSecondaryGlassButton(
-                      label: _finishing ? '正在进入…' : '稍后配置模型，直接进入',
+                      label: _finishing
+                          ? '正在进入…'
+                          : (envReady ? '稍后配置模型，进入首页' : '先进入首页'),
                       icon: CupertinoIcons.arrow_right_circle,
                       height: 48,
                       tier: tier,

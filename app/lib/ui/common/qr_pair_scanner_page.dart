@@ -335,6 +335,18 @@ class _QrPairScannerPageState extends ConsumerState<QrPairScannerPage>
                                         }()),
                                       ),
                                     ),
+                                    SizedBox(
+                                      width: 158,
+                                      child: GrassBagSecondaryGlassButton(
+                                        label: '改用粘贴连接链接',
+                                        icon: CupertinoIcons.doc_on_clipboard,
+                                        height: 38,
+                                        tier: tier,
+                                        insideGlass: true,
+                                        accentForeground: true,
+                                        onTap: _useClipboardFallback,
+                                      ),
+                                    ),
                                   ],
                                 ),
                               ],

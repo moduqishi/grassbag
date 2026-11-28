@@ -63,21 +63,23 @@ void main() {
     expect(find.text('选择你的运行方式'), findsOneWidget);
     expect(find.text('连接远程电脑'), findsOneWidget);
 
-    // Toggle Remote mode and confirm redesigned RemoteHostConnectCard is visible
+    // Toggle Remote mode and confirm unified "连接电脑" pairing card is visible
     await tester.tap(find.text('连接远程电脑'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
-    expect(find.text('连接远程设备'), findsOneWidget);
+    expect(find.byKey(const ValueKey('pair-link-input')), findsOneWidget);
+    expect(find.byKey(const ValueKey('pair-prepare-guide-btn')), findsOneWidget);
 
-    // Step 2 -> Step 3 (Ready & Model setup)
+    // Step 2 -> Step 3 (When host is not connected yet, shows honest "先连接主机" + "先进入首页" instead of bouncing model buttons!)
     await tester.tap(find.textContaining('下一步'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 500));
-    expect(find.text('登录 DeepSeek'), findsOneWidget);
-    expect(find.text('API Key / 中转'), findsOneWidget);
+    expect(find.text('先连接主机'), findsOneWidget);
+    expect(find.text('先进入首页'), findsOneWidget);
+    expect(find.text('登录 DeepSeek'), findsNothing);
 
-    // Finish onboarding (when model is not yet configured, deferred secondary CTA is shown)
-    await tester.tap(find.text('稍后配置模型，直接进入'));
+    // Finish onboarding cleanly via "先进入首页"
+    await tester.tap(find.text('先进入首页'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 200));
     expect(finished, isTrue);
@@ -199,6 +201,11 @@ void main() {
         req.response.statusCode = 401;
         req.response.write('auth required');
         await req.response.close();
+        return;
+      }
+      if (path == '/api/remote.mux' && WebSocketTransformer.isUpgradeRequest(req)) {
+        final ws = await WebSocketTransformer.upgrade(req);
+        ws.listen((_) {});
         return;
       }
       if (path == '/api/session/list') {

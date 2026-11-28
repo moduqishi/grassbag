@@ -94,7 +94,7 @@ void main() {
   );
 
   testWidgets(
-    'Sending a prompt when disconnected reports honest offline notice instead of fake LLM reply',
+    'Sending a prompt when disconnected keeps single editable draft with persistent unsent status and Connect Host CTA',
     (tester) async {
       tester.view.physicalSize = const Size(396, 834);
       tester.view.devicePixelRatio = 1.0;
@@ -109,9 +109,11 @@ void main() {
       await tester.tap(find.byIcon(CupertinoIcons.arrow_up));
       await tester.pumpAndSettle();
 
-      expect(find.text(msg), findsWidgets);
-      expect(find.textContaining('尚未连接到运行中的 DSH 引擎'), findsOneWidget);
-      expect(find.byType(CustomScrollView), findsOneWidget);
+      // Single editable draft stays in the composer (no duplicate chat bubble!)
+      expect(find.text(msg), findsOneWidget);
+      expect(find.byKey(const ValueKey('composer-offline-unsent-strip')), findsOneWidget);
+      expect(find.textContaining('未发送'), findsOneWidget);
+      expect(find.byKey(const ValueKey('composer-offline-connect-btn')), findsOneWidget);
     },
   );
 
@@ -1846,23 +1848,27 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('直连远程电脑 / 服务器'), findsOneWidget);
-      expect(find.text('扫码连接'), findsOneWidget);
-      expect(find.text('粘贴'), findsOneWidget);
-      expect(find.text('重新扫描'), findsOneWidget);
-      expect(find.text('连接远程设备'), findsOneWidget);
+      expect(find.text('连接电脑'), findsOneWidget);
+      expect(find.byKey(const ValueKey('pair-scan-qr-btn')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pair-paste-link-btn')), findsOneWidget);
+      expect(find.byKey(const ValueKey('pair-prepare-guide-btn')), findsOneWidget);
 
-      // Expand Official Plugin + CLI guide
-      await tester.tap(find.text('如何获取电脑链接？'));
+      // Expand preparation guide -> presents explicit choice between DSH Desktop and dsh web
+      await tester.tap(find.byKey(const ValueKey('pair-prepare-guide-btn')));
       await tester.pumpAndSettle();
-      expect(find.text('官方插件（扫码推荐）'), findsOneWidget);
-      expect(find.textContaining('dsh-gbridge.tgz'), findsWidgets);
-      await tester.tap(find.text('免插件直连（dsh web）'));
+      expect(find.text('我用 DSH Desktop'), findsOneWidget);
+      expect(find.text('我已运行 dsh web'), findsOneWidget);
+      expect(find.text('复制电脑端操作指南链接'), findsOneWidget);
+
+      await tester.tap(find.text('我已运行 dsh web'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('启动链接'), findsWidgets);
+      await tester.tap(find.textContaining('127.0.0.1'));
       await tester.pumpAndSettle();
       expect(find.textContaining('dsh web --host'), findsWidgets);
 
       // Expand optional advanced options (Token optional + self-signed cert toggle)
-      await tester.tap(find.text('名称 / Token / 证书选项'));
+      await tester.tap(find.byKey(const ValueKey('pair-advanced-toggle')));
       await tester.pumpAndSettle();
       expect(find.textContaining('信任自签名 HTTPS 证书'), findsOneWidget);
       await tester.pump(const Duration(seconds: 5));
@@ -2027,7 +2033,8 @@ void main() {
         deviceIpsOverride: const {'192.168.1.42'},
       );
       expect(pcLoopbackHint, isNotNull);
-      expect(pcLoopbackHint, contains('局域网 IP'));
+      expect(pcLoopbackHint, contains('手机自己'));
+      expect(pcLoopbackHint, contains('局域网'));
 
       final androidSelfHint = ctrl.selfDeviceGuidanceForUri(
         Uri.parse('http://127.0.0.1:13080'),
@@ -2109,13 +2116,15 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.text('如何获取电脑链接？'));
+      await tester.tap(find.byKey(const ValueKey('pair-prepare-guide-btn')));
       await tester.pumpAndSettle();
-      expect(find.text('官方插件（扫码推荐）'), findsOneWidget);
-      expect(find.text('复制 AI 安装指令'), findsOneWidget);
-      expect(find.text('复制加速包地址'), findsOneWidget);
+      expect(find.text('我用 DSH Desktop'), findsOneWidget);
+      expect(find.text('我已运行 dsh web'), findsOneWidget);
+      expect(find.text('复制电脑端操作指南链接'), findsOneWidget);
 
-      await tester.tap(find.text('免插件直连（dsh web）'));
+      await tester.tap(find.text('我已运行 dsh web'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('127.0.0.1'));
       await tester.pumpAndSettle();
       expect(find.textContaining('--host 0.0.0.0'), findsNothing);
       expect(find.textContaining('dsh web --host'), findsWidgets);
@@ -2187,8 +2196,8 @@ void main() {
       await tester.pumpAndSettle();
       // Deep-linked directly into Hosts subpage (header title is '本机与远程主机', not root '设置')!
       expect(find.text('本机与远程主机'), findsWidgets);
-      expect(find.text('直连远程电脑 / 服务器'), findsOneWidget);
-      expect(tester.getSize(find.text('直连远程电脑 / 服务器')).width, greaterThan(40));
+      expect(find.text('连接电脑'), findsOneWidget);
+      expect(tester.getSize(find.text('连接电脑')).width, greaterThan(40));
 
       // 2) Settings search matches DeepSeek Account Hero Card (also inside GrassBagGlobalToastHost)
       await tester.pumpWidget(

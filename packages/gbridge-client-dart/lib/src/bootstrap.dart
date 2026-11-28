@@ -19,6 +19,11 @@ const String kOfficialGbridgeChecksumsUrl =
 const String kOfficialGbridgeAcceleratedUrl =
     'https://gh-proxy.com/https://github.com/moduqishi/grassbag/releases/latest/download/dsh-gbridge.tgz';
 
+/// Official short guide URL opened on a computer browser to walk DSH Desktop users
+/// directly through 「插件 → 添加插件 → 手机连接」 with copy buttons right on the computer.
+const String kOfficialDesktopPairingGuideUrl =
+    'https://github.com/moduqishi/grassbag/blob/main/docs/pair-desktop.md';
+
 /// Ordered fallback list tried automatically when installing the official `dsh-gbridge` plugin.
 const List<String> kOfficialGbridgeInstallSpecs = [
   kOfficialGbridgeAcceleratedUrl,
@@ -184,12 +189,14 @@ class HostProbeNeedsAuth extends HostProbeResult {
     this.dshVersion,
     this.hasGbridge = false,
     this.isHtmlLoginPage = false,
+    this.isPairingCodeExpired = false,
     this.message,
   });
 
   final String? dshVersion;
   final bool hasGbridge;
   final bool isHtmlLoginPage;
+  final bool isPairingCodeExpired;
   final String? message;
 }
 
@@ -256,9 +263,12 @@ class RemoteBootstrapClient {
     } on GbridgeException catch (err) {
       if (err.status == 401) {
         final dshVer = await _transport.probeDshSseVersion();
+        final isPairExpired = err.code == 'gbridge/pairing_code_expired' ||
+            _transport.lastAuthErrorCode == 'gbridge/pairing_code_expired';
         return HostProbeNeedsAuth(
           dshVersion: dshVer,
-          hasGbridge: err.code.startsWith('gbridge/') && err.code != 'gbridge/http_401',
+          hasGbridge: isPairExpired || (err.code.startsWith('gbridge/') && err.code != 'gbridge/http_401'),
+          isPairingCodeExpired: isPairExpired,
           message: err.message,
         );
       }

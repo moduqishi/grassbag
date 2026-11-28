@@ -20,7 +20,6 @@ import '../web/remote_web_login_page.dart';
 import '../web/web_embed.dart';
 import 'file_preview_sheet.dart';
 import 'preview_highlight_utils.dart';
-import 'qr_pair_scanner_page.dart';
 import 'remote_host_connect_card.dart';
 
 /// Root navigator key used by [GrassBagGlobalToastHost] so toasts tapped above
@@ -3930,10 +3929,21 @@ void showHostQuickSheet(
   VoidCallback? onConnected,
 }) {
   final outerCtx = context;
+  final current = ref.read(appProvider);
+  // Single-tap direct entry into the unified "连接电脑" pairing flow whenever the user
+  // has no saved remote computers yet and isn't actively using a connected local host.
+  if (current.hosts.length <= 1 && !current.activeHost.isConnectedUsable) {
+    showPairComputerSheet(
+      context,
+      onConnected: onConnected,
+      onOpenHostSettings: onOpenHostSettings,
+    );
+    return;
+  }
   showGrassBagSheet(
     context,
     title: '切换主机',
-    subtitle: '选择用于对话与执行的本机或远程主机',
+    subtitle: '选择已连接设备，或配对一台新电脑',
     icon: CupertinoIcons.desktopcomputer,
     preferredHeight: 380,
     bodyBuilder: (ctx) => Consumer(
@@ -4029,76 +4039,24 @@ void showHostQuickSheet(
               ),
             ],
             const SizedBox(height: 12),
-            Row(
-              children: [
-                if (!kIsWeb &&
-                    (defaultTargetPlatform == TargetPlatform.android ||
-                        defaultTargetPlatform == TargetPlatform.iOS ||
-                        defaultTargetPlatform == TargetPlatform.macOS)) ...[
-                  Expanded(
-                    child: GrassBagPrimaryGlassButton(
-                      label: '扫码连接',
-                      icon: CupertinoIcons.qrcode_viewfinder,
-                      tier: state.glassTier,
-                      insideGlass: true,
-                      onTap: () async {
-                        Navigator.of(ctx).pop();
-                        await Future<void>.delayed(const Duration(milliseconds: 140));
-                        if (!outerCtx.mounted) return;
-                        final raw = await Navigator.of(outerCtx).push<String>(
-                          GrassBagPageRoute<String>(
-                            builder: (_) => const QrPairScannerPage(),
-                          ),
-                        );
-                        if (!outerCtx.mounted || raw == null || raw.trim().isEmpty) return;
-                        final parsed = parseRemoteHostInput(raw.trim());
-                        if (parsed == null) {
-                          ctrl.showToast('未识别到有效的 GrassBag 配对链接', tone: ToastTone.warn);
-                          return;
-                        }
-                        ctrl.showToast('已扫码识别「${parsed.suggestedName ?? parsed.address}」，正在接入…',
-                            tone: ToastTone.info);
-                        final outcome = await ctrl.connectRemoteInput(
-                          raw.trim(),
-                          name: parsed.suggestedName,
-                        );
-                        if (!outerCtx.mounted) return;
-                        if (outcome.connected) {
-                          onConnected?.call();
-                        } else {
-                          showQuickRemoteConnectSheet(
-                            outerCtx,
-                            initialInput: raw.trim(),
-                            initialDiagnosis: outcome.diagnosis,
-                            onConnected: onConnected,
-                          );
-                        }
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                Expanded(
-                  child: GrassBagSecondaryGlassButton(
-                    label: '手动 / 发现',
-                    icon: CupertinoIcons.plus_circle_fill,
-                    tier: state.glassTier,
-                    insideGlass: true,
-                    accentForeground: true,
-                    onTap: () {
-                      Navigator.of(ctx).pop();
-                      Future<void>.delayed(const Duration(milliseconds: 160), () {
-                        if (outerCtx.mounted) {
-                          showQuickRemoteConnectSheet(
-                            outerCtx,
-                            onConnected: onConnected,
-                          );
-                        }
-                      });
-                    },
-                  ),
-                ),
-              ],
+            GrassBagPrimaryGlassButton(
+              key: const ValueKey('host-sheet-connect-computer-btn'),
+              label: '连接电脑',
+              icon: CupertinoIcons.desktopcomputer,
+              tier: state.glassTier,
+              insideGlass: true,
+              onTap: () {
+                Navigator.of(ctx).pop();
+                Future<void>.delayed(const Duration(milliseconds: 140), () {
+                  if (outerCtx.mounted) {
+                    showPairComputerSheet(
+                      outerCtx,
+                      onConnected: onConnected,
+                      onOpenHostSettings: onOpenHostSettings,
+                    );
+                  }
+                });
+              },
             ),
             if (onOpenHostSettings != null) ...[
               const SizedBox(height: 10),
@@ -4138,35 +4096,106 @@ void showHostQuickSheet(
   );
 }
 
-/// Direct 1-tap remote device connection sheet launchable straight from the Chat host pill.
+/// Unified "连接电脑" pairing sheet shared by Top Bar, Onboarding, Settings, and Deep Links.
+void showPairComputerSheet(
+  BuildContext context, {
+  String? initialInput,
+  RemoteHostDiagnosis? initialDiagnosis,
+  bool autoLaunchScanner = false,
+  bool confirmBeforeConnect = false,
+  VoidCallback? onConnected,
+  VoidCallback? onOpenHostSettings,
+}) {
+  showGrassBagSheet<void>(
+    context,
+    title: '连接电脑',
+    subtitle: kIsWeb
+        ? '粘贴电脑配对链接或 dsh web 启动链接，确认可打开会话后再切换'
+        : '扫码或粘贴链接，确认可打开会话后再切换',
+    icon: CupertinoIcons.desktopcomputer,
+    preferredHeight: 580,
+    bodyBuilder: (sheetCtx) {
+      final t = GrassBagTokens.of(sheetCtx);
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          RemoteHostConnectCard(
+            showHeader: false,
+            embeddedInSheet: true,
+            connectImmediately: true,
+            initiallyShowGuide: false,
+            autoLaunchScanner: autoLaunchScanner,
+            confirmBeforeConnect: confirmBeforeConnect,
+            initialInput: initialInput,
+            initialDiagnosis: initialDiagnosis,
+            onConnectedHost: (_) {
+              if (sheetCtx.mounted) {
+                Navigator.of(sheetCtx).pop();
+              }
+              onConnected?.call();
+            },
+          ),
+          if (onOpenHostSettings != null) ...[
+            const SizedBox(height: 10),
+            GrassBagSpringTap(
+              enablePointerGlow: false,
+              haptic: true,
+              onTap: () {
+                if (sheetCtx.mounted) Navigator.of(sheetCtx).pop();
+                onOpenHostSettings();
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(CupertinoIcons.slider_horizontal_3, size: 13.5, color: t.primary),
+                    const SizedBox(width: 5),
+                    Text(
+                      '管理本机与全部主机',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                        color: t.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 2),
+                    Icon(
+                      CupertinoIcons.chevron_right,
+                      size: 12,
+                      color: t.primary.withValues(alpha: 0.72),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ],
+      );
+    },
+  );
+}
+
+/// Alias kept for existing call sites; opens the unified "连接电脑" pairing sheet.
 void showQuickRemoteConnectSheet(
   BuildContext context, {
   String? initialInput,
   RemoteHostDiagnosis? initialDiagnosis,
+  bool autoLaunchScanner = false,
+  bool confirmBeforeConnect = false,
   VoidCallback? onConnected,
-}) {
-  showGrassBagSheet<void>(
-    context,
-    title: '连接远程电脑 / 服务器',
-    subtitle: '自动扫描同局域网设备，或直接粘贴 dsh web 启动链接',
-    icon: CupertinoIcons.wifi,
-    preferredHeight: 560,
-    bodyBuilder: (sheetCtx) => RemoteHostConnectCard(
-      showHeader: false,
-      embeddedInSheet: true,
-      connectImmediately: true,
-      initiallyShowGuide: false,
+  VoidCallback? onOpenHostSettings,
+}) =>
+    showPairComputerSheet(
+      context,
       initialInput: initialInput,
       initialDiagnosis: initialDiagnosis,
-      onConnectedHost: (_) {
-        if (sheetCtx.mounted) {
-          Navigator.of(sheetCtx).pop();
-        }
-        onConnected?.call();
-      },
-    ),
-  );
-}
+      autoLaunchScanner: autoLaunchScanner,
+      confirmBeforeConnect: confirmBeforeConnect,
+      onConnected: onConnected,
+      onOpenHostSettings: onOpenHostSettings,
+    );
 
 /// Guided one-time authorization sheet for remote DSH hosts (missing token / expired cookie).
 /// Replaces red error dialogs with a calm, 1-tap paste / token / WebView-login workflow.

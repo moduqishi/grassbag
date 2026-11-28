@@ -386,5 +386,25 @@ void main() {
       expect(updatedCaps.hasDomain('schedule'), isFalse);
       expect(updatedCaps.domains['schedule']?.reason, 'endpoint_unsupported');
     });
+
+    test('parseRemoteHostInput extracts short-lived pairCode (?p=) and strips it from stored address', () {
+      final fromScheme = parseRemoteHostInput(
+        'grassbag://pair?url=http%3A%2F%2F192.168.1.42%3A3085&token=tok123&name=StudioMac&p=deadbeef1234',
+        strictQr: true,
+      );
+      expect(fromScheme, isNotNull);
+      expect(fromScheme!.address, 'http://192.168.1.42:3085');
+      expect(fromScheme.token, 'tok123');
+      expect(fromScheme.suggestedName, 'StudioMac');
+      expect(fromScheme.pairCode, 'deadbeef1234');
+
+      final fromHttp = parseRemoteHostInput(
+        'http://192.168.1.42:3085/?token=tok123&name=StudioMac&p=cafe9988',
+        strictQr: true,
+      );
+      expect(fromHttp, isNotNull);
+      expect(fromHttp!.address, 'http://192.168.1.42:3085');
+      expect(fromHttp.pairCode, 'cafe9988');
+    });
   });
 }

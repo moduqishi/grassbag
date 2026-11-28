@@ -1515,9 +1515,10 @@ void showVisualProviderEditorSheet(
           ? '添加自定义渠道 / 中转站'
           : '配置 ${initialDisplayName.isNotEmpty ? initialDisplayName : providerId}',
       subtitle: isCustomNew
-          ? '填写 API 地址、密钥与模型即可接入任意 OpenAI / Anthropic / Gemini 兼容服务'
+          ? '选模板预填协议与地址，填好密钥后即可测试连通并保存'
           : '密钥加密写入宿主机凭据库，修改保存后自动刷新模型目录',
       expandable: true,
+      scrollableBody: false,
       onWillDismiss: () async {
         if (!dirtyNotifier.value) return true;
         if (!context.mounted) return true;
@@ -1610,6 +1611,7 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
   bool _protocolManuallyPicked = false;
   bool _obscureKey = true;
   bool _showAdvancedEnv = false;
+  bool _showEndpointSettings = true;
   bool _saving = false;
   bool _testingConnection = false;
   bool _discovering = false;
@@ -1638,11 +1640,25 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
     String sampleModel,
   })>[
     (
+      label: 'DeepSeek API',
+      name: 'DeepSeek API',
+      protocol: 'openai-completions',
+      baseUrl: 'https://api.deepseek.com/v1',
+      sampleModel: 'deepseek-chat',
+    ),
+    (
       label: 'OpenAI 中转',
       name: '我的 OpenAI 中转',
       protocol: 'openai-completions',
       baseUrl: 'https://api.openai.com/v1',
       sampleModel: 'gpt-4.1',
+    ),
+    (
+      label: 'OpenRouter',
+      name: 'OpenRouter',
+      protocol: 'openai-completions',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      sampleModel: 'anthropic/claude-sonnet-4',
     ),
     (
       label: 'SiliconFlow',
@@ -1652,18 +1668,18 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       sampleModel: 'deepseek-ai/DeepSeek-V3',
     ),
     (
-      label: 'Ollama 本地',
-      name: 'Ollama 本地模型',
-      protocol: 'openai-completions',
-      baseUrl: 'http://127.0.0.1:11434/v1',
-      sampleModel: 'qwen2.5-coder:7b',
-    ),
-    (
       label: 'Claude 中转',
       name: '我的 Claude 中转',
       protocol: 'anthropic-messages',
       baseUrl: 'https://api.anthropic.com',
       sampleModel: 'claude-sonnet-4-5',
+    ),
+    (
+      label: 'Ollama 本地',
+      name: 'Ollama 本地模型',
+      protocol: 'openai-completions',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      sampleModel: 'qwen2.5-coder:7b',
     ),
     (
       label: 'Gemini 兼容',
@@ -1690,12 +1706,12 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
       _baseUrlCtrl.text = tpl.baseUrl;
       _protocol = tpl.protocol;
       _protocolManuallyPicked = true;
+      // Collapse protocol/Base URL into a compact summary once a template prefills them,
+      // keeping API Key + Test + Sticky Save immediately visible above the fold!
+      _showEndpointSettings = false;
       final curModel = _newModelIdCtrl.text.trim();
       if (curModel.isEmpty || curModel == _lastTplModel) {
         _newModelIdCtrl.text = tpl.sampleModel;
-      }
-      if (_models.isEmpty) {
-        _showAddModel = true;
       }
       _lastTplName = tpl.name;
       _lastTplModel = tpl.sampleModel;
@@ -2346,10 +2362,25 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
         piAiNs.value['providers'] is Map &&
         (piAiNs.value['providers'] as Map).containsKey(widget.providerId);
 
+    final protocolLabel = _kApiProtocols
+            .where((p) => p.$1 == _protocol)
+            .firstOrNull
+            ?.$2 ??
+        'OpenAI 兼容';
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        Flexible(
+          child: SingleChildScrollView(
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            physics: const BouncingScrollPhysics(),
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
         if (!isPiAi && _probeSuccessMsg != null) ...[
           GrassBagFresnelGlassSurface(
             borderRadius: 13,
@@ -2429,73 +2460,109 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           const SizedBox(height: 12),
         ],
 
-        // 1. Provider Name (and optional ID on new custom relay)
-        if (isPiAi) ...[
-          Text('渠道名称', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
+        // 1-3. Collapsible Provider Name + Protocol + Base URL summary when prefilled by a template
+        if (isPiAi && widget.isCustomNew && !_showEndpointSettings && _baseUrlCtrl.text.trim().isNotEmpty) ...[
+          GrassBagSpringTap(
+            onTap: () => setState(() => _showEndpointSettings = true),
+            pressedScale: 0.985,
+            enablePointerGlow: false,
+            haptic: true,
+            child: GrassBagFresnelGlassSurface(
+              borderRadius: 14,
+              innerWell: true,
+              interactive: true,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '${_nameCtrl.text.trim().isEmpty ? '自定义渠道' : _nameCtrl.text.trim()} · $protocolLabel',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          _baseUrlCtrl.text.trim(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: t.text3),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '修改地址',
+                    style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600, color: t.primary),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 11),
+        ] else ...[
+          // 1. Provider Name (and optional ID on new custom relay)
+          if (isPiAi) ...[
+            Text('渠道名称', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
+            const SizedBox(height: 5),
+            GrassBagTextField(
+              controller: _nameCtrl,
+              insideGlass: true,
+              onChanged: (_) => _markDirty(),
+              placeholder: '例如：我的中转站 / OpenAI / DeepSeek',
+              fontSize: 13.5,
+              padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+            ),
+            const SizedBox(height: 10),
+          ],
+
+          // 2. API Protocol Selector (only for llm-pi-ai)
+          if (isPiAi) ...[
+            Text('接口协议', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final proto in _kApiProtocols)
+                  _FilterPill(
+                    label: proto.$2,
+                    active: _protocol == proto.$1,
+                    onTap: () {
+                      setState(() {
+                        _protocol = proto.$1;
+                        _protocolManuallyPicked = true;
+                      });
+                      _markDirty();
+                    },
+                  ),
+              ],
+            ),
+            const SizedBox(height: 10),
+          ],
+
+          // 3. Base URL
+          Text('API 地址 (Base URL)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
           const SizedBox(height: 5),
           GrassBagTextField(
-            controller: _nameCtrl,
+            controller: _baseUrlCtrl,
             insideGlass: true,
-            onChanged: (_) => _markDirty(),
-            placeholder: '例如：我的中转站 / OpenAI / DeepSeek',
-            fontSize: 13.5,
+            monospace: true,
+            keyboardType: TextInputType.url,
+            textInputAction: TextInputAction.next,
+            onChanged: _maybeInferProtocolFromUrl,
+            placeholder: _protocol == 'anthropic-messages'
+                ? 'https://api.anthropic.com'
+                : 'https://api.example.com/v1',
+            fontSize: 13,
             padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
           ),
           const SizedBox(height: 11),
         ],
-
-        // 2. API Protocol Selector (only for llm-pi-ai)
-        if (isPiAi) ...[
-          Text('接口协议', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: [
-              for (final proto in _kApiProtocols)
-                _FilterPill(
-                  label: proto.$2,
-                  active: _protocol == proto.$1,
-                  onTap: () {
-                    setState(() {
-                      _protocol = proto.$1;
-                      _protocolManuallyPicked = true;
-                    });
-                    _markDirty();
-                  },
-                ),
-            ],
-          ),
-          const SizedBox(height: 5),
-          Text(
-            '常见中转站 / 聚合站选「OpenAI 兼容」，Claude 官方或原生中转选「Anthropic」',
-            style: TextStyle(fontSize: 11, color: t.text3),
-          ),
-          const SizedBox(height: 11),
-        ],
-
-        // 3. Base URL
-        Text('API 地址 (Base URL)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2)),
-        const SizedBox(height: 5),
-        GrassBagTextField(
-          controller: _baseUrlCtrl,
-          insideGlass: true,
-          monospace: true,
-          keyboardType: TextInputType.url,
-          textInputAction: TextInputAction.next,
-          onChanged: _maybeInferProtocolFromUrl,
-          placeholder: _protocol == 'anthropic-messages'
-              ? 'https://api.anthropic.com'
-              : 'https://api.example.com/v1',
-          fontSize: 13,
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          'OpenAI 兼容地址通常以 /v1 结尾，Anthropic 协议一般不含 /v1',
-          style: TextStyle(fontSize: 11, color: t.text3),
-        ),
-        const SizedBox(height: 11),
 
         // 4. API Key with Paste + Eye Toggle + Configured Status Pill
         Row(
@@ -2703,16 +2770,14 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           ),
         ],
 
-        // 5b. Visual Custom Models List & Quick Add Model (for llm-pi-ai / custom relays!)
+        // 5b. Single clear Test & Fetch button + Visual Custom Models List (zero duplicate "测试连通"!)
         if (isPiAi) ...[
-          const SizedBox(height: 14),
-          if (widget.isCustomNew &&
-              _models.isEmpty &&
-              state.connectionPhase == ConnectionPhase.connected) ...[
+          const SizedBox(height: 12),
+          if (state.connectionPhase == ConnectionPhase.connected) ...[
             GrassBagSecondaryGlassButton(
-              label: _discovering ? '正在测试并拉取模型…' : '测试连通并自动拉取模型（推荐）',
+              label: _discovering ? '正在测试并拉取模型…' : '测试连通并拉取模型',
               icon: CupertinoIcons.cloud_download,
-              height: 38,
+              height: 40,
               tier: tier,
               insideGlass: true,
               accentForeground: true,
@@ -2721,74 +2786,16 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
                   ? null
                   : () => _discoverModels(testOnly: false),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 12),
           ],
-          Text(
-            '自定义模型列表 (${_models.length})',
-            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
-          ),
-          const SizedBox(height: 7),
-          Wrap(
-            spacing: 7,
-            runSpacing: 6,
+          Row(
             children: [
-              if (state.connectionPhase == ConnectionPhase.connected) ...[
-                GrassBagSpringTap(
-                  enabled: !_testingConnection && !_discovering && !_saving,
-                  onTap: () => _discoverModels(testOnly: true),
-                  pressedScale: 0.94,
-                  enablePointerGlow: false,
-                  haptic: true,
-                  child: GrassBagFresnelGlassSurface(
-                    isPill: true,
-                    innerWell: true,
-                    interactive: true,
-                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5.5),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (_testingConnection)
-                          GrassBagActivityIndicator(radius: 6, color: t.text2)
-                        else
-                          Icon(CupertinoIcons.checkmark_shield, size: 13, color: t.text2),
-                        const SizedBox(width: 4),
-                        Text(
-                          _testingConnection ? '测试中…' : '测试连通',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: t.text2),
-                        ),
-                      ],
-                    ),
-                  ),
+              Expanded(
+                child: Text(
+                  '模型列表 (${_models.length})',
+                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: t.text2),
                 ),
-                GrassBagSpringTap(
-                  enabled: !_discovering && !_testingConnection && !_saving,
-                  onTap: () => _discoverModels(testOnly: false),
-                  pressedScale: 0.94,
-                  enablePointerGlow: false,
-                  haptic: true,
-                  child: GrassBagFresnelGlassSurface(
-                    isPill: true,
-                    innerWell: true,
-                    interactive: true,
-                    tintColor: t.primarySoft,
-                    padding: const EdgeInsets.symmetric(horizontal: 10.5, vertical: 5.5),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (_discovering)
-                          GrassBagActivityIndicator(radius: 6, color: t.primary)
-                        else
-                          Icon(CupertinoIcons.cloud_download, size: 13, color: t.primary),
-                        const SizedBox(width: 4),
-                        Text(
-                          _discovering ? '拉取中…' : '自动拉取',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: t.primary),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+              ),
               GrassBagSpringTap(
                 onTap: () {
                   if (_showAddModel) {
@@ -3365,9 +3372,14 @@ class _VisualProviderEditorBodyState extends ConsumerState<_VisualProviderEditor
           ],
         ],
 
-        const SizedBox(height: 16),
-
-        // 6. Inline error near bottom Save CTA + Primary Save / Clear Key / Delete Custom Provider
+        const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        ),
+        // Sticky Bottom Action Bar — "保存并刷新模型" is ALWAYS visible above the fold!
+        Divider(height: 0.5, color: t.sep),
+        const SizedBox(height: 10),
         if (_errorMsg != null) ...[
           GrassBagFresnelGlassSurface(
             borderRadius: 13,
